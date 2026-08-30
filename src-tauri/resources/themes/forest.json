@@ -1,0 +1,24 @@
+{
+  "id": "forest",
+  "name": "Deep Forest",
+  "variant": "dark",
+  "order": 2,
+  "editorBg": "#131a15",
+  "editorFg": "#cdd6c9",
+  "uiBg": "#17201a",
+  "uiFg": "#93a08e",
+  "uiAccent": "#7fb069",
+  "uiBorder": "#26302a",
+  "danger": "#e0685a",
+  "syntax": {
+    "keyword": "#c98fb0",
+    "string": "#a8c78c",
+    "number": "#e0b56b",
+    "comment": "#5f6b5c",
+    "function": "#6fae8f",
+    "type": "#7fb0a0",
+    "variable": "#cdd6c9",
+    "operator": "#9db38f",
+    "const": "#e0b56b"
+  }
+}

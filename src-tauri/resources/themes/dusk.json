@@ -1,0 +1,24 @@
+{
+  "id": "dusk",
+  "name": "Dusk",
+  "variant": "dark",
+  "order": 4,
+  "editorBg": "#1a161f",
+  "editorFg": "#d6cede",
+  "uiBg": "#201b26",
+  "uiFg": "#a498ac",
+  "uiAccent": "#a97fc9",
+  "uiBorder": "#302838",
+  "danger": "#e37a83",
+  "syntax": {
+    "keyword": "#c98fd0",
+    "string": "#9cbf9a",
+    "number": "#d6a35f",
+    "comment": "#6a5f72",
+    "function": "#a97fc9",
+    "type": "#7fb0c0",
+    "variable": "#d6cede",
+    "operator": "#b09ac0",
+    "const": "#d6a35f"
+  }
+}

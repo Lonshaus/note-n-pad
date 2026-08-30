@@ -1,0 +1,33 @@
+<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<!--
+  Replaces tauri-build's default manifest, which declares only Common-Controls
+  v6. That default leaves DPI awareness undeclared, so the App Certification Kit
+  raises "app manifest does not declare dpiAware".
+  tao still calls SetProcessDpiAwarenessContext at startup, so the process was
+  already per-monitor v2 at runtime; declaring it here makes it true from the
+  first pixel and satisfies the static check.
+
+  The Common-Controls dependency must stay: Tauri's dialog APIs need it.
+-->
+<assembly xmlns="urn:schemas-microsoft-com:asm.v1" manifestVersion="1.0">
+  <dependency>
+    <dependentAssembly>
+      <assemblyIdentity
+        type="win32"
+        name="Microsoft.Windows.Common-Controls"
+        version="6.0.0.0"
+        processorArchitecture="*"
+        publicKeyToken="6595b64144ccf1df"
+        language="*"
+      />
+    </dependentAssembly>
+  </dependency>
+  <application xmlns="urn:schemas-microsoft-com:asm.v3">
+    <windowsSettings>
+      <!-- The 2016 key is what Windows 10 1607+ reads; the 2005 key is the
+           fallback older loaders (and the certification kit) look for. -->
+      <dpiAwareness xmlns="http://schemas.microsoft.com/SMI/2016/WindowsSettings">PerMonitorV2</dpiAwareness>
+      <dpiAware xmlns="http://schemas.microsoft.com/SMI/2005/WindowsSettings">true/pm</dpiAware>
+    </windowsSettings>
+  </application>
+</assembly>

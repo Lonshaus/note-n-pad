@@ -1,0 +1,69 @@
+{{!--
+  Custom Handlebars template for Tauri's Linux .desktop file (see
+  bundle.linux.deb.desktopTemplate and bundle.linux.rpm.desktopTemplate in
+  tauri.linux.conf.json — both formats use this one file). The base
+  [Desktop Entry] fields mirror Tauri's default template; the two
+  [Desktop Action ...] groups add the Jump List's static "Tasks" entries
+  (see jumplist.rs::build_tasks) as a GNOME/KDE launcher right-click menu.
+
+  The Name[xx]= values are copied by hand from i18n.rs's Key::NewSticky and
+  Key::DockOpenWorkspace strings (locale order: zh_TW, zh_CN, ja, en, ru, es,
+  pt_BR, de, fr, ko, pl, tr, it, th, vi). This file is static, so it does not
+  update itself when those i18n.rs strings change — the two are kept in sync
+  by src/linux_desktop_actions.rs's desktop_actions_match_i18n test, which
+  reads this committed file and fails if either side drifts.
+--}}
+[Desktop Entry]
+Categories={{categories}}
+{{#if comment}}
+Comment={{comment}}
+{{/if}}
+Exec={{exec}}
+StartupWMClass={{exec}}
+Icon={{icon}}
+{{!-- Literal rather than {{name}}: productName is lowercased for Linux so the
+     deb and rpm package names come out as note-n-pad, and the launcher must
+     still read Note&Pad (issue #24). --}}
+Name=Note&Pad
+Terminal=false
+Type=Application
+{{#if mime_type}}
+MimeType={{mime_type}}
+{{/if}}
+Actions=NewSticky;OpenWorkspace;
+
+[Desktop Action NewSticky]
+Name=New Sticky
+Name[zh_TW]=新增便利貼
+Name[zh_CN]=新建便签
+Name[ja]=新しい付箋
+Name[ru]=Новая заметка
+Name[es]=Nueva nota adhesiva
+Name[pt_BR]=Nova nota adesiva
+Name[de]=Neue Haftnotiz
+Name[fr]=Nouveau pense-bête
+Name[ko]=새 메모지
+Name[pl]=Nowa karteczka
+Name[tr]=Yeni Yapışkan Not
+Name[it]=Nuovo foglietto
+Name[th]=โน้ตกระดาษใหม่
+Name[vi]=Ghi chú dán mới
+Exec={{exec}} --new-sticky
+
+[Desktop Action OpenWorkspace]
+Name=Open Workspace
+Name[zh_TW]=開啟工作區
+Name[zh_CN]=打开工作区
+Name[ja]=ワークスペースを開く
+Name[ru]=Открыть рабочую область
+Name[es]=Abrir espacio de trabajo
+Name[pt_BR]=Abrir área de trabalho
+Name[de]=Arbeitsbereich öffnen
+Name[fr]=Ouvrir l'espace de travail
+Name[ko]=작업 공간 열기
+Name[pl]=Otwórz obszar roboczy
+Name[tr]=Çalışma Alanını Aç
+Name[it]=Apri area di lavoro
+Name[th]=เปิดพื้นที่ทำงาน
+Name[vi]=Mở không gian làm việc
+Exec={{exec}} --workspace

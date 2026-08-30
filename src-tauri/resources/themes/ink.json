@@ -1,0 +1,24 @@
+{
+  "id": "ink",
+  "name": "Ink",
+  "variant": "dark",
+  "order": 1,
+  "editorBg": "#17181c",
+  "editorFg": "#d4d6dc",
+  "uiBg": "#1c1e24",
+  "uiFg": "#9aa0ac",
+  "uiAccent": "#6f9bd8",
+  "uiBorder": "#2b2e36",
+  "danger": "#e2635c",
+  "syntax": {
+    "keyword": "#b48ead",
+    "string": "#9cc09a",
+    "number": "#d3a15c",
+    "comment": "#656b78",
+    "function": "#6f9bd8",
+    "type": "#6fb3ad",
+    "variable": "#d4d6dc",
+    "operator": "#b09aa8",
+    "const": "#d3a15c"
+  }
+}

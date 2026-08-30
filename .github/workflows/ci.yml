@@ -1,0 +1,80 @@
+name: CI
+
+# Manual trigger only: a three-platform matrix run costs about 18 billable
+# minutes (GitHub weights private-repo minutes by platform — Linux 1x,
+# Windows 2x, macOS 10x), so it runs when asked for rather than on every push.
+on:
+  workflow_dispatch:
+
+# Cancel superseded runs on the same ref to save CI minutes.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-latest, windows-latest, ubuntu-24.04]
+    steps:
+      - uses: actions/checkout@v7
+
+      # The list lives in scripts/linux-check/apt-packages.txt so this job and
+      # the local Linux container (scripts/linux-check/check.sh) install exactly
+      # the same packages; two hand-copied lists had already drifted apart once,
+      # which quietly makes the container stop standing in for this job.
+      - name: Install Tauri system dependencies (Linux)
+        if: startsWith(matrix.os, 'ubuntu')
+        run: |
+          sudo apt-get update
+          grep -vE '^[[:space:]]*(#|$)' scripts/linux-check/apt-packages.txt \
+            | xargs sudo apt-get install -y
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v7
+        with:
+          node-version: 24
+          cache: npm
+
+      - name: Install npm dependencies
+        run: npm ci
+
+      # rustfmt and clippy are not in the minimal profile this action installs
+      # by default, so both are requested explicitly.
+      - name: Setup Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      # Needs no compilation, so it runs before the build cache is even restored.
+      - name: Rust format check (cargo fmt)
+        working-directory: src-tauri
+        run: cargo fmt --check
+
+      - name: Cache Rust build
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+
+      - name: Type check (svelte-check + tsc)
+        run: npm run check
+
+      - name: Unit tests (vitest)
+        run: npx vitest run
+
+      - name: Format check (prettier)
+        run: npm run format:check
+
+      - name: Rust tests (cargo test)
+        working-directory: src-tauri
+        run: cargo test
+
+      # Runs on all three platforms deliberately: most of the platform-specific
+      # code is behind #[cfg(target_os = ...)], so a lint that only ran on one
+      # runner would never compile the other two platforms' branches at all.
+      - name: Rust lint (cargo clippy)
+        working-directory: src-tauri
+        run: cargo clippy --all-targets -- -D warnings

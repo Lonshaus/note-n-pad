@@ -1,0 +1,34 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Note&amp;Pad</title>
+    <!-- Inline critical background so the very first paint - before any CSS or
+         JS module loads, and on the Rust-side grace force-show - already
+         matches the system theme instead of flashing white in dark mode.
+         Values mirror app.css --bg for light / dark.
+         `data-nonce` carries the CSP nonce to the frontend. Tauri replaces every
+         occurrence of that token in the served HTML with a fresh nonce and adds
+         each one to `style-src`, so this attribute is a valid nonce even though
+         it is not the same value as the `nonce` attribute Tauri stamps onto this
+         same element. It has to be a separate attribute: WebKit blanks the real
+         `nonce` attribute after parsing it, and on macOS 13's WebKit the `.nonce`
+         IDL property does not keep the value either, so the nonce is otherwise
+         unreadable at runtime. See src/lib/util/cspNonce.ts. -->
+    <style data-nonce="__TAURI_STYLE_NONCE__">
+      html {
+        background: #ffffff;
+      }
+      @media (prefers-color-scheme: dark) {
+        html {
+          background: #1e1e1e;
+        }
+      }
+    </style>
+  </head>
+  <body>
+    <div id="app"></div>
+    <script type="module" src="/src/main.ts"></script>
+  </body>
+</html>
