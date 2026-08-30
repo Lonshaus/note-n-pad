@@ -1,0 +1,24 @@
+{
+  "id": "dawn",
+  "name": "Dawn",
+  "variant": "light",
+  "order": 5,
+  "editorBg": "#f8f0ee",
+  "editorFg": "#3a2e2e",
+  "uiBg": "#f0e4e1",
+  "uiFg": "#6e5c58",
+  "uiAccent": "#c06a5a",
+  "uiBorder": "#e7d6d1",
+  "danger": "#b23b30",
+  "syntax": {
+    "keyword": "#9a5488",
+    "string": "#4f7a4f",
+    "number": "#a05f2a",
+    "comment": "#9d8a86",
+    "function": "#b0604f",
+    "type": "#2f7a72",
+    "variable": "#3a2e2e",
+    "operator": "#7a6a66",
+    "const": "#a05f2a"
+  }
+}

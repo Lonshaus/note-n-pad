@@ -1,0 +1,107 @@
+[package]
+name = "note-n-pad"
+version = "1.0.0"
+description = "Sticky notes and a plain-text editor"
+authors = ["Lonshaus"]
+license = "GPL-3.0-only"
+repository = "https://github.com/Lonshaus/note-n-pad"
+edition = "2021"
+rust-version = "1.77.2"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[lib]
+name = "note_n_pad_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2.6.3", features = [] }
+
+[dependencies]
+encoding_rs = "0.8"
+chardetng = "0.1"
+serde_json = "1.0"
+serde = { version = "1.0", features = ["derive"] }
+log = "0.4"
+sys-locale = "0.3"
+tauri = { version = "2.11.3", features = ["tray-icon"] }
+tauri-plugin-dialog = "2.7.1"
+tauri-plugin-global-shortcut = "2.3.2"
+trash = "5"
+uuid = { version = "1", features = ["v4"] }
+
+# Used only from Rust (the Help menu's Documentation / Report an Issue items);
+# never exposed to the frontend, so it needs no capability entry. Absent on
+# Windows: it reaches the shell by spawning `powershell.exe` (and `explorer.exe`
+# as a fallback), which a packaged app cannot rely on in S mode and which puts
+# `powershell`/`cmd` strings in the binary. `navigation::open_externally` calls
+# ShellExecuteW directly there instead.
+[target.'cfg(not(target_os = "windows"))'.dependencies]
+tauri-plugin-opener = "2"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = "0.6"
+objc2-app-kit = { version = "0.3.2", features = [
+  "NSWorkspace",
+  "NSRunningApplication",
+  "NSApplication",
+  "NSMenu",
+  "NSMenuItem",
+  "NSResponder",
+] }
+objc2-foundation = { version = "0.3.2", features = [
+  "NSArray",
+  "NSData",
+  "NSError",
+  "NSFileManager",
+  "NSPathUtilities",
+  "NSString",
+  "NSURL",
+] }
+
+[target.'cfg(target_os = "windows")'.dependencies]
+windows-sys = { version = "0.60", features = [
+  "Win32_Foundation",
+  "Win32_UI_WindowsAndMessaging",
+  "Win32_System_Threading",
+  "Win32_System_Registry",
+  "Win32_Storage_FileSystem",
+  "Win32_Security",
+  "Win32_Security_Authorization",
+] }
+# Only windows-sys (raw FFI, no COM) was a dependency before; the Jump List
+# needs COM interfaces (ICustomDestinationList, IShellLinkW), which windows-sys
+# does not model, so the higher-level `windows` crate is added for that alone.
+windows = { version = "0.61", features = [
+  "Win32_Foundation",
+  "Win32_Storage_Packaging_Appx",
+  "Win32_Storage_EnhancedStorage",
+  "Win32_System_Com",
+  "Win32_System_Com_StructuredStorage",
+  "Win32_System_Variant",
+  "Win32_UI_Shell",
+  "Win32_UI_Shell_Common",
+  "Win32_UI_Shell_PropertiesSystem",
+  "Win32_UI_WindowsAndMessaging",
+] }
+
+# Single-instance guard is only needed off macOS: macOS already routes a second
+# launch through the Reopen event, so the app is inherently single-instance.
+[target.'cfg(any(target_os = "windows", target_os = "linux"))'.dependencies]
+tauri-plugin-single-instance = "2"
+
+[target.'cfg(target_os = "linux")'.dependencies]
+# Same gtk version tao/wry already pull in, so no extra build cost.
+gtk = "0.18"
+# Same gdk version already locked as a transitive dependency of gtk above;
+# pinned here directly to read the CLIPBOARD selection for Edit > Paste.
+gdk = "0.18"
+# Pure-Rust X11 client for reading the active window / client list under X11
+# (and XWayland). No system X11 dev libraries required at build time.
+x11rb = "0.13"
+# Already a transitive dependency of the gtk stack (Cargo.lock has gio 0.18.4);
+# pinned here to reuse that copy for .desktop-based app-name resolution.
+gio = "0.18"
+
+[dev-dependencies]
+tempfile = "3.27.0"

@@ -1,0 +1,24 @@
+{
+  "id": "plain",
+  "name": "Plain",
+  "variant": "light",
+  "order": 4,
+  "editorBg": "#fafafa",
+  "editorFg": "#2e2e2e",
+  "uiBg": "#f0f0f0",
+  "uiFg": "#606060",
+  "uiAccent": "#4a6a9a",
+  "uiBorder": "#e2e2e2",
+  "danger": "#c0433a",
+  "syntax": {
+    "keyword": "#8a4f9a",
+    "string": "#4a7a4a",
+    "number": "#9a6030",
+    "comment": "#909090",
+    "function": "#3a6aa5",
+    "type": "#2a7a72",
+    "variable": "#2e2e2e",
+    "operator": "#707070",
+    "const": "#9a6030"
+  }
+}

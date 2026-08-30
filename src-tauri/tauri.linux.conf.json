@@ -1,0 +1,15 @@
+{
+  "$schema": "../node_modules/@tauri-apps/cli/config.schema.json",
+  "mainBinaryName": "note-n-pad",
+  "productName": "note-n-pad",
+  "bundle": {
+    "linux": {
+      "deb": {
+        "desktopTemplate": "linux/note-n-pad.desktop.hbs"
+      },
+      "rpm": {
+        "desktopTemplate": "linux/note-n-pad.desktop.hbs"
+      }
+    }
+  }
+}

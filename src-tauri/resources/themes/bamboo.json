@@ -1,0 +1,24 @@
+{
+  "id": "bamboo",
+  "name": "Bamboo",
+  "variant": "light",
+  "order": 3,
+  "editorBg": "#f0f3ea",
+  "editorFg": "#333829",
+  "uiBg": "#e6ebdc",
+  "uiFg": "#5f6650",
+  "uiAccent": "#5f9147",
+  "uiBorder": "#d5dcc8",
+  "danger": "#c14f3c",
+  "syntax": {
+    "keyword": "#97588f",
+    "string": "#47773a",
+    "number": "#9c6520",
+    "comment": "#8b917c",
+    "function": "#3c7a68",
+    "type": "#2f7a52",
+    "variable": "#333829",
+    "operator": "#6d7360",
+    "const": "#9c6520"
+  }
+}

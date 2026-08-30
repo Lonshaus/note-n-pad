@@ -1,0 +1,312 @@
+/* Fallback values only: every window sets the real ones at runtime (see
+   `lib/theme/applyTheme.ts`), from the resolved built-in theme's data
+   (`lib/theme/themes.ts`), before the window is ever revealed. These mirror
+   the "paper" theme so a window briefly rendered before that runs (there
+   isn't one — windows start hidden — but this keeps the sheet self-consistent)
+   still looks like a plausible light theme rather than unstyled black-on-white. */
+:root {
+  color-scheme: light dark;
+  font-family: system-ui, sans-serif;
+  --bg: #ebe5d6;
+  --fg: #6a6252;
+  --topbar-border: #ddd4c2;
+  --accent: #4f7bb0;
+  /* Unified danger red for every close/delete glyph and error state. Each
+     built-in theme sets its own (see themes.ts); this is the "paper" value. */
+  --danger: #c0463c;
+  /* Editor surface, read by DocumentEditor.svelte's var-based EditorView theme. */
+  --e-bg: #f4f0e6;
+  --e-fg: #3a352c;
+  /* The 9 syntax-color roles shared by CodeMirror's synchronous HighlightStyle
+     (DocumentEditor.svelte) and the worker-highlight `.tok-*` CSS below, so
+     both paths always render identically. */
+  --tok-keyword: #8a5c8a;
+  --tok-string: #4f7a4a;
+  --tok-number: #9a6a2a;
+  --tok-comment: #9a9280;
+  --tok-function: #3a6ea5;
+  --tok-type: #2a7a72;
+  --tok-variable: #3a352c;
+  --tok-operator: #7a6a70;
+  --tok-const: #9a6a2a;
+}
+
+html,
+body {
+  height: 100%;
+}
+
+body {
+  margin: 0;
+  overflow: hidden;
+  background: var(--bg);
+  color: var(--fg);
+}
+
+#app {
+  height: 100%;
+}
+
+/* LANDMINE: a native drop-down's colors have to be stated on the options, not
+   on the select. Chromium opens the popup as its own window and paints each row
+   from the *option's* computed background/color; the select's own background
+   never reaches it (measured on Windows — setting it there changed nothing).
+   Left to inherit, an option picks up the light `--fg` and lands on a popup
+   Chromium grounds in its light default palette: white on white, legible only
+   for the row under the pointer. Global rather than per-component because every
+   select in the app (status bar, settings) has the same inherited colors, and
+   macOS hides the bug entirely — WebKit draws the popup as a native menu and
+   ignores author colors. */
+option {
+  background: var(--bg);
+  color: var(--fg);
+}
+
+/* Sticky and workspace windows are OS-transparent so CSS can draw a rounded
+   card; the page chrome behind it must not paint a square. */
+html.transparent-window,
+html.transparent-window body,
+html.transparent-window #app {
+  background: transparent;
+}
+
+/* Paper palettes. The sticky card look is fully determined by its paper,
+   independent of the app theme. Every paper except graphite is a light
+   surface (light syntax colors); graphite is dark (oneDark editor theme). */
+.paper-classic {
+  --sticky-bg: #fdf6c9;
+  --sticky-bg-top: #fefadb;
+  --sticky-fg: #4a4632;
+  --sticky-accent: #d9a300;
+  --sticky-scrim: rgba(120, 105, 40, 0.1);
+  --sticky-caret: #4a4632;
+  --sticky-selection: rgba(217, 163, 0, 0.22);
+  --sticky-track: rgba(74, 70, 50, 0.25);
+}
+
+.paper-white {
+  --sticky-bg: #ffffff;
+  --sticky-bg-top: #fffef9;
+  --sticky-fg: #333333;
+  --sticky-accent: #e0a500;
+  --sticky-scrim: rgba(0, 0, 0, 0.05);
+  --sticky-caret: #333333;
+  --sticky-selection: rgba(224, 165, 0, 0.2);
+  --sticky-track: rgba(0, 0, 0, 0.22);
+}
+
+.paper-pink {
+  --sticky-bg: #fcdce6;
+  --sticky-bg-top: #fde7ee;
+  --sticky-fg: #5b3a45;
+  --sticky-accent: #d6607f;
+  --sticky-scrim: rgba(150, 60, 90, 0.1);
+  --sticky-caret: #5b3a45;
+  --sticky-selection: rgba(214, 96, 127, 0.22);
+  --sticky-track: rgba(91, 58, 69, 0.25);
+}
+
+.paper-blue {
+  --sticky-bg: #d6e8fb;
+  --sticky-bg-top: #e4f0fd;
+  --sticky-fg: #34465b;
+  --sticky-accent: #3f7fce;
+  --sticky-scrim: rgba(50, 90, 150, 0.1);
+  --sticky-caret: #34465b;
+  --sticky-selection: rgba(63, 127, 206, 0.22);
+  --sticky-track: rgba(52, 70, 91, 0.25);
+}
+
+.paper-green {
+  --sticky-bg: #d9efd6;
+  --sticky-bg-top: #e6f5e3;
+  --sticky-fg: #38492f;
+  --sticky-accent: #4e9a4e;
+  --sticky-scrim: rgba(60, 120, 60, 0.1);
+  --sticky-caret: #38492f;
+  --sticky-selection: rgba(78, 154, 78, 0.22);
+  --sticky-track: rgba(56, 73, 47, 0.25);
+}
+
+.paper-graphite {
+  --sticky-bg: #2b2a25;
+  --sticky-bg-top: #34322c;
+  --sticky-fg: #e6e2d6;
+  --sticky-accent: #e0a500;
+  --sticky-scrim: rgba(255, 255, 255, 0.06);
+  --sticky-caret: #e6e2d6;
+  --sticky-selection: rgba(224, 165, 0, 0.28);
+  --sticky-track: rgba(230, 226, 214, 0.25);
+}
+
+/* Checkboxes follow the app accent in both themes, everywhere. */
+input[type='checkbox'] {
+  accent-color: var(--accent);
+}
+
+/* CodeMirror search/replace panel, themed as a flat app control in both the
+   document and sticky editors (global so a single rule covers both). */
+.cm-panel.cm-search {
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  gap: 7px;
+  /* Right padding keeps wrapped rows clear of the absolute close button.
+     CM's injected base theme sets its own padding with a higher-specificity
+     selector, so this needs important to win. */
+  padding: 10px 36px 10px 12px !important;
+  background: var(--bg);
+  color: var(--fg);
+  border-top: 1px solid var(--topbar-border);
+  font-size: 0.85rem;
+}
+/* Each row wraps as whole controls, never mid-checkbox. */
+.cm-panel.cm-search .cm-search-row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  row-gap: 6px;
+}
+.cm-panel.cm-search .cm-search-opts {
+  column-gap: 16px;
+}
+.cm-panel.cm-search .cm-search-opts label {
+  display: inline-flex;
+  align-items: center;
+  white-space: nowrap;
+}
+/* CM's base theme shrinks these labels to 80%; important wins it back so the
+   whole panel reads at one size. */
+.cm-panel.cm-search label {
+  font-size: 0.85rem !important;
+}
+.cm-panel.cm-search input[type='checkbox'] {
+  margin: 0 5px 0 0;
+  vertical-align: middle;
+}
+.cm-panel.cm-search .cm-textfield {
+  /* Grow into the row but also shrink below the input's intrinsic size so a
+     narrow window never pushes the field under the close button. */
+  flex: 1 1 120px;
+  min-width: 60px;
+  max-width: 340px;
+  background: var(--bg);
+  color: var(--fg);
+  border: 1px solid var(--topbar-border);
+  border-radius: 5px;
+  padding: 5px 9px;
+  margin: 2px 5px 2px 0;
+  font-size: 0.85rem;
+}
+.cm-panel.cm-search .cm-textfield:focus {
+  outline: none;
+  border-color: var(--accent);
+  box-shadow: 0 0 0 2px var(--accent);
+}
+.cm-panel.cm-search .cm-button {
+  background: var(--bg);
+  background-image: none;
+  color: var(--fg);
+  border: 1px solid var(--topbar-border);
+  border-radius: 5px;
+  padding: 5px 11px;
+  margin: 2px 3px;
+  font-size: 0.85rem;
+}
+.cm-panel.cm-search .cm-button:hover {
+  border-color: var(--accent);
+}
+/* Round close button in a reserved top-right slot, matching the tab close.
+   CM's base theme pins it with higher-specificity top/right/font, so those
+   need important to win. */
+.cm-panel.cm-search [name='close'] {
+  position: absolute;
+  top: 10px !important;
+  right: 9px !important;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 20px;
+  height: 20px;
+  border-radius: 50%;
+  color: var(--fg);
+  font-size: 1rem !important;
+  line-height: 1;
+}
+/* Close affordances hover red everywhere in the app, this one included. */
+.cm-panel.cm-search [name='close']:hover {
+  color: var(--danger);
+  background: rgba(127, 127, 127, 0.3);
+}
+/* Tint marking the captured range while "in selection" is on. A faint accent
+   wash stays legible over text in both light and dark themes. */
+.cm-searchScope {
+  background: color-mix(in srgb, var(--accent) 20%, transparent);
+}
+/* Worker-highlight token colors. The background worker tags spans with
+   `@lezer/highlight`'s `tok-*` classes (classHighlighter's default mapping);
+   these rules reproduce the synchronous editor palette (DocumentEditor.svelte's
+   `tokenVarHighlightStyle`) so worker highlighting always matches it — one set
+   of rules for every theme, since both read the same `--tok-*` variables the
+   active theme sets (see themes.ts / applyTheme.ts). Grouped by the 9 syntax
+   roles a theme defines; see the M8 report for the full tag/class -> role table. */
+.cm-content .tok-keyword {
+  color: var(--tok-keyword);
+}
+.cm-content .tok-url,
+.cm-content .tok-string,
+.cm-content .tok-string2,
+.cm-content .tok-inserted {
+  color: var(--tok-string);
+}
+.cm-content .tok-number {
+  color: var(--tok-number);
+}
+.cm-content .tok-comment,
+.cm-content .tok-meta,
+.cm-content .tok-deleted {
+  color: var(--tok-comment);
+}
+.cm-content .tok-macroName {
+  color: var(--tok-function);
+}
+.cm-content .tok-typeName,
+.cm-content .tok-namespace,
+.cm-content .tok-className {
+  color: var(--tok-type);
+}
+.cm-content .tok-labelName,
+.cm-content .tok-variableName.tok-definition,
+.cm-content .tok-variableName.tok-local,
+.cm-content .tok-propertyName,
+.cm-content .tok-propertyName.tok-definition {
+  color: var(--tok-variable);
+}
+.cm-content .tok-operator {
+  color: var(--tok-operator);
+}
+.cm-content .tok-atom,
+.cm-content .tok-bool,
+.cm-content .tok-literal,
+.cm-content .tok-variableName2 {
+  color: var(--tok-const);
+}
+/* Error/decoration-only tokens are not part of the 9-role palette: invalid
+   stays a fixed alert red in every theme, the rest are decoration only. */
+.cm-content .tok-invalid {
+  color: #f00;
+}
+.cm-content .tok-link {
+  text-decoration: underline;
+}
+.cm-content .tok-heading {
+  color: var(--tok-keyword);
+  text-decoration: underline;
+  font-weight: bold;
+}
+.cm-content .tok-emphasis {
+  font-style: italic;
+}
+.cm-content .tok-strong {
+  font-weight: bold;
+}

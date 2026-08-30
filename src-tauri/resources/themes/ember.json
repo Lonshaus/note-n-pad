@@ -1,0 +1,24 @@
+{
+  "id": "ember",
+  "name": "Ember",
+  "variant": "dark",
+  "order": 5,
+  "editorBg": "#1c1712",
+  "editorFg": "#e0d4c4",
+  "uiBg": "#241d16",
+  "uiFg": "#a89680",
+  "uiAccent": "#d98f4f",
+  "uiBorder": "#342a20",
+  "danger": "#e2604a",
+  "syntax": {
+    "keyword": "#cf8f6f",
+    "string": "#b0c07f",
+    "number": "#e0b56b",
+    "comment": "#6f6152",
+    "function": "#d98f4f",
+    "type": "#9fbf9f",
+    "variable": "#e0d4c4",
+    "operator": "#c0a080",
+    "const": "#e0b56b"
+  }
+}

@@ -1,0 +1,24 @@
+{
+  "id": "voyage",
+  "name": "Night Voyage",
+  "variant": "dark",
+  "order": 3,
+  "editorBg": "#0f1522",
+  "editorFg": "#c6d0e0",
+  "uiBg": "#131b2b",
+  "uiFg": "#8592a8",
+  "uiAccent": "#5fb3d4",
+  "uiBorder": "#212a3d",
+  "danger": "#ef6d6d",
+  "syntax": {
+    "keyword": "#7f9cf0",
+    "string": "#6fc0b0",
+    "number": "#d6a76a",
+    "comment": "#566179",
+    "function": "#5fb3d4",
+    "type": "#8fb8e0",
+    "variable": "#c6d0e0",
+    "operator": "#8fa0c0",
+    "const": "#d6a76a"
+  }
+}

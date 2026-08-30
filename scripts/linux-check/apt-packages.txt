@@ -1,0 +1,29 @@
+# System packages needed to build and test Note&Pad on Linux (Tauri v2 on
+# webkit2gtk). Single source of truth: read by .github/workflows/ci.yml and by
+# scripts/linux-check/Dockerfile, so the local container cannot drift from the
+# CI job it stands in for — two hand-copied lists had already diverged once.
+# One package per line; blank lines and # comments are ignored.
+libwebkit2gtk-4.1-dev
+# Ayatana, not the older libappindicator3-dev: a desktop Ubuntu 24.04 already
+# carries libayatana-appindicator3-1 (GNOME's appindicator extension depends on
+# it) and that package Conflicts: libappindicator3-1, so the old name cannot be
+# installed there at all — apt refuses the whole line. The build never needed it
+# anyway: this machine's packages were produced with only Ayatana present.
+libayatana-appindicator3-dev
+librsvg2-dev
+build-essential
+curl
+wget
+file
+libssl-dev
+libxdo-dev
+pkg-config
+ca-certificates
+# Provides desktop-file-validate, for checking the generated .desktop file by
+# hand (see src-tauri/linux/note-n-pad.desktop.hbs).
+desktop-file-utils
+# Provides xdg-open, which Tauri's AppImage bundler copies into the AppDir.
+# Without it `tauri build` gets through .deb and .rpm and then exits non-zero on
+# the AppImage — which is what anyone following this list as the packaging
+# recipe would hit, since a minimal system has no reason to carry it.
+xdg-utils

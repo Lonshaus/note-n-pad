@@ -1,0 +1,9 @@
+# The Windows CRT is linked statically. Linking it dynamically makes the binary
+# import VCRUNTIME140.dll, which is not a Windows component: on a machine
+# without the Visual C++ redistributable the loader fails before `main`, so the
+# launch ends with no window and not even the WebView2 message box.
+[target.x86_64-pc-windows-msvc]
+rustflags = ["-C", "target-feature=+crt-static"]
+
+[target.aarch64-pc-windows-msvc]
+rustflags = ["-C", "target-feature=+crt-static"]

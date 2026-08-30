@@ -1,0 +1,4 @@
+# Normalize all text files to LF on checkout across platforms.
+# Keeps prettier (endOfLine: lf) green on Windows CI runners, which default
+# to core.autocrlf=true and would otherwise check out CRLF.
+* text=auto eol=lf

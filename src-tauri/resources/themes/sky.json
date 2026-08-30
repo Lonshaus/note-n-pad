@@ -1,0 +1,24 @@
+{
+  "id": "sky",
+  "name": "Clear Sky",
+  "variant": "light",
+  "order": 2,
+  "editorBg": "#f6f9fd",
+  "editorFg": "#2c3440",
+  "uiBg": "#e9f0f8",
+  "uiFg": "#5a6472",
+  "uiAccent": "#2f7fd0",
+  "uiBorder": "#d6e0ec",
+  "danger": "#d1453f",
+  "syntax": {
+    "keyword": "#9a4fa0",
+    "string": "#3f8a4f",
+    "number": "#a05a20",
+    "comment": "#8a94a2",
+    "function": "#2f7fd0",
+    "type": "#1f8a80",
+    "variable": "#2c3440",
+    "operator": "#6a7a8a",
+    "const": "#a05a20"
+  }
+}
