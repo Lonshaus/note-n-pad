@@ -2,8 +2,9 @@
 // SPDX-License-Identifier: GPL-3.0-only
 // The hook file is generated, committed, and read by the bundler at build time,
 // so nothing at build time notices when it drifts from the association list.
-// Adding an extension without regenerating would leave that extension's registry
-// key orphaned on uninstall, which is exactly the bug the hook exists to fix.
+// Adding an extension without regenerating would leave that extension's default
+// claimed at install and its registry key orphaned on uninstall, which is exactly
+// what the hooks exist to prevent.
 import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -21,16 +22,25 @@ const HOOK_FILE = path.join(
 
 const conf = JSON.parse(fs.readFileSync(CONFIG_FILE, 'utf8'));
 
+/** The lines between `!macro <name>` and its `!macroend`. */
+function hookBody(source, hook) {
+  const start = source.indexOf(`!macro ${hook}\n`);
+  expect(start).toBeGreaterThan(-1);
+  return source.slice(start, source.indexOf('!macroend', start));
+}
+
 describe('uninstall-cleanup.nsh', () => {
   it('is up to date with the association list', () => {
     expect(fs.readFileSync(HOOK_FILE, 'utf8')).toBe(buildHook(conf));
   });
 
-  it('covers every declared extension exactly once', () => {
+  it.each([
+    ['NSIS_HOOK_POSTINSTALL', 'NotePadOfferExt'],
+    ['NSIS_HOOK_POSTUNINSTALL', 'NotePadCleanExt'],
+  ])('covers every declared extension exactly once in %s', (hook, macro) => {
+    const body = hookBody(fs.readFileSync(HOOK_FILE, 'utf8'), hook);
     const covered = [
-      ...fs
-        .readFileSync(HOOK_FILE, 'utf8')
-        .matchAll(/NotePadCleanExt "([^"]+)"/g),
+      ...body.matchAll(new RegExp(`!insertmacro ${macro} "([^"]+)"`, 'g')),
     ].map((m) => m[1]);
     expect(covered).toEqual(extensionPairs(conf).map(([ext]) => ext));
   });
