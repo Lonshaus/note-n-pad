@@ -53,7 +53,15 @@ Built around one goal: open fast, stay reliable, find what you need. Daily notes
 
 ## Getting It
 
-An auto-updating version of the app will be released on Steam. macOS 13.3 or later is required.
+The app will be available from:
+
+- **Steam** — macOS and Windows (link to follow)
+- **Mac App Store** — macOS (link to follow)
+- **Microsoft Store** — Windows (link to follow)
+
+macOS 13.3 or later, or Windows 10 64-bit or later.
+
+Updates arrive through the store you bought it from.
 
 You can also build it from source; see [BUILDING.md](BUILDING.md) for the steps.
 
