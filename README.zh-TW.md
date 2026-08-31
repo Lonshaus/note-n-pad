@@ -53,7 +53,15 @@
 
 ## 取得方式
 
-支援版本自動更新的應用程式將於 Steam 上架。macOS 需要 13.3 以上。
+應用程式將於以下商店上架：
+
+- **Steam** — macOS 與 Windows（連結待補）
+- **Mac App Store** — macOS（連結待補）
+- **Microsoft Store** — Windows（連結待補）
+
+macOS 需要 13.3 以上，Windows 需要 10 64 位元以上。
+
+更新由購買的商店派送。
 
 也可以自行從原始碼建置，步驟見 [BUILDING.zh-TW.md](BUILDING.zh-TW.md)。
 
