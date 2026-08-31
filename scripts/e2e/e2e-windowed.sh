@@ -499,14 +499,14 @@ e2e_kill_owned_ports
 sleep 3
 
 echo "=== restart restore (windowed tab reopens editable, no rescan) ==="
-# #57: the tab was a windowed-editing tab last session (its persisted
+# The tab was a windowed-editing tab last session (its persisted
 # windowed_index is what marks it as "was unlocked" — see snapshot()/loadTab()),
 # and big.log was not touched on disk since the discard above rebased the
 # session onto it — fingerprint and digest still match, so windowed_reopen takes
 # the no-scan fast path. The lazy restore (beginWindowedRestore) should therefore
 # swap the tab from its momentary pending state into `windowed` well within this
 # poll's first second or two; it must never settle into the permanent read-only
-# large view (that would be the #57 regression this test guards against).
+# large view (that would be the regression this test guards against).
 launch
 sleep 3
 DL=$(doc_label)
@@ -545,7 +545,7 @@ check "tab restored straight into windowed editing (fast-path reopen)" "$(evl "$
 check "restart restore took the fast path, not a rescan" "$(evl "$DL" "String(__auto.windowedRestoreRescanned())")" "false"
 check "tab restored, not range" "$(evl "$DL" "String(__auto.isRangeTab())")" "false"
 check "not left in the read-only large view" "$(evl "$DL" "String(__auto.isLargeTab())")" "false"
-# #63: the top-of-viewport line at last quit (reset to 0 by the discard just
+# The top-of-viewport line at last quit (reset to 0 by the discard just
 # above, which reopens a fresh session at the on-disk baseline) is persisted as
 # windowed_top_line and fed back through initialTopLine, so the restored window
 # should again cover the start of the file rather than defaulting somewhere else.
