@@ -267,7 +267,7 @@
     }
   }
 
-  // #7 open dialog: the staged over-long-line open, and its cancel (mirroring
+  // The open dialog: the staged over-long-line open, and its cancel (mirroring
   // the large-file confirm — a window opened solely for this file collapses).
   const pendingLongLine = $derived(documentWindow.pendingLongLineOpen);
 

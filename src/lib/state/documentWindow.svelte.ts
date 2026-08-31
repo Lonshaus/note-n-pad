@@ -403,7 +403,7 @@ class DocumentWindowState {
    *  nothing (cancel). */
   pendingLargeOpen = $state<{ path: string; size: number } | null>(null);
   /** Set while a freshly opened file with an over-threshold line awaits the
-   *  open-mode confirm (#7). Carries the path and whether the "format" choice
+   *  open-mode confirm. Carries the path and whether the "format" choice
    *  applies (the content beautifies as JSON). The loaded tab itself is staged
    *  off the reactive graph in `pendingLongLineTab` (it holds a large rope). */
   pendingLongLineOpen = $state<{
@@ -1220,7 +1220,7 @@ class DocumentWindowState {
       this.openFailed = path;
       return;
     }
-    // #7: a freshly opened file whose longest line is over the threshold can
+    // A freshly opened file whose longest line is over the threshold can
     // stall synchronous syntax parsing on every keystroke. When the ask setting
     // is on, stage the open and let the user pick how to open it (as-is,
     // formatted, or soft-wrapped) instead of committing the tab straight away.
@@ -1239,7 +1239,7 @@ class DocumentWindowState {
     await this.upsertTab(tab);
   }
 
-  /** #7 open-dialog choice. 'asis' commits the buffer unchanged (it opens in the
+  /** Open-dialog choice. 'asis' commits the buffer unchanged (it opens in the
    *  long-line gate mode); 'format' swaps in the pre-computed beautified JSON;
    *  'softwrap' inserts a break every SOFT_WRAP_LIMIT code units. The
    *  transforming choices mutate the buffer while its saved baseline stays the
@@ -1266,7 +1266,7 @@ class DocumentWindowState {
     })();
   }
 
-  /** #7 open-dialog cancel: drop the staged open as if it never happened. */
+  /** Open-dialog cancel: drop the staged open as if it never happened. */
   cancelLongLineOpen(): void {
     this.pendingLongLineOpen = null;
     this.pendingLongLineTab = null;
