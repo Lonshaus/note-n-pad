@@ -53,7 +53,15 @@ macOSとWindowsに対応した、軽量なデスクトップテキストエデ�
 
 ## 入手方法
 
-自動アップデートに対応したアプリケーションを、Steamで配信予定です。macOSは13.3以降が必要です。
+以下のストアで配信予定です。
+
+- **Steam** — macOS と Windows（リンクは後日掲載）
+- **Mac App Store** — macOS（リンクは後日掲載）
+- **Microsoft Store** — Windows（リンクは後日掲載）
+
+macOS は 13.3 以降、Windows は 10 64 ビット以降が必要です。
+
+アップデートは購入したストアから配信されます。
 
 ソースコードから自分でビルドすることも可能です。手順は [BUILDING.ja.md](BUILDING.ja.md) を参照してください。
 

@@ -4,7 +4,7 @@ English · [正體中文](BUILDING.zh-TW.md) · [日本語](BUILDING.ja.md)
 
 Note&Pad is released under GPL-3.0-only. You don't have to pay for it: you can build the current version straight from source.
 
-For the same version, the build behaves identically to the store release. The only two differences are that the store build is signed and notarized so the OS lets it run without complaint, while a self-built binary is unsigned, so the first launch needs an extra click or two, and it doesn't support auto-updates, so a new release means repackaging by hand.
+For the same version, the build behaves identically to a store release. The only two differences are signing and updates. The store build is signed and notarized so the OS lets it run without complaint, while a self-built binary is unsigned and the first launch needs an extra click or two. And a store copy receives new versions from the store it came from, while a self-built one means building again.
 
 ## Common prerequisites
 
