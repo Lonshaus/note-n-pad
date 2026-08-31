@@ -30,10 +30,13 @@ const NO_LANGUAGE_NEEDED = ['txt', 'log', 'conf', 'csv', 'tsv'];
 // contains any of these six extensions, the bundler writes an
 // `LSItemContentTypes` key into that group's `CFBundleDocumentTypes` entry, and
 // LaunchServices then discards every `CFBundleTypeExtensions` entry in that
-// group, binding only the listed UTIs. A group that mixes a mapped extension
-// with unmapped ones silently loses the unmapped ones on macOS. This list was
-// measured by building a bundle with one group per extension and reading back
-// `LSItemContentTypes` for each.
+// group. Measured by building a bundle with one group per extension and
+// reading back `LSItemContentTypes` for each.
+//
+// Dormant, not dead: scripts/gen-doc-types.mjs now overrides the bundler's
+// block with an empty one, so nothing reaches LaunchServices and no group can
+// lose anything today. The grouping is kept correct so that restoring the macOS
+// declarations stays a one-line change rather than a hunt for this rule.
 const UTI_MAPPED = ['txt', 'json', 'svg', 'xml', 'htm', 'html'];
 
 // Extensions CodeMirror's registry does cover, but which are deliberately not
@@ -109,11 +112,10 @@ describe('fileAssociations', () => {
 
   it('declares no mimeType', () => {
     // A mimeType widens a group's LSItemContentTypes, and every extension in a
-    // group carrying that key stops binding. Note this does not buy back a
-    // narrow claim: `txt` maps to public.plain-text on its own, and UTI
-    // conformance is hierarchical, so the app is a handler for every type
-    // conforming to plain text no matter what. Dropping mimeType is about
-    // keeping the six mapped extensions from spreading, nothing more.
+    // group carrying that key stops binding. Dormant on macOS for the same
+    // reason as UTI_MAPPED above — the app declares no document types there —
+    // but the key is also what the Linux bundler writes into the .desktop
+    // MimeType line, so an accidental mimeType would still reach one bundler.
     for (const group of groups) {
       expect(group).not.toHaveProperty('mimeType');
     }
