@@ -9,7 +9,11 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { describe, expect, it } from 'vitest';
-import { buildHook, extensionPairs } from './gen-nsis-hooks.mjs';
+import {
+  buildHook,
+  capabilityValues,
+  extensionPairs,
+} from './gen-nsis-hooks.mjs';
 
 const REPO_ROOT = path.join(path.dirname(fileURLToPath(import.meta.url)), '..');
 const CONFIG_FILE = path.join(REPO_ROOT, 'src-tauri', 'tauri.conf.json');
@@ -43,6 +47,47 @@ describe('uninstall-cleanup.nsh', () => {
       ...body.matchAll(new RegExp(`!insertmacro ${macro} "([^"]+)"`, 'g')),
     ].map((m) => m[1]);
     expect(covered).toEqual(extensionPairs(conf).map(([ext]) => ext));
+  });
+
+  // Without these the app is absent from Windows' Default apps list, and the
+  // in-app shortcut to its page has nothing to open.
+  it('registers the app capabilities, covering every declared extension', () => {
+    const body = hookBody(
+      fs.readFileSync(HOOK_FILE, 'utf8'),
+      'NSIS_HOOK_POSTINSTALL',
+    );
+    const capabilities = `Software\\${conf.productName}\\Capabilities`;
+    expect(capabilityValues(conf)).toEqual([
+      [capabilities, 'ApplicationName', conf.productName],
+      [capabilities, 'ApplicationDescription', conf.bundle.shortDescription],
+      ...extensionPairs(conf).map(([ext, progId]) => [
+        `${capabilities}\\FileAssociations`,
+        `.${ext}`,
+        progId,
+      ]),
+      ['Software\\RegisteredApplications', conf.productName, capabilities],
+    ]);
+    for (const [key, name, value] of capabilityValues(conf)) {
+      expect(body).toContain(`WriteRegStr HKCU "${key}" "${name}" "${value}"`);
+    }
+  });
+
+  it('removes the capabilities it wrote, and only those', () => {
+    const body = hookBody(
+      fs.readFileSync(HOOK_FILE, 'utf8'),
+      'NSIS_HOOK_POSTUNINSTALL',
+    );
+    expect(body).toContain(
+      `DeleteRegValue HKCU "Software\\RegisteredApplications" "${conf.productName}"`,
+    );
+    expect(body).toContain(
+      `DeleteRegKey HKCU "Software\\${conf.productName}\\Capabilities"`,
+    );
+    // The parent key may hold something this hook never wrote, so it goes only
+    // when nothing is left in it.
+    expect(body).toContain(
+      `DeleteRegKey /ifempty HKCU "Software\\${conf.productName}"`,
+    );
   });
 
   it('is wired into the bundler', () => {
