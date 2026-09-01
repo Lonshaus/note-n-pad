@@ -235,6 +235,8 @@
     "skipped.reveal.linux": "Mostra nel file manager",
     "skipped.snapshotHeading": "Non è stato possibile caricare {count} istantanee di note o documenti",
     "skipped.windowHint": "Non è stato possibile leggere questi file all’avvio di Note&Pad, quindi il loro contenuto non compare in nessuna finestra.",
-    "privacy.loadError": "Impossibile caricare l’informativa sulla privacy: {detail}"
+    "privacy.loadError": "Impossibile caricare l’informativa sulla privacy: {detail}",
+    "settings.general.defaultApps": "Tipi di file predefiniti",
+    "settings.general.defaultAppsOpen": "Apri le impostazioni di Windows"
   }
 }

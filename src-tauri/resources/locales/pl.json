@@ -235,6 +235,8 @@
     "skipped.reveal.linux": "Pokaż w menedżerze plików",
     "skipped.snapshotHeading": "Nie udało się wczytać migawek notatek lub dokumentów: {count}",
     "skipped.windowHint": "Tych plików nie udało się odczytać przy uruchamianiu Note&Pad, więc ich zawartość nie jest widoczna w żadnym oknie.",
-    "privacy.loadError": "Nie można wczytać polityki prywatności: {detail}"
+    "privacy.loadError": "Nie można wczytać polityki prywatności: {detail}",
+    "settings.general.defaultApps": "Domyślne typy plików",
+    "settings.general.defaultAppsOpen": "Otwórz ustawienia systemu Windows"
   }
 }

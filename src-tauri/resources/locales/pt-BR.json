@@ -235,6 +235,8 @@
     "skipped.reveal.linux": "Mostrar no gerenciador de arquivos",
     "skipped.snapshotHeading": "Não foi possível carregar {count} instantâneos de notas ou documentos",
     "skipped.windowHint": "Estes arquivos não puderam ser lidos ao iniciar o Note&Pad, então o conteúdo deles não aparece em nenhuma janela.",
-    "privacy.loadError": "Não foi possível carregar a política de privacidade: {detail}"
+    "privacy.loadError": "Não foi possível carregar a política de privacidade: {detail}",
+    "settings.general.defaultApps": "Tipos de arquivo padrão",
+    "settings.general.defaultAppsOpen": "Abrir as configurações do Windows"
   }
 }

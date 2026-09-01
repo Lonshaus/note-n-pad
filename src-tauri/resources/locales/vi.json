@@ -235,6 +235,8 @@
     "skipped.reveal.linux": "Hiển thị trong trình quản lý tệp",
     "skipped.snapshotHeading": "Không thể tải {count} bản lưu của ghi chú hoặc tài liệu",
     "skipped.windowHint": "Không đọc được các tệp này khi khởi động Note&Pad, nên nội dung của chúng không hiện trong cửa sổ nào.",
-    "privacy.loadError": "Không thể tải chính sách quyền riêng tư: {detail}"
+    "privacy.loadError": "Không thể tải chính sách quyền riêng tư: {detail}",
+    "settings.general.defaultApps": "Loại tệp mặc định",
+    "settings.general.defaultAppsOpen": "Mở cài đặt Windows"
   }
 }

@@ -288,4 +288,7 @@ export const zhTW = {
   'doc.longLine.softWrap': '軟斷行開啟',
   'settings.general.askLongLineOpen': '開啟含超長行的檔案時詢問',
   'settings.general.previewLocalResources': '預覽顯示本機圖片與可點擊連結',
+  // Settings — general, Windows only
+  'settings.general.defaultApps': '預設開啟的檔案類型',
+  'settings.general.defaultAppsOpen': '開啟 Windows 設定',
 } as const;
