@@ -235,6 +235,8 @@
     "skipped.reveal.linux": "Afficher dans le gestionnaire de fichiers",
     "skipped.snapshotHeading": "{count} instantanés de notes ou de documents n’ont pas pu être chargés",
     "skipped.windowHint": "Ces fichiers n’ont pas pu être lus au démarrage de Note&Pad, leur contenu n’apparaît donc dans aucune fenêtre.",
-    "privacy.loadError": "Impossible de charger la politique de confidentialité : {detail}"
+    "privacy.loadError": "Impossible de charger la politique de confidentialité : {detail}",
+    "settings.general.defaultApps": "Types de fichiers par défaut",
+    "settings.general.defaultAppsOpen": "Ouvrir les paramètres Windows"
   }
 }

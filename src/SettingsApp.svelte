@@ -78,6 +78,11 @@
 
   let snapshotDirError = $state('');
 
+  // Windows-only row, and only on builds where the Default apps deep link
+  // understands its app parameter. The Rust check answers false everywhere
+  // else, so this stays false and the row never renders.
+  let defaultAppsSupported = $state(false);
+
   // A small in-app choice dialog (message + arbitrary buttons), used for the
   // two snapshot-folder-switch prompts below: `ask()`'s system dialog only
   // ever offers OK/Cancel, and these need three and four labeled choices.
@@ -277,6 +282,11 @@
     const unlistenThemes = themeRegistry.listen();
     const unlistenLocales = localeRegistry.listen();
     void platform.init();
+    void invoke<boolean>('default_apps_page_supported')
+      .catch(() => false)
+      .then((supported) => {
+        defaultAppsSupported = supported;
+      });
     void settingsState.refreshResolvedSnapshotDir();
     // On Linux, fontconfig substitutes missing families with a metric-compatible
     // one, so the rendered-width heuristic below can't tell "installed" from
@@ -1111,6 +1121,18 @@
         </select>
       </div>
 
+      {#if defaultAppsSupported}
+        <div class="field">
+          <span class="field-label">{t('settings.general.defaultApps')}</span>
+          <button
+            class="btn default-apps-action"
+            onclick={() => void invoke('open_default_apps_page')}
+          >
+            {t('settings.general.defaultAppsOpen')}
+          </button>
+        </div>
+      {/if}
+
       <label class="toggle">
         <input
           type="checkbox"
@@ -1445,6 +1467,10 @@
   .snapshot-actions {
     display: flex;
     gap: 0.5rem;
+  }
+  /* A lone button in a column field would otherwise stretch the full width. */
+  .default-apps-action {
+    align-self: flex-start;
   }
   .select {
     align-self: flex-start;

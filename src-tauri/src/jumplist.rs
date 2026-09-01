@@ -56,7 +56,7 @@ const APPMODEL_ERROR_NO_PACKAGE: u32 = 15700;
 /// (still on the package id) shows only Windows' own "pin"/"close" entries.
 /// Measured on Windows 11 with the Store package, which is why both the
 /// process id claim and `SetAppID` below are skipped when this is true.
-fn has_package_identity() -> bool {
+pub(crate) fn has_package_identity() -> bool {
   let mut len: u32 = 0;
   // Contained unsafe: the documented length probe. A packaged process answers
   // ERROR_INSUFFICIENT_BUFFER (the name does not fit in zero bytes), an

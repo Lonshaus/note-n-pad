@@ -311,4 +311,7 @@ export const en = {
     'Ask when opening files with very long lines',
   'settings.general.previewLocalResources':
     'Show local images and clickable links in preview',
+  // Settings — general, Windows only
+  'settings.general.defaultApps': 'Default file types',
+  'settings.general.defaultAppsOpen': 'Open Windows settings',
 } satisfies Record<I18nKey, string>;

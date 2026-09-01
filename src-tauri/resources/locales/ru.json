@@ -235,6 +235,8 @@
     "skipped.reveal.linux": "Показать в файловом менеджере",
     "skipped.snapshotHeading": "Не удалось загрузить снимков заметок и документов: {count}",
     "skipped.windowHint": "Эти файлы не удалось прочитать при запуске Note&Pad, поэтому их содержимое не показано ни в одном окне.",
-    "privacy.loadError": "Не удалось загрузить политику конфиденциальности: {detail}"
+    "privacy.loadError": "Не удалось загрузить политику конфиденциальности: {detail}",
+    "settings.general.defaultApps": "Типы файлов по умолчанию",
+    "settings.general.defaultAppsOpen": "Открыть параметры Windows"
   }
 }

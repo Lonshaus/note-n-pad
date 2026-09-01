@@ -235,6 +235,8 @@
     "skipped.reveal.linux": "在文件管理器中显示",
     "skipped.snapshotHeading": "有 {count} 个便签或文档的快照无法载入",
     "skipped.windowHint": "这些文件在启动 Note&Pad 时无法载入，里面的内容没有显示在任何窗口。",
-    "privacy.loadError": "无法加载隐私政策：{detail}"
+    "privacy.loadError": "无法加载隐私政策：{detail}",
+    "settings.general.defaultApps": "默认打开的文件类型",
+    "settings.general.defaultAppsOpen": "打开 Windows 设置"
   }
 }
