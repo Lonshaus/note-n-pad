@@ -235,6 +235,8 @@
     "skipped.reveal.linux": "แสดงในตัวจัดการไฟล์",
     "skipped.snapshotHeading": "โหลดสแนปช็อตของโน้ตหรือเอกสารไม่ได้ {count} รายการ",
     "skipped.windowHint": "ไฟล์เหล่านี้อ่านไม่ได้ตอนเปิด Note&Pad เนื้อหาในไฟล์จึงไม่ปรากฏในหน้าต่างใด",
-    "privacy.loadError": "โหลดนโยบายความเป็นส่วนตัวไม่สำเร็จ: {detail}"
+    "privacy.loadError": "โหลดนโยบายความเป็นส่วนตัวไม่สำเร็จ: {detail}",
+    "settings.general.defaultApps": "ชนิดไฟล์ที่เปิดโดยค่าเริ่มต้น",
+    "settings.general.defaultAppsOpen": "เปิดการตั้งค่า Windows"
   }
 }

@@ -235,6 +235,8 @@
     "skipped.reveal.linux": "Im Dateimanager anzeigen",
     "skipped.snapshotHeading": "{count} Notiz- oder Dokument-Sicherungen konnten nicht geladen werden",
     "skipped.windowHint": "Diese Dateien konnten beim Start von Note&Pad nicht gelesen werden, ihr Inhalt wird daher in keinem Fenster angezeigt.",
-    "privacy.loadError": "Datenschutzerklärung konnte nicht geladen werden: {detail}"
+    "privacy.loadError": "Datenschutzerklärung konnte nicht geladen werden: {detail}",
+    "settings.general.defaultApps": "Standardmäßig geöffnete Dateitypen",
+    "settings.general.defaultAppsOpen": "Windows-Einstellungen öffnen"
   }
 }

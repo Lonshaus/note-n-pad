@@ -235,6 +235,8 @@
     "skipped.reveal.linux": "Dosya Yöneticisi’nde Göster",
     "skipped.snapshotHeading": "{count} not veya belge anlık görüntüsü yüklenemedi",
     "skipped.windowHint": "Note&Pad başlatılırken bu dosyalar okunamadı, bu yüzden içerikleri hiçbir pencerede görünmüyor.",
-    "privacy.loadError": "Gizlilik politikası yüklenemedi: {detail}"
+    "privacy.loadError": "Gizlilik politikası yüklenemedi: {detail}",
+    "settings.general.defaultApps": "Varsayılan dosya türleri",
+    "settings.general.defaultAppsOpen": "Windows ayarlarını aç"
   }
 }

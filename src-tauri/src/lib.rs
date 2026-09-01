@@ -7,6 +7,7 @@ mod automation;
 mod cmdline;
 mod ctx_menu;
 mod data_files;
+mod default_apps;
 mod diag;
 #[cfg(target_os = "macos")]
 mod dock;
@@ -2593,6 +2594,8 @@ pub fn run() {
       open_picked_files,
       app_watch::list_running_apps,
       platform::platform_info,
+      default_apps::default_apps_page_supported,
+      default_apps::open_default_apps_page,
       fonts::installed_font_families,
       linux_clipboard::read_clipboard_text,
       preview_img::set_preview_base,
