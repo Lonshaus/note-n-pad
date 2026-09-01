@@ -308,4 +308,7 @@ export const ja = {
     '非常に長い行を含むファイルを開くとき確認する',
   'settings.general.previewLocalResources':
     'プレビューでローカル画像とリンクを有効にする',
+  // Settings — general, Windows only
+  'settings.general.defaultApps': '既定で開くファイルの種類',
+  'settings.general.defaultAppsOpen': 'Windows の設定を開く',
 } satisfies Record<I18nKey, string>;
