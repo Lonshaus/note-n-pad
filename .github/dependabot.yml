@@ -1,0 +1,25 @@
+# Version bumps only. Dependabot alerts for known vulnerabilities are a
+# separate repository setting and are not configured here.
+#
+# Monthly rather than weekly: this is a desktop app with no server surface, so
+# a dependency being a few weeks behind costs nothing, while a weekly cadence
+# across three ecosystems opens more pull requests than the project can review.
+version: 2
+updates:
+  - package-ecosystem: 'npm'
+    directory: '/'
+    schedule:
+      interval: 'monthly'
+
+  # The manifest lives beside the Rust crate, not at the repository root.
+  - package-ecosystem: 'cargo'
+    directory: '/src-tauri'
+    schedule:
+      interval: 'monthly'
+
+  # dtolnay/rust-toolchain is pinned to a branch, so Dependabot leaves it
+  # alone; the rest are tag pins and do get bumped.
+  - package-ecosystem: 'github-actions'
+    directory: '/'
+    schedule:
+      interval: 'monthly'
