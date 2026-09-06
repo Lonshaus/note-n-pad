@@ -85,7 +85,11 @@ mod tests {
       Locale::Th,
       Locale::Vi,
     ] {
-      assert_eq!(document_for(locale), "en.md", "{locale:?} should read English");
+      assert_eq!(
+        document_for(locale),
+        "en.md",
+        "{locale:?} should read English"
+      );
     }
   }
 
