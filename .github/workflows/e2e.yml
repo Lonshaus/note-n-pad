@@ -1,11 +1,13 @@
 name: E2E
 
-# Manual trigger, like ci.yml: every suite builds the app, launches it, and
-# drives the real UI, so a full run is tens of minutes.
+# Automatic on pull requests into master only, where a merge means a version
+# is being released. Everywhere else it stays on demand.
 #
 # No Windows job: scripts/e2e/lib.sh resolves the app-data directory and the
 # WebView process name for Darwin and Linux only.
 on:
+  pull_request:
+    branches: [master]
   workflow_dispatch:
     inputs:
       suites:
