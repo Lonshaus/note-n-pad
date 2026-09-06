@@ -72,7 +72,7 @@ windows-sys = { version = "0.60", features = [
 # Only windows-sys (raw FFI, no COM) was a dependency before; the Jump List
 # needs COM interfaces (ICustomDestinationList, IShellLinkW), which windows-sys
 # does not model, so the higher-level `windows` crate is added for that alone.
-windows = { version = "0.61", features = [
+windows = { version = "0.62", features = [
   "Win32_Foundation",
   "Win32_Storage_Packaging_Appx",
   "Win32_Storage_EnhancedStorage",
