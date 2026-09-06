@@ -101,7 +101,7 @@ gdk = "0.18"
 x11rb = "0.13"
 # Already a transitive dependency of the gtk stack (Cargo.lock has gio 0.18.4);
 # pinned here to reuse that copy for .desktop-based app-name resolution.
-gio = "0.18"
+gio = "0.22"
 
 [dev-dependencies]
 tempfile = "3.27.0"
