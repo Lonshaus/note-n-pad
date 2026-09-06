@@ -98,7 +98,7 @@ gtk = "0.18"
 gdk = "0.18"
 # Pure-Rust X11 client for reading the active window / client list under X11
 # (and XWayland). No system X11 dev libraries required at build time.
-x11rb = "0.13"
+x11rb = "0.14"
 # Already a transitive dependency of the gtk stack (Cargo.lock has gio 0.18.4);
 # pinned here to reuse that copy for .desktop-based app-name resolution.
 gio = "0.18"
