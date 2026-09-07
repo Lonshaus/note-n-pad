@@ -197,14 +197,10 @@
   // and wrongly concludes they fell behind, which is what left a first
   // scroll-to-bottom stuck short of the real end.
   let lastAnchor: ScrollAnchor = { pinnedBottom: false, blockIndex: 0 };
-  // True for the one 'scroll' event a correction's own `scrollTop` write is
-  // about to cause. That event fires as a task, after the reactive re-render
-  // for this same write has already run — so by the time it reaches
-  // `onScroll`, `scrollMax()` can already reflect territory this very
-  // correction just revealed, and re-deriving `lastAnchor` from it would
-  // compare against a maximum newer than the one the correction targeted,
-  // wrongly reporting the reader as having fallen behind their own jump.
-  let ownScrollPending = false;
+  // Where a correction's own write is about to land, so `onScroll` does not
+  // re-derive `lastAnchor` from the event that write causes. A position rather
+  // than a flag: a write that moves nothing leaves a flag latched for good.
+  let ownScrollTarget: number | null = null;
 
   function onScroll(): void {
     // A scroll arriving while a correction is pending is the reader moving on
@@ -213,8 +209,10 @@
     // that write produces never lands here while still pending.
     pendingAnchor = null;
     scrollTop = scrollEl.scrollTop;
-    if (ownScrollPending) {
-      ownScrollPending = false;
+    // Cleared on a miss too, or it waits for whatever scrolls there next.
+    const target = ownScrollTarget;
+    ownScrollTarget = null;
+    if (scrollTop === target) {
       return;
     }
     lastAnchor = captureScrollAnchor(scrollTop, scrollMax(), avgHeight);
@@ -398,11 +396,17 @@
       }
     }
     pendingAnchor = null;
-    const restored = anchoredScrollTop(anchor, max, avgHeight);
-    if (Math.abs(restored - scrollEl.scrollTop) > 0.5) {
-      ownScrollPending = true;
+    // Whole pixels: WebKit truncates `scrollTop`, so a sub-pixel write moves
+    // nothing and no event arrives to acknowledge it.
+    const restored = Math.round(anchoredScrollTop(anchor, max, avgHeight));
+    if (Math.abs(restored - scrollEl.scrollTop) >= 1) {
+      ownScrollTarget = restored;
       scrollEl.scrollTop = restored;
-      scrollTop = restored;
+      scrollTop = scrollEl.scrollTop;
+      // Clamped by the scroller's real maximum: nothing moved, no event coming.
+      if (scrollTop !== restored) {
+        ownScrollTarget = null;
+      }
     }
   }
 
