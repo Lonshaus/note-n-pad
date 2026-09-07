@@ -22,12 +22,23 @@ OUT="${NOTE_N_PAD_E2E_OUT:-${E2E_TMP_BASE%/}/note-n-pad-e2e}"
 OUT="${OUT%/}"
 
 # Tauri v2 app_data_dir() for E2E_APP_IDENTIFIER:
-#   macOS -> ~/Library/Application Support/<id>
-#   Linux -> $XDG_DATA_HOME/<id>  (default ~/.local/share/<id>)
+#   macOS   -> ~/Library/Application Support/<id>
+#   Linux   -> $XDG_DATA_HOME/<id>  (default ~/.local/share/<id>)
+#   Windows -> %APPDATA%\<id>  (the Roaming folder)
 app_data_dir() {
   case "$(uname -s)" in
     Darwin)
       printf '%s\n' "$HOME/Library/Application Support/$E2E_APP_IDENTIFIER"
+      ;;
+    MINGW64_NT* | MSYS_NT*)
+      # $APPDATA is a Windows path with backslashes; cygpath -u is what the
+      # runner actually has, the tr/sed pair is only a fallback for images
+      # that lack it.
+      if command -v cygpath >/dev/null 2>&1; then
+        printf '%s/%s\n' "$(cygpath -u "$APPDATA")" "$E2E_APP_IDENTIFIER"
+      else
+        printf '%s/%s\n' "$(printf '%s' "$APPDATA" | sed 's#^\([A-Za-z]\):#/\L\1#; s#\\#/#g')" "$E2E_APP_IDENTIFIER"
+      fi
       ;;
     *)
       printf '%s\n' "${XDG_DATA_HOME:-$HOME/.local/share}/$E2E_APP_IDENTIFIER"
@@ -57,11 +68,15 @@ make_sparse_file() {
 }
 
 # Name of the WebView renderer process, for RSS attribution in the memory
-# checks. macOS shares a system WebContent process; Linux uses WebKitGTK.
+# checks. macOS shares a system WebContent process; Linux uses WebKitGTK;
+# Windows uses WebView2, backed by msedgewebview2.exe.
 webcontent_pattern() {
   case "$(uname -s)" in
     Darwin)
       printf '%s\n' "com.apple.WebKit.WebContent"
+      ;;
+    MINGW64_NT* | MSYS_NT*)
+      printf '%s\n' "msedgewebview2.exe"
       ;;
     *)
       printf '%s\n' "WebKitWebProcess"
