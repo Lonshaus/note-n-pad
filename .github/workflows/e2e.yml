@@ -93,6 +93,8 @@ jobs:
         run: cargo build
 
       - name: Run the E2E suites
+        # Windows runners default to PowerShell, and this script is POSIX.
+        shell: bash
         env:
           # Through the environment, never interpolated into the script.
           SUITES: ${{ inputs.suites }}
