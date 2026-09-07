@@ -61,7 +61,7 @@ clean_snaps() {
 launch() {
   NOTE_N_PAD_AUTOMATION=1 npm run tauri dev >"$OUT/dev-perf.log" 2>&1 &
   local tries=0
-  until nc -z 127.0.0.1 45678 2>/dev/null; do
+  until e2e_automation_up; do
     sleep 1
     tries=$((tries + 1))
     if [ "$tries" -gt 240 ]; then
@@ -89,7 +89,7 @@ quit_and_time() {
   local t0 t1 waited=0
   t0=$(python3 -c 'import time; print(time.time())')
   auto '{"id":99,"cmd":"quit"}' >/dev/null 2>&1
-  while pgrep -x note-n-pad >/dev/null 2>&1; do
+  while e2e_app_running; do
     sleep 0.1
     waited=$((waited + 1))
     if [ $((waited % 20)) -eq 0 ]; then

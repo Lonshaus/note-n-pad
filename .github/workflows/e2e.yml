@@ -154,7 +154,7 @@ jobs:
           [ -z "$failed" ] || { echo "failed:$failed" >&2; exit 1; }
 
       - name: Upload logs
-        if: failure()
+        if: always()
         uses: actions/upload-artifact@v7
         with:
           name: e2e-logs-${{ matrix.os }}

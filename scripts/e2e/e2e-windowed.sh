@@ -27,6 +27,7 @@ WORK="$OUT/windowed-fixture"
 PASS=0
 FAIL=0
 mkdir -p "$OUT"
+: >"$OUT/dev-windowed.log"
 
 ok() {
   PASS=$((PASS + 1))
@@ -95,9 +96,10 @@ evl() {
   auto "{\"id\":9,\"cmd\":\"eval\",\"label\":\"$1\",\"js\":$(jq -Rn --arg js "$2" '$js')}" | jq -r '.data'
 }
 launch() {
-  NOTE_N_PAD_AUTOMATION=1 npm run tauri dev >"$OUT/dev-windowed.log" 2>&1 &
+  e2e_require_clean_slate
+  NOTE_N_PAD_AUTOMATION=1 npm run tauri dev >>"$OUT/dev-windowed.log" 2>&1 &
   local tries=0
-  until nc -z 127.0.0.1 45678 2>/dev/null; do
+  until e2e_automation_up; do
     sleep 1
     tries=$((tries + 1))
     if [ "$tries" -gt 240 ]; then
@@ -110,7 +112,7 @@ launch() {
 quit_app() {
   auto '{"id":99,"cmd":"quit"}' >/dev/null 2>&1
   local tries=0
-  while pgrep -x note-n-pad >/dev/null 2>&1; do
+  while e2e_app_running; do
     sleep 1
     tries=$((tries + 1))
     if [ "$tries" -gt 20 ]; then
@@ -487,14 +489,14 @@ check "oversized gate visible" "$(evl "$DL" "String(__auto.oversizedGateVisible(
 # pending quit resumes via request_exit, so the process must actually exit.
 evl "$DL" "__auto.oversizedGateDiscard()" >/dev/null 2>&1
 tries=0
-while pgrep -f "target/debug/note-n-pad" >/dev/null 2>&1; do
+while e2e_dev_app_running; do
   sleep 1
   tries=$((tries + 1))
   if [ "$tries" -gt 30 ]; then
     break
   fi
 done
-check "app exited after discard" "$(pgrep -f 'target/debug/note-n-pad' >/dev/null 2>&1 && echo alive || echo gone)" "gone"
+check "app exited after discard" "$(e2e_dev_app_running && echo alive || echo gone)" "gone"
 e2e_kill_owned_ports
 sleep 3
 

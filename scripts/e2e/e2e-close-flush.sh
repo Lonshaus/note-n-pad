@@ -22,6 +22,7 @@ MARKER="CLOSEFLUSHMARKERA"
 PASS=0
 FAIL=0
 mkdir -p "$OUT"
+: >"$OUT/dev-close-flush.log"
 
 ok() {
   PASS=$((PASS + 1))
@@ -76,9 +77,10 @@ evl() {
   auto "{\"id\":9,\"cmd\":\"eval\",\"label\":\"$1\",\"js\":$(jq -Rn --arg js "$2" '$js')}" | jq -r '.data'
 }
 launch() {
-  NOTE_N_PAD_AUTOMATION=1 npm run tauri dev >"$OUT/dev-close-flush.log" 2>&1 &
+  e2e_require_clean_slate
+  NOTE_N_PAD_AUTOMATION=1 npm run tauri dev >>"$OUT/dev-close-flush.log" 2>&1 &
   local tries=0
-  until nc -z 127.0.0.1 45678 2>/dev/null; do
+  until e2e_automation_up; do
     sleep 1
     tries=$((tries + 1))
     if [ "$tries" -gt 240 ]; then
@@ -91,7 +93,7 @@ launch() {
 quit_app() {
   auto '{"id":99,"cmd":"quit"}' >/dev/null 2>&1
   local tries=0
-  while pgrep -x note-n-pad >/dev/null 2>&1; do
+  while e2e_app_running; do
     sleep 1
     tries=$((tries + 1))
     if [ "$tries" -gt 20 ]; then
@@ -276,7 +278,7 @@ until [ "$(doc_count)" = "0" ]; do
   fi
 done
 check "window closed after discard" "$(doc_count)" "0"
-check "app still running after close" "$(pgrep -f 'target/debug/note-n-pad' >/dev/null 2>&1 && echo alive || echo gone)" "alive"
+check "app still running after close" "$(e2e_dev_app_running && echo alive || echo gone)" "alive"
 quit_app
 wipe_test_docs
 

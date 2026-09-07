@@ -15,11 +15,26 @@ REPO="$(cd "$E2E_LIB_DIR/../.." && pwd)"
 E2E_APP_IDENTIFIER="net.lonshaus.note-n-pad"
 
 # Throwaway scratch base for fixtures and dev logs. Honors TMPDIR (set on
-# macOS, usually unset on Linux). The basename stays note-n-pad-e2e so the
-# snapshot-cleanup guards can match fixture paths by substring.
-E2E_TMP_BASE="${TMPDIR:-/tmp}"
+# macOS, usually unset on Linux). On Windows, Git Bash's own TMPDIR resolves to
+# an MSYS path that native tools (python, the app) cannot see, so cygpath -m
+# is used instead to get the mixed form (C:/Users/...) that every consumer
+# accepts. The basename stays note-n-pad-e2e so the snapshot-cleanup guards can
+# match fixture paths by substring.
+case "$(uname -s)" in
+  MINGW64_NT* | MSYS_NT*)
+    E2E_TMP_BASE="$(cygpath -m "${TEMP:-$LOCALAPPDATA/Temp}")"
+    ;;
+  *)
+    E2E_TMP_BASE="${TMPDIR:-/tmp}"
+    ;;
+esac
 OUT="${NOTE_N_PAD_E2E_OUT:-${E2E_TMP_BASE%/}/note-n-pad-e2e}"
 OUT="${OUT%/}"
+# Echoed to stderr, not stdout: the workflow captures this file's OUT by
+# running `bash -c '. scripts/e2e/lib.sh; printf %s "$OUT"'`, and an extra
+# stdout line here would corrupt that captured path. Each suite's own log
+# still tees stderr, so this line lands there.
+echo "e2e: OUT=$OUT" >&2
 
 # Tauri v2 app_data_dir() for E2E_APP_IDENTIFIER:
 #   macOS   -> ~/Library/Application Support/<id>
@@ -31,11 +46,12 @@ app_data_dir() {
       printf '%s\n' "$HOME/Library/Application Support/$E2E_APP_IDENTIFIER"
       ;;
     MINGW64_NT* | MSYS_NT*)
-      # $APPDATA is a Windows path with backslashes; cygpath -u is what the
-      # runner actually has, the tr/sed pair is only a fallback for images
-      # that lack it.
+      # $APPDATA is a Windows path with backslashes; cygpath -m gives the
+      # mixed form (C:/Users/...) that shell built-ins, jq, rm and ls all
+      # accept, and that matches the OUT convention above. The tr/sed pair is
+      # only a fallback for images that lack cygpath.
       if command -v cygpath >/dev/null 2>&1; then
-        printf '%s/%s\n' "$(cygpath -u "$APPDATA")" "$E2E_APP_IDENTIFIER"
+        printf '%s/%s\n' "$(cygpath -m "$APPDATA")" "$E2E_APP_IDENTIFIER"
       else
         printf '%s/%s\n' "$(printf '%s' "$APPDATA" | sed 's#^\([A-Za-z]\):#/\L\1#; s#\\#/#g')" "$E2E_APP_IDENTIFIER"
       fi
@@ -164,22 +180,102 @@ E2E_OWNED_PORTS="1420 45678"
 # invisible to a port-based check and won't be reached here. Left as a known
 # gap rather than reintroducing a broad process-name pattern to cover it.
 e2e_kill_owned_ports() {
-  local timeout_s="${1:-3}" port pid waited
-  for port in $E2E_OWNED_PORTS; do
-    pid="$(lsof -ti "tcp:$port" -sTCP:LISTEN 2>/dev/null)"
-    if [ -z "$pid" ]; then
-      continue
-    fi
-    kill $pid 2>/dev/null
-    waited=0
-    while [ "$waited" -lt "$timeout_s" ] && [ -n "$pid" ]; do
-      sleep 1
-      waited=$((waited + 1))
-      pid="$(lsof -ti "tcp:$port" -sTCP:LISTEN 2>/dev/null)"
-    done
-    if [ -n "$pid" ]; then
-      kill -9 $pid 2>/dev/null
-    fi
-  done
+  local timeout_s="${1:-3}" port pid pids waited
+  case "$(uname -s)" in
+    MINGW64_NT* | MSYS_NT*)
+      for port in $E2E_OWNED_PORTS; do
+        # netstat -ano -p tcp columns: Proto  Local  Foreign  State  PID
+        pids="$(netstat -ano -p tcp | awk -v p=":$port\$" '$2 ~ p && $4 == "LISTENING" {print $5}' | sort -u)"
+        if [ -z "$pids" ]; then
+          continue
+        fi
+        for pid in $pids; do
+          taskkill //PID "$pid" >/dev/null 2>&1
+        done
+        waited=0
+        while [ "$waited" -lt "$timeout_s" ] && [ -n "$pids" ]; do
+          sleep 1
+          waited=$((waited + 1))
+          pids="$(netstat -ano -p tcp | awk -v p=":$port\$" '$2 ~ p && $4 == "LISTENING" {print $5}' | sort -u)"
+        done
+        for pid in $pids; do
+          taskkill //F //PID "$pid" >/dev/null 2>&1
+        done
+      done
+      ;;
+    *)
+      for port in $E2E_OWNED_PORTS; do
+        pid="$(lsof -ti "tcp:$port" -sTCP:LISTEN 2>/dev/null)"
+        if [ -z "$pid" ]; then
+          continue
+        fi
+        kill $pid 2>/dev/null
+        waited=0
+        while [ "$waited" -lt "$timeout_s" ] && [ -n "$pid" ]; do
+          sleep 1
+          waited=$((waited + 1))
+          pid="$(lsof -ti "tcp:$port" -sTCP:LISTEN 2>/dev/null)"
+        done
+        if [ -n "$pid" ]; then
+          kill -9 $pid 2>/dev/null
+        fi
+      done
+      ;;
+  esac
   return 0
+}
+
+# Whether the app's own process is running, by exact release process name.
+# Used by every suite's quit_app to wait for a real exit.
+e2e_app_running() {
+  case "$(uname -s)" in
+    MINGW64_NT* | MSYS_NT*)
+      tasklist //FI "IMAGENAME eq note-n-pad.exe" | grep -q note-n-pad.exe
+      ;;
+    *)
+      pgrep -x note-n-pad >/dev/null 2>&1
+      ;;
+  esac
+}
+e2e_app_gone() {
+  ! e2e_app_running
+}
+
+# Whether the dev binary (cargo run's debug build, matched by path) is
+# running. Narrower than e2e_app_running on purpose: the RSS attribution and
+# the exit-after-discard checks must not start matching an installed build.
+e2e_dev_app_running() {
+  case "$(uname -s)" in
+    MINGW64_NT* | MSYS_NT*)
+      powershell -NoProfile -Command \
+        "if (Get-Process | Where-Object { \$_.Path -like '*\\target\\debug\\note-n-pad.exe' }) { exit 0 } else { exit 1 }"
+      ;;
+    *)
+      pgrep -f 'target/debug/note-n-pad' >/dev/null 2>&1
+      ;;
+  esac
+}
+
+# Whether the automation socket answers at all, regardless of whose process it
+# is. Bounded by NOTE_N_PAD_AUTO_TIMEOUT_MS so a socket that accepts but never
+# answers cannot hang this check.
+e2e_automation_up() {
+  NOTE_N_PAD_AUTO_TIMEOUT_MS=5000 node "$REPO/scripts/auto.mjs" \
+    '{"id":0,"cmd":"list_windows"}' >/dev/null 2>&1
+}
+_e2e_automation_down() {
+  ! e2e_automation_up
+}
+
+# Refuse to launch onto a previous instance's socket. The single-instance
+# plugin makes a second process defer and exit, so "something answers on
+# 45678" is not proof the app under test is the one about to be started —
+# every launch() must first prove the slate is clean: app gone AND both owned
+# ports free, or fail loudly.
+e2e_require_clean_slate() {
+  e2e_kill_owned_ports
+  if ! e2e_wait_until 30 e2e_app_gone || ! e2e_wait_until 30 _e2e_automation_down; then
+    echo "FATAL: a previous app instance is still alive; refusing to launch"
+    exit 1
+  fi
 }
