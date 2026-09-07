@@ -893,6 +893,129 @@ Gap paragraph 119.
 ## Notes
 
 second notes body
+
+```
+row 001 | 2026-08-18T09:00:01.549Z | render.worker | watcher dropped 302 events
+row 002 | 2026-08-18T09:00:02.549Z | render.worker | watcher dropped 304 events
+row 003 | 2026-08-18T09:00:03.549Z | render.worker | watcher dropped 306 events
+row 004 | 2026-08-18T09:00:04.549Z | render.worker | watcher dropped 308 events
+row 005 | 2026-08-18T09:00:05.549Z | render.worker | watcher dropped 310 events
+row 006 | 2026-08-18T09:00:06.549Z | render.worker | watcher dropped 312 events
+row 007 | 2026-08-18T09:00:07.549Z | render.worker | watcher dropped 314 events
+row 008 | 2026-08-18T09:00:08.549Z | render.worker | watcher dropped 316 events
+row 009 | 2026-08-18T09:00:09.549Z | render.worker | watcher dropped 318 events
+row 010 | 2026-08-18T09:00:10.549Z | render.worker | watcher dropped 320 events
+row 011 | 2026-08-18T09:00:11.549Z | render.worker | watcher dropped 322 events
+row 012 | 2026-08-18T09:00:12.549Z | render.worker | watcher dropped 324 events
+row 013 | 2026-08-18T09:00:13.549Z | render.worker | watcher dropped 326 events
+row 014 | 2026-08-18T09:00:14.549Z | render.worker | watcher dropped 328 events
+row 015 | 2026-08-18T09:00:15.549Z | render.worker | watcher dropped 330 events
+row 016 | 2026-08-18T09:00:16.549Z | render.worker | watcher dropped 332 events
+row 017 | 2026-08-18T09:00:17.549Z | render.worker | watcher dropped 334 events
+row 018 | 2026-08-18T09:00:18.549Z | render.worker | watcher dropped 336 events
+row 019 | 2026-08-18T09:00:19.549Z | render.worker | watcher dropped 338 events
+row 020 | 2026-08-18T09:00:20.549Z | render.worker | watcher dropped 340 events
+row 021 | 2026-08-18T09:00:21.549Z | render.worker | watcher dropped 342 events
+row 022 | 2026-08-18T09:00:22.549Z | render.worker | watcher dropped 344 events
+row 023 | 2026-08-18T09:00:23.549Z | render.worker | watcher dropped 346 events
+row 024 | 2026-08-18T09:00:24.549Z | render.worker | watcher dropped 348 events
+row 025 | 2026-08-18T09:00:25.549Z | render.worker | watcher dropped 350 events
+row 026 | 2026-08-18T09:00:26.549Z | render.worker | watcher dropped 352 events
+row 027 | 2026-08-18T09:00:27.549Z | render.worker | watcher dropped 354 events
+row 028 | 2026-08-18T09:00:28.549Z | render.worker | watcher dropped 356 events
+row 029 | 2026-08-18T09:00:29.549Z | render.worker | watcher dropped 358 events
+row 030 | 2026-08-18T09:00:30.549Z | render.worker | watcher dropped 360 events
+row 031 | 2026-08-18T09:00:31.549Z | render.worker | watcher dropped 362 events
+row 032 | 2026-08-18T09:00:32.549Z | render.worker | watcher dropped 364 events
+row 033 | 2026-08-18T09:00:33.549Z | render.worker | watcher dropped 366 events
+row 034 | 2026-08-18T09:00:34.549Z | render.worker | watcher dropped 368 events
+row 035 | 2026-08-18T09:00:35.549Z | render.worker | watcher dropped 370 events
+row 036 | 2026-08-18T09:00:36.549Z | render.worker | watcher dropped 372 events
+row 037 | 2026-08-18T09:00:37.549Z | render.worker | watcher dropped 374 events
+row 038 | 2026-08-18T09:00:38.549Z | render.worker | watcher dropped 376 events
+row 039 | 2026-08-18T09:00:39.549Z | render.worker | watcher dropped 378 events
+row 040 | 2026-08-18T09:00:40.549Z | render.worker | watcher dropped 380 events
+row 041 | 2026-08-18T09:00:41.549Z | render.worker | watcher dropped 382 events
+row 042 | 2026-08-18T09:00:42.549Z | render.worker | watcher dropped 384 events
+row 043 | 2026-08-18T09:00:43.549Z | render.worker | watcher dropped 386 events
+row 044 | 2026-08-18T09:00:44.549Z | render.worker | watcher dropped 388 events
+row 045 | 2026-08-18T09:00:45.549Z | render.worker | watcher dropped 390 events
+row 046 | 2026-08-18T09:00:46.549Z | render.worker | watcher dropped 392 events
+row 047 | 2026-08-18T09:00:47.549Z | render.worker | watcher dropped 394 events
+row 048 | 2026-08-18T09:00:48.549Z | render.worker | watcher dropped 396 events
+row 049 | 2026-08-18T09:00:49.549Z | render.worker | watcher dropped 398 events
+row 050 | 2026-08-18T09:00:50.549Z | render.worker | watcher dropped 400 events
+row 051 | 2026-08-18T09:00:51.549Z | render.worker | watcher dropped 402 events
+row 052 | 2026-08-18T09:00:52.549Z | render.worker | watcher dropped 404 events
+row 053 | 2026-08-18T09:00:53.549Z | render.worker | watcher dropped 406 events
+row 054 | 2026-08-18T09:00:54.549Z | render.worker | watcher dropped 408 events
+row 055 | 2026-08-18T09:00:55.549Z | render.worker | watcher dropped 410 events
+row 056 | 2026-08-18T09:00:56.549Z | render.worker | watcher dropped 412 events
+row 057 | 2026-08-18T09:00:57.549Z | render.worker | watcher dropped 414 events
+row 058 | 2026-08-18T09:00:58.549Z | render.worker | watcher dropped 416 events
+row 059 | 2026-08-18T09:00:59.549Z | render.worker | watcher dropped 418 events
+row 060 | 2026-08-18T09:00:00.549Z | render.worker | watcher dropped 420 events
+row 061 | 2026-08-18T09:00:01.549Z | render.worker | watcher dropped 422 events
+row 062 | 2026-08-18T09:00:02.549Z | render.worker | watcher dropped 424 events
+row 063 | 2026-08-18T09:00:03.549Z | render.worker | watcher dropped 426 events
+row 064 | 2026-08-18T09:00:04.549Z | render.worker | watcher dropped 428 events
+row 065 | 2026-08-18T09:00:05.549Z | render.worker | watcher dropped 430 events
+row 066 | 2026-08-18T09:00:06.549Z | render.worker | watcher dropped 432 events
+row 067 | 2026-08-18T09:00:07.549Z | render.worker | watcher dropped 434 events
+row 068 | 2026-08-18T09:00:08.549Z | render.worker | watcher dropped 436 events
+row 069 | 2026-08-18T09:00:09.549Z | render.worker | watcher dropped 438 events
+row 070 | 2026-08-18T09:00:10.549Z | render.worker | watcher dropped 440 events
+row 071 | 2026-08-18T09:00:11.549Z | render.worker | watcher dropped 442 events
+row 072 | 2026-08-18T09:00:12.549Z | render.worker | watcher dropped 444 events
+row 073 | 2026-08-18T09:00:13.549Z | render.worker | watcher dropped 446 events
+row 074 | 2026-08-18T09:00:14.549Z | render.worker | watcher dropped 448 events
+row 075 | 2026-08-18T09:00:15.549Z | render.worker | watcher dropped 450 events
+row 076 | 2026-08-18T09:00:16.549Z | render.worker | watcher dropped 452 events
+row 077 | 2026-08-18T09:00:17.549Z | render.worker | watcher dropped 454 events
+row 078 | 2026-08-18T09:00:18.549Z | render.worker | watcher dropped 456 events
+row 079 | 2026-08-18T09:00:19.549Z | render.worker | watcher dropped 458 events
+row 080 | 2026-08-18T09:00:20.549Z | render.worker | watcher dropped 460 events
+row 081 | 2026-08-18T09:00:21.549Z | render.worker | watcher dropped 462 events
+row 082 | 2026-08-18T09:00:22.549Z | render.worker | watcher dropped 464 events
+row 083 | 2026-08-18T09:00:23.549Z | render.worker | watcher dropped 466 events
+row 084 | 2026-08-18T09:00:24.549Z | render.worker | watcher dropped 468 events
+row 085 | 2026-08-18T09:00:25.549Z | render.worker | watcher dropped 470 events
+row 086 | 2026-08-18T09:00:26.549Z | render.worker | watcher dropped 472 events
+row 087 | 2026-08-18T09:00:27.549Z | render.worker | watcher dropped 474 events
+row 088 | 2026-08-18T09:00:28.549Z | render.worker | watcher dropped 476 events
+row 089 | 2026-08-18T09:00:29.549Z | render.worker | watcher dropped 478 events
+row 090 | 2026-08-18T09:00:30.549Z | render.worker | watcher dropped 480 events
+row 091 | 2026-08-18T09:00:31.549Z | render.worker | watcher dropped 482 events
+row 092 | 2026-08-18T09:00:32.549Z | render.worker | watcher dropped 484 events
+row 093 | 2026-08-18T09:00:33.549Z | render.worker | watcher dropped 486 events
+row 094 | 2026-08-18T09:00:34.549Z | render.worker | watcher dropped 488 events
+row 095 | 2026-08-18T09:00:35.549Z | render.worker | watcher dropped 490 events
+row 096 | 2026-08-18T09:00:36.549Z | render.worker | watcher dropped 492 events
+row 097 | 2026-08-18T09:00:37.549Z | render.worker | watcher dropped 494 events
+row 098 | 2026-08-18T09:00:38.549Z | render.worker | watcher dropped 496 events
+row 099 | 2026-08-18T09:00:39.549Z | render.worker | watcher dropped 498 events
+row 100 | 2026-08-18T09:00:40.549Z | render.worker | watcher dropped 500 events
+row 101 | 2026-08-18T09:00:41.549Z | render.worker | watcher dropped 502 events
+row 102 | 2026-08-18T09:00:42.549Z | render.worker | watcher dropped 504 events
+row 103 | 2026-08-18T09:00:43.549Z | render.worker | watcher dropped 506 events
+row 104 | 2026-08-18T09:00:44.549Z | render.worker | watcher dropped 508 events
+row 105 | 2026-08-18T09:00:45.549Z | render.worker | watcher dropped 510 events
+row 106 | 2026-08-18T09:00:46.549Z | render.worker | watcher dropped 512 events
+row 107 | 2026-08-18T09:00:47.549Z | render.worker | watcher dropped 514 events
+row 108 | 2026-08-18T09:00:48.549Z | render.worker | watcher dropped 516 events
+row 109 | 2026-08-18T09:00:49.549Z | render.worker | watcher dropped 518 events
+row 110 | 2026-08-18T09:00:50.549Z | render.worker | watcher dropped 520 events
+row 111 | 2026-08-18T09:00:51.549Z | render.worker | watcher dropped 522 events
+row 112 | 2026-08-18T09:00:52.549Z | render.worker | watcher dropped 524 events
+row 113 | 2026-08-18T09:00:53.549Z | render.worker | watcher dropped 526 events
+row 114 | 2026-08-18T09:00:54.549Z | render.worker | watcher dropped 528 events
+row 115 | 2026-08-18T09:00:55.549Z | render.worker | watcher dropped 530 events
+row 116 | 2026-08-18T09:00:56.549Z | render.worker | watcher dropped 532 events
+row 117 | 2026-08-18T09:00:57.549Z | render.worker | watcher dropped 534 events
+row 118 | 2026-08-18T09:00:58.549Z | render.worker | watcher dropped 536 events
+row 119 | 2026-08-18T09:00:59.549Z | render.worker | watcher dropped 538 events
+row 120 | 2026-08-18T09:00:00.549Z | render.worker | watcher dropped 540 events
+```
 MDEOF
 cat >"$WORK/hostile.md" <<'MDEOF'
 <script>window.__mdPwned = 'block'</script>
@@ -1130,6 +1253,28 @@ check "the suffixed anchor reached the second heading of that name" \
   "$(evl "$DL" "String(document.querySelector('.markdown-view').textContent.includes('second notes body'))")" "true"
 check "and not the first" \
   "$(evl "$DL" "String(document.querySelector('.markdown-view').textContent.includes('first notes body'))")" "false"
+
+# The right blocks being in the DOM is not enough: `.blocks` is absolutely
+# positioned, so a wrong offset leaves an empty pane with every block present.
+# One stop per call with a settle between — writing `scrollTop` and reading the
+# box back in the same task measures the previous window at its previous
+# position, because Svelte has not re-rendered yet.
+BLIND=0
+for FRAC in 0 25 50 75 100 75 50 25 0; do
+  evl "$DL" "(()=>{const el=document.querySelector('.markdown-view');el.scrollTop=Math.round((el.scrollHeight-el.clientHeight)*$FRAC/100);return '';})()" >/dev/null
+  sleep 2
+  # Assigned first rather than substituted straight into `[`: this shell's
+  # `$( )` mis-parses a nested expansion carrying JS this brace-heavy, and the
+  # failure is a `[` error the loop would count as a pass.
+  TOUCHING=$(evl "$DL" "(()=>{const el=document.querySelector('.markdown-view');if(el===null){return 'false';}const b=el.querySelector('.blocks');if(b===null){return 'false';}const s=el.getBoundingClientRect(),r=b.getBoundingClientRect();return String(Math.min(s.bottom,r.bottom)-Math.max(s.top,r.top)>0);})()")
+  if [ "$TOUCHING" != "true" ]; then
+    BLIND=$((BLIND + 1))
+  fi
+done
+check "the rendered blocks touch the viewport at every scroll position, both directions" \
+  "$BLIND" "0"
+evl "$DL" "document.querySelector('.markdown-view').scrollTop = 0" >/dev/null
+sleep 1
 evl "$DL" "__auto.setViewMode('source')" >/dev/null
 sleep 2
 
