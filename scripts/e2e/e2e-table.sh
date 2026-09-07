@@ -23,6 +23,7 @@ WORK="$OUT/table-fixture"
 PASS=0
 FAIL=0
 mkdir -p "$OUT"
+: >"$OUT/dev-table.log"
 
 ok() {
   PASS=$((PASS + 1))
@@ -98,12 +99,9 @@ _pane_taller_than() {
   [ "$(_pane_height "$1")" -gt "$2" ] 2>/dev/null
 }
 launch() {
-  if nc -z 127.0.0.1 45678 2>/dev/null; then
-    echo "launch: reusing dev server already on 45678"
-    return
-  fi
-  NOTE_N_PAD_AUTOMATION=1 npm run tauri dev >"$OUT/dev-table.log" 2>&1 &
-  if ! e2e_wait_until 240 nc -z 127.0.0.1 45678; then
+  e2e_require_clean_slate
+  NOTE_N_PAD_AUTOMATION=1 npm run tauri dev >>"$OUT/dev-table.log" 2>&1 &
+  if ! e2e_wait_until 240 e2e_automation_up; then
     echo "FATAL: automation port never opened"
     exit 1
   fi
@@ -111,7 +109,7 @@ launch() {
 }
 quit_app() {
   auto '{"id":99,"cmd":"quit"}' >/dev/null 2>&1
-  e2e_wait_until 20 sh -c '! pgrep -x note-n-pad >/dev/null 2>&1'
+  e2e_wait_until 20 e2e_app_gone
   e2e_kill_owned_ports
   sleep 3
 }
@@ -122,7 +120,7 @@ echo "=== preflight ==="
 # it writes its dirty tabs to snapshots on the way out — which the next run's
 # app would then adopt, so its very first assertions would read another run's
 # leftovers. (Seen: a 270,001-row fixture opening with 270,002 rows and dirty.)
-if ! e2e_wait_until 60 sh -c '! pgrep -x note-n-pad >/dev/null 2>&1'; then
+if ! e2e_wait_until 60 e2e_app_gone; then
   echo "FATAL: a note-n-pad process is still running; refusing to start"
   exit 1
 fi

@@ -18,6 +18,7 @@ WORK="$OUT/highlight-fixture"
 PASS=0
 FAIL=0
 mkdir -p "$OUT"
+: >"$OUT/dev-highlight.log"
 
 ok() {
   PASS=$((PASS + 1))
@@ -57,9 +58,10 @@ evl() {
   auto "{\"id\":9,\"cmd\":\"eval\",\"label\":\"$1\",\"js\":$(jq -Rn --arg js "$2" '$js')}" | jq -r '.data'
 }
 launch() {
-  NOTE_N_PAD_AUTOMATION=1 npm run tauri dev >"$OUT/dev-highlight.log" 2>&1 &
+  e2e_require_clean_slate
+  NOTE_N_PAD_AUTOMATION=1 npm run tauri dev >>"$OUT/dev-highlight.log" 2>&1 &
   local tries=0
-  until nc -z 127.0.0.1 45678 2>/dev/null; do
+  until e2e_automation_up; do
     sleep 1
     tries=$((tries + 1))
     if [ "$tries" -gt 240 ]; then
@@ -72,7 +74,7 @@ launch() {
 quit_app() {
   auto '{"id":99,"cmd":"quit"}' >/dev/null 2>&1
   local tries=0
-  while pgrep -x note-n-pad >/dev/null 2>&1; do
+  while e2e_app_running; do
     sleep 1
     tries=$((tries + 1))
     if [ "$tries" -gt 20 ]; then
@@ -88,7 +90,7 @@ for f in "$STORE"/*.json; do
   if [ "$(jq -r '.kind' "$f" 2>/dev/null)" = "document" ]; then
     FP=$(jq -r '.file_path // empty' "$f" 2>/dev/null)
     case "$FP" in
-      *note-n-pad-e2e/*)
+      *note-n-pad-e2e*)
         rm -f "$f"
         echo "preflight: removed scratchpad snapshot ($FP)"
         ;;
@@ -229,7 +231,7 @@ for f in "$STORE"/*.json; do
   if [ "$(jq -r '.kind' "$f" 2>/dev/null)" = "document" ]; then
     FP=$(jq -r '.file_path // empty' "$f" 2>/dev/null)
     case "$FP" in
-      *note-n-pad-e2e/*)
+      *note-n-pad-e2e*)
         rm -f "$f"
         echo "cleaned: $f"
         ;;
