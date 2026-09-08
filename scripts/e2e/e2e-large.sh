@@ -74,10 +74,14 @@ doc_count() {
 # in the list either way, so comparing against the full set skips it.
 new_doc_label() {
   local known="$1" l
+  printf 'new-doc-label: known=%q\n' "$known" >&2
   doc_labels | while read -r l; do
     case "$known" in
-      *"$l"*) ;;
+      *"$l"*)
+        printf 'new-doc-label: candidate=%q arm=skip\n' "$l" >&2
+        ;;
       *)
+        printf 'new-doc-label: candidate=%q arm=pick\n' "$l" >&2
         printf '%s\n' "$l"
         return 0
         ;;
