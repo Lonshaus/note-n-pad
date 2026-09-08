@@ -1074,7 +1074,7 @@ python3 - <<PYEOF
 # reason.
 line_bytes = 40
 n = (115 * 1024 * 1024) // line_bytes
-with open('$WORK/big.json', 'w') as f:
+with open('$WORK/big.json', 'w', newline='') as f:
     buf = []
     for i in range(n):
         buf.append('{"id": %s, "note": "padding"}' % f'{i:012d}')

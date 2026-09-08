@@ -109,7 +109,7 @@ mkdir -p "$WORK"
 python3 - <<PYEOF
 import json
 n = 150000
-with open('$WORK/nested.json', 'w') as f:
+with open('$WORK/nested.json', 'w', newline='') as f:
     f.write('[\n')
     for i in range(n):
         obj = {'id': i, 'name': f'item-{i}', 'tags': ['a', 'b', 'c'],

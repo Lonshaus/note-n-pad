@@ -148,26 +148,26 @@ mkdir -p "$WORK"
 # Every row carries its own index so a rendered cell proves which row it is.
 python3 - <<PYEOF
 w = '$WORK'
-with open(f'{w}/big.csv', 'w') as f:
+with open(f'{w}/big.csv', 'w', newline='') as f:
     f.write('col a,col b,col c\n')
     for i in range(270000):
         f.write(f'{i},value {i},another {i}\n')
-with open(f'{w}/small.csv', 'w') as f:
+with open(f'{w}/small.csv', 'w', newline='') as f:
     f.write('col a,col b,col c\n')
     for i in range(50):
         f.write(f'{i},value {i},another {i}\n')
-with open(f'{w}/huge.csv', 'w') as f:
+with open(f'{w}/huge.csv', 'w', newline='') as f:
     f.write('n,v\n')
     for i in range(1600000):
         f.write(f'{i},r{i}\n')
 for name, tag in (('a.csv', 'A'), ('b.csv', 'B')):
-    with open(f'{w}/{name}', 'w') as f:
+    with open(f'{w}/{name}', 'w', newline='') as f:
         f.write('col a,col b,col c\n')
         for i in range(2000):
             f.write(f'{i},{tag}-{i},another {i}\n')
-with open(f'{w}/quoted.csv', 'w') as f:
+with open(f'{w}/quoted.csv', 'w', newline='') as f:
     f.write('"multi\nline",x\ny,z\n')
-with open(f'{w}/host.txt', 'w') as f:
+with open(f'{w}/host.txt', 'w', newline='') as f:
     f.write('short host document\n')
 PYEOF
 BIG_LINES=$(wc -l <"$WORK/big.csv" | tr -d ' ')

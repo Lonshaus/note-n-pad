@@ -144,7 +144,7 @@ rm -rf "$WORK"
 mkdir -p "$WORK"
 python3 - <<PYEOF
 lines = 2400000
-with open('$WORK/big.log', 'w') as f:
+with open('$WORK/big.log', 'w', newline='') as f:
     for i in range(1, lines + 1):
         f.write(f'line {i:07d} abcdefghijklmnopqrstuvwxyz0123456789\n')
 PYEOF
