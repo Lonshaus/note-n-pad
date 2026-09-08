@@ -88,7 +88,7 @@ new_doc_exists() {
   [ -n "$(new_doc_label "$1")" ]
 }
 evl() {
-  auto "{\"id\":9,\"cmd\":\"eval\",\"label\":\"$1\",\"js\":$(jq -Rn --arg js "$2" '$js')}" | jq -r '.data'
+  auto "{\"id\":$(e2e_next_id),\"cmd\":\"eval\",\"label\":\"$1\",\"js\":$(jq -Rn --arg js "$2" '$js')}" | jq -r '.data'
 }
 launch() {
   e2e_require_clean_slate
@@ -398,7 +398,21 @@ else
 fi
 evl "$DL" "__auto.setLargeOpenMode('$ORIG_MODE')" >/dev/null
 e2e_wait_setting large_open_mode "$ORIG_MODE"
-check "mode restored" "$(evl "$DL" "String(__auto.getLargeOpenMode())")" "$ORIG_MODE"
+MODE_RESTORED="$(evl "$DL" "String(__auto.getLargeOpenMode())")"
+if [ "$MODE_RESTORED" != "$ORIG_MODE" ]; then
+  # $DL can be gone by the time this reads it; dump the window list so a
+  # missing window is distinguished from a setting that never landed.
+  echo "full window list: $(auto '{"id":96,"cmd":"list_windows"}' 2>/dev/null)"
+  case "$(doc_labels 2>/dev/null)" in
+    *"$DL"*)
+      echo "\$DL ($DL) still in window list: yes"
+      ;;
+    *)
+      echo "\$DL ($DL) still in window list: no"
+      ;;
+  esac
+fi
+check "mode restored" "$MODE_RESTORED" "$ORIG_MODE"
 
 echo "=== restart restore ==="
 quit_app

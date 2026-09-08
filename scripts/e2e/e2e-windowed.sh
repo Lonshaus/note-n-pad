@@ -93,7 +93,7 @@ new_doc_exists() {
   [ -n "$(new_doc_label "$1")" ]
 }
 evl() {
-  auto "{\"id\":9,\"cmd\":\"eval\",\"label\":\"$1\",\"js\":$(jq -Rn --arg js "$2" '$js')}" | jq -r '.data'
+  auto "{\"id\":$(e2e_next_id),\"cmd\":\"eval\",\"label\":\"$1\",\"js\":$(jq -Rn --arg js "$2" '$js')}" | jq -r '.data'
 }
 launch() {
   e2e_require_clean_slate
@@ -167,19 +167,9 @@ open_large() {
 mem_capture() {
   {
     echo "MAIN"
-    for pid in $(pgrep -f "target/debug/note-n-pad"); do
-      rss=$(ps -o rss= -p "$pid" 2>/dev/null | tr -d ' ')
-      if [ -n "$rss" ]; then
-        echo "$pid $rss"
-      fi
-    done
+    e2e_process_rss "target/debug/note-n-pad"
     echo "WEBCONTENT"
-    for pid in $(pgrep -f "$(webcontent_pattern)"); do
-      rss=$(ps -o rss= -p "$pid" 2>/dev/null | tr -d ' ')
-      if [ -n "$rss" ]; then
-        echo "$pid $rss"
-      fi
-    done
+    e2e_process_rss "$(webcontent_pattern)"
   } >"$1"
 }
 
@@ -431,11 +421,19 @@ main_inc = sum(ma.values()) - sum(mb.values())
 web_inc = sum(max(0, rss - wb.get(pid, 0)) for pid, rss in wa.items())
 total_kb = main_inc + web_inc
 print(f'{sum(mb.values())} {sum(ma.values())} {main_inc} {web_inc} {total_kb} {total_kb / 1024:.1f}')
+print(f'{sum(wb.values())} {sum(wa.values())}')
 PYEOF
 )
 echo "MEM base_main_kb after_main_kb main_inc_kb web_inc_kb total_inc_kb total_inc_mb"
-echo "MEM $MEM"
-TOTAL_MB=$(echo "$MEM" | awk '{print $6}')
+echo "MEM $(echo "$MEM" | sed -n '1p')"
+# Windows printed MEM 0 0 0 0 0 0.0 and passed before e2e_process_rss existed:
+# measuring nothing looked identical to measuring well. This line carries the
+# renderer totals the MEM line has no room for, so a still-zero renderer total
+# on Windows is visible in the log instead of hiding behind a legitimate 0
+# web_inc_kb.
+echo "MEMWEB base_web_kb after_web_kb"
+echo "MEMWEB $(echo "$MEM" | sed -n '2p')"
+TOTAL_MB=$(echo "$MEM" | awk 'NR==1{print $6}')
 UNDER=$(awk -v m="$TOTAL_MB" 'BEGIN{print (m < 300) ? "true" : "false"}')
 check "memory increase under 300MB (windowed, not whole-load)" "$UNDER" "true"
 
@@ -587,7 +585,21 @@ evl "$DLE" "__auto.closeActiveTab()" >/dev/null
 sleep 2
 evl "$DL" "__auto.setLargeOpenMode('$ORIG_MODE')" >/dev/null 2>&1
 e2e_wait_setting large_open_mode "$ORIG_MODE"
-check "mode restored to original" "$(evl "$DL" "String(__auto.getLargeOpenMode())")" "$ORIG_MODE"
+MODE_RESTORED="$(evl "$DL" "String(__auto.getLargeOpenMode())")"
+if [ "$MODE_RESTORED" != "$ORIG_MODE" ]; then
+  # $DL can be gone by the time this reads it; dump the window list so a
+  # missing window is distinguished from a setting that never landed.
+  echo "full window list: $(auto '{"id":31,"cmd":"list_windows"}' 2>/dev/null)"
+  case "$(doc_labels 2>/dev/null)" in
+    *"$DL"*)
+      echo "\$DL ($DL) still in window list: yes"
+      ;;
+    *)
+      echo "\$DL ($DL) still in window list: no"
+      ;;
+  esac
+fi
+check "mode restored to original" "$MODE_RESTORED" "$ORIG_MODE"
 
 echo "=== teardown ==="
 evl "$DL" "__auto.setLanguage('$ORIG_LANG')" >/dev/null

@@ -136,6 +136,27 @@ e2e_wait_until() {
   return 0
 }
 
+# Next eval request id, unique across the whole suite run. The 3 s
+# EVAL_TIMEOUT lets an eval's JS keep running after wait() gives up on it; a
+# late automation_result() then fills whatever slot currently carries that
+# id, corrupting an unrelated later eval, if every request reuses the same
+# literal id. The counter is a file under $OUT rather than a shell variable
+# because nearly every `evl` call runs inside `$( )`, and a variable
+# incremented in a subshell is lost the moment it exits. Seeded at 1000 so it
+# never collides with the small literal ids the non-eval commands use. The
+# suites are single-threaded, so no locking is needed.
+E2E_ID_FILE="$OUT/req-id"
+e2e_next_id() {
+  local next
+  # A write that fails leaves the counter at its seed, which is the very bug
+  # this replaces, so make sure the directory exists rather than trusting the
+  # caller to have created it.
+  mkdir -p "$OUT" 2>/dev/null
+  next="$(cat "$E2E_ID_FILE" 2>/dev/null || echo 1000)"
+  echo "$((next + 1))" >"$E2E_ID_FILE"
+  printf '%s\n' "$next"
+}
+
 # Poll until settings.json's <key> equals <value>. A window created after a
 # setting changes reads it while mounting, so asserting on a window opened right
 # after the change is a race: on a slow machine it mounts with the old value and
@@ -297,6 +318,54 @@ e2e_dev_app_running() {
   esac
 }
 
+# Prints "pid rss_kib" per process matching <pattern>, one line per match,
+# nothing when there is none. POSIX keeps the existing pgrep -f + ps -o rss=,
+# which sees the pattern as a command-line substring. Git Bash's pgrep/ps
+# cannot see a native Windows process at all, so both mem_capture loops would
+# read empty there without this. Get-Process exposes no command-line-substring
+# match, so the same one-argument call needs two different strategies on
+# Windows depending on what kind of pattern it was given: a pattern with a
+# slash is the main process's executable path fragment (as
+# e2e_dev_app_running matches it at :291-292 above), matched via
+# $_.Path -like after the fragment's forward slashes become the backslashes a
+# Windows path actually has; anything else is a renderer name from
+# webcontent_pattern() (e.g. msedgewebview2.exe), matched via ProcessName —
+# which never carries the trailing .exe an image-name filter would need, so it
+# is stripped before the comparison. WorkingSet64 is bytes; dividing by 1024
+# matches ps -o rss='s KiB.
+e2e_process_rss() {
+  local pattern="$1"
+  case "$(uname -s)" in
+    MINGW64_NT* | MSYS_NT*)
+      case "$pattern" in
+        */*)
+          local winpat="${pattern//\//\\}"
+          case "$winpat" in
+            *.exe) ;;
+            *) winpat="$winpat.exe" ;;
+          esac
+          powershell -NoProfile -Command \
+            "Get-Process | Where-Object { \$_.Path -like '*\\$winpat' } | ForEach-Object { \"\$(\$_.Id) \$([int64](\$_.WorkingSet64 / 1024))\" }"
+          ;;
+        *)
+          local name="${pattern%.exe}"
+          powershell -NoProfile -Command \
+            "Get-Process | Where-Object { \$_.ProcessName -eq '$name' } | ForEach-Object { \"\$(\$_.Id) \$([int64](\$_.WorkingSet64 / 1024))\" }"
+          ;;
+      esac
+      ;;
+    *)
+      local pid rss
+      for pid in $(pgrep -f "$pattern" 2>/dev/null); do
+        rss="$(ps -o rss= -p "$pid" 2>/dev/null | tr -d ' ')"
+        if [ -n "$rss" ]; then
+          echo "$pid $rss"
+        fi
+      done
+      ;;
+  esac
+}
+
 # Whether the automation socket answers at all, regardless of whose process it
 # is. Bounded by NOTE_N_PAD_AUTO_TIMEOUT_MS so a socket that accepts but never
 # answers cannot hang this check.
@@ -328,9 +397,13 @@ e2e_require_clean_slate() {
   local round=0
   while [ "$round" -lt 3 ]; do
     e2e_kill_owned_ports
+    # Checked twice, one second apart: a leftover mid-rebind can pass a single
+    # free check and still take the port before vite binds it, reopening the
+    # window this whole function exists to close.
     if e2e_wait_until 20 e2e_app_gone &&
       e2e_wait_until 20 _e2e_automation_down &&
-      e2e_wait_until 10 _e2e_owned_ports_free; then
+      e2e_wait_until 10 _e2e_owned_ports_free &&
+      { sleep 1; _e2e_owned_ports_free; }; then
       return 0
     fi
     round=$((round + 1))
