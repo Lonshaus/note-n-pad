@@ -166,8 +166,43 @@ _e2e_eval_equals() {
 # own dev server, not ours, and must never be touched.
 E2E_OWNED_PORTS="1420 45678"
 
+# PIDs listening on <port>, one per line, empty when nothing is bound. The
+# one place a listener is identified, so the kill path and the port-free check
+# can never disagree about what counts as bound.
+e2e_port_listeners() {
+  case "$(uname -s)" in
+    MINGW64_NT* | MSYS_NT*)
+      # netstat -ano -p tcp columns: Proto  Local  Foreign  State  PID
+      netstat -ano -p tcp | awk -v p=":$1\$" '$2 ~ p && $4 == "LISTENING" {print $5}' | sort -u
+      ;;
+    *)
+      lsof -ti "tcp:$1" -sTCP:LISTEN 2>/dev/null
+      ;;
+  esac
+}
+_e2e_kill_pid() {
+  case "$(uname -s)" in
+    MINGW64_NT* | MSYS_NT*)
+      taskkill //PID "$1" >/dev/null 2>&1
+      ;;
+    *)
+      kill "$1" 2>/dev/null
+      ;;
+  esac
+}
+_e2e_force_kill_pid() {
+  case "$(uname -s)" in
+    MINGW64_NT* | MSYS_NT*)
+      taskkill //F //PID "$1" >/dev/null 2>&1
+      ;;
+    *)
+      kill -9 "$1" 2>/dev/null
+      ;;
+  esac
+}
 # Stop whatever is listening on our owned ports. Processes are
-# identified by listening port via lsof, never by command-line pattern —
+# identified by listening port via e2e_port_listeners, never by command-line
+# pattern —
 # `pkill -f vite` or `pkill -f "tauri dev"` also matches any other project's
 # unrelated dev session, which is the bug this replaces. For each owned port:
 # send SIGTERM, wait up to <timeout_s> seconds (default 3) for the port to
@@ -181,47 +216,24 @@ E2E_OWNED_PORTS="1420 45678"
 # gap rather than reintroducing a broad process-name pattern to cover it.
 e2e_kill_owned_ports() {
   local timeout_s="${1:-3}" port pid pids waited
-  case "$(uname -s)" in
-    MINGW64_NT* | MSYS_NT*)
-      for port in $E2E_OWNED_PORTS; do
-        # netstat -ano -p tcp columns: Proto  Local  Foreign  State  PID
-        pids="$(netstat -ano -p tcp | awk -v p=":$port\$" '$2 ~ p && $4 == "LISTENING" {print $5}' | sort -u)"
-        if [ -z "$pids" ]; then
-          continue
-        fi
-        for pid in $pids; do
-          taskkill //PID "$pid" >/dev/null 2>&1
-        done
-        waited=0
-        while [ "$waited" -lt "$timeout_s" ] && [ -n "$pids" ]; do
-          sleep 1
-          waited=$((waited + 1))
-          pids="$(netstat -ano -p tcp | awk -v p=":$port\$" '$2 ~ p && $4 == "LISTENING" {print $5}' | sort -u)"
-        done
-        for pid in $pids; do
-          taskkill //F //PID "$pid" >/dev/null 2>&1
-        done
-      done
-      ;;
-    *)
-      for port in $E2E_OWNED_PORTS; do
-        pid="$(lsof -ti "tcp:$port" -sTCP:LISTEN 2>/dev/null)"
-        if [ -z "$pid" ]; then
-          continue
-        fi
-        kill $pid 2>/dev/null
-        waited=0
-        while [ "$waited" -lt "$timeout_s" ] && [ -n "$pid" ]; do
-          sleep 1
-          waited=$((waited + 1))
-          pid="$(lsof -ti "tcp:$port" -sTCP:LISTEN 2>/dev/null)"
-        done
-        if [ -n "$pid" ]; then
-          kill -9 $pid 2>/dev/null
-        fi
-      done
-      ;;
-  esac
+  for port in $E2E_OWNED_PORTS; do
+    pids="$(e2e_port_listeners "$port")"
+    if [ -z "$pids" ]; then
+      continue
+    fi
+    for pid in $pids; do
+      _e2e_kill_pid "$pid"
+    done
+    waited=0
+    while [ "$waited" -lt "$timeout_s" ] && [ -n "$pids" ]; do
+      sleep 1
+      waited=$((waited + 1))
+      pids="$(e2e_port_listeners "$port")"
+    done
+    for pid in $pids; do
+      _e2e_force_kill_pid "$pid"
+    done
+  done
   return 0
 }
 
@@ -267,15 +279,33 @@ _e2e_automation_down() {
   ! e2e_automation_up
 }
 
-# Refuse to launch onto a previous instance's socket. The single-instance
-# plugin makes a second process defer and exit, so "something answers on
-# 45678" is not proof the app under test is the one about to be started —
-# every launch() must first prove the slate is clean: app gone AND both owned
-# ports free, or fail loudly.
+# Refuse to launch onto anything the previous launch left behind. The
+# single-instance plugin makes a second app process defer and exit, so
+# "something answers on 45678" is not proof the app under test is the one
+# about to start; and a vite still holding 1420 is the dev server the next
+# `tauri dev` silently ends up serving from. Both ports must be free, and the
+# app gone, before a launch is allowed. Reclaiming is retried because a
+# process can outlive the first SIGTERM by more than the kill helper waits.
+_e2e_owned_ports_free() {
+  local port
+  for port in $E2E_OWNED_PORTS; do
+    if [ -n "$(e2e_port_listeners "$port")" ]; then
+      return 1
+    fi
+  done
+  return 0
+}
 e2e_require_clean_slate() {
-  e2e_kill_owned_ports
-  if ! e2e_wait_until 30 e2e_app_gone || ! e2e_wait_until 30 _e2e_automation_down; then
-    echo "FATAL: a previous app instance is still alive; refusing to launch"
-    exit 1
-  fi
+  local round=0
+  while [ "$round" -lt 3 ]; do
+    e2e_kill_owned_ports
+    if e2e_wait_until 20 e2e_app_gone &&
+      e2e_wait_until 20 _e2e_automation_down &&
+      e2e_wait_until 10 _e2e_owned_ports_free; then
+      return 0
+    fi
+    round=$((round + 1))
+  done
+  echo "FATAL: a previous app instance is still alive; refusing to launch"
+  exit 1
 }
