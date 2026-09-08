@@ -181,6 +181,31 @@ _e2e_eval_equals() {
   [ "$(evl "$1" "$2")" = "$3" ]
 }
 
+# Read the JS expression <js> in window <label> through the suite-local `evl`,
+# retrying only while the result is exactly `null`: automation.rs times an
+# eval out after 3 s and a timed-out request comes back as an error, which
+# `jq -r '.data'` renders as the literal string `null` — indistinguishable
+# from a real value unless the caller knows a null there can only be a failed
+# measurement. Six attempts, 1 s apart, an order of magnitude over that 3 s
+# timeout without approaching any suite's own waits. Returns the first
+# non-null result, or `null` after six attempts, so an assertion against a
+# genuinely absent window still fails exactly as before. One line per retry
+# goes to stderr, never stdout, which is the captured value.
+e2e_read() {
+  local label="$1" js="$2" attempt=1 result
+  while [ "$attempt" -le 6 ]; do
+    result="$(evl "$label" "$js")"
+    if [ "$result" != "null" ]; then
+      printf '%s\n' "$result"
+      return 0
+    fi
+    echo "e2e_read: retry $attempt after null" >&2
+    sleep 1
+    attempt=$((attempt + 1))
+  done
+  printf '%s\n' "$result"
+}
+
 # Ports this project's own E2E run is allowed to reclaim: 1420 is the Vite dev
 # server `tauri dev` spawns, 45678 is the automation socket the app listens on.
 # Never add 5173 here (or anywhere else in these scripts) — it is the user's
