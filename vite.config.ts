@@ -7,6 +7,31 @@ import { svelte } from '@sveltejs/vite-plugin-svelte';
 // https://vite.dev/config/
 export default defineConfig({
   plugins: [svelte()],
+  optimizeDeps: {
+    // Parsers reach the dev server only through the dynamic import() in
+    // src/lib/highlight/languages.ts, so vite discovers them the first time a
+    // document is highlighted and forces a client reload right then, which
+    // takes window.__auto with it. Naming them up front pre-bundles them at
+    // server start. `vite build` does not read optimizeDeps.
+    include: [
+      '@lezer/common',
+      '@lezer/cpp',
+      '@lezer/css',
+      '@lezer/go',
+      '@lezer/highlight',
+      '@lezer/html',
+      '@lezer/java',
+      '@lezer/javascript',
+      '@lezer/json',
+      '@lezer/markdown',
+      '@lezer/php',
+      '@lezer/python',
+      '@lezer/rust',
+      '@lezer/sass',
+      '@lezer/xml',
+      '@lezer/yaml',
+    ],
+  },
   server: {
     port: 1420,
     strictPort: true,

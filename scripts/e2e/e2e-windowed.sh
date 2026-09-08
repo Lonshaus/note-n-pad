@@ -98,15 +98,21 @@ evl() {
 launch() {
   e2e_require_clean_slate
   NOTE_N_PAD_AUTOMATION=1 npm run tauri dev >>"$OUT/dev-windowed.log" 2>&1 &
+  e2e_report_port_holders
   local tries=0
   until e2e_automation_up; do
     sleep 1
     tries=$((tries + 1))
     if [ "$tries" -gt 240 ]; then
+      e2e_report_port_holders
       echo "FATAL: automation port never opened"
       exit 1
     fi
   done
+  # The dev server binds 1420 while the app is coming up, so this is the
+  # first moment a leftover holding it is visible; the app answering on
+  # 45678 does not mean vite got its port.
+  e2e_report_port_holders
   sleep 4
 }
 quit_app() {
