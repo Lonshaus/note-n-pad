@@ -193,8 +193,12 @@ E2E_OWNED_PORTS="1420 45678"
 e2e_port_listeners() {
   case "$(uname -s)" in
     MINGW64_NT* | MSYS_NT*)
-      # netstat -ano -p tcp columns: Proto  Local  Foreign  State  PID
-      netstat -ano -p tcp | awk -v p=":$1\$" '$2 ~ p && $4 == "LISTENING" {print $5}' | sort -u
+      # netstat -ano columns: Proto  Local  Foreign  State  PID. No -p filter:
+      # on Windows the address family is part of that filter, so `-p tcp`
+      # drops every IPv6 row — and Node resolves `localhost` to ::1, so vite
+      # binds [::1]:1420 and was invisible here while the app's own IPv4
+      # socket on 45678 was not.
+      netstat -ano | awk -v p=":$1\$" '$1 == "TCP" && $2 ~ p && $4 == "LISTENING" {print $5}' | sort -u
       ;;
     *)
       lsof -ti "tcp:$1" -sTCP:LISTEN 2>/dev/null
