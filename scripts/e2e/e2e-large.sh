@@ -337,23 +337,28 @@ check "mode defaults to ask" "$ORIG_MODE" "ask"
 # 'view' mode: no confirm, the file opens straight in the read-only large view.
 evl "$DL" "__auto.setLargeOpenMode('view')" >/dev/null
 e2e_wait_setting large_open_mode "view"
+echo "open-modes trace: after :339 windows=$(auto '{"id":201,"cmd":"list_windows"}') DOCS_BEFORE=${DOCS_BEFORE:-<unset>} DL4=${DL4:-<unset>} DL5=${DL5:-<unset>}"
 DOCS_BEFORE=$(doc_labels)
 evl "$DL" "window.__TAURI_INTERNALS__.invoke('open_document_window',{path:'$WORK/huge.bin'})" >/dev/null
 e2e_wait_until new_doc_exists "$DOCS_BEFORE"
+echo "open-modes trace: after :342 windows=$(auto '{"id":202,"cmd":"list_windows"}') DOCS_BEFORE=${DOCS_BEFORE:-<unset>} DL4=${DL4:-<unset>} DL5=${DL5:-<unset>}"
 DL4=$(new_doc_label "$DOCS_BEFORE")
 if [ -n "$DL4" ]; then
   # The window exists; its tab still has to finish opening before either
   # assertion means anything.
   e2e_wait_eval "$DL4" "String(__auto.isLargeTab())" "true"
+  echo "open-modes trace: after :347 windows=$(auto '{"id":203,"cmd":"list_windows"}') DOCS_BEFORE=${DOCS_BEFORE:-<unset>} DL4=${DL4:-<unset>} DL5=${DL5:-<unset>}"
   check "no confirm in view mode" "$(evl "$DL4" "String(__auto.largeConfirmVisible())")" "false"
   check "opened straight into large view" "$(evl "$DL4" "String(__auto.isLargeTab())")" "true"
   evl "$DL4" "__auto.closeActiveTab()" >/dev/null
+  echo "open-modes trace: after :350 windows=$(auto '{"id":204,"cmd":"list_windows"}') DOCS_BEFORE=${DOCS_BEFORE:-<unset>} DL4=${DL4:-<unset>} DL5=${DL5:-<unset>}"
 else
   bad "view-mode window never appeared"
 fi
 # 'ask' mode: an editable large file's confirm offers an Edit button that unlocks
 # straight into in-place (windowed) editing. big.ask is UTF-8 and under the 512MB
 # cap, and is a separate copy so this open really does get its own window.
+echo "open-modes trace: before :357 windows=$(auto '{"id":205,"cmd":"list_windows"}') DOCS_BEFORE=${DOCS_BEFORE:-<unset>} DL4=${DL4:-<unset>} DL5=${DL5:-<unset>}"
 ASK_EVAL_RESULT="$(evl "$DL" "__auto.setLargeOpenMode('ask')")"
 e2e_wait_setting large_open_mode "ask"
 ASK_WAIT_STATUS=$?
@@ -366,6 +371,11 @@ if [ -n "$DL5" ]; then
   # one did not, and an eval that runs before __auto exists throws, which the
   # harness reports as an error and evl renders as a bare "null".
   e2e_wait_eval "$DL5" "typeof __auto!=='undefined' && typeof __auto.largeConfirmVisible==='function'" "true"
+  # Instrumentation only: what documentWindow.svelte.ts's open path actually
+  # read and decided for this open, read back on both the new window and the
+  # driving window since either side could hold a stale settingsState copy.
+  echo "open-modes trace: big.ask decision on \$DL5 ($DL5): $(evl "$DL5" "JSON.stringify(__auto.largeOpenDecision())")"
+  echo "open-modes trace: big.ask decision on \$DL ($DL): $(evl "$DL" "JSON.stringify(__auto.largeOpenDecision())")"
   if ! e2e_wait_eval "$DL5" "String(__auto.largeConfirmVisible())" "true"; then
     # Distinguishes "the setting never landed / $DL was already dead" from
     # "the setting landed and the new window still showed no confirm", so a
