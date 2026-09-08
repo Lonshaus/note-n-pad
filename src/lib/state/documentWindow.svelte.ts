@@ -31,7 +31,7 @@ import {
   type OpenRoute,
 } from '../util/openRouting';
 import type { CheckpointIndex, NoteSnapshot } from './stickyNote.svelte';
-import { settingsState } from './settings.svelte';
+import { settingsState, type LargeOpenMode } from './settings.svelte';
 import {
   snapshotContentPolicy,
   debounceContentPolicy,
@@ -402,6 +402,16 @@ class DocumentWindowState {
    *  shows the confirm modal; resolving it opens the view, the editor, or
    *  nothing (cancel). */
   pendingLargeOpen = $state<{ path: string; size: number } | null>(null);
+  /** DEV/E2E: what `route` read from `settingsState.largeOpenMode` at the most
+   *  recent over-threshold open and whether that raised the confirm. Null
+   *  before any over-threshold open has been routed. Instrumentation only —
+   *  the app's stdout carries no WebView-originated output, so a Windows CI
+   *  run that skips the confirm has otherwise left no trace of what was read. */
+  lastLargeOpenDecision = $state<{
+    path: string;
+    mode: LargeOpenMode;
+    confirmed: boolean;
+  } | null>(null);
   /** Set while a freshly opened file with an over-threshold line awaits the
    *  open-mode confirm. Carries the path and whether the "format" choice
    *  applies (the content beautifies as JSON). The loaded tab itself is staged
@@ -1202,12 +1212,23 @@ class DocumentWindowState {
       // chosen mode (edit falls back to the read-only view for a non-UTF-8 or
       // oversized file, handled inside confirmLargeOpen).
       const mode = settingsState.largeOpenMode;
+      this.lastLargeOpenDecision = { path, mode, confirmed: mode === 'ask' };
       if (mode !== 'ask') {
         this.confirmLargeOpen(mode === 'edit');
       }
       return;
     }
     await this.openNormal(path);
+  }
+
+  /** DEV/E2E: the record left by the most recent over-threshold open, or null
+   *  before one has happened (see `lastLargeOpenDecision`). */
+  largeOpenDecision(): {
+    path: string;
+    mode: LargeOpenMode;
+    confirmed: boolean;
+  } | null {
+    return this.lastLargeOpenDecision;
   }
 
   /** Open `path` as an ordinary editable tab (full decode), bypassing the

@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-3.0-only
 
 import { activeView } from './editorRegistry';
+import { documentWindow } from '../state/documentWindow.svelte';
 import { settingsState, type LargeOpenMode } from '../state/settings.svelte';
 import type { LineEnding } from '../util/text';
 import type { Language } from '../i18n/locale';
@@ -221,6 +222,9 @@ export function installDocumentAuto(hooks: DocumentHooks): void {
     editorFocused,
     getLanguage: () => settingsState.language,
     setLanguage: (l: Language) => settingsState.setLanguage(l),
+    // Instrumentation only, read straight off the singleton rather than
+    // through `hooks` — see `documentWindow.largeOpenDecision`.
+    largeOpenDecision: () => documentWindow.largeOpenDecision(),
     ...hooks,
   };
 }
