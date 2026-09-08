@@ -205,7 +205,7 @@ mkdir -p "$WORK"
 python3 - <<PYEOF
 import os
 n = 5_000_000
-with open('$WORK/big.log', 'w') as f:
+with open('$WORK/big.log', 'w', newline='') as f:
     buf = []
     for i in range(1, n + 1):
         buf.append(f'{i:010d} ' + 'x' * 36)
@@ -225,7 +225,7 @@ check "fixture is ~240MB" "$ORIG_SIZE" "239999999"
 # and the lock stays disabled.
 python3 - <<PYEOF
 n = (105 * 1024 * 1024) // 48 + 1
-with open('$WORK/bad.log', 'w') as f:
+with open('$WORK/bad.log', 'w', newline='') as f:
     buf = []
     for i in range(n):
         buf.append('A' * 47)

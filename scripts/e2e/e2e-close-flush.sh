@@ -159,18 +159,18 @@ mkdir -p "$WORK"
 # mid.txt: ~2M chars (40,000 lines of 50 'm' + LF). Dirty, it stays well under the
 # 16M snapshot ceiling, so it rides along in a snapshot and restores after a quit.
 python3 - <<PYEOF
-with open('$WORK/mid.txt', 'w') as f:
+with open('$WORK/mid.txt', 'w', newline='') as f:
     f.write(('m' * 50 + '\n') * 40000)
 PYEOF
 # huge.txt: ~16.8M chars (330,000 lines of 50 'h' + LF). Once dirty it exceeds the
 # 16M ceiling ('skip'), so it cannot be snapshotted and the close raises the gate.
 python3 - <<PYEOF
-with open('$WORK/huge.txt', 'w') as f:
+with open('$WORK/huge.txt', 'w', newline='') as f:
     f.write(('h' * 50 + '\n') * 330000)
 PYEOF
 # clean.txt: a few KB, opened and never edited (scenario C).
 python3 - <<PYEOF
-with open('$WORK/clean.txt', 'w') as f:
+with open('$WORK/clean.txt', 'w', newline='') as f:
     f.write(('c' * 50 + '\n') * 100)
 PYEOF
 echo "mid.txt bytes:   $(file_size "$WORK/mid.txt")"

@@ -188,27 +188,27 @@ w = '$WORK'
 # Plain long lines (non-JSON): 15,000 'a' on one line. Splittable in half so an
 # Enter at the midpoint yields two sub-threshold lines. Two distinct copies.
 for name in ('plain-a.txt', 'plain-b.txt', 'otab-plain.txt'):
-    with open(f'{w}/{name}', 'w') as f:
+    with open(f'{w}/{name}', 'w', newline='') as f:
         f.write('a' * 15000)
 # Flat, shallow JSON on one line (~18k chars, depth 2): beautify succeeds, so the
 # confirm offers "format". Two distinct copies (new-window + openTab paths).
 flat = json.dumps({'items': list(range(3000))}, separators=(',', ':'))
 assert '\n' not in flat and len(flat) > 10000
 for name in ('flat.json', 'otab-flat.json'):
-    with open(f'{w}/{name}', 'w') as f:
+    with open(f'{w}/{name}', 'w', newline='') as f:
         f.write(flat)
 # Pathologically deep but valid JSON: 30,000 nested arrays on one line. maxJsonDepth
 # exceeds the beautify cap, so "format" must be refused and the open must not freeze.
-with open(f'{w}/deep.json', 'w') as f:
+with open(f'{w}/deep.json', 'w', newline='') as f:
     f.write('[' * 30000 + ']' * 30000)
 # Astral emoji line: 8,000 U+1F600 = 16,000 UTF-16 units on one line. Soft-wrap
 # must break it into pieces without ever cutting a surrogate pair. Two copies.
 for name in ('emoji.txt', 'otab-emoji.txt'):
-    with open(f'{w}/{name}', 'w', encoding='utf-8') as f:
+    with open(f'{w}/{name}', 'w', encoding='utf-8', newline='') as f:
         f.write('\U0001F600' * 8000)
 # Short host file (no long line): opens a plain document window with no confirm,
 # used as the live window the in-window openTab path runs against.
-with open(f'{w}/host.txt', 'w') as f:
+with open(f'{w}/host.txt', 'w', newline='') as f:
     f.write('short host document\n')
 PYEOF
 echo "fixtures:"

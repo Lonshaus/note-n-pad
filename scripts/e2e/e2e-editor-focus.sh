@@ -158,13 +158,13 @@ rm -rf "$WORK"
 mkdir -p "$WORK"
 # small.txt: a few KB editable tab (scenarios A and C).
 python3 - <<PYEOF
-with open('$WORK/small.txt', 'w') as f:
+with open('$WORK/small.txt', 'w', newline='') as f:
     f.write(('s' * 40 + '\n') * 200)
 PYEOF
 # huge.txt: ~16.8M chars; once dirty it exceeds the 16M snapshot ceiling so a
 # close raises the oversized gate (scenario B reuses that dialog).
 python3 - <<PYEOF
-with open('$WORK/huge.txt', 'w') as f:
+with open('$WORK/huge.txt', 'w', newline='') as f:
     f.write(('h' * 50 + '\n') * 330000)
 PYEOF
 echo "small.txt bytes: $(file_size "$WORK/small.txt")"
