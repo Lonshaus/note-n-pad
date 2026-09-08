@@ -66,8 +66,11 @@ doc_label() {
 doc_count() {
   auto '{"id":3,"cmd":"list_windows"}' | jq -r '[.data[]|select(.label|startswith("doc-"))]|length'
 }
+# jq is a native binary on Windows and writes CRLF; `read -r` keeps the CR
+# and `$( )` strips only the trailing one, so a captured set and a streamed
+# line would silently never match without stripping it here.
 doc_labels() {
-  auto '{"id":31,"cmd":"list_windows"}' | jq -r '.data[]|select(.label|startswith("doc-"))|.label'
+  auto '{"id":31,"cmd":"list_windows"}' | jq -r '.data[]|select(.label|startswith("doc-"))|.label' | tr -d '\r'
 }
 # The label of the first doc window that was not in $1 (a newline-separated list
 # captured before the window was asked for), or empty if none has appeared yet.

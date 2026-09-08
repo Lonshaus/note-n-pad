@@ -77,7 +77,10 @@ label_present() {
 new_doc_label() {
   local tries=0 lab
   while [ "$tries" -lt 30 ]; do
-    lab=$(auto '{"id":3,"cmd":"list_windows"}' | jq -r '.data[]|select(.label|startswith("doc-"))|.label' | grep -vxF -f "$SEEN" 2>/dev/null | head -1)
+    # jq writes CRLF on Windows; -x needs a whole-line match, so the CR has
+    # to come off the stream before it can compare against $SEEN's CR-free
+    # entries (each was captured through a $( ) that already stripped it).
+    lab=$(auto '{"id":3,"cmd":"list_windows"}' | jq -r '.data[]|select(.label|startswith("doc-"))|.label' | tr -d '\r' | grep -vxF -f "$SEEN" 2>/dev/null | head -1)
     if [ -n "$lab" ]; then
       echo "$lab" >>"$SEEN"
       printf '%s\n' "$lab"

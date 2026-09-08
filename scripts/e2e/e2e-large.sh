@@ -58,8 +58,11 @@ boot_label() {
 doc_label() {
   auto '{"id":3,"cmd":"list_windows"}' | jq -r '.data[]|select(.label|startswith("doc-"))|.label' | head -1
 }
+# jq is a native binary on Windows and writes CRLF; `read -r` keeps the CR
+# and `$( )` strips only the trailing one, so a captured set and a streamed
+# line would silently never match without stripping it here.
 doc_labels() {
-  auto '{"id":30,"cmd":"list_windows"}' | jq -r '.data[]|select(.label|startswith("doc-"))|.label'
+  auto '{"id":30,"cmd":"list_windows"}' | jq -r '.data[]|select(.label|startswith("doc-"))|.label' | tr -d '\r'
 }
 doc_count() {
   auto '{"id":33,"cmd":"list_windows"}' | jq -r '[.data[]|select(.label|startswith("doc-"))]|length'
@@ -74,14 +77,10 @@ doc_count() {
 # in the list either way, so comparing against the full set skips it.
 new_doc_label() {
   local known="$1" l
-  printf 'new-doc-label: known=%q\n' "$known" >&2
   doc_labels | while read -r l; do
     case "$known" in
-      *"$l"*)
-        printf 'new-doc-label: candidate=%q arm=skip\n' "$l" >&2
-        ;;
+      *"$l"*) ;;
       *)
-        printf 'new-doc-label: candidate=%q arm=pick\n' "$l" >&2
         printf '%s\n' "$l"
         return 0
         ;;
@@ -325,7 +324,9 @@ echo "=== cap and cancel ==="
 # The second open lands in a NEW doc window; query the newest doc- label.
 evl "$DL" "window.__TAURI_INTERNALS__.invoke('open_document_window',{path:'$WORK/huge.bin'})" >/dev/null
 sleep 4
-DL2=$(auto '{"id":13,"cmd":"list_windows"}' | jq -r '.data[]|select(.label|startswith("doc-"))|.label' | grep -v "^$DL$" | head -1)
+# jq writes CRLF on Windows, so the stream needs the same tr -d '\r' as
+# doc_labels before it can be compared against a $( )-captured, CR-free $DL.
+DL2=$(auto '{"id":13,"cmd":"list_windows"}' | jq -r '.data[]|select(.label|startswith("doc-"))|.label' | tr -d '\r' | grep -v "^$DL$" | head -1)
 if [ -z "$DL2" ]; then
   DL2="$DL"
 fi
@@ -341,28 +342,26 @@ check "mode defaults to ask" "$ORIG_MODE" "ask"
 # 'view' mode: no confirm, the file opens straight in the read-only large view.
 evl "$DL" "__auto.setLargeOpenMode('view')" >/dev/null
 e2e_wait_setting large_open_mode "view"
-echo "open-modes trace: after :339 windows=$(auto '{"id":201,"cmd":"list_windows"}') DOCS_BEFORE=${DOCS_BEFORE:-<unset>} DL4=${DL4:-<unset>} DL5=${DL5:-<unset>}"
 DOCS_BEFORE=$(doc_labels)
 evl "$DL" "window.__TAURI_INTERNALS__.invoke('open_document_window',{path:'$WORK/huge.bin'})" >/dev/null
 e2e_wait_until new_doc_exists "$DOCS_BEFORE"
-echo "open-modes trace: after :342 windows=$(auto '{"id":202,"cmd":"list_windows"}') DOCS_BEFORE=${DOCS_BEFORE:-<unset>} DL4=${DL4:-<unset>} DL5=${DL5:-<unset>}"
 DL4=$(new_doc_label "$DOCS_BEFORE")
 if [ -n "$DL4" ]; then
   # The window exists; its tab still has to finish opening before either
   # assertion means anything.
   e2e_wait_eval "$DL4" "String(__auto.isLargeTab())" "true"
-  echo "open-modes trace: after :347 windows=$(auto '{"id":203,"cmd":"list_windows"}') DOCS_BEFORE=${DOCS_BEFORE:-<unset>} DL4=${DL4:-<unset>} DL5=${DL5:-<unset>}"
   check "no confirm in view mode" "$(evl "$DL4" "String(__auto.largeConfirmVisible())")" "false"
   check "opened straight into large view" "$(evl "$DL4" "String(__auto.isLargeTab())")" "true"
+  # Both assertions above pass whichever window is bound; the size pins it
+  # down to the huge.bin window actually meant by this block.
+  check "view-mode window is the huge.bin window" "$(evl "$DL4" "String(__auto.largeInfo().size)")" "629145600"
   evl "$DL4" "__auto.closeActiveTab()" >/dev/null
-  echo "open-modes trace: after :350 windows=$(auto '{"id":204,"cmd":"list_windows"}') DOCS_BEFORE=${DOCS_BEFORE:-<unset>} DL4=${DL4:-<unset>} DL5=${DL5:-<unset>}"
 else
   bad "view-mode window never appeared"
 fi
 # 'ask' mode: an editable large file's confirm offers an Edit button that unlocks
 # straight into in-place (windowed) editing. big.ask is UTF-8 and under the 512MB
 # cap, and is a separate copy so this open really does get its own window.
-echo "open-modes trace: before :357 windows=$(auto '{"id":205,"cmd":"list_windows"}') DOCS_BEFORE=${DOCS_BEFORE:-<unset>} DL4=${DL4:-<unset>} DL5=${DL5:-<unset>}"
 ASK_EVAL_RESULT="$(evl "$DL" "__auto.setLargeOpenMode('ask')")"
 e2e_wait_setting large_open_mode "ask"
 ASK_WAIT_STATUS=$?
@@ -375,11 +374,10 @@ if [ -n "$DL5" ]; then
   # one did not, and an eval that runs before __auto exists throws, which the
   # harness reports as an error and evl renders as a bare "null".
   e2e_wait_eval "$DL5" "typeof __auto!=='undefined' && typeof __auto.largeConfirmVisible==='function'" "true"
-  # Instrumentation only: what documentWindow.svelte.ts's open path actually
-  # read and decided for this open, read back on both the new window and the
-  # driving window since either side could hold a stale settingsState copy.
-  echo "open-modes trace: big.ask decision on \$DL5 ($DL5): $(evl "$DL5" "JSON.stringify(__auto.largeOpenDecision())")"
-  echo "open-modes trace: big.ask decision on \$DL ($DL): $(evl "$DL" "JSON.stringify(__auto.largeOpenDecision())")"
+  # $DL5 must be the new window for big.ask, not $DL itself: both existing
+  # assertions in this block pass whichever window is bound, which is how a
+  # wrong binding survived five runs.
+  check "ask-mode open bound its own window" "$([ "$DL5" != "$DL" ] && echo true || echo false)" "true"
   if ! e2e_wait_eval "$DL5" "String(__auto.largeConfirmVisible())" "true"; then
     # Distinguishes "the setting never landed / $DL was already dead" from
     # "the setting landed and the new window still showed no confirm", so a
