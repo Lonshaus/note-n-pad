@@ -93,15 +93,21 @@ evl() {
 launch() {
   e2e_require_clean_slate
   NOTE_N_PAD_AUTOMATION=1 npm run tauri dev >>"$OUT/dev-large.log" 2>&1 &
+  e2e_report_port_holders
   local tries=0
   until e2e_automation_up; do
     sleep 1
     tries=$((tries + 1))
     if [ "$tries" -gt 240 ]; then
+      e2e_report_port_holders
       echo "FATAL: automation port never opened"
       exit 1
     fi
   done
+  # The dev server binds 1420 while the app is coming up, so this is the
+  # first moment a leftover holding it is visible; the app answering on
+  # 45678 does not mean vite got its port.
+  e2e_report_port_holders
   sleep 4
 }
 quit_app() {
@@ -348,8 +354,9 @@ fi
 # 'ask' mode: an editable large file's confirm offers an Edit button that unlocks
 # straight into in-place (windowed) editing. big.ask is UTF-8 and under the 512MB
 # cap, and is a separate copy so this open really does get its own window.
-evl "$DL" "__auto.setLargeOpenMode('ask')" >/dev/null
+ASK_EVAL_RESULT="$(evl "$DL" "__auto.setLargeOpenMode('ask')")"
 e2e_wait_setting large_open_mode "ask"
+ASK_WAIT_STATUS=$?
 DOCS_BEFORE=$(doc_labels)
 evl "$DL" "window.__TAURI_INTERNALS__.invoke('open_document_window',{path:'$WORK/big.ask'})" >/dev/null
 e2e_wait_until new_doc_exists "$DOCS_BEFORE"
@@ -359,7 +366,26 @@ if [ -n "$DL5" ]; then
   # one did not, and an eval that runs before __auto exists throws, which the
   # harness reports as an error and evl renders as a bare "null".
   e2e_wait_eval "$DL5" "typeof __auto!=='undefined' && typeof __auto.largeConfirmVisible==='function'" "true"
-  e2e_wait_eval "$DL5" "String(__auto.largeConfirmVisible())" "true"
+  if ! e2e_wait_eval "$DL5" "String(__auto.largeConfirmVisible())" "true"; then
+    # Distinguishes "the setting never landed / $DL was already dead" from
+    # "the setting landed and the new window still showed no confirm", so a
+    # fix is not guessed at from the assertion failure alone.
+    echo "=== ask-mode diagnostics ==="
+    echo "setLargeOpenMode('ask') eval returned: $ASK_EVAL_RESULT"
+    echo "e2e_wait_setting large_open_mode ask exit status: $ASK_WAIT_STATUS"
+    echo "large_open_mode in settings.json: $(jq -r '.large_open_mode // empty' "$APPDIR/settings.json" 2>/dev/null)"
+    case "$(doc_labels 2>/dev/null)" in
+      *"$DL"*)
+        echo "\$DL ($DL) still in window list: yes"
+        ;;
+      *)
+        echo "\$DL ($DL) still in window list: no"
+        ;;
+    esac
+    echo "full window list: $(auto '{"id":96,"cmd":"list_windows"}' 2>/dev/null)"
+    echo "new window getLargeOpenMode(): $(evl "$DL5" "String(__auto.getLargeOpenMode())" 2>/dev/null)"
+    echo "new window largeInfo(): $(evl "$DL5" "JSON.stringify(__auto.largeInfo())" 2>/dev/null)"
+  fi
   check "ask mode shows confirm" "$(evl "$DL5" "String(__auto.largeConfirmVisible())")" "true"
   evl "$DL5" "__auto.largeConfirmEdit()" >/dev/null
   # Unlocking scans the whole file, so this is the longest wait in the suite —

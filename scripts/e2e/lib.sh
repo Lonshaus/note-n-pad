@@ -237,6 +237,35 @@ e2e_kill_owned_ports() {
   return 0
 }
 
+# Prints one line per owned port naming who holds it, or that it is free.
+# Detection goes through e2e_port_listeners so this can never disagree with
+# the kill path about what counts as bound; on Windows each pid is also
+# resolved to an image name via tasklist, since a bare pid means nothing to a
+# human reading the log. Writes to stdout so the line lands in the suite log.
+e2e_report_port_holders() {   # prints one line per owned port: pid(s) + image, or free
+  local port pids pid image images
+  for port in $E2E_OWNED_PORTS; do
+    pids="$(e2e_port_listeners "$port")"
+    if [ -z "$pids" ]; then
+      echo "port $port: free"
+      continue
+    fi
+    case "$(uname -s)" in
+      MINGW64_NT* | MSYS_NT*)
+        images=""
+        for pid in $pids; do
+          image="$(tasklist //FI "PID eq $pid" 2>/dev/null | awk -v p="$pid" '$2 == p {print $1}')"
+          images="$images $pid(${image:-unknown})"
+        done
+        echo "port $port: held by${images}"
+        ;;
+      *)
+        echo "port $port: held by pid(s) $pids"
+        ;;
+    esac
+  done
+}
+
 # Whether the app's own process is running, by exact release process name.
 # Used by every suite's quit_app to wait for a real exit.
 e2e_app_running() {
