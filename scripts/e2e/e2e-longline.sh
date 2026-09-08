@@ -65,7 +65,7 @@ boot_label() {
   auto '{"id":1,"cmd":"list_windows"}' | jq -r '.data[]|select(.label|startswith("note-") or startswith("doc-"))|.label' | head -1
 }
 evl() {
-  auto "{\"id\":9,\"cmd\":\"eval\",\"label\":\"$1\",\"js\":$(jq -Rn --arg js "$2" '$js')}" | jq -r '.data'
+  auto "{\"id\":$(e2e_next_id),\"cmd\":\"eval\",\"label\":\"$1\",\"js\":$(jq -Rn --arg js "$2" '$js')}" | jq -r '.data'
 }
 # Whether a doc- window with this label is currently present.
 label_present() {
@@ -265,6 +265,9 @@ fi
 echo "=== 1+2. new window, open as-is: window survives, gate holds ==="
 # bug b: the fresh window must stay alive to show the confirm.
 open_window "$WORK/plain-a.txt" || true
+# open_window only waits for the window's hooks; the confirm itself renders
+# after that, so an assertion right behind it is a race.
+e2e_wait_eval "$DL" "String(__auto.longLineConfirmVisible())" "true"
 check "confirm visible in fresh window" "$(evl "$DL" "String(__auto.longLineConfirmVisible())")" "true"
 check "format not offered for plain text" "$(evl "$DL" "String(__auto.longLineFormatAvailable())")" "false"
 sleep 2
@@ -282,6 +285,8 @@ check "typing lands in as-is tab" "$(evl "$DL" "String(__auto.getContent().start
 echo "=== 3. new window, format: multi-line, gate lifts, dirty, disk untouched ==="
 FLAT_SIZE=$(file_size "$WORK/flat.json")
 open_window "$WORK/flat.json" || true
+# Same hooks-vs-render race as above.
+e2e_wait_eval "$DL" "String(__auto.longLineConfirmVisible())" "true"
 check "format offered for flat JSON" "$(evl "$DL" "String(__auto.longLineFormatAvailable())")" "true"
 evl "$DL" "__auto.longLineConfirmFormat()" >/dev/null
 wait_gate "$DL" "false"
@@ -297,6 +302,8 @@ open_window "$WORK/deep.json" || true
 T1=$(date +%s.%N)
 OPEN_RT=$(python3 -c "print(round($T1-$T0,2))")
 echo "deep-file open->confirm elapsed: ${OPEN_RT}s"
+# Same hooks-vs-render race as above.
+e2e_wait_eval "$DL" "String(__auto.longLineConfirmVisible())" "true"
 check "deep open reached the confirm without freezing" "$(evl "$DL" "String(__auto.longLineConfirmVisible())")" "true"
 check "format refused for over-deep nesting" "$(evl "$DL" "String(__auto.longLineFormatAvailable())")" "false"
 # Main thread stayed responsive: a fresh eval round-trips quickly (a real freeze
@@ -312,6 +319,8 @@ sleep 2
 
 echo "=== 5. new window, soft-wrap: multi-line, gate lifts, surrogates intact ==="
 open_window "$WORK/emoji.txt" || true
+# Same hooks-vs-render race as above.
+e2e_wait_eval "$DL" "String(__auto.longLineConfirmVisible())" "true"
 check "confirm visible for emoji line" "$(evl "$DL" "String(__auto.longLineConfirmVisible())")" "true"
 evl "$DL" "__auto.longLineConfirmSoftWrap()" >/dev/null
 wait_gate "$DL" "false"
@@ -323,6 +332,10 @@ check "no surrogate pair split at a break" "$(evl "$DL" "String([...__auto.getCo
 
 echo "=== 6. new window, Enter mid super-long line lifts the gate live (bug a) ==="
 open_window "$WORK/plain-b.txt" || true
+# No waited assertion precedes this action: without the wait, a confirm that
+# has not rendered yet turns the click into a no-op and wait_gate below burns
+# its full bound before the run goes red for exactly this race.
+e2e_wait_eval "$DL" "String(__auto.longLineConfirmVisible())" "true"
 evl "$DL" "__auto.longLineConfirmAsIs()" >/dev/null
 wait_gate "$DL" "true"
 check "gate active before split" "$(evl "$DL" "String(__auto.longLineActive())")" "true"
