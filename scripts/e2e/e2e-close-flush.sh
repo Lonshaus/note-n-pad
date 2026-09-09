@@ -22,6 +22,7 @@ MARKER="CLOSEFLUSHMARKERA"
 PASS=0
 FAIL=0
 mkdir -p "$OUT"
+: >"$OUT/dev-close-flush.log"
 
 ok() {
   PASS=$((PASS + 1))
@@ -73,25 +74,33 @@ doc_count() {
   auto '{"id":3,"cmd":"list_windows"}' | jq -r '[.data[]|select(.label|startswith("doc-"))]|length'
 }
 evl() {
-  auto "{\"id\":9,\"cmd\":\"eval\",\"label\":\"$1\",\"js\":$(jq -Rn --arg js "$2" '$js')}" | jq -r '.data'
+  auto "{\"id\":$(e2e_next_id),\"cmd\":\"eval\",\"label\":\"$1\",\"js\":$(jq -Rn --arg js "$2" '$js')}" | jq -r '.data'
 }
 launch() {
-  NOTE_N_PAD_AUTOMATION=1 npm run tauri dev >"$OUT/dev-close-flush.log" 2>&1 &
+  e2e_require_clean_slate
+  NOTE_N_PAD_AUTOMATION=1 npm run tauri dev >>"$OUT/dev-close-flush.log" 2>&1 &
+  e2e_report_port_holders
   local tries=0
-  until nc -z 127.0.0.1 45678 2>/dev/null; do
+  until e2e_automation_up; do
     sleep 1
     tries=$((tries + 1))
     if [ "$tries" -gt 240 ]; then
+      e2e_report_port_holders
       echo "FATAL: automation port never opened"
       exit 1
     fi
   done
+  e2e_require_automation_listener "$OUT/dev-close-flush.log"
+  # The dev server binds 1420 while the app is coming up, so this is the
+  # first moment a leftover holding it is visible; the app answering on
+  # the automation port does not mean vite got its port.
+  e2e_report_port_holders
   sleep 4
 }
 quit_app() {
   auto '{"id":99,"cmd":"quit"}' >/dev/null 2>&1
   local tries=0
-  while pgrep -x note-n-pad >/dev/null 2>&1; do
+  while e2e_app_running; do
     sleep 1
     tries=$((tries + 1))
     if [ "$tries" -gt 20 ]; then
@@ -157,18 +166,18 @@ mkdir -p "$WORK"
 # mid.txt: ~2M chars (40,000 lines of 50 'm' + LF). Dirty, it stays well under the
 # 16M snapshot ceiling, so it rides along in a snapshot and restores after a quit.
 python3 - <<PYEOF
-with open('$WORK/mid.txt', 'w') as f:
+with open('$WORK/mid.txt', 'w', newline='') as f:
     f.write(('m' * 50 + '\n') * 40000)
 PYEOF
 # huge.txt: ~16.8M chars (330,000 lines of 50 'h' + LF). Once dirty it exceeds the
 # 16M ceiling ('skip'), so it cannot be snapshotted and the close raises the gate.
 python3 - <<PYEOF
-with open('$WORK/huge.txt', 'w') as f:
+with open('$WORK/huge.txt', 'w', newline='') as f:
     f.write(('h' * 50 + '\n') * 330000)
 PYEOF
 # clean.txt: a few KB, opened and never edited (scenario C).
 python3 - <<PYEOF
-with open('$WORK/clean.txt', 'w') as f:
+with open('$WORK/clean.txt', 'w', newline='') as f:
     f.write(('c' * 50 + '\n') * 100)
 PYEOF
 echo "mid.txt bytes:   $(file_size "$WORK/mid.txt")"
@@ -276,7 +285,7 @@ until [ "$(doc_count)" = "0" ]; do
   fi
 done
 check "window closed after discard" "$(doc_count)" "0"
-check "app still running after close" "$(pgrep -f 'target/debug/note-n-pad' >/dev/null 2>&1 && echo alive || echo gone)" "alive"
+check "app still running after close" "$(e2e_dev_app_running && echo alive || echo gone)" "alive"
 quit_app
 wipe_test_docs
 

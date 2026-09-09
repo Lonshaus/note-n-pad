@@ -23,6 +23,7 @@ WORK="$OUT/table-fixture"
 PASS=0
 FAIL=0
 mkdir -p "$OUT"
+: >"$OUT/dev-table.log"
 
 ok() {
   PASS=$((PASS + 1))
@@ -62,7 +63,7 @@ doc_label() {
   auto '{"id":3,"cmd":"list_windows"}' | jq -r '.data[]|select(.label|startswith("doc-"))|.label' | head -1
 }
 evl() {
-  auto "{\"id\":9,\"cmd\":\"eval\",\"label\":\"$1\",\"js\":$(jq -Rn --arg js "$2" '$js')}" | jq -r '.data'
+  auto "{\"id\":$(e2e_next_id),\"cmd\":\"eval\",\"label\":\"$1\",\"js\":$(jq -Rn --arg js "$2" '$js')}" | jq -r '.data'
 }
 # Rows currently in the DOM, spacers and gutter strip included.
 rows_in_dom() {
@@ -98,20 +99,24 @@ _pane_taller_than() {
   [ "$(_pane_height "$1")" -gt "$2" ] 2>/dev/null
 }
 launch() {
-  if nc -z 127.0.0.1 45678 2>/dev/null; then
-    echo "launch: reusing dev server already on 45678"
-    return
-  fi
-  NOTE_N_PAD_AUTOMATION=1 npm run tauri dev >"$OUT/dev-table.log" 2>&1 &
-  if ! e2e_wait_until 240 nc -z 127.0.0.1 45678; then
+  e2e_require_clean_slate
+  NOTE_N_PAD_AUTOMATION=1 npm run tauri dev >>"$OUT/dev-table.log" 2>&1 &
+  e2e_report_port_holders
+  if ! e2e_wait_until 240 e2e_automation_up; then
+    e2e_report_port_holders
     echo "FATAL: automation port never opened"
     exit 1
   fi
+  e2e_require_automation_listener "$OUT/dev-table.log"
+  # The dev server binds 1420 while the app is coming up, so this is the
+  # first moment a leftover holding it is visible; the app answering on
+  # the automation port does not mean vite got its port.
+  e2e_report_port_holders
   sleep 4
 }
 quit_app() {
   auto '{"id":99,"cmd":"quit"}' >/dev/null 2>&1
-  e2e_wait_until 20 sh -c '! pgrep -x note-n-pad >/dev/null 2>&1'
+  e2e_wait_until 20 e2e_app_gone
   e2e_kill_owned_ports
   sleep 3
 }
@@ -122,7 +127,7 @@ echo "=== preflight ==="
 # it writes its dirty tabs to snapshots on the way out — which the next run's
 # app would then adopt, so its very first assertions would read another run's
 # leftovers. (Seen: a 270,001-row fixture opening with 270,002 rows and dirty.)
-if ! e2e_wait_until 60 sh -c '! pgrep -x note-n-pad >/dev/null 2>&1'; then
+if ! e2e_wait_until 60 e2e_app_gone; then
   echo "FATAL: a note-n-pad process is still running; refusing to start"
   exit 1
 fi
@@ -150,26 +155,26 @@ mkdir -p "$WORK"
 # Every row carries its own index so a rendered cell proves which row it is.
 python3 - <<PYEOF
 w = '$WORK'
-with open(f'{w}/big.csv', 'w') as f:
+with open(f'{w}/big.csv', 'w', newline='') as f:
     f.write('col a,col b,col c\n')
     for i in range(270000):
         f.write(f'{i},value {i},another {i}\n')
-with open(f'{w}/small.csv', 'w') as f:
+with open(f'{w}/small.csv', 'w', newline='') as f:
     f.write('col a,col b,col c\n')
     for i in range(50):
         f.write(f'{i},value {i},another {i}\n')
-with open(f'{w}/huge.csv', 'w') as f:
+with open(f'{w}/huge.csv', 'w', newline='') as f:
     f.write('n,v\n')
     for i in range(1600000):
         f.write(f'{i},r{i}\n')
 for name, tag in (('a.csv', 'A'), ('b.csv', 'B')):
-    with open(f'{w}/{name}', 'w') as f:
+    with open(f'{w}/{name}', 'w', newline='') as f:
         f.write('col a,col b,col c\n')
         for i in range(2000):
             f.write(f'{i},{tag}-{i},another {i}\n')
-with open(f'{w}/quoted.csv', 'w') as f:
+with open(f'{w}/quoted.csv', 'w', newline='') as f:
     f.write('"multi\nline",x\ny,z\n')
-with open(f'{w}/host.txt', 'w') as f:
+with open(f'{w}/host.txt', 'w', newline='') as f:
     f.write('short host document\n')
 PYEOF
 BIG_LINES=$(wc -l <"$WORK/big.csv" | tr -d ' ')
@@ -217,19 +222,40 @@ e2e_wait_eval "$DL" "typeof __auto!=='undefined' && typeof __auto.tableDims==='f
 
 echo "=== A. 270k-row open: premise, DOM size, responsiveness ==="
 T0=$(date +%s.%N)
-evl "$DL" "__auto.openTab('$WORK/big.csv')" >/dev/null
+# `void` keeps the eval's own value undefined: the automation wrapper awaits
+# that value, so handing it the open's promise would block the eval on the
+# whole open. The settle marker read back below is what tells a rejected open
+# apart from a route that returned quietly without opening anything.
+evl "$DL" "void __auto.openTabSettled('$WORK/big.csv').then(()=>{window.__openSettled='ok'},(e)=>{window.__openSettled='ERR '+String(e)})" >/dev/null
 e2e_wait_eval "$DL" "String(__auto.tableDims().rows)" "270001"
 T1=$(date +%s.%N)
 OPEN_RT=$(python3 -c "print(round($T1-$T0,2))")
 echo "open->table-ready elapsed: ${OPEN_RT}s"
-# Premise: this really is a 270,001-row table view, not a source tab or a
-# confirm dialog that never opened anything.
-check "tab holds 270001 rows" "$(evl "$DL" "String(__auto.tableDims().rows)")" "270001"
-check "table view is mounted" "$(evl "$DL" "String(document.querySelector('.table-view')!==null)")" "true"
-# The fix itself: a window of rows, not the whole file.
-DOM_ROWS=$(rows_in_dom "$DL")
-echo "rows in DOM: $DOM_ROWS"
-check "only a window of rows is in the DOM" "$(python3 -c "print(0 < $DOM_ROWS < 200)")" "True"
+# The premise as one value, so a failed open is named once instead of being
+# inferred from three assertions that each restate it. `tableDims().rows` comes
+# from the path, not the view mode, so a tab open in source mode reports the
+# full row count too — hence the `.table-view` term. Through e2e_read because
+# the only values this can hold are true and false: a null is a timed-out eval.
+BIG_OPENED=$(e2e_read "$DL" "String(__auto.tableDims().rows===270001 && document.querySelector('.table-view')!==null)")
+# Four reads that tell the silent endings of the open apart: a rejection, a
+# swallowed loadTab failure, a focus handed to another window, a tab that
+# opened without the table view. None of them can render null except by timing
+# out, which is why openFailed carries a sentinel: its clean value is null.
+echo "open settled: $(e2e_read "$DL" "String(window.__openSettled)")"
+echo "tabs after open: $(e2e_read "$DL" "JSON.stringify(__auto.getTabs().map((t)=>t.path))")"
+echo "view mode after open: $(e2e_read "$DL" "String(__auto.getViewMode())")"
+echo "openFailed after open: $(e2e_read "$DL" "String(__auto.openFailed() ?? 'none')")"
+check "the open produced the 270k table" "$BIG_OPENED" "true"
+if [ "$BIG_OPENED" = "true" ]; then
+  # Premise: this really is a 270,001-row table view, not a source tab or a
+  # confirm dialog that never opened anything.
+  check "tab holds 270001 rows" "$(evl "$DL" "String(__auto.tableDims().rows)")" "270001"
+  check "table view is mounted" "$(evl "$DL" "String(document.querySelector('.table-view')!==null)")" "true"
+  # The fix itself: a window of rows, not the whole file.
+  DOM_ROWS=$(rows_in_dom "$DL")
+  echo "rows in DOM: $DOM_ROWS"
+  check "only a window of rows is in the DOM" "$(python3 -c "print(0 < $DOM_ROWS < 200)")" "True"
+fi
 # Responsive: a fresh eval round-trips quickly. Before the fix this call sat
 # behind tens of seconds of DOM construction.
 T2=$(date +%s.%N)
@@ -240,117 +266,121 @@ echo "eval round-trip after open: ${PONG_RT}s"
 check "eval round-trip returned" "$PONG" "pong"
 check "window responsive right after the open" "$(python3 -c "print($PONG_RT < 2.0)")" "True"
 
-echo "=== B. the scrollbar still measures the whole document ==="
-# Spacer arithmetic: the table's own height must match every row being there.
-# A 2% tolerance covers the gutter strip and the append bar.
-ROW_H=$(evl "$DL" "String(document.querySelector('.cell').closest('tr').offsetHeight)")
-GRID_H=$(evl "$DL" "String(document.querySelector('.table-view .grid').offsetHeight)")
-echo "row height: ${ROW_H}px, grid height: ${GRID_H}px, expected ~$((270001 * ROW_H))px"
-check "grid height covers all 270001 rows" \
-  "$(python3 -c "print(abs($GRID_H - 270001*$ROW_H) < 270001*$ROW_H*0.02)")" "True"
+if [ "$BIG_OPENED" = "true" ]; then
+  echo "=== B. the scrollbar still measures the whole document ==="
+  # Spacer arithmetic: the table's own height must match every row being there.
+  # A 2% tolerance covers the gutter strip and the append bar.
+  ROW_H=$(evl "$DL" "String(document.querySelector('.cell').closest('tr').offsetHeight)")
+  GRID_H=$(evl "$DL" "String(document.querySelector('.table-view .grid').offsetHeight)")
+  echo "row height: ${ROW_H}px, grid height: ${GRID_H}px, expected ~$((270001 * ROW_H))px"
+  check "grid height covers all 270001 rows" \
+    "$(python3 -c "print(abs($GRID_H - 270001*$ROW_H) < 270001*$ROW_H*0.02)")" "True"
 
-echo "=== C. both ends of the document render the right rows ==="
-check "row 0 is the header line" "$(cell_value "$DL" 0 0)" "col a"
-COL_W_TOP=$(evl "$DL" "String(Math.round(document.querySelector('.cell[data-c=\"1\"]').getBoundingClientRect().width))")
-evl "$DL" "document.querySelector('.grid-scroll').scrollTop=document.querySelector('.grid-scroll').scrollHeight" >/dev/null
-e2e_wait_eval "$DL" "String(document.querySelector('.cell[data-r=\"270000\"][data-c=\"0\"]')!==null)" "true"
-check "last row rendered after scrolling to the bottom" "$(cell_value "$DL" 270000 0)" "269999"
-# Column widths must not depend on which rows happen to be rendered, or the
-# table would shift sideways under the pointer while scrolling.
-COL_W_BOTTOM=$(evl "$DL" "String(Math.round(document.querySelector('.cell[data-c=\"1\"]').getBoundingClientRect().width))")
-echo "column 1 width: top ${COL_W_TOP}px, bottom ${COL_W_BOTTOM}px"
-check "column width does not change between the two ends" "$COL_W_TOP" "$COL_W_BOTTOM"
-check "first row dropped at the bottom" "$(cell_value "$DL" 0 0)" "absent"
-DOM_ROWS_BOTTOM=$(rows_in_dom "$DL")
-check "still only a window of rows at the bottom" "$(python3 -c "print(0 < $DOM_ROWS_BOTTOM < 200)")" "True"
-evl "$DL" "document.querySelector('.grid-scroll').scrollTop=0" >/dev/null
-e2e_wait_eval "$DL" "String(document.querySelector('.cell[data-r=\"0\"][data-c=\"0\"]')!==null)" "true"
-check "back at the top, row 0 is rendered again" "$(cell_value "$DL" 0 0)" "col a"
+  echo "=== C. both ends of the document render the right rows ==="
+  check "row 0 is the header line" "$(cell_value "$DL" 0 0)" "col a"
+  COL_W_TOP=$(evl "$DL" "String(Math.round(document.querySelector('.cell[data-c=\"1\"]').getBoundingClientRect().width))")
+  evl "$DL" "document.querySelector('.grid-scroll').scrollTop=document.querySelector('.grid-scroll').scrollHeight" >/dev/null
+  e2e_wait_eval "$DL" "String(document.querySelector('.cell[data-r=\"270000\"][data-c=\"0\"]')!==null)" "true"
+  check "last row rendered after scrolling to the bottom" "$(cell_value "$DL" 270000 0)" "269999"
+  # Column widths must not depend on which rows happen to be rendered, or the
+  # table would shift sideways under the pointer while scrolling.
+  COL_W_BOTTOM=$(evl "$DL" "String(Math.round(document.querySelector('.cell[data-c=\"1\"]').getBoundingClientRect().width))")
+  echo "column 1 width: top ${COL_W_TOP}px, bottom ${COL_W_BOTTOM}px"
+  check "column width does not change between the two ends" "$COL_W_TOP" "$COL_W_BOTTOM"
+  check "first row dropped at the bottom" "$(cell_value "$DL" 0 0)" "absent"
+  DOM_ROWS_BOTTOM=$(rows_in_dom "$DL")
+  check "still only a window of rows at the bottom" "$(python3 -c "print(0 < $DOM_ROWS_BOTTOM < 200)")" "True"
+  evl "$DL" "document.querySelector('.grid-scroll').scrollTop=0" >/dev/null
+  e2e_wait_eval "$DL" "String(document.querySelector('.cell[data-r=\"0\"][data-c=\"0\"]')!==null)" "true"
+  check "back at the top, row 0 is rendered again" "$(cell_value "$DL" 0 0)" "col a"
 
-echo "=== D. an edit is not lost when its row scrolls out of the window ==="
-# The input holding a pending edit is destroyed once its row leaves the window,
-# and a removed element fires no blur event, so the typed text would disappear
-# with no commit and no dirty flag. Type into row 5, scroll far past it, and the
-# value must have committed on the way out.
-check "tab is clean before the edit" \
-  "$(evl "$DL" "String((__auto.getTabs().find((t)=>t.active)||{}).dirty)")" "false"
-evl "$DL" "document.querySelector('.cell[data-r=\"5\"][data-c=\"1\"]').focus()" >/dev/null
-type_cell "$DL" 5 1 "EDITED-WHILE-SCROLLING"
-check "the cell really holds the typed value before scrolling" \
-  "$(cell_value "$DL" 5 1)" "EDITED-WHILE-SCROLLING"
-evl "$DL" "document.querySelector('.grid-scroll').scrollTop=document.querySelector('.grid-scroll').scrollHeight/2" >/dev/null
-e2e_wait_eval "$DL" "String(document.querySelector('.cell[data-r=\"5\"][data-c=\"1\"]')===null)" "true"
-check "the row did leave the window" \
-  "$(evl "$DL" "String(document.querySelector('.cell[data-r=\"5\"][data-c=\"1\"]')===null)")" "true"
-check "the edit committed on the way out" \
-  "$(evl "$DL" "String(__auto.getContent().includes('EDITED-WHILE-SCROLLING'))")" "true"
-check "the tab is dirty after the edit" \
-  "$(evl "$DL" "String((__auto.getTabs().find((t)=>t.active)||{}).dirty)")" "true"
-# Scrolling back must show the committed value, not the old one.
-evl "$DL" "document.querySelector('.grid-scroll').scrollTop=0" >/dev/null
-e2e_wait_eval "$DL" "String(document.querySelector('.cell[data-r=\"5\"][data-c=\"1\"]')!==null)" "true"
-check "the committed value is there on the way back" \
-  "$(cell_value "$DL" 5 1)" "EDITED-WHILE-SCROLLING"
-GRID_H2=$(evl "$DL" "String(document.querySelector('.table-view .grid').offsetHeight)")
-check "the grid height is unchanged by the edit" "$GRID_H2" "$GRID_H"
+  echo "=== D. an edit is not lost when its row scrolls out of the window ==="
+  # The input holding a pending edit is destroyed once its row leaves the window,
+  # and a removed element fires no blur event, so the typed text would disappear
+  # with no commit and no dirty flag. Type into row 5, scroll far past it, and the
+  # value must have committed on the way out.
+  check "tab is clean before the edit" \
+    "$(evl "$DL" "String((__auto.getTabs().find((t)=>t.active)||{}).dirty)")" "false"
+  evl "$DL" "document.querySelector('.cell[data-r=\"5\"][data-c=\"1\"]').focus()" >/dev/null
+  type_cell "$DL" 5 1 "EDITED-WHILE-SCROLLING"
+  check "the cell really holds the typed value before scrolling" \
+    "$(cell_value "$DL" 5 1)" "EDITED-WHILE-SCROLLING"
+  evl "$DL" "document.querySelector('.grid-scroll').scrollTop=document.querySelector('.grid-scroll').scrollHeight/2" >/dev/null
+  e2e_wait_eval "$DL" "String(document.querySelector('.cell[data-r=\"5\"][data-c=\"1\"]')===null)" "true"
+  check "the row did leave the window" \
+    "$(evl "$DL" "String(document.querySelector('.cell[data-r=\"5\"][data-c=\"1\"]')===null)")" "true"
+  check "the edit committed on the way out" \
+    "$(evl "$DL" "String(__auto.getContent().includes('EDITED-WHILE-SCROLLING'))")" "true"
+  check "the tab is dirty after the edit" \
+    "$(evl "$DL" "String((__auto.getTabs().find((t)=>t.active)||{}).dirty)")" "true"
+  # Scrolling back must show the committed value, not the old one.
+  evl "$DL" "document.querySelector('.grid-scroll').scrollTop=0" >/dev/null
+  e2e_wait_eval "$DL" "String(document.querySelector('.cell[data-r=\"5\"][data-c=\"1\"]')!==null)" "true"
+  check "the committed value is there on the way back" \
+    "$(cell_value "$DL" 5 1)" "EDITED-WHILE-SCROLLING"
+  GRID_H2=$(evl "$DL" "String(document.querySelector('.table-view .grid').offsetHeight)")
+  check "the grid height is unchanged by the edit" "$GRID_H2" "$GRID_H"
 
-echo "=== D2. an edit is not lost when the pane shrinks under it ==="
-# The sibling of D: a shorter pane narrows the window and drops rows off the
-# bottom with no scroll event at all, so a guard on the scroll path alone
-# misses it. Resize the real window rather than restyle the pane, and prove the
-# pane actually got shorter before reading anything into what followed.
-evl "$DL" "document.querySelector('.grid-scroll').scrollTop=0" >/dev/null
-e2e_wait_eval "$DL" "String(document.querySelector('.cell[data-r=\"0\"][data-c=\"0\"]')!==null)" "true"
-PANE_BEFORE=$(evl "$DL" "String(document.querySelector('.grid-scroll').clientHeight)")
-LAST_VIS=$(evl "$DL" "String(Math.max(...[...document.querySelectorAll('.cell[data-c=\"1\"]')].map((e)=>Number(e.dataset.r))))")
-echo "pane height ${PANE_BEFORE}px, bottom-most rendered row $LAST_VIS"
-check "a bottom-most row was found" "$(python3 -c "print(0 < $LAST_VIS < 1000)")" "True"
-type_cell "$DL" "$LAST_VIS" 1 "EDITED-WHILE-SHRINKING"
-check "the cell holds the typed value before the resize" \
-  "$(cell_value "$DL" "$LAST_VIS" 1)" "EDITED-WHILE-SHRINKING"
-evl "$DL" "window.__TAURI_INTERNALS__.invoke('plugin:window|set_size',{label:'$DL',value:{Logical:{width:900,height:260}}})" >/dev/null
-e2e_wait_until 30 _pane_shorter_than "$DL" "$PANE_BEFORE"
-PANE_AFTER=$(evl "$DL" "String(document.querySelector('.grid-scroll').clientHeight)")
-echo "pane height after resize: ${PANE_AFTER}px"
-# Premise: the pane really is shorter. Without this the checks below can pass
-# for the wrong reason (a scroll that moved the row out on its own).
-check "the pane actually got shorter" \
-  "$(python3 -c "print($PANE_AFTER < $PANE_BEFORE)")" "True"
-check "the scroll position did not move" \
-  "$(evl "$DL" "String(document.querySelector('.grid-scroll').scrollTop)")" "0"
-check "the row left the window because of the resize" \
-  "$(evl "$DL" "String(document.querySelector('.cell[data-r=\"$LAST_VIS\"][data-c=\"1\"]')===null)")" "true"
-check "the edit committed on the resize" \
-  "$(evl "$DL" "String(__auto.getContent().includes('EDITED-WHILE-SHRINKING'))")" "true"
-evl "$DL" "window.__TAURI_INTERNALS__.invoke('plugin:window|set_size',{label:'$DL',value:{Logical:{width:1000,height:700}}})" >/dev/null
-e2e_wait_until 30 _pane_taller_than "$DL" "$PANE_AFTER"
+  echo "=== D2. an edit is not lost when the pane shrinks under it ==="
+  # The sibling of D: a shorter pane narrows the window and drops rows off the
+  # bottom with no scroll event at all, so a guard on the scroll path alone
+  # misses it. Resize the real window rather than restyle the pane, and prove the
+  # pane actually got shorter before reading anything into what followed.
+  evl "$DL" "document.querySelector('.grid-scroll').scrollTop=0" >/dev/null
+  e2e_wait_eval "$DL" "String(document.querySelector('.cell[data-r=\"0\"][data-c=\"0\"]')!==null)" "true"
+  PANE_BEFORE=$(evl "$DL" "String(document.querySelector('.grid-scroll').clientHeight)")
+  LAST_VIS=$(evl "$DL" "String(Math.max(...[...document.querySelectorAll('.cell[data-c=\"1\"]')].map((e)=>Number(e.dataset.r))))")
+  echo "pane height ${PANE_BEFORE}px, bottom-most rendered row $LAST_VIS"
+  check "a bottom-most row was found" "$(python3 -c "print(0 < $LAST_VIS < 1000)")" "True"
+  type_cell "$DL" "$LAST_VIS" 1 "EDITED-WHILE-SHRINKING"
+  check "the cell holds the typed value before the resize" \
+    "$(cell_value "$DL" "$LAST_VIS" 1)" "EDITED-WHILE-SHRINKING"
+  evl "$DL" "window.__TAURI_INTERNALS__.invoke('plugin:window|set_size',{label:'$DL',value:{Logical:{width:900,height:260}}})" >/dev/null
+  e2e_wait_until 30 _pane_shorter_than "$DL" "$PANE_BEFORE"
+  PANE_AFTER=$(evl "$DL" "String(document.querySelector('.grid-scroll').clientHeight)")
+  echo "pane height after resize: ${PANE_AFTER}px"
+  # Premise: the pane really is shorter. Without this the checks below can pass
+  # for the wrong reason (a scroll that moved the row out on its own).
+  check "the pane actually got shorter" \
+    "$(python3 -c "print($PANE_AFTER < $PANE_BEFORE)")" "True"
+  check "the scroll position did not move" \
+    "$(evl "$DL" "String(document.querySelector('.grid-scroll').scrollTop)")" "0"
+  check "the row left the window because of the resize" \
+    "$(evl "$DL" "String(document.querySelector('.cell[data-r=\"$LAST_VIS\"][data-c=\"1\"]')===null)")" "true"
+  check "the edit committed on the resize" \
+    "$(evl "$DL" "String(__auto.getContent().includes('EDITED-WHILE-SHRINKING'))")" "true"
+  evl "$DL" "window.__TAURI_INTERNALS__.invoke('plugin:window|set_size',{label:'$DL',value:{Logical:{width:1000,height:700}}})" >/dev/null
+  e2e_wait_until 30 _pane_taller_than "$DL" "$PANE_AFTER"
 
-echo "=== E. the context menu reaches a row that is not rendered ==="
-evl "$DL" "document.querySelector('.grid-scroll').scrollTop=0" >/dev/null
-e2e_wait_eval "$DL" "String(document.querySelector('.cell[data-r=\"0\"][data-c=\"0\"]')!==null)" "true"
-check "target row is not rendered to begin with" \
-  "$(evl "$DL" "String(document.querySelector('.cell[data-r=\"200000\"][data-c=\"1\"]')!==null)")" "false"
-evl "$DL" "__auto.openTableMenu(200000,1)" >/dev/null
-e2e_wait_eval "$DL" "String(__auto.tableMenuOpen())" "true"
-check "menu opened for an off-screen row" "$(evl "$DL" "String(__auto.tableMenuOpen())")" "true"
-# The menu opening proves nothing on its own: it opens at the 0,0 corner even
-# when the scroll landed nowhere near the row. The row has to be rendered.
-check "the target row was actually scrolled into the window" \
-  "$(evl "$DL" "String(document.querySelector('.cell[data-r=\"200000\"][data-c=\"1\"]')!==null)")" "true"
-evl "$DL" "document.querySelector('.menu-backdrop').click()" >/dev/null
-e2e_wait_eval "$DL" "String(__auto.tableMenuOpen())" "false"
+  echo "=== E. the context menu reaches a row that is not rendered ==="
+  evl "$DL" "document.querySelector('.grid-scroll').scrollTop=0" >/dev/null
+  e2e_wait_eval "$DL" "String(document.querySelector('.cell[data-r=\"0\"][data-c=\"0\"]')!==null)" "true"
+  check "target row is not rendered to begin with" \
+    "$(evl "$DL" "String(document.querySelector('.cell[data-r=\"200000\"][data-c=\"1\"]')!==null)")" "false"
+  evl "$DL" "__auto.openTableMenu(200000,1)" >/dev/null
+  e2e_wait_eval "$DL" "String(__auto.tableMenuOpen())" "true"
+  check "menu opened for an off-screen row" "$(evl "$DL" "String(__auto.tableMenuOpen())")" "true"
+  # The menu opening proves nothing on its own: it opens at the 0,0 corner even
+  # when the scroll landed nowhere near the row. The row has to be rendered.
+  check "the target row was actually scrolled into the window" \
+    "$(evl "$DL" "String(document.querySelector('.cell[data-r=\"200000\"][data-c=\"1\"]')!==null)")" "true"
+  evl "$DL" "document.querySelector('.menu-backdrop').click()" >/dev/null
+  e2e_wait_eval "$DL" "String(__auto.tableMenuOpen())" "false"
 
-echo "=== F. the promoted header row stays pinned while scrolled away ==="
-evl "$DL" "__auto.setHeaderRow(true)" >/dev/null
-e2e_wait_eval "$DL" "String(__auto.getHeaderRow())" "true"
-evl "$DL" "document.querySelector('.grid-scroll').scrollTop=document.querySelector('.grid-scroll').scrollHeight" >/dev/null
-e2e_wait_eval "$DL" "String(document.querySelector('.cell[data-r=\"270000\"][data-c=\"0\"]')!==null)" "true"
-check "header row is still rendered at the bottom of the file" \
-  "$(evl "$DL" "String(document.querySelector('.cell[data-r=\"0\"][data-c=\"0\"]')!==null)")" "true"
-check "and it still shows the header text" "$(cell_value "$DL" 0 0)" "col a"
-evl "$DL" "__auto.setHeaderRow(false)" >/dev/null
-evl "$DL" "__auto.closeActiveTab()" >/dev/null
-sleep 2
+  echo "=== F. the promoted header row stays pinned while scrolled away ==="
+  evl "$DL" "__auto.setHeaderRow(true)" >/dev/null
+  e2e_wait_eval "$DL" "String(__auto.getHeaderRow())" "true"
+  evl "$DL" "document.querySelector('.grid-scroll').scrollTop=document.querySelector('.grid-scroll').scrollHeight" >/dev/null
+  e2e_wait_eval "$DL" "String(document.querySelector('.cell[data-r=\"270000\"][data-c=\"0\"]')!==null)" "true"
+  check "header row is still rendered at the bottom of the file" \
+    "$(evl "$DL" "String(document.querySelector('.cell[data-r=\"0\"][data-c=\"0\"]')!==null)")" "true"
+  check "and it still shows the header text" "$(cell_value "$DL" 0 0)" "col a"
+  evl "$DL" "__auto.setHeaderRow(false)" >/dev/null
+  evl "$DL" "__auto.closeActiveTab()" >/dev/null
+  sleep 2
+else
+  echo "SKIP: B-F need the 270k table, which never opened"
+fi
 
 echo "=== G. a small file still reaches every row and still edits ==="
 # A 51-row file is still taller than the pane, so it is windowed too — the count

@@ -11,7 +11,7 @@ It is **doubly gated**: the Rust module is compiled only under
 NOTE_N_PAD_AUTOMATION=1 npm run tauri dev
 ```
 
-Optional: `NOTE_N_PAD_AUTOMATION_PORT=45678` (default). The listener binds
+Optional: `NOTE_N_PAD_AUTOMATION_PORT=21456` (default). The listener binds
 `127.0.0.1:<port>` and serves one client at a time; open as many sequential
 connections as you like.
 

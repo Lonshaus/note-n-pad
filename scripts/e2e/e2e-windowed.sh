@@ -27,6 +27,7 @@ WORK="$OUT/windowed-fixture"
 PASS=0
 FAIL=0
 mkdir -p "$OUT"
+: >"$OUT/dev-windowed.log"
 
 ok() {
   PASS=$((PASS + 1))
@@ -65,8 +66,11 @@ doc_label() {
 doc_count() {
   auto '{"id":3,"cmd":"list_windows"}' | jq -r '[.data[]|select(.label|startswith("doc-"))]|length'
 }
+# jq is a native binary on Windows and writes CRLF; `read -r` keeps the CR
+# and `$( )` strips only the trailing one, so a captured set and a streamed
+# line would silently never match without stripping it here.
 doc_labels() {
-  auto '{"id":31,"cmd":"list_windows"}' | jq -r '.data[]|select(.label|startswith("doc-"))|.label'
+  auto '{"id":31,"cmd":"list_windows"}' | jq -r '.data[]|select(.label|startswith("doc-"))|.label' | tr -d '\r'
 }
 # The label of the first doc window that was not in $1 (a newline-separated list
 # captured before the window was asked for), or empty if none has appeared yet.
@@ -92,25 +96,33 @@ new_doc_exists() {
   [ -n "$(new_doc_label "$1")" ]
 }
 evl() {
-  auto "{\"id\":9,\"cmd\":\"eval\",\"label\":\"$1\",\"js\":$(jq -Rn --arg js "$2" '$js')}" | jq -r '.data'
+  auto "{\"id\":$(e2e_next_id),\"cmd\":\"eval\",\"label\":\"$1\",\"js\":$(jq -Rn --arg js "$2" '$js')}" | jq -r '.data'
 }
 launch() {
-  NOTE_N_PAD_AUTOMATION=1 npm run tauri dev >"$OUT/dev-windowed.log" 2>&1 &
+  e2e_require_clean_slate
+  NOTE_N_PAD_AUTOMATION=1 npm run tauri dev >>"$OUT/dev-windowed.log" 2>&1 &
+  e2e_report_port_holders
   local tries=0
-  until nc -z 127.0.0.1 45678 2>/dev/null; do
+  until e2e_automation_up; do
     sleep 1
     tries=$((tries + 1))
     if [ "$tries" -gt 240 ]; then
+      e2e_report_port_holders
       echo "FATAL: automation port never opened"
       exit 1
     fi
   done
+  e2e_require_automation_listener "$OUT/dev-windowed.log"
+  # The dev server binds 1420 while the app is coming up, so this is the
+  # first moment a leftover holding it is visible; the app answering on
+  # the automation port does not mean vite got its port.
+  e2e_report_port_holders
   sleep 4
 }
 quit_app() {
   auto '{"id":99,"cmd":"quit"}' >/dev/null 2>&1
   local tries=0
-  while pgrep -x note-n-pad >/dev/null 2>&1; do
+  while e2e_app_running; do
     sleep 1
     tries=$((tries + 1))
     if [ "$tries" -gt 20 ]; then
@@ -159,19 +171,9 @@ open_large() {
 mem_capture() {
   {
     echo "MAIN"
-    for pid in $(pgrep -f "target/debug/note-n-pad"); do
-      rss=$(ps -o rss= -p "$pid" 2>/dev/null | tr -d ' ')
-      if [ -n "$rss" ]; then
-        echo "$pid $rss"
-      fi
-    done
+    e2e_process_rss "target/debug/note-n-pad"
     echo "WEBCONTENT"
-    for pid in $(pgrep -f "$(webcontent_pattern)"); do
-      rss=$(ps -o rss= -p "$pid" 2>/dev/null | tr -d ' ')
-      if [ -n "$rss" ]; then
-        echo "$pid $rss"
-      fi
-    done
+    e2e_process_rss "$(webcontent_pattern)"
   } >"$1"
 }
 
@@ -203,7 +205,7 @@ mkdir -p "$WORK"
 python3 - <<PYEOF
 import os
 n = 5_000_000
-with open('$WORK/big.log', 'w') as f:
+with open('$WORK/big.log', 'w', newline='') as f:
     buf = []
     for i in range(1, n + 1):
         buf.append(f'{i:010d} ' + 'x' * 36)
@@ -223,7 +225,7 @@ check "fixture is ~240MB" "$ORIG_SIZE" "239999999"
 # and the lock stays disabled.
 python3 - <<PYEOF
 n = (105 * 1024 * 1024) // 48 + 1
-with open('$WORK/bad.log', 'w') as f:
+with open('$WORK/bad.log', 'w', newline='') as f:
     buf = []
     for i in range(n):
         buf.append('A' * 47)
@@ -423,11 +425,19 @@ main_inc = sum(ma.values()) - sum(mb.values())
 web_inc = sum(max(0, rss - wb.get(pid, 0)) for pid, rss in wa.items())
 total_kb = main_inc + web_inc
 print(f'{sum(mb.values())} {sum(ma.values())} {main_inc} {web_inc} {total_kb} {total_kb / 1024:.1f}')
+print(f'{sum(wb.values())} {sum(wa.values())}')
 PYEOF
 )
 echo "MEM base_main_kb after_main_kb main_inc_kb web_inc_kb total_inc_kb total_inc_mb"
-echo "MEM $MEM"
-TOTAL_MB=$(echo "$MEM" | awk '{print $6}')
+echo "MEM $(echo "$MEM" | sed -n '1p')"
+# Windows printed MEM 0 0 0 0 0 0.0 and passed before e2e_process_rss existed:
+# measuring nothing looked identical to measuring well. This line carries the
+# renderer totals the MEM line has no room for, so a still-zero renderer total
+# on Windows is visible in the log instead of hiding behind a legitimate 0
+# web_inc_kb.
+echo "MEMWEB base_web_kb after_web_kb"
+echo "MEMWEB $(echo "$MEM" | sed -n '2p')"
+TOTAL_MB=$(echo "$MEM" | awk 'NR==1{print $6}')
 UNDER=$(awk -v m="$TOTAL_MB" 'BEGIN{print (m < 300) ? "true" : "false"}')
 check "memory increase under 300MB (windowed, not whole-load)" "$UNDER" "true"
 
@@ -487,14 +497,14 @@ check "oversized gate visible" "$(evl "$DL" "String(__auto.oversizedGateVisible(
 # pending quit resumes via request_exit, so the process must actually exit.
 evl "$DL" "__auto.oversizedGateDiscard()" >/dev/null 2>&1
 tries=0
-while pgrep -f "target/debug/note-n-pad" >/dev/null 2>&1; do
+while e2e_dev_app_running; do
   sleep 1
   tries=$((tries + 1))
   if [ "$tries" -gt 30 ]; then
     break
   fi
 done
-check "app exited after discard" "$(pgrep -f 'target/debug/note-n-pad' >/dev/null 2>&1 && echo alive || echo gone)" "gone"
+check "app exited after discard" "$(e2e_dev_app_running && echo alive || echo gone)" "gone"
 e2e_kill_owned_ports
 sleep 3
 
@@ -564,8 +574,11 @@ DOCS_BEFORE=$(doc_labels)
 evl "$BOOT2" "window.__TAURI_INTERNALS__.invoke('open_document_window',{path:'$WORK/big.orig'})" >/dev/null
 e2e_wait_until new_doc_exists "$DOCS_BEFORE"
 DLE=$(new_doc_label "$DOCS_BEFORE")
+# Never fall back to $DL: it still holds the restored windowed tab, against which
+# all three assertions below pass without ever testing the edit-mode open.
 if [ -z "$DLE" ]; then
-  DLE="$DL"
+  echo "FATAL: no doc window after the edit-mode open of big.orig"
+  exit 1
 fi
 e2e_wait_eval "$DLE" "typeof __auto!=='undefined' && typeof __auto.isWindowedTab==='function'" "true"
 # Opening straight into editing scans the whole 240 MB file first, so this is
@@ -579,7 +592,23 @@ evl "$DLE" "__auto.closeActiveTab()" >/dev/null
 sleep 2
 evl "$DL" "__auto.setLargeOpenMode('$ORIG_MODE')" >/dev/null 2>&1
 e2e_wait_setting large_open_mode "$ORIG_MODE"
-check "mode restored to original" "$(evl "$DL" "String(__auto.getLargeOpenMode())")" "$ORIG_MODE"
+# e2e_read, not evl: a timed-out eval renders as the literal `null`, which can
+# never equal $ORIG_MODE, and the only legitimate values here are ask/view/edit.
+MODE_RESTORED="$(e2e_read "$DL" "String(__auto.getLargeOpenMode())")"
+if [ "$MODE_RESTORED" != "$ORIG_MODE" ]; then
+  # $DL can be gone by the time this reads it; dump the window list so a
+  # missing window is distinguished from a setting that never landed.
+  echo "full window list: $(auto '{"id":31,"cmd":"list_windows"}' 2>/dev/null)"
+  case "$(doc_labels 2>/dev/null)" in
+    *"$DL"*)
+      echo "\$DL ($DL) still in window list: yes"
+      ;;
+    *)
+      echo "\$DL ($DL) still in window list: no"
+      ;;
+  esac
+fi
+check "mode restored to original" "$MODE_RESTORED" "$ORIG_MODE"
 
 echo "=== teardown ==="
 evl "$DL" "__auto.setLanguage('$ORIG_LANG')" >/dev/null
