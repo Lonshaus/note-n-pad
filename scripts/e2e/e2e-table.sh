@@ -242,7 +242,7 @@ BIG_OPENED=$(e2e_read "$DL" "String(__auto.tableDims().rows===270001 && document
 # opened without the table view. None of them can render null except by timing
 # out, which is why openFailed carries a sentinel: its clean value is null.
 echo "open settled: $(e2e_read "$DL" "String(window.__openSettled)")"
-echo "tabs after open: $(e2e_read "$DL" "JSON.stringify(__auto.getTabs().map((t)=>t.path))")"
+echo "tabs after open: $(e2e_read "$DL" "JSON.stringify(__auto.getTabs().map((t)=>({path:t.path,active:t.active})))")"
 echo "view mode after open: $(e2e_read "$DL" "String(__auto.getViewMode())")"
 echo "openFailed after open: $(e2e_read "$DL" "String(__auto.openFailed() ?? 'none')")"
 check "the open produced the 270k table" "$BIG_OPENED" "true"
