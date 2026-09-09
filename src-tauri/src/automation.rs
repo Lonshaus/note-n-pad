@@ -13,7 +13,7 @@ use tauri::{AppHandle, Manager, State};
 /// How long an `eval` waits for the webview to report its result before failing.
 const EVAL_TIMEOUT: Duration = Duration::from_secs(3);
 /// Default TCP port when NOTE_N_PAD_AUTOMATION_PORT is unset.
-const DEFAULT_PORT: u16 = 45678;
+const DEFAULT_PORT: u16 = 21456;
 
 /// One line-delimited JSON request. Unknown params for a given command are simply
 /// left as None; each command reads only the fields it needs.

@@ -90,9 +90,10 @@ launch() {
       exit 1
     fi
   done
+  e2e_require_automation_listener "$OUT/dev-close-flush.log"
   # The dev server binds 1420 while the app is coming up, so this is the
   # first moment a leftover holding it is visible; the app answering on
-  # 45678 does not mean vite got its port.
+  # the automation port does not mean vite got its port.
   e2e_report_port_holders
   sleep 4
 }

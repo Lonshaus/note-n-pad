@@ -112,9 +112,10 @@ launch() {
       exit 1
     fi
   done
+  e2e_require_automation_listener "$OUT/dev-windowed.log"
   # The dev server binds 1420 while the app is coming up, so this is the
   # first moment a leftover holding it is visible; the app answering on
-  # 45678 does not mean vite got its port.
+  # the automation port does not mean vite got its port.
   e2e_report_port_holders
   sleep 4
 }
@@ -573,8 +574,11 @@ DOCS_BEFORE=$(doc_labels)
 evl "$BOOT2" "window.__TAURI_INTERNALS__.invoke('open_document_window',{path:'$WORK/big.orig'})" >/dev/null
 e2e_wait_until new_doc_exists "$DOCS_BEFORE"
 DLE=$(new_doc_label "$DOCS_BEFORE")
+# Never fall back to $DL: it still holds the restored windowed tab, against which
+# all three assertions below pass without ever testing the edit-mode open.
 if [ -z "$DLE" ]; then
-  DLE="$DL"
+  echo "FATAL: no doc window after the edit-mode open of big.orig"
+  exit 1
 fi
 e2e_wait_eval "$DLE" "typeof __auto!=='undefined' && typeof __auto.isWindowedTab==='function'" "true"
 # Opening straight into editing scans the whole 240 MB file first, so this is
@@ -588,7 +592,9 @@ evl "$DLE" "__auto.closeActiveTab()" >/dev/null
 sleep 2
 evl "$DL" "__auto.setLargeOpenMode('$ORIG_MODE')" >/dev/null 2>&1
 e2e_wait_setting large_open_mode "$ORIG_MODE"
-MODE_RESTORED="$(evl "$DL" "String(__auto.getLargeOpenMode())")"
+# e2e_read, not evl: a timed-out eval renders as the literal `null`, which can
+# never equal $ORIG_MODE, and the only legitimate values here are ask/view/edit.
+MODE_RESTORED="$(e2e_read "$DL" "String(__auto.getLargeOpenMode())")"
 if [ "$MODE_RESTORED" != "$ORIG_MODE" ]; then
   # $DL can be gone by the time this reads it; dump the window list so a
   # missing window is distinguished from a setting that never landed.

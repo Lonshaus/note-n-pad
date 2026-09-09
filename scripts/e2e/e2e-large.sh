@@ -107,9 +107,10 @@ launch() {
       exit 1
     fi
   done
+  e2e_require_automation_listener "$OUT/dev-large.log"
   # The dev server binds 1420 while the app is coming up, so this is the
   # first moment a leftover holding it is visible; the app answering on
-  # 45678 does not mean vite got its port.
+  # the automation port does not mean vite got its port.
   e2e_report_port_holders
   sleep 4
 }
@@ -327,8 +328,12 @@ sleep 4
 # jq writes CRLF on Windows, so the stream needs the same tr -d '\r' as
 # doc_labels before it can be compared against a $( )-captured, CR-free $DL.
 DL2=$(auto '{"id":13,"cmd":"list_windows"}' | jq -r '.data[]|select(.label|startswith("doc-"))|.label' | tr -d '\r' | grep -v "^$DL$" | head -1)
+# Never fall back to $DL. Binding this section to the window it was supposed to
+# replace makes every assertion below report on a window that was never under
+# test, which is how a wrong-window run once passed for five runs in a row.
 if [ -z "$DL2" ]; then
-  DL2="$DL"
+  echo "FATAL: no second doc window after opening huge.bin"
+  exit 1
 fi
 check "confirm visible for 600MB" "$(e2e_read "$DL2" "String(__auto.largeConfirmVisible())")" "true"
 evl "$DL2" "__auto.largeConfirmCancel()" >/dev/null
