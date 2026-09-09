@@ -93,6 +93,8 @@ jobs:
         run: cargo build
 
       - name: Run the E2E suites
+        # Windows runners default to PowerShell, and this script is POSIX.
+        shell: bash
         env:
           # Through the environment, never interpolated into the script.
           SUITES: ${{ inputs.suites }}
@@ -141,11 +143,18 @@ jobs:
             echo "::endgroup::"
           done
 
+          # The app's own output goes to $OUT/dev-<suite>.log, which is outside
+          # the upload path; without it a failed launch shows only the socket
+          # refusing connections. $OUT also holds the multi-hundred-MB fixtures,
+          # so copy the logs out rather than uploading the directory.
+          out="$(bash -c '. scripts/e2e/lib.sh; printf %s "$OUT"')"
+          cp "$out"/dev-*.log e2e-logs/ 2>/dev/null || true
+
           cat e2e-logs/summary.txt >>"$GITHUB_STEP_SUMMARY"
           [ -z "$failed" ] || { echo "failed:$failed" >&2; exit 1; }
 
       - name: Upload logs
-        if: failure()
+        if: always()
         uses: actions/upload-artifact@v7
         with:
           name: e2e-logs-${{ matrix.os }}

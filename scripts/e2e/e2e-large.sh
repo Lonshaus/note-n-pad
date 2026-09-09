@@ -17,6 +17,7 @@ source "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
 # Fixtures and logs live in a throwaway tmp dir, never in the repo.
 WORK="$OUT/large-fixture"
 mkdir -p "$OUT"
+: >"$OUT/dev-large.log"
 PASS=0
 FAIL=0
 
@@ -57,8 +58,11 @@ boot_label() {
 doc_label() {
   auto '{"id":3,"cmd":"list_windows"}' | jq -r '.data[]|select(.label|startswith("doc-"))|.label' | head -1
 }
+# jq is a native binary on Windows and writes CRLF; `read -r` keeps the CR
+# and `$( )` strips only the trailing one, so a captured set and a streamed
+# line would silently never match without stripping it here.
 doc_labels() {
-  auto '{"id":30,"cmd":"list_windows"}' | jq -r '.data[]|select(.label|startswith("doc-"))|.label'
+  auto '{"id":30,"cmd":"list_windows"}' | jq -r '.data[]|select(.label|startswith("doc-"))|.label' | tr -d '\r'
 }
 doc_count() {
   auto '{"id":33,"cmd":"list_windows"}' | jq -r '[.data[]|select(.label|startswith("doc-"))]|length'
@@ -87,25 +91,33 @@ new_doc_exists() {
   [ -n "$(new_doc_label "$1")" ]
 }
 evl() {
-  auto "{\"id\":9,\"cmd\":\"eval\",\"label\":\"$1\",\"js\":$(jq -Rn --arg js "$2" '$js')}" | jq -r '.data'
+  auto "{\"id\":$(e2e_next_id),\"cmd\":\"eval\",\"label\":\"$1\",\"js\":$(jq -Rn --arg js "$2" '$js')}" | jq -r '.data'
 }
 launch() {
-  NOTE_N_PAD_AUTOMATION=1 npm run tauri dev >"$OUT/dev-large.log" 2>&1 &
+  e2e_require_clean_slate
+  NOTE_N_PAD_AUTOMATION=1 npm run tauri dev >>"$OUT/dev-large.log" 2>&1 &
+  e2e_report_port_holders
   local tries=0
-  until nc -z 127.0.0.1 45678 2>/dev/null; do
+  until e2e_automation_up; do
     sleep 1
     tries=$((tries + 1))
     if [ "$tries" -gt 240 ]; then
+      e2e_report_port_holders
       echo "FATAL: automation port never opened"
       exit 1
     fi
   done
+  e2e_require_automation_listener "$OUT/dev-large.log"
+  # The dev server binds 1420 while the app is coming up, so this is the
+  # first moment a leftover holding it is visible; the app answering on
+  # the automation port does not mean vite got its port.
+  e2e_report_port_holders
   sleep 4
 }
 quit_app() {
   auto '{"id":99,"cmd":"quit"}' >/dev/null 2>&1
   local tries=0
-  while pgrep -x note-n-pad >/dev/null 2>&1; do
+  while e2e_app_running; do
     sleep 1
     tries=$((tries + 1))
     if [ "$tries" -gt 20 ]; then
@@ -142,7 +154,7 @@ rm -rf "$WORK"
 mkdir -p "$WORK"
 python3 - <<PYEOF
 lines = 2400000
-with open('$WORK/big.log', 'w') as f:
+with open('$WORK/big.log', 'w', newline='') as f:
     for i in range(1, lines + 1):
         f.write(f'line {i:07d} abcdefghijklmnopqrstuvwxyz0123456789\n')
 PYEOF
@@ -181,11 +193,11 @@ done
 # Pin the UI language so text assertions never depend on the host system
 # language; restore the user's real preference on exit or interrupt. The trap
 # looks the doc label up live because the restart section opens a fresh window.
-ORIG_LANG=$(evl "$DL" "String(__auto.getLanguage())")
+ORIG_LANG=$(e2e_read "$DL" "String(__auto.getLanguage())")
 echo "original language: $ORIG_LANG"
 # The open-modes section writes the user's real large_open_mode; capture it now
 # and restore it on any exit (single value, replacing the old ask toggle).
-ORIG_MODE=$(evl "$DL" "String(__auto.getLargeOpenMode())")
+ORIG_MODE=$(e2e_read "$DL" "String(__auto.getLargeOpenMode())")
 echo "original large_open_mode: $ORIG_MODE"
 restore_lang() {
   trap '' INT TERM
@@ -215,13 +227,13 @@ evl "$DL" "__auto.setLanguage('zh-TW')" >/dev/null
 sleep 1
 
 echo "=== confirm modal ==="
-check "confirm visible for >100MB" "$(evl "$DL" "String(__auto.largeConfirmVisible())")" "true"
+check "confirm visible for >100MB" "$(e2e_read "$DL" "String(__auto.largeConfirmVisible())")" "true"
 evl "$DL" "__auto.largeConfirmAccept()" >/dev/null
 sleep 2
-check "large tab active" "$(evl "$DL" "String(__auto.isLargeTab())")" "true"
-check "lock available for editable large file (<512MB)" "$(evl "$DL" "String(__auto.largeUnlockAvailable())")" "true"
+check "large tab active" "$(e2e_read "$DL" "String(__auto.isLargeTab())")" "true"
+check "lock available for editable large file (<512MB)" "$(e2e_read "$DL" "String(__auto.largeUnlockAvailable())")" "true"
 check "size reported" "$(evl "$DL" "JSON.stringify(__auto.largeInfo().size)")" "$BIGSIZE"
-check "first line rendered" "$(evl "$DL" "String(__auto.largeVisibleText().includes('line 0000001 '))")" "true"
+check "first line rendered" "$(e2e_read "$DL" "String(__auto.largeVisibleText().includes('line 0000001 '))")" "true"
 
 echo "=== index completes ==="
 tries=0
@@ -239,30 +251,30 @@ check "total lines exact" "$(evl "$DL" "JSON.stringify(__auto.largeInfo().totalL
 echo "=== deep jump ==="
 evl "$DL" "void __auto.largeScrollToLine(1999999)" >/dev/null
 sleep 3
-FIRST=$(evl "$DL" "String(__auto.largeVisibleFirstLine())")
+FIRST=$(e2e_read "$DL" "String(__auto.largeVisibleFirstLine())")
 case "$FIRST" in
   199*) ok "scrolled near line 2000000 (first=$FIRST)" ;;
   200*) ok "scrolled near line 2000000 (first=$FIRST)" ;;
   *) bad "scrolled near line 2000000 (first=$FIRST)" ;;
 esac
-check "deep content correct" "$(evl "$DL" "String(__auto.largeVisibleText().includes('line 2000000 '))")" "true"
+check "deep content correct" "$(e2e_read "$DL" "String(__auto.largeVisibleText().includes('line 2000000 '))")" "true"
 
 echo "=== goto line ==="
-check "goto hidden initially" "$(evl "$DL" "String(__auto.largeGotoVisible())")" "false"
+check "goto hidden initially" "$(e2e_read "$DL" "String(__auto.largeGotoVisible())")" "false"
 evl "$DL" "__auto.largeGotoOpen()" >/dev/null
-check "goto opens" "$(evl "$DL" "String(__auto.largeGotoVisible())")" "true"
+check "goto opens" "$(e2e_read "$DL" "String(__auto.largeGotoVisible())")" "true"
 evl "$DL" "__auto.largeGoto(42)" >/dev/null
 sleep 2
-FIRST_G=$(evl "$DL" "String(__auto.largeVisibleFirstLine())")
+FIRST_G=$(e2e_read "$DL" "String(__auto.largeVisibleFirstLine())")
 case "$FIRST_G" in
   4[0-9]) ok "goto landed near line 42 (first=$FIRST_G)" ;;
   *) bad "goto landed near line 42 (first=$FIRST_G)" ;;
 esac
-check "goto content correct" "$(evl "$DL" "String(__auto.largeVisibleText().includes('line 0000042 '))")" "true"
+check "goto content correct" "$(e2e_read "$DL" "String(__auto.largeVisibleText().includes('line 0000042 '))")" "true"
 
 echo "=== stream search ==="
 evl "$DL" "__auto.largeSearchOpen()" >/dev/null
-check "search panel opens" "$(evl "$DL" "String(__auto.largeSearchVisible())")" "true"
+check "search panel opens" "$(e2e_read "$DL" "String(__auto.largeSearchVisible())")" "true"
 evl "$DL" "__auto.largeSearch('line 0000777 ', false)" >/dev/null
 tries=0
 until [ "$(evl "$DL" "String(__auto.largeSearchDone())")" = "true" ]; do
@@ -276,7 +288,7 @@ check "unique query found once" "$(evl "$DL" "JSON.stringify(__auto.largeSearchR
 check "hit line correct (1-based)" "$(evl "$DL" "JSON.stringify(__auto.largeSearchResults()[0]?.line)")" "777"
 evl "$DL" "__auto.largeSearchJump(0)" >/dev/null
 sleep 2
-check "jump to hit shows content" "$(evl "$DL" "String(__auto.largeVisibleText().includes('line 0000777 '))")" "true"
+check "jump to hit shows content" "$(e2e_read "$DL" "String(__auto.largeVisibleText().includes('line 0000777 '))")" "true"
 evl "$DL" "__auto.largeSearch('line 0', false)" >/dev/null
 tries=0
 until [ "$(evl "$DL" "String(__auto.largeSearchDone())")" = "true" ]; do
@@ -288,7 +300,7 @@ until [ "$(evl "$DL" "String(__auto.largeSearchDone())")" = "true" ]; do
 done
 check "broad query hits capped at 5000" "$(evl "$DL" "JSON.stringify(__auto.largeSearchResults().length)")" "5000"
 evl "$DL" "__auto.largeSearchClose()" >/dev/null
-check "search closes" "$(evl "$DL" "String(__auto.largeSearchVisible())")" "false"
+check "search closes" "$(e2e_read "$DL" "String(__auto.largeSearchVisible())")" "false"
 
 echo "=== range actions on a file that has gone away ==="
 # `lineToOffset` answers null once the file is unreadable, and both range
@@ -296,15 +308,15 @@ echo "=== range actions on a file that has gone away ==="
 # click looked like it had missed the button.
 evl "$DL" "__auto.largeSelectRange(10,20)" >/dev/null
 check "a range is selected" "$(evl "$DL" "JSON.stringify(__auto.largeGetRange())")" '{"startLine":10,"endLine":20}'
-check "no error is showing yet" "$(evl "$DL" "String((document.querySelector('.range-error')||{textContent:''}).textContent)")" ""
+check "no error is showing yet" "$(e2e_read "$DL" "String((document.querySelector('.range-error')||{textContent:''}).textContent)")" ""
 mv "$WORK/big.log" "$WORK/big.gone"
 evl "$DL" "__auto.largeRangeEdit()" >/dev/null
 e2e_wait_eval "$DL" "String((document.querySelector('.range-error')||{textContent:''}).textContent!=='')" "true"
-check "edit-range says why nothing opened" "$(evl "$DL" "String((document.querySelector('.range-error')||{textContent:''}).textContent!=='')")" "true"
-check "no range tab was opened" "$(evl "$DL" "String(__auto.isRangeTab())")" "false"
+check "edit-range says why nothing opened" "$(e2e_read "$DL" "String((document.querySelector('.range-error')||{textContent:''}).textContent!=='')")" "true"
+check "no range tab was opened" "$(e2e_read "$DL" "String(__auto.isRangeTab())")" "false"
 evl "$DL" "window.__rsa='pending';__auto.largeRangeSaveAs('$WORK/vanished.out').then(function(r){window.__rsa=String(r)}).catch(function(e){window.__rsa='err'})" >/dev/null
 e2e_wait_eval "$DL" "String(window.__rsa)" "false"
-check "save-range reports failure rather than resolving quietly" "$(evl "$DL" "String((document.querySelector('.range-error')||{textContent:''}).textContent!=='')")" "true"
+check "save-range reports failure rather than resolving quietly" "$(e2e_read "$DL" "String((document.querySelector('.range-error')||{textContent:''}).textContent!=='')")" "true"
 check "no half-written destination was left" "$([ -f "$WORK/vanished.out" ] && echo present || echo absent)" "absent"
 mv "$WORK/big.gone" "$WORK/big.log"
 evl "$DL" "__auto.largeSelectRange(10,20)" >/dev/null
@@ -313,16 +325,22 @@ echo "=== cap and cancel ==="
 # The second open lands in a NEW doc window; query the newest doc- label.
 evl "$DL" "window.__TAURI_INTERNALS__.invoke('open_document_window',{path:'$WORK/huge.bin'})" >/dev/null
 sleep 4
-DL2=$(auto '{"id":13,"cmd":"list_windows"}' | jq -r '.data[]|select(.label|startswith("doc-"))|.label' | grep -v "^$DL$" | head -1)
+# jq writes CRLF on Windows, so the stream needs the same tr -d '\r' as
+# doc_labels before it can be compared against a $( )-captured, CR-free $DL.
+DL2=$(auto '{"id":13,"cmd":"list_windows"}' | jq -r '.data[]|select(.label|startswith("doc-"))|.label' | tr -d '\r' | grep -v "^$DL$" | head -1)
+# Never fall back to $DL. Binding this section to the window it was supposed to
+# replace makes every assertion below report on a window that was never under
+# test, which is how a wrong-window run once passed for five runs in a row.
 if [ -z "$DL2" ]; then
-  DL2="$DL"
+  echo "FATAL: no second doc window after opening huge.bin"
+  exit 1
 fi
-check "confirm visible for 600MB" "$(evl "$DL2" "String(__auto.largeConfirmVisible())")" "true"
+check "confirm visible for 600MB" "$(e2e_read "$DL2" "String(__auto.largeConfirmVisible())")" "true"
 evl "$DL2" "__auto.largeConfirmCancel()" >/dev/null
 sleep 2
 WIN_COUNT=$(auto '{"id":14,"cmd":"list_windows"}' | jq -r '[.data[]|select(.label|startswith("doc-"))]|length')
 check "cancel collapses the empty window" "$WIN_COUNT" "1"
-check "original large tab intact" "$(evl "$DL" "String(__auto.isLargeTab())")" "true"
+check "original large tab intact" "$(e2e_read "$DL" "String(__auto.isLargeTab())")" "true"
 
 echo "=== open modes ==="
 check "mode defaults to ask" "$ORIG_MODE" "ask"
@@ -337,8 +355,11 @@ if [ -n "$DL4" ]; then
   # The window exists; its tab still has to finish opening before either
   # assertion means anything.
   e2e_wait_eval "$DL4" "String(__auto.isLargeTab())" "true"
-  check "no confirm in view mode" "$(evl "$DL4" "String(__auto.largeConfirmVisible())")" "false"
-  check "opened straight into large view" "$(evl "$DL4" "String(__auto.isLargeTab())")" "true"
+  check "no confirm in view mode" "$(e2e_read "$DL4" "String(__auto.largeConfirmVisible())")" "false"
+  check "opened straight into large view" "$(e2e_read "$DL4" "String(__auto.isLargeTab())")" "true"
+  # Both assertions above pass whichever window is bound; the size pins it
+  # down to the huge.bin window actually meant by this block.
+  check "view-mode window is the huge.bin window" "$(e2e_read "$DL4" "String(__auto.largeInfo().size)")" "629145600"
   evl "$DL4" "__auto.closeActiveTab()" >/dev/null
 else
   bad "view-mode window never appeared"
@@ -346,8 +367,9 @@ fi
 # 'ask' mode: an editable large file's confirm offers an Edit button that unlocks
 # straight into in-place (windowed) editing. big.ask is UTF-8 and under the 512MB
 # cap, and is a separate copy so this open really does get its own window.
-evl "$DL" "__auto.setLargeOpenMode('ask')" >/dev/null
+ASK_EVAL_RESULT="$(evl "$DL" "__auto.setLargeOpenMode('ask')")"
 e2e_wait_setting large_open_mode "ask"
+ASK_WAIT_STATUS=$?
 DOCS_BEFORE=$(doc_labels)
 evl "$DL" "window.__TAURI_INTERNALS__.invoke('open_document_window',{path:'$WORK/big.ask'})" >/dev/null
 e2e_wait_until new_doc_exists "$DOCS_BEFORE"
@@ -357,20 +379,57 @@ if [ -n "$DL5" ]; then
   # one did not, and an eval that runs before __auto exists throws, which the
   # harness reports as an error and evl renders as a bare "null".
   e2e_wait_eval "$DL5" "typeof __auto!=='undefined' && typeof __auto.largeConfirmVisible==='function'" "true"
-  e2e_wait_eval "$DL5" "String(__auto.largeConfirmVisible())" "true"
-  check "ask mode shows confirm" "$(evl "$DL5" "String(__auto.largeConfirmVisible())")" "true"
+  # $DL5 must be the new window for big.ask, not $DL itself: both existing
+  # assertions in this block pass whichever window is bound, which is how a
+  # wrong binding survived five runs.
+  check "ask-mode open bound its own window" "$([ "$DL5" != "$DL" ] && echo true || echo false)" "true"
+  if ! e2e_wait_eval "$DL5" "String(__auto.largeConfirmVisible())" "true"; then
+    # Distinguishes "the setting never landed / $DL was already dead" from
+    # "the setting landed and the new window still showed no confirm", so a
+    # fix is not guessed at from the assertion failure alone.
+    echo "=== ask-mode diagnostics ==="
+    echo "setLargeOpenMode('ask') eval returned: $ASK_EVAL_RESULT"
+    echo "e2e_wait_setting large_open_mode ask exit status: $ASK_WAIT_STATUS"
+    echo "large_open_mode in settings.json: $(jq -r '.large_open_mode // empty' "$APPDIR/settings.json" 2>/dev/null)"
+    case "$(doc_labels 2>/dev/null)" in
+      *"$DL"*)
+        echo "\$DL ($DL) still in window list: yes"
+        ;;
+      *)
+        echo "\$DL ($DL) still in window list: no"
+        ;;
+    esac
+    echo "full window list: $(auto '{"id":96,"cmd":"list_windows"}' 2>/dev/null)"
+    echo "new window getLargeOpenMode(): $(evl "$DL5" "String(__auto.getLargeOpenMode())" 2>/dev/null)"
+    echo "new window largeInfo(): $(evl "$DL5" "JSON.stringify(__auto.largeInfo())" 2>/dev/null)"
+  fi
+  check "ask mode shows confirm" "$(e2e_read "$DL5" "String(__auto.largeConfirmVisible())")" "true"
   evl "$DL5" "__auto.largeConfirmEdit()" >/dev/null
   # Unlocking scans the whole file, so this is the longest wait in the suite —
   # 30 s was not enough for 120 MB on a 2-core VM.
   e2e_wait_eval "$DL5" "String(__auto.isWindowedTab())" "true"
-  check "edit button unlocks into windowed editing" "$(evl "$DL5" "String(__auto.isWindowedTab())")" "true"
+  check "edit button unlocks into windowed editing" "$(e2e_read "$DL5" "String(__auto.isWindowedTab())")" "true"
   evl "$DL5" "__auto.closeActiveTab()" >/dev/null
 else
   bad "ask-mode window never appeared"
 fi
 evl "$DL" "__auto.setLargeOpenMode('$ORIG_MODE')" >/dev/null
 e2e_wait_setting large_open_mode "$ORIG_MODE"
-check "mode restored" "$(evl "$DL" "String(__auto.getLargeOpenMode())")" "$ORIG_MODE"
+MODE_RESTORED="$(e2e_read "$DL" "String(__auto.getLargeOpenMode())")"
+if [ "$MODE_RESTORED" != "$ORIG_MODE" ]; then
+  # $DL can be gone by the time this reads it; dump the window list so a
+  # missing window is distinguished from a setting that never landed.
+  echo "full window list: $(auto '{"id":96,"cmd":"list_windows"}' 2>/dev/null)"
+  case "$(doc_labels 2>/dev/null)" in
+    *"$DL"*)
+      echo "\$DL ($DL) still in window list: yes"
+      ;;
+    *)
+      echo "\$DL ($DL) still in window list: no"
+      ;;
+  esac
+fi
+check "mode restored" "$MODE_RESTORED" "$ORIG_MODE"
 
 echo "=== restart restore ==="
 quit_app
@@ -389,10 +448,10 @@ until [ -n "$DLR" ] && [ "$(evl "$DLR" "typeof __auto!=='undefined' && typeof __
 done
 evl "$DLR" "__auto.setLanguage('$ORIG_LANG')" >/dev/null
 sleep 1
-check "restored without confirm" "$(evl "$DLR" "String(__auto.largeConfirmVisible())")" "false"
-check "restored as large tab" "$(evl "$DLR" "String(__auto.isLargeTab())")" "true"
+check "restored without confirm" "$(e2e_read "$DLR" "String(__auto.largeConfirmVisible())")" "false"
+check "restored as large tab" "$(e2e_read "$DLR" "String(__auto.isLargeTab())")" "true"
 check "restored size intact" "$(evl "$DLR" "JSON.stringify(__auto.largeInfo().size)")" "$BIGSIZE"
-check "restored content renders" "$(evl "$DLR" "String(__auto.largeVisibleText().includes('line '))")" "true"
+check "restored content renders" "$(e2e_read "$DLR" "String(__auto.largeVisibleText().includes('line '))")" "true"
 evl "$DLR" "__auto.closeActiveTab()" >/dev/null
 sleep 2
 check "closing large tab deletes snapshot" "$(count_kind document)" "0"

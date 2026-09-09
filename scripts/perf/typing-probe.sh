@@ -11,7 +11,7 @@
 # Prerequisite: the dev app must be buildable/launchable from this checkout
 # (run `npm install` once, and a first `npm run tauri dev` to warm the build).
 # The probe then manages the app itself: it launches
-# `NOTE_N_PAD_AUTOMATION=1 npm run tauri dev` per size, drives it over TCP 45678,
+# `NOTE_N_PAD_AUTOMATION=1 npm run tauri dev` per size, drives it over TCP 21456,
 # and quits it between sizes. Nothing needs to be running beforehand.
 #
 # Usage, optionally with a custom size list in MB:
@@ -44,7 +44,7 @@ doc_label() {
   auto '{"id":3,"cmd":"list_windows"}' | jq -r '.data[]|select(.label|startswith("doc-"))|.label' | head -1
 }
 evl() {
-  auto "{\"id\":9,\"cmd\":\"eval\",\"label\":\"$1\",\"js\":$(jq -Rn --arg js "$2" '$js')}" | jq -r '.data'
+  auto "{\"id\":$(e2e_next_id),\"cmd\":\"eval\",\"label\":\"$1\",\"js\":$(jq -Rn --arg js "$2" '$js')}" | jq -r '.data'
 }
 clean_snaps() {
   for f in "$STORE"/*.json; do
@@ -61,7 +61,7 @@ clean_snaps() {
 launch() {
   NOTE_N_PAD_AUTOMATION=1 npm run tauri dev >"$OUT/dev-perf.log" 2>&1 &
   local tries=0
-  until nc -z 127.0.0.1 45678 2>/dev/null; do
+  until e2e_automation_up; do
     sleep 1
     tries=$((tries + 1))
     if [ "$tries" -gt 240 ]; then
@@ -89,7 +89,7 @@ quit_and_time() {
   local t0 t1 waited=0
   t0=$(python3 -c 'import time; print(time.time())')
   auto '{"id":99,"cmd":"quit"}' >/dev/null 2>&1
-  while pgrep -x note-n-pad >/dev/null 2>&1; do
+  while e2e_app_running; do
     sleep 0.1
     waited=$((waited + 1))
     if [ $((waited % 20)) -eq 0 ]; then

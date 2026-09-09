@@ -62,8 +62,16 @@ export interface DocumentHooks {
   getTabs: () => unknown;
   switchTab: (index: number) => void;
   openTab: (path: string) => void;
+  /** The same open, handing back the promise so a test can observe a
+   *  rejection. `openTab` stays void on purpose: the automation wrapper
+   *  awaits the eval's value, so a promise there would make every existing
+   *  `openTab` call block on the whole open and hit the 3 s eval timeout. */
+  openTabSettled: (path: string) => Promise<void>;
   newTab: () => void;
   closeActiveTab: () => void;
+  /** `openNormal` swallows `loadTab`'s exception and only sets this, so a
+   *  failed open is otherwise indistinguishable from no open at all. */
+  openFailed: () => string | null;
   toggleLineEnding: () => void;
   setEncoding: (label: string) => void;
   saveActive: (path?: string) => Promise<boolean>;

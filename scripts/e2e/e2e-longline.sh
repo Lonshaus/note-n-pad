@@ -28,6 +28,7 @@ SEEN="$OUT/longline-seen-docs.txt"
 PASS=0
 FAIL=0
 mkdir -p "$OUT"
+: >"$OUT/dev-longline.log"
 
 ok() {
   PASS=$((PASS + 1))
@@ -64,7 +65,7 @@ boot_label() {
   auto '{"id":1,"cmd":"list_windows"}' | jq -r '.data[]|select(.label|startswith("note-") or startswith("doc-"))|.label' | head -1
 }
 evl() {
-  auto "{\"id\":9,\"cmd\":\"eval\",\"label\":\"$1\",\"js\":$(jq -Rn --arg js "$2" '$js')}" | jq -r '.data'
+  auto "{\"id\":$(e2e_next_id),\"cmd\":\"eval\",\"label\":\"$1\",\"js\":$(jq -Rn --arg js "$2" '$js')}" | jq -r '.data'
 }
 # Whether a doc- window with this label is currently present.
 label_present() {
@@ -76,7 +77,10 @@ label_present() {
 new_doc_label() {
   local tries=0 lab
   while [ "$tries" -lt 30 ]; do
-    lab=$(auto '{"id":3,"cmd":"list_windows"}' | jq -r '.data[]|select(.label|startswith("doc-"))|.label' | grep -vxF -f "$SEEN" 2>/dev/null | head -1)
+    # jq writes CRLF on Windows; -x needs a whole-line match, so the CR has
+    # to come off the stream before it can compare against $SEEN's CR-free
+    # entries (each was captured through a $( ) that already stripped it).
+    lab=$(auto '{"id":3,"cmd":"list_windows"}' | jq -r '.data[]|select(.label|startswith("doc-"))|.label' | tr -d '\r' | grep -vxF -f "$SEEN" 2>/dev/null | head -1)
     if [ -n "$lab" ]; then
       echo "$lab" >>"$SEEN"
       printf '%s\n' "$lab"
@@ -126,28 +130,30 @@ wait_gate() {
   done
 }
 launch() {
-  # Reuse a dev server already listening on the automation port (e.g. one the
-  # orchestrator started); only spawn our own when the port is closed.
-  if nc -z 127.0.0.1 45678 2>/dev/null; then
-    echo "launch: reusing dev server already on 45678"
-    return
-  fi
-  NOTE_N_PAD_AUTOMATION=1 npm run tauri dev >"$OUT/dev-longline.log" 2>&1 &
+  e2e_require_clean_slate
+  NOTE_N_PAD_AUTOMATION=1 npm run tauri dev >>"$OUT/dev-longline.log" 2>&1 &
+  e2e_report_port_holders
   local tries=0
-  until nc -z 127.0.0.1 45678 2>/dev/null; do
+  until e2e_automation_up; do
     sleep 1
     tries=$((tries + 1))
     if [ "$tries" -gt 240 ]; then
+      e2e_report_port_holders
       echo "FATAL: automation port never opened"
       exit 1
     fi
   done
+  e2e_require_automation_listener "$OUT/dev-longline.log"
+  # The dev server binds 1420 while the app is coming up, so this is the
+  # first moment a leftover holding it is visible; the app answering on
+  # the automation port does not mean vite got its port.
+  e2e_report_port_holders
   sleep 4
 }
 quit_app() {
   auto '{"id":99,"cmd":"quit"}' >/dev/null 2>&1
   local tries=0
-  while pgrep -x note-n-pad >/dev/null 2>&1; do
+  while e2e_app_running; do
     sleep 1
     tries=$((tries + 1))
     if [ "$tries" -gt 20 ]; then
@@ -192,27 +198,27 @@ w = '$WORK'
 # Plain long lines (non-JSON): 15,000 'a' on one line. Splittable in half so an
 # Enter at the midpoint yields two sub-threshold lines. Two distinct copies.
 for name in ('plain-a.txt', 'plain-b.txt', 'otab-plain.txt'):
-    with open(f'{w}/{name}', 'w') as f:
+    with open(f'{w}/{name}', 'w', newline='') as f:
         f.write('a' * 15000)
 # Flat, shallow JSON on one line (~18k chars, depth 2): beautify succeeds, so the
 # confirm offers "format". Two distinct copies (new-window + openTab paths).
 flat = json.dumps({'items': list(range(3000))}, separators=(',', ':'))
 assert '\n' not in flat and len(flat) > 10000
 for name in ('flat.json', 'otab-flat.json'):
-    with open(f'{w}/{name}', 'w') as f:
+    with open(f'{w}/{name}', 'w', newline='') as f:
         f.write(flat)
 # Pathologically deep but valid JSON: 30,000 nested arrays on one line. maxJsonDepth
 # exceeds the beautify cap, so "format" must be refused and the open must not freeze.
-with open(f'{w}/deep.json', 'w') as f:
+with open(f'{w}/deep.json', 'w', newline='') as f:
     f.write('[' * 30000 + ']' * 30000)
 # Astral emoji line: 8,000 U+1F600 = 16,000 UTF-16 units on one line. Soft-wrap
 # must break it into pieces without ever cutting a surrogate pair. Two copies.
 for name in ('emoji.txt', 'otab-emoji.txt'):
-    with open(f'{w}/{name}', 'w', encoding='utf-8') as f:
+    with open(f'{w}/{name}', 'w', encoding='utf-8', newline='') as f:
         f.write('\U0001F600' * 8000)
 # Short host file (no long line): opens a plain document window with no confirm,
 # used as the live window the in-window openTab path runs against.
-with open(f'{w}/host.txt', 'w') as f:
+with open(f'{w}/host.txt', 'w', newline='') as f:
     f.write('short host document\n')
 PYEOF
 echo "fixtures:"
@@ -263,6 +269,9 @@ fi
 echo "=== 1+2. new window, open as-is: window survives, gate holds ==="
 # bug b: the fresh window must stay alive to show the confirm.
 open_window "$WORK/plain-a.txt" || true
+# open_window only waits for the window's hooks; the confirm itself renders
+# after that, so an assertion right behind it is a race.
+e2e_wait_eval "$DL" "String(__auto.longLineConfirmVisible())" "true"
 check "confirm visible in fresh window" "$(evl "$DL" "String(__auto.longLineConfirmVisible())")" "true"
 check "format not offered for plain text" "$(evl "$DL" "String(__auto.longLineFormatAvailable())")" "false"
 sleep 2
@@ -280,6 +289,8 @@ check "typing lands in as-is tab" "$(evl "$DL" "String(__auto.getContent().start
 echo "=== 3. new window, format: multi-line, gate lifts, dirty, disk untouched ==="
 FLAT_SIZE=$(file_size "$WORK/flat.json")
 open_window "$WORK/flat.json" || true
+# Same hooks-vs-render race as above.
+e2e_wait_eval "$DL" "String(__auto.longLineConfirmVisible())" "true"
 check "format offered for flat JSON" "$(evl "$DL" "String(__auto.longLineFormatAvailable())")" "true"
 evl "$DL" "__auto.longLineConfirmFormat()" >/dev/null
 wait_gate "$DL" "false"
@@ -295,6 +306,8 @@ open_window "$WORK/deep.json" || true
 T1=$(date +%s.%N)
 OPEN_RT=$(python3 -c "print(round($T1-$T0,2))")
 echo "deep-file open->confirm elapsed: ${OPEN_RT}s"
+# Same hooks-vs-render race as above.
+e2e_wait_eval "$DL" "String(__auto.longLineConfirmVisible())" "true"
 check "deep open reached the confirm without freezing" "$(evl "$DL" "String(__auto.longLineConfirmVisible())")" "true"
 check "format refused for over-deep nesting" "$(evl "$DL" "String(__auto.longLineFormatAvailable())")" "false"
 # Main thread stayed responsive: a fresh eval round-trips quickly (a real freeze
@@ -310,6 +323,8 @@ sleep 2
 
 echo "=== 5. new window, soft-wrap: multi-line, gate lifts, surrogates intact ==="
 open_window "$WORK/emoji.txt" || true
+# Same hooks-vs-render race as above.
+e2e_wait_eval "$DL" "String(__auto.longLineConfirmVisible())" "true"
 check "confirm visible for emoji line" "$(evl "$DL" "String(__auto.longLineConfirmVisible())")" "true"
 evl "$DL" "__auto.longLineConfirmSoftWrap()" >/dev/null
 wait_gate "$DL" "false"
@@ -321,6 +336,10 @@ check "no surrogate pair split at a break" "$(evl "$DL" "String([...__auto.getCo
 
 echo "=== 6. new window, Enter mid super-long line lifts the gate live (bug a) ==="
 open_window "$WORK/plain-b.txt" || true
+# No waited assertion precedes this action: without the wait, a confirm that
+# has not rendered yet turns the click into a no-op and wait_gate below burns
+# its full bound before the run goes red for exactly this race.
+e2e_wait_eval "$DL" "String(__auto.longLineConfirmVisible())" "true"
 evl "$DL" "__auto.longLineConfirmAsIs()" >/dev/null
 wait_gate "$DL" "true"
 check "gate active before split" "$(evl "$DL" "String(__auto.longLineActive())")" "true"
