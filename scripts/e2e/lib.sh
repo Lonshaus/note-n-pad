@@ -192,17 +192,30 @@ _e2e_eval_equals() {
 # genuinely absent window still fails exactly as before. One line per retry
 # goes to stderr, never stdout, which is the captured value.
 e2e_read() {
-  local label="$1" js="$2" attempt=1 result
+  local label="$1" js="$2" attempt=1 result err
   while [ "$attempt" -le 6 ]; do
     result="$(evl "$label" "$js")"
-    if [ "$result" != "null" ]; then
+    # A thrown eval comes back as the object automation.rs answers on its catch
+    # path, which jq prints over four lines and `check` then compares as if it
+    # were a value: a read that never ran reads exactly like one that did. Reads
+    # that legitimately return objects (largeInfo, rangeInfo, windowedInfo) carry
+    # no `error` key, so keying on it leaves them alone.
+    err="$(printf '%s' "$result" | jq -r 'select(type == "object" and has("error")) | .error' 2>/dev/null)"
+    if [ -n "$err" ]; then
+      echo "e2e_read: retry $attempt after eval error: $err" >&2
+    elif [ "$result" != "null" ]; then
       printf '%s\n' "$result"
       return 0
+    else
+      echo "e2e_read: retry $attempt after null" >&2
     fi
-    echo "e2e_read: retry $attempt after null" >&2
     sleep 1
     attempt=$((attempt + 1))
   done
+  if [ -n "$err" ]; then
+    printf 'EVAL-ERROR: %s\n' "$err"
+    return 0
+  fi
   printf '%s\n' "$result"
 }
 
