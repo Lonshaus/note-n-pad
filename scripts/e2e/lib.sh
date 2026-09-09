@@ -206,11 +206,19 @@ e2e_read() {
   printf '%s\n' "$result"
 }
 
+# The automation socket the app listens on. Outside every platform's ephemeral
+# range on purpose: Linux hands out 32768-60999 as source ports, macOS and
+# Windows 49152-65535, and a port inside that range can be taken as some other
+# process's client-side source port. Such a socket is not a listener, so the
+# LISTEN-only check below cannot see it, yet it still makes the app's bind fail
+# with EADDRINUSE; and a loopback connect to a port in that range can even
+# connect to itself. 45678 was inside the Linux range and did all three.
+E2E_AUTOMATION_PORT=21456
 # Ports this project's own E2E run is allowed to reclaim: 1420 is the Vite dev
-# server `tauri dev` spawns, 45678 is the automation socket the app listens on.
+# server `tauri dev` spawns, the other is the automation socket above.
 # Never add 5173 here (or anywhere else in these scripts) — it is the user's
 # own dev server, not ours, and must never be touched.
-E2E_OWNED_PORTS="1420 45678"
+E2E_OWNED_PORTS="1420 $E2E_AUTOMATION_PORT"
 
 # PIDs listening on <port>, one per line, empty when nothing is bound. The
 # one place a listener is identified, so the kill path and the port-free check
@@ -222,7 +230,7 @@ e2e_port_listeners() {
       # on Windows the address family is part of that filter, so `-p tcp`
       # drops every IPv6 row — and Node resolves `localhost` to ::1, so vite
       # binds [::1]:1420 and was invisible here while the app's own IPv4
-      # socket on 45678 was not.
+      # automation socket was not.
       netstat -ano | awk -v p=":$1\$" '$1 == "TCP" && $2 ~ p && $4 == "LISTENING" {print $5}' | sort -u
       ;;
     *)
@@ -406,9 +414,26 @@ _e2e_automation_down() {
   ! e2e_automation_up
 }
 
+# Called by every suite's launch() the moment its readiness loop exits. The loop
+# only proves something answered; this proves the app actually holds the port.
+# The app's own bind failure goes to its dev log and never to the suite log, so
+# a launch onto an occupied port otherwise surfaces as a puzzling failure two
+# sections later instead of here. $1 is that dev log.
+e2e_require_automation_listener() {
+  if [ -n "$(e2e_port_listeners "$E2E_AUTOMATION_PORT")" ]; then
+    return 0
+  fi
+  echo "FATAL: nothing is listening on automation port $E2E_AUTOMATION_PORT after the readiness probe"
+  if [ -n "${1:-}" ] && [ -f "${1:-}" ]; then
+    echo "--- last 30 lines of $(basename "$1") ---"
+    tail -30 "$1"
+  fi
+  exit 1
+}
+
 # Refuse to launch onto anything the previous launch left behind. The
 # single-instance plugin makes a second app process defer and exit, so
-# "something answers on 45678" is not proof the app under test is the one
+# "something answers on the automation port" is not proof the app under test is the one
 # about to start; and a vite still holding 1420 is the dev server the next
 # `tauri dev` silently ends up serving from. Both ports must be free, and the
 # app gone, before a launch is allowed. Reclaiming is retried because a

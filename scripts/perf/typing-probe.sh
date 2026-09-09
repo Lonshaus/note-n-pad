@@ -11,7 +11,7 @@
 # Prerequisite: the dev app must be buildable/launchable from this checkout
 # (run `npm install` once, and a first `npm run tauri dev` to warm the build).
 # The probe then manages the app itself: it launches
-# `NOTE_N_PAD_AUTOMATION=1 npm run tauri dev` per size, drives it over TCP 45678,
+# `NOTE_N_PAD_AUTOMATION=1 npm run tauri dev` per size, drives it over TCP 21456,
 # and quits it between sizes. Nothing needs to be running beforehand.
 #
 # Usage, optionally with a custom size list in MB:

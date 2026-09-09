@@ -1284,3 +1284,70 @@ describe('the write-failure quit/close gate (firstUnwritableDirtyIndex / firstBl
     });
   });
 });
+
+// Nothing else covers the composition: `applyLineEnding` and `detectLineEnding`
+// have their own unit tests, and Rust covers the byte write, but no test until
+// here asserted what `saveActive` actually hands to `write_file_encoded` — so a
+// tab opened from a CRLF file could have been written back as LF with every
+// existing test still green.
+describe('saveActive line endings in the write_file_encoded payload', () => {
+  /** Runs `saveActive` against a tab holding <lines> with <lineEnding> and
+   *  returns the `content` the write received. The buffer is always LF, the way
+   *  the editor holds it; the terminator is applied on the way out. */
+  async function savedContentFor(
+    lineEnding: 'LF' | 'CRLF',
+    lines: string[],
+  ): Promise<string> {
+    documentWindow.tabs.length = 0;
+    documentWindow.saveFailed = null;
+    documentWindow.tabs.push(
+      baseTab({
+        id: 'save-tab',
+        path: '/tmp/doc.txt',
+        content: Text.of(lines),
+        savedContent: Text.empty,
+        lineEnding,
+        savedLineEnding: lineEnding,
+      }),
+    );
+    documentWindow.activeIndex = 0;
+    mockInvoke.mockClear();
+    mockInvoke.mockImplementation((() =>
+      Promise.resolve(null)) as typeof invoke);
+
+    expect(await documentWindow.saveActive()).toBe(true);
+
+    const call = mockInvoke.mock.calls.find(
+      (c) => c[0] === 'write_file_encoded',
+    );
+    return (call?.[1] as { content: string }).content;
+  }
+
+  it('writes CRLF terminators for a CRLF tab, and no bare LF', async () => {
+    const out = await savedContentFor('CRLF', ['one', 'two', 'three']);
+    expect(out).toBe('one\r\ntwo\r\nthree');
+    expect(out.replace(/\r\n/g, '')).not.toContain('\n');
+  });
+
+  it('writes LF terminators for an LF tab, and no CR at all', async () => {
+    const out = await savedContentFor('LF', ['one', 'two', 'three']);
+    expect(out).toBe('one\ntwo\nthree');
+    expect(out).not.toContain('\r');
+  });
+
+  it('follows toggleLineEnding, flipping every terminator and nothing else', async () => {
+    await savedContentFor('LF', ['one', 'two', 'three']);
+    documentWindow.toggleLineEnding();
+    expect(documentWindow.tabs[0]?.lineEnding).toBe('CRLF');
+    mockInvoke.mockClear();
+
+    expect(await documentWindow.saveActive()).toBe(true);
+
+    const call = mockInvoke.mock.calls.find(
+      (c) => c[0] === 'write_file_encoded',
+    );
+    const out = (call?.[1] as { content: string }).content;
+    expect(out).toBe('one\r\ntwo\r\nthree');
+    expect(out.split(/\r\n/).join('\n')).toBe('one\ntwo\nthree');
+  });
+});
