@@ -194,8 +194,9 @@ echo "=== edit and splice back ==="
 evl "$DL" "__auto.typeText('EDITED>>')" >/dev/null
 sleep 1
 RES=$(evl "$DL" "'pending'")
-SAVE=$(evl "$DL" "__auto.rangeSave().then((r)=>{window.__rangeSaveResult=r;}) && 'started'")
-sleep 3
+evl "$DL" "window.__rangeSaveResult=undefined" >/dev/null
+SAVE=$(evl "$DL" "__auto.rangeSave().then((r)=>{window.__rangeSaveResult=r;},(e)=>{window.__rangeSaveResult='ERR '+String(e);}) && 'started'")
+e2e_wait_eval "$DL" "String(window.__rangeSaveResult!==undefined)" "true"
 check "splice result ok" "$(evl "$DL" "String(window.__rangeSaveResult)")" "ok"
 python3 - <<PYEOF
 lines = open('$WORK/big.log', 'rb').read().split(b'\n')
@@ -227,8 +228,9 @@ echo "=== conflict flow ==="
 printf 'external change\n' >>"$WORK/big.log"
 evl "$DL" "__auto.typeText('AGAIN>>')" >/dev/null
 sleep 1
-evl "$DL" "__auto.rangeSave().then((r)=>{window.__rangeSaveResult=r;})" >/dev/null
-sleep 3
+evl "$DL" "window.__rangeSaveResult=undefined" >/dev/null
+evl "$DL" "__auto.rangeSave().then((r)=>{window.__rangeSaveResult=r;},(e)=>{window.__rangeSaveResult='ERR '+String(e);})" >/dev/null
+e2e_wait_eval "$DL" "String(window.__rangeSaveResult!==undefined)" "true"
 check "mismatch detected" "$(evl "$DL" "String(window.__rangeSaveResult)")" "mismatch"
 check "conflict modal shown" "$(evl "$DL" "String(__auto.rangeConflictVisible())")" "true"
 evl "$DL" "__auto.rangeConflictForce()" >/dev/null
@@ -288,8 +290,9 @@ sleep 2
 check "range tab restored" "$(evl "$DL" "String(__auto.isRangeTab())")" "true"
 check "restored dirty" "$(evl "$DL" "JSON.stringify(__auto.getTabs())" | jq -r '.[]|select(.active)|.dirty')" "true"
 check "restored content keeps edit" "$(evl "$DL" "String(__auto.getContent().includes('DIRTY>>'))")" "true"
-evl "$DL" "__auto.rangeSave().then((r)=>{window.__rangeSaveResult=r;})" >/dev/null
-sleep 3
+evl "$DL" "window.__rangeSaveResult=undefined" >/dev/null
+evl "$DL" "__auto.rangeSave().then((r)=>{window.__rangeSaveResult=r;},(e)=>{window.__rangeSaveResult='ERR '+String(e);})" >/dev/null
+e2e_wait_eval "$DL" "String(window.__rangeSaveResult!==undefined)" "true"
 check "restored tab splices ok" "$(evl "$DL" "String(window.__rangeSaveResult)")" "ok"
 
 echo "=== teardown ==="
