@@ -181,6 +181,53 @@ _e2e_eval_equals() {
   [ "$(evl "$1" "$2")" = "$3" ]
 }
 
+# One-line record of whether the app is still there, written when a read came
+# back with nothing to read. Everything goes to stderr: `e2e_read`'s stdout is
+# the value the caller captures. A gone app leaves nothing else behind — the
+# process exits without reaching Tauri's logged exit path — so a crash report is
+# the only thing that separates a native crash from a kill, and it is copied
+# under a `dev-*.log` name because that glob is the only thing the workflow
+# lifts out of $OUT.
+e2e_note_app_gone() {
+  if e2e_app_running; then
+    echo "e2e_read: giving up while the app is still running" >&2
+    return 0
+  fi
+  echo "e2e_read: the app is GONE at $(date -u '+%Y-%m-%dT%H:%M:%SZ')" >&2
+  case "$(uname -s)" in
+    Darwin) ;;
+    *) return 0 ;;
+  esac
+  # $0 is the suite script, not this file: BASH_SOURCE inside a sourced
+  # function names lib.sh and would label every report the same.
+  local suite cutoff n=0 ips name
+  suite="$(basename "$0" .sh)"
+  mkdir -p "$OUT" 2>/dev/null
+  # $OUT is both the cutoff and the destination, and a copy into it bumps its
+  # own mtime, so the cutoff is read once before anything is written: comparing
+  # against the live directory would drop every report after the first, and an
+  # app that takes its WebContent process down with it produces two.
+  cutoff="$(stat -f %m "$OUT" 2>/dev/null || echo 0)"
+  for ips in "$HOME/Library/Logs/DiagnosticReports"/*.ips; do
+    [ -e "$ips" ] || continue
+    # -ge, not -gt: the cutoff is whole seconds where the old -nt test compared
+    # sub-second, so a report written inside the same second as the cutoff would
+    # otherwise be dropped. Re-collecting one costs a duplicate of a file that
+    # already carries its own name.
+    [ "$(stat -f %m "$ips" 2>/dev/null || echo 0)" -ge "$cutoff" ] || continue
+    # Named after the report, not a counter: a later call collecting a newer
+    # report must not overwrite what an earlier one already saved.
+    name="$(basename "$ips" .ips)"
+    if cp "$ips" "$OUT/dev-$suite-crash-$name.log" 2>/dev/null; then
+      n=$((n + 1))
+      echo "e2e_read: collected crash report $name" >&2
+    else
+      echo "e2e_read: could not copy crash report $name" >&2
+    fi
+  done
+  [ "$n" -gt 0 ] || echo "e2e_read: no crash report newer than $OUT" >&2
+}
+
 # Read the JS expression <js> in window <label> through the suite-local `evl`,
 # retrying only while the result is exactly `null`: automation.rs times an
 # eval out after 3 s and a timed-out request comes back as an error, which
@@ -204,6 +251,12 @@ e2e_read() {
     if [ -n "$err" ]; then
       echo "e2e_read: retry $attempt after eval error: $err" >&2
     elif [ "$result" != "null" ]; then
+      # An empty result is what a gone app looks like: auto.mjs prints nothing
+      # and exits 1, so `jq -r '.data'` yields "". It is also a legitimate value
+      # for a few reads, so this records what happened and returns it either way.
+      if [ -z "$result" ]; then
+        e2e_note_app_gone
+      fi
       printf '%s\n' "$result"
       return 0
     else
@@ -216,6 +269,7 @@ e2e_read() {
     printf 'EVAL-ERROR: %s\n' "$err"
     return 0
   fi
+  e2e_note_app_gone
   printf '%s\n' "$result"
 }
 
