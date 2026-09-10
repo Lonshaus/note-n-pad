@@ -147,11 +147,11 @@ until [ -n "$DL" ] && [ "$(evl "$DL" "typeof __auto!=='undefined' && typeof __au
 done
 
 echo "=== baseline (flag off) ==="
-ORIG_FLAG=$(evl "$DL" "String(__auto.getWorkerHighlight())")
+ORIG_FLAG=$(e2e_read "$DL" "String(__auto.getWorkerHighlight())")
 echo "original flag: $ORIG_FLAG"
 # Pin the UI language so text assertions never depend on the host system
 # language; restored alongside the flag below.
-ORIG_LANG=$(evl "$DL" "String(__auto.getLanguage())")
+ORIG_LANG=$(e2e_read "$DL" "String(__auto.getLanguage())")
 echo "original language: $ORIG_LANG"
 # The flag writes the user's real settings.json; make sure an interrupt between
 # enable and teardown still restores it and the language (and kills the app)
@@ -182,8 +182,8 @@ evl "$DL" "__auto.setLanguage('zh-TW')" >/dev/null
 sleep 1
 evl "$DL" "__auto.setWorkerHighlight(false)" >/dev/null
 sleep 1
-check "worker inactive when off" "$(evl "$DL" "String(__auto.workerHighlightActive())")" "false"
-check "no tok spans when off" "$(evl "$DL" "String(document.querySelectorAll('.cm-content [class*=tok-]').length)")" "0"
+check "worker inactive when off" "$(e2e_read "$DL" "String(__auto.workerHighlightActive())")" "false"
+check "no tok spans when off" "$(e2e_read "$DL" "String(document.querySelectorAll('.cm-content [class*=tok-]').length)")" "0"
 
 echo "=== enable and color ==="
 evl "$DL" "__auto.setWorkerHighlight(true)" >/dev/null
@@ -195,7 +195,7 @@ until [ "$(evl "$DL" "String(__auto.workerHighlightActive())")" = "true" ]; do
     break
   fi
 done
-check "worker active when on" "$(evl "$DL" "String(__auto.workerHighlightActive())")" "true"
+check "worker active when on" "$(e2e_read "$DL" "String(__auto.workerHighlightActive())")" "true"
 TOKN=0
 tries=0
 until [ "$TOKN" != "0" ] && [ "$TOKN" != "null" ]; do
@@ -214,20 +214,20 @@ fi
 
 echo "=== UI responsiveness during/after parse ==="
 T0=$(date +%s.%N)
-PONG=$(evl "$DL" "'pong'")
+PONG=$(e2e_read "$DL" "'pong'")
 T1=$(date +%s.%N)
 RT=$(python3 -c "print(round($T1-$T0,2))")
 check "eval roundtrip responsive" "$(python3 -c "print($RT < 2.0)")" "True"
 evl "$DL" "document.querySelector('.cm-content').focus()" >/dev/null
 evl "$DL" "__auto.typeText('E2E_MARK')" >/dev/null
 sleep 1
-check "typing lands while highlighting" "$(evl "$DL" "String(__auto.getContent().includes('E2E_MARK'))")" "true"
+check "typing lands while highlighting" "$(e2e_read "$DL" "String(__auto.getContent().includes('E2E_MARK'))")" "true"
 
 echo "=== disable cleans up ==="
 evl "$DL" "__auto.setWorkerHighlight(false)" >/dev/null
 sleep 2
-check "worker inactive after off" "$(evl "$DL" "String(__auto.workerHighlightActive())")" "false"
-check "tok spans removed" "$(evl "$DL" "String(document.querySelectorAll('.cm-content [class*=tok-]').length)")" "0"
+check "worker inactive after off" "$(e2e_read "$DL" "String(__auto.workerHighlightActive())")" "false"
+check "tok spans removed" "$(e2e_read "$DL" "String(document.querySelectorAll('.cm-content [class*=tok-]').length)")" "0"
 
 echo "=== teardown ==="
 evl "$DL" "__auto.setWorkerHighlight($ORIG_FLAG)" >/dev/null

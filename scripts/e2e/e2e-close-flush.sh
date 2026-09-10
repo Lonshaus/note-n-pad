@@ -195,11 +195,11 @@ trap restore_state EXIT INT TERM
 echo "=== scenario A: mid dirty close + restart restore ==="
 launch
 open_doc "$WORK/mid.txt"
-check "mid.txt opened as an editable tab" "$(evl "$DL" "String(__auto.isLargeTab())")" "false"
+check "mid.txt opened as an editable tab" "$(e2e_read "$DL" "String(__auto.isLargeTab())")" "false"
 evl "$DL" "__auto.typeText('$MARKER')" >/dev/null
 sleep 1
-check "dirty after typing marker" "$(evl "$DL" "JSON.stringify(__auto.getTabs())" | jq -r '.[]|select(.active)|.dirty')" "true"
-check "marker present in buffer" "$(evl "$DL" "String(__auto.getContent().includes('$MARKER'))")" "true"
+check "dirty after typing marker" "$(e2e_read "$DL" "JSON.stringify(__auto.getTabs())" | jq -r '.[]|select(.active)|.dirty')" "true"
+check "marker present in buffer" "$(e2e_read "$DL" "String(__auto.getContent().includes('$MARKER'))")" "true"
 DOC_BEFORE=$(doc_count)
 check "one doc window before close" "$DOC_BEFORE" "1"
 close_window_expect_gone
@@ -227,24 +227,24 @@ until [ "$(evl "$DL" "String(__auto.getContent().includes('$MARKER'))")" = "true
     break
   fi
 done
-check "restored tab still holds the marker" "$(evl "$DL" "String(__auto.getContent().includes('$MARKER'))")" "true"
-check "restored tab is still dirty" "$(evl "$DL" "JSON.stringify(__auto.getTabs())" | jq -r '.[]|select(.active)|.dirty')" "true"
+check "restored tab still holds the marker" "$(e2e_read "$DL" "String(__auto.getContent().includes('$MARKER'))")" "true"
+check "restored tab is still dirty" "$(e2e_read "$DL" "JSON.stringify(__auto.getTabs())" | jq -r '.[]|select(.active)|.dirty')" "true"
 quit_app
 wipe_test_docs
 
 echo "=== scenario C: clean tab closes straight through ==="
 launch
 open_doc "$WORK/clean.txt"
-check "clean.txt not dirty" "$(evl "$DL" "JSON.stringify(__auto.getTabs())" | jq -r '.[]|select(.active)|.dirty')" "false"
+check "clean.txt not dirty" "$(e2e_read "$DL" "JSON.stringify(__auto.getTabs())" | jq -r '.[]|select(.active)|.dirty')" "false"
 close_window_expect_gone
 check "clean window closed without a prompt" "$(doc_count)" "0"
 
 echo "=== scenario B: oversized dirty close gate ==="
 open_doc "$WORK/huge.txt"
-check "huge.txt opened as an editable tab" "$(evl "$DL" "String(__auto.isLargeTab())")" "false"
+check "huge.txt opened as an editable tab" "$(e2e_read "$DL" "String(__auto.isLargeTab())")" "false"
 evl "$DL" "__auto.typeText('X')" >/dev/null
 sleep 1
-check "dirty after typing" "$(evl "$DL" "JSON.stringify(__auto.getTabs())" | jq -r '.[]|select(.active)|.dirty')" "true"
+check "dirty after typing" "$(e2e_read "$DL" "JSON.stringify(__auto.getTabs())" | jq -r '.[]|select(.active)|.dirty')" "true"
 # First close: the buffer is too big to snapshot, so the gate must appear and the
 # window must stay put (no destroy).
 evl "$DL" "window.__TAURI_INTERNALS__.invoke('plugin:window|close')" >/dev/null
@@ -256,12 +256,12 @@ until [ "$(evl "$DL" "String(__auto.oversizedGateVisible())")" = "true" ]; do
     break
   fi
 done
-check "oversized gate visible on close" "$(evl "$DL" "String(__auto.oversizedGateVisible())")" "true"
+check "oversized gate visible on close" "$(e2e_read "$DL" "String(__auto.oversizedGateVisible())")" "true"
 check "window still open while gate is up" "$(doc_count)" "1"
 # Cancel: the gate clears and the window remains (the close was already prevented).
 evl "$DL" "__auto.oversizedGateCancel()" >/dev/null
 sleep 1
-check "gate dismissed after cancel" "$(evl "$DL" "String(__auto.oversizedGateVisible())")" "false"
+check "gate dismissed after cancel" "$(e2e_read "$DL" "String(__auto.oversizedGateVisible())")" "false"
 check "window still open after cancel" "$(doc_count)" "1"
 # Second close then discard: the tab reverts to clean, the gate clears, and the
 # pending close resumes and destroys the window — while the app keeps running.
@@ -274,7 +274,7 @@ until [ "$(evl "$DL" "String(__auto.oversizedGateVisible())")" = "true" ]; do
     break
   fi
 done
-check "gate visible again on second close" "$(evl "$DL" "String(__auto.oversizedGateVisible())")" "true"
+check "gate visible again on second close" "$(e2e_read "$DL" "String(__auto.oversizedGateVisible())")" "true"
 evl "$DL" "__auto.oversizedGateDiscard()" >/dev/null
 tries=0
 until [ "$(doc_count)" = "0" ]; do
