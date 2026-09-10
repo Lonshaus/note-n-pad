@@ -16,7 +16,6 @@
   import {
     addRun,
     anchoredScrollTop,
-    averageHeight,
     blockAt,
     blockHeightsFromTops,
     captureScrollAnchor,
@@ -24,6 +23,7 @@
     heightOf,
     isCovered,
     maxHasSettled,
+    metricOf,
     offsetOf,
     type Run,
     type ScrollAnchor,
@@ -107,7 +107,6 @@
   // and the document's total height (`heightOf`) are read from this same
   // list, so the two can never disagree.
   let runs = $state<Run[]>(EMPTY_RUNS);
-  const avgHeight = $derived(averageHeight(runs, SEED_HEIGHT));
   // The real DOM height of the currently rendered `[first, last)` window,
   // refreshed by every `measure()` call regardless of whether it found any
   // new territory to fold into `runs` — `topSpacer` needs it fresh every
@@ -126,39 +125,44 @@
   const refs = $derived(scanned.refs);
   const headings = $derived(scanned.headings);
   const total = $derived(blockCount(index));
+  // Two costs fitted to the runs themselves — a fixed amount per block plus
+  // an amount per source character. One flat average per block priced every
+  // block of a document by its tallest one: measured, a 7600px block among 197
+  // put block 8 at 1744px where it really sat at 563, which placed the whole
+  // rendered window outside the viewport.
+  const metric = $derived(metricOf(runs, index, SEED_HEIGHT));
   const first = $derived(
-    Math.max(0, blockAt(runs, scrollTop, avgHeight) - OVERSCAN),
+    Math.max(0, blockAt(runs, scrollTop, metric) - OVERSCAN),
   );
+  // Through `blockAt`, like `first`: dividing by a flat average instead
+  // measures from the document's origin in units the runs no longer use, and
+  // the two disagree the moment runs stop being uniform — far enough that
+  // `last` could land below `first`, and then nothing rendered at all.
   const last = $derived(
     Math.min(
       total,
-      Math.ceil((scrollTop + viewportHeight) / avgHeight) + OVERSCAN,
+      blockAt(runs, scrollTop + viewportHeight, metric) + 1 + OVERSCAN,
     ),
   );
-  // `.blocks`' own top must never let its real, measured DOM height run
-  // past `.spacer` — that ambiguity (one edge governed by a laid-out
-  // spacer, the other by an absolutely positioned box extending past it)
-  // is what a live report showed WebView2 resolving inconsistently frame
-  // to frame, flipping `scrollHeight` between the two readings even with
-  // nothing on screen changing.
+  const contentHeight = $derived(heightOf(runs, total, metric));
+  // Where the first rendered block starts. Anchored from the window's top
+  // edge, not its bottom: `offsetOf(last) - windowHeight` assumes the model
+  // and the DOM agree on how tall this window is, and they do not — measured,
+  // 10 blocks the DOM gave 1970px the model gave 2278, which at the very top
+  // of the document left a 308px empty band above the first block.
   //
-  // Computed from the *bottom* edge, not the top: `offsetOf(last)` minus
-  // this window's own real height, rather than `offsetOf(first)` on its
-  // own. `offsetOf(first)` can still be a proportional guess whenever
-  // `first` lands inside a run that was measured as part of a *different*
-  // window (unavoidable once two overlapping windows' runs merge — a run
-  // stores one aggregate, never a per-block breakdown), and guessing too
-  // high is exactly what let `.blocks` render short of where the document
-  // really put it. Anchoring off `last` instead needs no such guess to stay
-  // safe: `offsetOf` is monotonic and `total >= last`, so
-  // `offsetOf(last) - windowHeight + windowHeight = offsetOf(last) <=
-  // offsetOf(total) = contentHeight` always — `.blocks` can never be
-  // positioned to overflow `.spacer`. And once `last` reaches `total`,
-  // `offsetOf(last)` *is* `contentHeight` exactly, which makes this exact
-  // at the one place a live report showed it failing: `.blocks`' own
-  // bottom edge lands exactly on `.spacer`'s.
-  const topSpacer = $derived(offsetOf(runs, last, avgHeight) - windowHeight);
-  const contentHeight = $derived(heightOf(runs, total, avgHeight));
+  // The bounds are what anchoring from the bottom got for free. Never below
+  // zero, so a model that under-counts cannot lift `.blocks` above the
+  // scroller; never past `contentHeight - windowHeight`, so one that
+  // over-counts cannot push it out of `.spacer` — an overflow WebView2
+  // resolves inconsistently frame to frame, flipping `scrollHeight` between
+  // two readings with nothing on screen changing.
+  const topSpacer = $derived(
+    Math.max(
+      0,
+      Math.min(offsetOf(runs, first, metric), contentHeight - windowHeight),
+    ),
+  );
   // Parsing only what is on screen, which measured at about 1ms per screenful
   // regardless of document size — cheap enough that pushing it to a worker
   // would cost more in copying than it saves.
@@ -196,15 +200,11 @@
   // compares the reader's old position against an already-inflated maximum
   // and wrongly concludes they fell behind, which is what left a first
   // scroll-to-bottom stuck short of the real end.
-  let lastAnchor: ScrollAnchor = { pinnedBottom: false, blockIndex: 0 };
-  // True for the one 'scroll' event a correction's own `scrollTop` write is
-  // about to cause. That event fires as a task, after the reactive re-render
-  // for this same write has already run — so by the time it reaches
-  // `onScroll`, `scrollMax()` can already reflect territory this very
-  // correction just revealed, and re-deriving `lastAnchor` from it would
-  // compare against a maximum newer than the one the correction targeted,
-  // wrongly reporting the reader as having fallen behind their own jump.
-  let ownScrollPending = false;
+  let lastAnchor: ScrollAnchor = { pinnedBottom: false, block: 0, fraction: 0 };
+  // Where a correction's own write is about to land, so `onScroll` does not
+  // re-derive `lastAnchor` from the event that write causes. A position rather
+  // than a flag: a write that moves nothing leaves a flag latched for good.
+  let ownScrollTarget: number | null = null;
 
   function onScroll(): void {
     // A scroll arriving while a correction is pending is the reader moving on
@@ -213,11 +213,13 @@
     // that write produces never lands here while still pending.
     pendingAnchor = null;
     scrollTop = scrollEl.scrollTop;
-    if (ownScrollPending) {
-      ownScrollPending = false;
+    // Cleared on a miss too, or it waits for whatever scrolls there next.
+    const target = ownScrollTarget;
+    ownScrollTarget = null;
+    if (scrollTop === target) {
       return;
     }
-    lastAnchor = captureScrollAnchor(scrollTop, scrollMax(), avgHeight);
+    lastAnchor = captureScrollAnchor(scrollTop, scrollMax(), runs, metric);
   }
 
   // Anchors are resolved against the scan, not the DOM: the heading a link
@@ -234,7 +236,7 @@
       return headings.get(slug) ?? null;
     },
     jump(block: number): void {
-      scrollEl.scrollTop = offsetOf(runs, block, avgHeight);
+      scrollEl.scrollTop = offsetOf(runs, block, metric);
     },
   });
 
@@ -256,7 +258,7 @@
    *  blocks that are actually new — the layout pass is already forced by
    *  these reads, so no second one is added. `runs` only ever gains new,
    *  disjoint territory this way, never rewrites what it already has: that
-   *  append-only shape is what keeps `avgHeight` — and so `first`/`last`,
+   *  append-only shape is what keeps the metric — and so `first`/`last`,
    *  which derive from it — converging instead of chasing its own tail
    *  frame after frame (a real, reproduced failure of an earlier version of
    *  this function that instead overwrote the whole rendered window on
@@ -282,13 +284,14 @@
     const anchor = { ...lastAnchor };
     if (blockEl !== undefined) {
       // Snapshotted once, up front: `first`/`last` are `$derived` from
-      // `runs`/`avgHeight`, so writing `runs` below can make Svelte
+      // `runs`/`metric`, so writing `runs` below can make Svelte
       // recompute them on their very next read — reading the *live*
       // bindings again afterward, for the correspondence check, would
       // silently compare the just-measured window against whatever window
       // `runs` now says is current, not the one actually measured here.
       const windowFirst = first;
       const windowLast = last;
+      const windowMetric = metric;
       windowHeight = blockEl.offsetHeight;
       // One entry per block in the window: its first DOM node's own
       // `offsetTop`, or null for a block that produced no node at all.
@@ -316,7 +319,7 @@
         const blockHeight = heights[i - windowFirst] ?? 0;
         if (isCovered(runs, i)) {
           if (pendingFrom !== null) {
-            runs = addRun(runs, pendingFrom, i, pendingHeight);
+            runs = addRun(runs, pendingFrom, i, pendingHeight, windowMetric);
             pendingFrom = null;
             pendingHeight = 0;
           }
@@ -326,7 +329,13 @@
         }
       }
       if (pendingFrom !== null) {
-        runs = addRun(runs, pendingFrom, windowLast, pendingHeight);
+        runs = addRun(
+          runs,
+          pendingFrom,
+          windowLast,
+          pendingHeight,
+          windowMetric,
+        );
       }
       // Correspondence check: what the model now says about the window
       // just measured must equal what the DOM actually reported for it. A
@@ -341,8 +350,8 @@
       // actually renders (see its own comment).
       if (import.meta.env.DEV) {
         const modelHeight =
-          offsetOf(runs, windowLast, avgHeight) -
-          offsetOf(runs, windowFirst, avgHeight);
+          offsetOf(runs, windowLast, windowMetric) -
+          offsetOf(runs, windowFirst, windowMetric);
         if (Math.abs(modelHeight - windowHeight) > 1) {
           console.warn('[MarkdownView] model/DOM height mismatch', {
             first: windowFirst,
@@ -398,11 +407,17 @@
       }
     }
     pendingAnchor = null;
-    const restored = anchoredScrollTop(anchor, max, avgHeight);
-    if (Math.abs(restored - scrollEl.scrollTop) > 0.5) {
-      ownScrollPending = true;
+    // Whole pixels: WebKit truncates `scrollTop`, so a sub-pixel write moves
+    // nothing and no event arrives to acknowledge it.
+    const restored = Math.round(anchoredScrollTop(anchor, max, runs, metric));
+    if (Math.abs(restored - scrollEl.scrollTop) >= 1) {
+      ownScrollTarget = restored;
       scrollEl.scrollTop = restored;
-      scrollTop = restored;
+      scrollTop = scrollEl.scrollTop;
+      // Clamped by the scroller's real maximum: nothing moved, no event coming.
+      if (scrollTop !== restored) {
+        ownScrollTarget = null;
+      }
     }
   }
 
