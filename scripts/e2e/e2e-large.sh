@@ -336,8 +336,31 @@ if [ -z "$DL2" ]; then
   exit 1
 fi
 check "confirm visible for 600MB" "$(e2e_read "$DL2" "String(__auto.largeConfirmVisible())")" "true"
+# The cancel collapses DL2, and the app has gone away here without a trace: the
+# socket simply stops answering. Record the app's own pid and the window list
+# first, then say whether that pid survived — the socket cannot answer that
+# question once it is refused.
+APP_PID=$(pgrep -x note-n-pad | head -1)
+echo "before cancel: app pid=${APP_PID:-none} windows=$(auto '{"id":15,"cmd":"list_windows"}' 2>/dev/null | jq -c '[.data[]|select(.label|startswith("doc-"))|.label]' 2>/dev/null)"
 evl "$DL2" "__auto.largeConfirmCancel()" >/dev/null
 sleep 2
+if [ -n "$APP_PID" ] && kill -0 "$APP_PID" 2>/dev/null; then
+  echo "after cancel: app pid $APP_PID alive"
+else
+  echo "after cancel: app pid ${APP_PID:-none} GONE"
+  # Copy any crash report out under a dev-*.log name: that glob is the only
+  # thing the workflow lifts from $OUT (see .github/workflows/e2e.yml), so a
+  # report saved under any other name dies with the runner.
+  n=0
+  for ips in "$HOME/Library/Logs/DiagnosticReports"/*.ips; do
+    [ -e "$ips" ] || continue
+    [ "$ips" -nt "$WORK" ] || continue
+    n=$((n + 1))
+    cp "$ips" "$OUT/dev-large-crash-$n.log"
+    echo "after cancel: collected crash report $(basename "$ips")"
+  done
+  [ "$n" -gt 0 ] || echo "after cancel: no crash report newer than the fixtures"
+fi
 WIN_COUNT=$(auto '{"id":14,"cmd":"list_windows"}' | jq -r '[.data[]|select(.label|startswith("doc-"))]|length')
 check "cancel collapses the empty window" "$WIN_COUNT" "1"
 check "original large tab intact" "$(e2e_read "$DL" "String(__auto.isLargeTab())")" "true"
