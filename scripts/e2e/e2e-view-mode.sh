@@ -64,10 +64,10 @@ evl() {
   auto "{\"id\":$(e2e_next_id),\"cmd\":\"eval\",\"label\":\"$1\",\"js\":$(jq -Rn --arg js "$2" '$js')}" | jq -r '.data'
 }
 entry_count() {
-  evl "$DL" "String(__auto.viewModeEntryCount())"
+  e2e_read "$DL" "String(__auto.viewModeEntryCount())"
 }
 tab_count() {
-  evl "$DL" "String(__auto.getTabs().length)"
+  e2e_read "$DL" "String(__auto.getTabs().length)"
 }
 # The view-mode switcher is the only select in the status bar's right-hand
 # group, so its options can be counted without a test-only marker. 0 means the
@@ -78,13 +78,13 @@ open_and_confirm() {
   evl "$DL" "__auto.openTab('$path')" >/dev/null
   e2e_wait_eval "$DL" "String(__auto.activeContentLength())" "$bytes"
   check "opened $(basename "$path") (premise for what follows)" \
-    "$(evl "$DL" "String(__auto.activeContentLength())")" "$bytes"
+    "$(e2e_read "$DL" "String(__auto.activeContentLength())")" "$bytes"
 }
 mode_option_count() {
-  evl "$DL" "String(document.querySelectorAll('.statusbar .right select option').length)"
+  e2e_read "$DL" "String(document.querySelectorAll('.statusbar .right select option').length)"
 }
 disabled_count() {
-  evl "$DL" "String(document.querySelectorAll('.statusbar .right select option[disabled]').length)"
+  e2e_read "$DL" "String(document.querySelectorAll('.statusbar .right select option[disabled]').length)"
 }
 
 launch() {
@@ -1145,7 +1145,7 @@ evl "$DL" "__auto.setTableCell(1,0,'99')" >/dev/null
 sleep 2
 evl "$DL" "__auto.closeActiveTab()" >/dev/null
 sleep 2
-MODAL=$(evl "$DL" "String(document.querySelectorAll('.modal-actions .btn').length)")
+MODAL=$(e2e_read "$DL" "String(document.querySelectorAll('.modal-actions .btn').length)")
 check "confirm modal raised" "$MODAL" "3"
 # Buttons render primary (save), secondary (don't save), cancel — take the
 # middle one so the tab closes without writing the fixture back to disk.
@@ -1157,25 +1157,25 @@ check "discarded tab forgotten" "$(entry_count)" "1"
 echo "=== D. the JSON preview switches on and off ==="
 evl "$DL" "__auto.openTab('$WORK/good.json')" >/dev/null
 sleep 2
-check "json tab starts in source" "$(evl "$DL" "String(__auto.getViewMode())")" "source"
+check "json tab starts in source" "$(e2e_read "$DL" "String(__auto.getViewMode())")" "source"
 check "switcher offers two modes" "$(mode_option_count)" "2"
 evl "$DL" "__auto.setViewMode('json')" >/dev/null
 sleep 2
-check "switched to the preview" "$(evl "$DL" "String(__auto.getViewMode())")" "json"
-check "tree rendered" "$(evl "$DL" "String(document.querySelectorAll('.json-view .row').length > 0)")" "true"
-check "no raw html was injected" "$(evl "$DL" "String(document.querySelectorAll('.json-view script').length)")" "0"
+check "switched to the preview" "$(e2e_read "$DL" "String(__auto.getViewMode())")" "json"
+check "tree rendered" "$(e2e_read "$DL" "String(document.querySelectorAll('.json-view .row').length > 0)")" "true"
+check "no raw html was injected" "$(e2e_read "$DL" "String(document.querySelectorAll('.json-view script').length)")" "0"
 evl "$DL" "__auto.setViewMode('source')" >/dev/null
 sleep 2
-check "switched back" "$(evl "$DL" "String(__auto.getViewMode())")" "source"
-check "preview unmounted" "$(evl "$DL" "String(document.querySelectorAll('.json-view').length)")" "0"
+check "switched back" "$(e2e_read "$DL" "String(__auto.getViewMode())")" "source"
+check "preview unmounted" "$(e2e_read "$DL" "String(document.querySelectorAll('.json-view').length)")" "0"
 
 echo "=== E. a syntax error shows a message rather than an empty pane ==="
 evl "$DL" "__auto.openTab('$WORK/bad.json')" >/dev/null
 sleep 2
 evl "$DL" "__auto.setViewMode('json')" >/dev/null
 sleep 2
-check "error shown" "$(evl "$DL" "String((document.querySelector('.json-view .error')||{}).textContent||'').length > 0")" "true"
-check "no tree rows for a failed parse" "$(evl "$DL" "String(document.querySelectorAll('.json-view .row').length)")" "0"
+check "error shown" "$(e2e_read "$DL" "String((document.querySelector('.json-view .error')||{}).textContent||'').length > 0")" "true"
+check "no tree rows for a failed parse" "$(e2e_read "$DL" "String(document.querySelectorAll('.json-view .row').length)")" "0"
 
 echo "=== F. past the preview ceiling the option is disabled, not hidden ==="
 evl "$DL" "__auto.openTab('$WORK/huge.json')" >/dev/null
@@ -1183,30 +1183,30 @@ evl "$DL" "__auto.openTab('$WORK/huge.json')" >/dev/null
 # the *previous* tab and quietly passed the wrong thing. Wait for the active
 # tab to actually be the big one before looking at the switcher.
 e2e_wait_eval "$DL" "String(__auto.activeContentLength() > 10000000)" "true"
-check "the big tab is the active one" "$(evl "$DL" "String(__auto.activeContentLength() > 10000000)")" "true"
+check "the big tab is the active one" "$(e2e_read "$DL" "String(__auto.activeContentLength() > 10000000)")" "true"
 check "switcher still shown" "$(mode_option_count)" "2"
 check "json option disabled" "$(disabled_count)" "1"
-check "disabled option explains itself" "$(evl "$DL" "String(Array.from(document.querySelectorAll('.statusbar .right option')).filter((o)=>o.disabled).every((o)=>o.title.length>0))")" "true"
+check "disabled option explains itself" "$(e2e_read "$DL" "String(Array.from(document.querySelectorAll('.statusbar .right option')).filter((o)=>o.disabled).every((o)=>o.title.length>0))")" "true"
 
 echo "=== G. the markdown preview switches on and off ==="
 evl "$DL" "__auto.openTab('$WORK/doc.md')" >/dev/null
 sleep 2
-check "markdown tab starts in source" "$(evl "$DL" "String(__auto.getViewMode())")" "source"
+check "markdown tab starts in source" "$(e2e_read "$DL" "String(__auto.getViewMode())")" "source"
 check "switcher offers two modes" "$(mode_option_count)" "2"
 evl "$DL" "__auto.setViewMode('markdown')" >/dev/null
 sleep 2
-check "switched to the preview" "$(evl "$DL" "String(__auto.getViewMode())")" "markdown"
-check "at least one block rendered" "$(evl "$DL" "String(document.querySelectorAll('.markdown-view .blocks > *').length > 0)")" "true"
-check "the heading text is shown" "$(evl "$DL" "String((document.querySelector('.markdown-view .heading')||{}).textContent||'').trim()")" "Title"
-check "emphasis marks were stripped, not left as source" "$(evl "$DL" "String((document.querySelector('.markdown-view')||{}).textContent.includes('**'))")" "false"
-check "the fenced code block kept its blank line" "$(evl "$DL" "String((document.querySelector('.markdown-view pre.block')||{}).textContent.includes('code line one\n\ncode line two'))")" "true"
-check "the loose list has two items" "$(evl "$DL" "String(document.querySelectorAll('.markdown-view li').length)")" "2"
-check "the table rendered its one data row" "$(evl "$DL" "String(document.querySelectorAll('.markdown-view table td').length)")" "2"
-check "the rule rendered" "$(evl "$DL" "String(document.querySelectorAll('.markdown-view hr').length)")" "1"
+check "switched to the preview" "$(e2e_read "$DL" "String(__auto.getViewMode())")" "markdown"
+check "at least one block rendered" "$(e2e_read "$DL" "String(document.querySelectorAll('.markdown-view .blocks > *').length > 0)")" "true"
+check "the heading text is shown" "$(e2e_read "$DL" "String((document.querySelector('.markdown-view .heading')||{}).textContent||'').trim()")" "Title"
+check "emphasis marks were stripped, not left as source" "$(e2e_read "$DL" "String((document.querySelector('.markdown-view')||{}).textContent.includes('**'))")" "false"
+check "the fenced code block kept its blank line" "$(e2e_read "$DL" "String((document.querySelector('.markdown-view pre.block')||{}).textContent.includes('code line one\n\ncode line two'))")" "true"
+check "the loose list has two items" "$(e2e_read "$DL" "String(document.querySelectorAll('.markdown-view li').length)")" "2"
+check "the table rendered its one data row" "$(e2e_read "$DL" "String(document.querySelectorAll('.markdown-view table td').length)")" "2"
+check "the rule rendered" "$(e2e_read "$DL" "String(document.querySelectorAll('.markdown-view hr').length)")" "1"
 evl "$DL" "__auto.setViewMode('source')" >/dev/null
 sleep 2
-check "switched back" "$(evl "$DL" "String(__auto.getViewMode())")" "source"
-check "preview unmounted" "$(evl "$DL" "String(document.querySelectorAll('.markdown-view').length)")" "0"
+check "switched back" "$(e2e_read "$DL" "String(__auto.getViewMode())")" "source"
+check "preview unmounted" "$(e2e_read "$DL" "String(document.querySelectorAll('.markdown-view').length)")" "0"
 
 echo "=== H. find from a preview returns to the editor first ==="
 evl "$DL" "__auto.openTab('$WORK/good.json')" >/dev/null
@@ -1215,8 +1215,8 @@ evl "$DL" "__auto.setViewMode('json')" >/dev/null
 sleep 2
 evl "$DL" "__auto.openFind()" >/dev/null
 sleep 2
-check "back on the editor" "$(evl "$DL" "String(__auto.getViewMode())")" "source"
-check "search panel open" "$(evl "$DL" "String(__auto.searchPanelOpen())")" "true"
+check "back on the editor" "$(e2e_read "$DL" "String(__auto.getViewMode())")" "source"
+check "search panel open" "$(e2e_read "$DL" "String(__auto.searchPanelOpen())")" "true"
 evl "$DL" "__auto.closeFind()" >/dev/null
 sleep 1
 
@@ -1228,21 +1228,21 @@ sleep 2
 evl "$DL" "__auto.setViewMode('markdown')" >/dev/null
 sleep 2
 check "an anchor with a matching heading is a link" \
-  "$(evl "$DL" "String(!!document.querySelector('.markdown-view a[href=\"#install-steps\"]'))")" "true"
+  "$(e2e_read "$DL" "String(!!document.querySelector('.markdown-view a[href=\"#install-steps\"]'))")" "true"
 check "an anchor naming no heading is not a link" \
-  "$(evl "$DL" "String(!!document.querySelector('.markdown-view a[href=\"#missing\"]'))")" "false"
+  "$(e2e_read "$DL" "String(!!document.querySelector('.markdown-view a[href=\"#missing\"]'))")" "false"
 check "the dead anchor still shows its text" \
-  "$(evl "$DL" "String(document.querySelector('.markdown-view').textContent.includes('nowhere'))")" "true"
+  "$(e2e_read "$DL" "String(document.querySelector('.markdown-view').textContent.includes('nowhere'))")" "true"
 check "the target heading is not rendered yet" \
-  "$(evl "$DL" "String(document.querySelector('.markdown-view').textContent.includes('Install Steps'))")" "false"
+  "$(e2e_read "$DL" "String(document.querySelector('.markdown-view').textContent.includes('Install Steps'))")" "false"
 check "starts at the top" \
-  "$(evl "$DL" "String(document.querySelector('.markdown-view').scrollTop)")" "0"
+  "$(e2e_read "$DL" "String(document.querySelector('.markdown-view').scrollTop)")" "0"
 evl "$DL" "document.querySelector('.markdown-view a[href=\"#install-steps\"]').click()" >/dev/null
 sleep 2
 check "the click scrolled away from the top" \
-  "$(evl "$DL" "String(document.querySelector('.markdown-view').scrollTop > 0)")" "true"
+  "$(e2e_read "$DL" "String(document.querySelector('.markdown-view').scrollTop > 0)")" "true"
 check "the target heading is on screen now" \
-  "$(evl "$DL" "String(document.querySelector('.markdown-view').textContent.includes('Install Steps'))")" "true"
+  "$(e2e_read "$DL" "String(document.querySelector('.markdown-view').textContent.includes('Install Steps'))")" "true"
 # Two headings share the text "Notes". The bodies sit far enough apart that the
 # rendered window can hold one but not both, which is the only arrangement that
 # tells a suffixed lookup apart from a first-match one.
@@ -1251,17 +1251,17 @@ sleep 1
 evl "$DL" "document.querySelector('.markdown-view a[href=\"#notes\"]').click()" >/dev/null
 sleep 2
 check "the bare anchor reached the first heading of that name" \
-  "$(evl "$DL" "String(document.querySelector('.markdown-view').textContent.includes('first notes body'))")" "true"
+  "$(e2e_read "$DL" "String(document.querySelector('.markdown-view').textContent.includes('first notes body'))")" "true"
 check "and did not reach the second" \
-  "$(evl "$DL" "String(document.querySelector('.markdown-view').textContent.includes('second notes body'))")" "false"
+  "$(e2e_read "$DL" "String(document.querySelector('.markdown-view').textContent.includes('second notes body'))")" "false"
 evl "$DL" "document.querySelector('.markdown-view').scrollTop = 0" >/dev/null
 sleep 1
 evl "$DL" "document.querySelector('.markdown-view a[href=\"#notes-1\"]').click()" >/dev/null
 sleep 2
 check "the suffixed anchor reached the second heading of that name" \
-  "$(evl "$DL" "String(document.querySelector('.markdown-view').textContent.includes('second notes body'))")" "true"
+  "$(e2e_read "$DL" "String(document.querySelector('.markdown-view').textContent.includes('second notes body'))")" "true"
 check "and not the first" \
-  "$(evl "$DL" "String(document.querySelector('.markdown-view').textContent.includes('first notes body'))")" "false"
+  "$(e2e_read "$DL" "String(document.querySelector('.markdown-view').textContent.includes('first notes body'))")" "false"
 
 # The right blocks being in the DOM is not enough: `.blocks` is absolutely
 # positioned, so a wrong offset leaves an empty pane with every block present.
@@ -1275,7 +1275,7 @@ for FRAC in 0 25 50 75 100 75 50 25 0; do
   # Assigned first rather than substituted straight into `[`: this shell's
   # `$( )` mis-parses a nested expansion carrying JS this brace-heavy, and the
   # failure is a `[` error the loop would count as a pass.
-  TOUCHING=$(evl "$DL" "(()=>{const el=document.querySelector('.markdown-view');if(el===null){return 'false';}const b=el.querySelector('.blocks');if(b===null){return 'false';}const s=el.getBoundingClientRect(),r=b.getBoundingClientRect();return String(Math.min(s.bottom,r.bottom)-Math.max(s.top,r.top)>0);})()")
+  TOUCHING=$(e2e_read "$DL" "(()=>{const el=document.querySelector('.markdown-view');if(el===null){return 'false';}const b=el.querySelector('.blocks');if(b===null){return 'false';}const s=el.getBoundingClientRect(),r=b.getBoundingClientRect();return String(Math.min(s.bottom,r.bottom)-Math.max(s.top,r.top)>0);})()")
   if [ "$TOUCHING" != "true" ]; then
     BLIND=$((BLIND + 1))
   fi
@@ -1296,7 +1296,7 @@ sleep 2
 
 # Heaviest section last: it needs a file over the 100MB large-file threshold.
 echo "=== J. a read-only large tab keeps the status bar it always had ==="
-ORIG_MODE=$(evl "$DL" "String(__auto.getLargeOpenMode())")
+ORIG_MODE=$(e2e_read "$DL" "String(__auto.getLargeOpenMode())")
 echo "original large_open_mode: $ORIG_MODE"
 restore_mode() {
   if [ -n "${ORIG_MODE:-}" ] && [ -f "$APPDIR/settings.json" ]; then
@@ -1310,7 +1310,7 @@ evl "$DL" "__auto.setLargeOpenMode('view')" >/dev/null
 e2e_wait_setting large_open_mode "view"
 evl "$DL" "__auto.openTab('$WORK/big.json')" >/dev/null
 e2e_wait_until 180 _e2e_eval_equals "$DL" "String(__auto.isLargeTab())" "true"
-check "opened as a large read-only tab" "$(evl "$DL" "String(__auto.isLargeTab())")" "true"
+check "opened as a large read-only tab" "$(e2e_read "$DL" "String(__auto.isLargeTab())")" "true"
 check "large tab has no view switcher, exactly as before" "$(mode_option_count)" "0"
 
 echo "=== K. a windowed tab shows the switcher with everything but source off ==="
@@ -1318,51 +1318,51 @@ evl "$DL" "__auto.setLargeOpenMode('edit')" >/dev/null
 e2e_wait_setting large_open_mode "edit"
 evl "$DL" "__auto.largeUnlockEdit().then((r)=>{window.__u=r;})" >/dev/null
 e2e_wait_until 180 _e2e_eval_equals "$DL" "String(__auto.isWindowedTab())" "true"
-check "unlocked into windowed editing" "$(evl "$DL" "String(__auto.isWindowedTab())")" "true"
+check "unlocked into windowed editing" "$(e2e_read "$DL" "String(__auto.isWindowedTab())")" "true"
 check "switcher is still there" "$(mode_option_count)" "2"
 check "every non-source option is off" "$(disabled_count)" "1"
-check "the disabled option says why" "$(evl "$DL" "String(Array.from(document.querySelectorAll('.statusbar .right option')).filter((o)=>o.disabled).every((o)=>o.title.length>0))")" "true"
-check "the tab itself stays on source" "$(evl "$DL" "String(__auto.getViewMode())")" "source"
+check "the disabled option says why" "$(e2e_read "$DL" "String(Array.from(document.querySelectorAll('.statusbar .right option')).filter((o)=>o.disabled).every((o)=>o.title.length>0))")" "true"
+check "the tab itself stays on source" "$(e2e_read "$DL" "String(__auto.getViewMode())")" "source"
 
 echo
 echo "=== L. the XML preview switches on and off ==="
 open_and_confirm "$WORK/doc.xml"
-check "xml tab starts in source" "$(evl "$DL" "String(__auto.getViewMode())")" "source"
+check "xml tab starts in source" "$(e2e_read "$DL" "String(__auto.getViewMode())")" "source"
 check "switcher offers two modes" "$(mode_option_count)" "2"
 evl "$DL" "__auto.setViewMode('xml')" >/dev/null
 sleep 2
-check "switched to the preview" "$(evl "$DL" "String(__auto.getViewMode())")" "xml"
-check "tree rendered" "$(evl "$DL" "String(document.querySelectorAll('.xml-view .row').length > 0)")" "true"
-check "the element name is shown" "$(evl "$DL" "String((document.querySelector('.xml-view')||{}).textContent.includes('<item>'))")" "true"
-check "its attributes are shown" "$(evl "$DL" "String((document.querySelector('.xml-view')||{}).textContent.includes('lang'))")" "true"
+check "switched to the preview" "$(e2e_read "$DL" "String(__auto.getViewMode())")" "xml"
+check "tree rendered" "$(e2e_read "$DL" "String(document.querySelectorAll('.xml-view .row').length > 0)")" "true"
+check "the element name is shown" "$(e2e_read "$DL" "String((document.querySelector('.xml-view')||{}).textContent.includes('<item>'))")" "true"
+check "its attributes are shown" "$(e2e_read "$DL" "String((document.querySelector('.xml-view')||{}).textContent.includes('lang'))")" "true"
 # Collapsed subtrees are not built: the empty element and the comment are
 # siblings of item, so the root must be open while their children are not.
-check "a collapsed row builds no children" "$(evl "$DL" "String(document.querySelectorAll('.xml-view .row').length < 12)")" "true"
+check "a collapsed row builds no children" "$(e2e_read "$DL" "String(document.querySelectorAll('.xml-view .row').length < 12)")" "true"
 # Expanding is driven by a plain click, and the rows are rebuilt from the
 # expansion set on every scroll. A set that mutates without notifying passes
 # every unit test and never redraws, so this has to be clicked for real.
 # Twisty 0 is the root, which starts open — clicking it would collapse. Twisty 1
 # is the first child, which starts closed.
-ROWS_CLOSED=$(evl "$DL" "String(document.querySelectorAll('.xml-view .row').length)")
-OPEN_CLOSED=$(evl "$DL" "String(document.querySelectorAll('.xml-view .twisty[aria-expanded]').length)")
+ROWS_CLOSED=$(e2e_read "$DL" "String(document.querySelectorAll('.xml-view .row').length)")
+OPEN_CLOSED=$(e2e_read "$DL" "String(document.querySelectorAll('.xml-view .twisty[aria-expanded]').length)")
 evl "$DL" "document.querySelectorAll('.xml-view .row .twisty')[1].click()" >/dev/null
 sleep 1
-check "expanding a child shows more rows" "$(evl "$DL" "String(document.querySelectorAll('.xml-view .row').length > $ROWS_CLOSED)")" "true"
-check "one more row now reports itself expanded" "$(evl "$DL" "String(document.querySelectorAll('.xml-view .twisty[aria-expanded=\"true\"]').length)")" "2"
+check "expanding a child shows more rows" "$(e2e_read "$DL" "String(document.querySelectorAll('.xml-view .row').length > $ROWS_CLOSED)")" "true"
+check "one more row now reports itself expanded" "$(e2e_read "$DL" "String(document.querySelectorAll('.xml-view .twisty[aria-expanded=\"true\"]').length)")" "2"
 evl "$DL" "document.querySelectorAll('.xml-view .row .twisty')[1].click()" >/dev/null
 sleep 1
-check "collapsing it takes them away again" "$(evl "$DL" "String(document.querySelectorAll('.xml-view .row').length)")" "$ROWS_CLOSED"
+check "collapsing it takes them away again" "$(e2e_read "$DL" "String(document.querySelectorAll('.xml-view .row').length)")" "$ROWS_CLOSED"
 evl "$DL" "__auto.setViewMode('source')" >/dev/null
 sleep 2
-check "switched back" "$(evl "$DL" "String(__auto.getViewMode())")" "source"
-check "preview unmounted" "$(evl "$DL" "String(document.querySelectorAll('.xml-view').length)")" "0"
+check "switched back" "$(e2e_read "$DL" "String(__auto.getViewMode())")" "source"
+check "preview unmounted" "$(e2e_read "$DL" "String(document.querySelectorAll('.xml-view').length)")" "0"
 # Closing the preview releases its copy of the document. Reopening has to parse
 # it again from scratch — if the release left anything half-torn-down, this is
 # where an empty pane shows up.
 evl "$DL" "__auto.setViewMode('xml')" >/dev/null
 e2e_wait_eval "$DL" "String(document.querySelectorAll('.xml-view .row').length > 0)" "true"
-check "reopening after the release renders again" "$(evl "$DL" "String(document.querySelectorAll('.xml-view .row').length > 0)")" "true"
-check "and the element name is still right" "$(evl "$DL" "String(document.querySelectorAll('.xml-view .row .tag')[0].textContent)")" "<root>"
+check "reopening after the release renders again" "$(e2e_read "$DL" "String(document.querySelectorAll('.xml-view .row').length > 0)")" "true"
+check "and the element name is still right" "$(e2e_read "$DL" "String(document.querySelectorAll('.xml-view .row .tag')[0].textContent)")" "<root>"
 evl "$DL" "__auto.setViewMode('source')" >/dev/null
 sleep 1
 
@@ -1370,8 +1370,8 @@ echo "=== M. a malformed document shows a message rather than an empty pane ==="
 open_and_confirm "$WORK/bad.xml"
 evl "$DL" "__auto.setViewMode('xml')" >/dev/null
 sleep 2
-check "error shown" "$(evl "$DL" "String((document.querySelector('.xml-view .error')||{}).textContent||'').length > 0")" "true"
-check "no tree rows for a failed parse" "$(evl "$DL" "String(document.querySelectorAll('.xml-view .row').length)")" "0"
+check "error shown" "$(e2e_read "$DL" "String((document.querySelector('.xml-view .error')||{}).textContent||'').length > 0")" "true"
+check "no tree rows for a failed parse" "$(e2e_read "$DL" "String(document.querySelectorAll('.xml-view .row').length)")" "0"
 
 echo "=== N. no node of the parsed document reaches the screen ==="
 evl "$DL" "window.__xmlPwned = undefined" >/dev/null
@@ -1380,24 +1380,24 @@ evl "$DL" "__auto.setViewMode('xml')" >/dev/null
 sleep 3
 # Premise: the hostile document really did parse and render, otherwise every
 # assertion below is vacuously true.
-check "the hostile document rendered" "$(evl "$DL" "String(document.querySelectorAll('.xml-view .row').length > 0)")" "true"
-check "its script element is visible as text" "$(evl "$DL" "String((document.querySelector('.xml-view')||{}).textContent.includes('script'))")" "true"
-check "its handler attribute is visible as text" "$(evl "$DL" "String((document.querySelector('.xml-view')||{}).textContent.includes('onclick'))")" "true"
+check "the hostile document rendered" "$(e2e_read "$DL" "String(document.querySelectorAll('.xml-view .row').length > 0)")" "true"
+check "its script element is visible as text" "$(e2e_read "$DL" "String((document.querySelector('.xml-view')||{}).textContent.includes('script'))")" "true"
+check "its handler attribute is visible as text" "$(e2e_read "$DL" "String((document.querySelector('.xml-view')||{}).textContent.includes('onclick'))")" "true"
 # The conclusions.
-check "nothing from the document ran" "$(evl "$DL" "String(window.__xmlPwned === undefined)")" "true"
-check "no script element was inserted" "$(evl "$DL" "String(document.querySelectorAll('.xml-view script').length)")" "0"
-check "no image element was inserted" "$(evl "$DL" "String(document.querySelectorAll('.xml-view img').length)")" "0"
-check "every rendered element is one the view builds itself" "$(evl "$DL" "String([...document.querySelectorAll('.xml-view *')].every((e)=>['DIV','SPAN','BUTTON'].includes(e.tagName)))")" "true"
-check "every rendered element is HTML-namespaced" "$(evl "$DL" "String([...document.querySelectorAll('.xml-view *')].every((e)=>e.namespaceURI==='http://www.w3.org/1999/xhtml'))")" "true"
-check "no on* attribute survived onto a live element" "$(evl "$DL" "String([...document.querySelectorAll('.xml-view *')].some((e)=>[...e.attributes].some((a)=>a.name.toLowerCase().startsWith('on'))))")" "false"
+check "nothing from the document ran" "$(e2e_read "$DL" "String(window.__xmlPwned === undefined)")" "true"
+check "no script element was inserted" "$(e2e_read "$DL" "String(document.querySelectorAll('.xml-view script').length)")" "0"
+check "no image element was inserted" "$(e2e_read "$DL" "String(document.querySelectorAll('.xml-view img').length)")" "0"
+check "every rendered element is one the view builds itself" "$(e2e_read "$DL" "String([...document.querySelectorAll('.xml-view *')].every((e)=>['DIV','SPAN','BUTTON'].includes(e.tagName)))")" "true"
+check "every rendered element is HTML-namespaced" "$(e2e_read "$DL" "String([...document.querySelectorAll('.xml-view *')].every((e)=>e.namespaceURI==='http://www.w3.org/1999/xhtml'))")" "true"
+check "no on* attribute survived onto a live element" "$(e2e_read "$DL" "String([...document.querySelectorAll('.xml-view *')].some((e)=>[...e.attributes].some((a)=>a.name.toLowerCase().startsWith('on'))))")" "false"
 
 echo "=== O. a valid document is not mistaken for a parse error ==="
 open_and_confirm "$WORK/named-error.xml"
 evl "$DL" "__auto.setViewMode('xml')" >/dev/null
 sleep 2
-check "the tree rendered" "$(evl "$DL" "String(document.querySelectorAll('.xml-view .row').length > 0)")" "true"
-check "no error was reported" "$(evl "$DL" "String(document.querySelectorAll('.xml-view .error').length)")" "0"
-check "the element is shown as content" "$(evl "$DL" "String((document.querySelector('.xml-view')||{}).textContent.includes('parsererror'))")" "true"
+check "the tree rendered" "$(e2e_read "$DL" "String(document.querySelectorAll('.xml-view .row').length > 0)")" "true"
+check "no error was reported" "$(e2e_read "$DL" "String(document.querySelectorAll('.xml-view .error').length)")" "0"
+check "the element is shown as content" "$(e2e_read "$DL" "String((document.querySelector('.xml-view')||{}).textContent.includes('parsererror'))")" "true"
 
 echo "=== P. an entity-defining document previews without expanding anything ==="
 open_and_confirm "$WORK/entities.xml"
@@ -1408,17 +1408,17 @@ e2e_wait_eval "$DL" "String(document.querySelectorAll('.xml-view .row').length >
 # The whole point: the window still answers. Parsing this used to wedge it for
 # good, taking every other tab in the window with it, which is why the document
 # used to be refused outright rather than previewed.
-check "the window still answers" "$(evl "$DL" "String(6*7)")" "42"
-check "the document previewed instead of being refused" "$(evl "$DL" "String(document.querySelectorAll('.xml-view .row').length > 0)")" "true"
-check "no error message" "$(evl "$DL" "String(document.querySelectorAll('.xml-view .error').length)")" "0"
+check "the window still answers" "$(e2e_read "$DL" "String(6*7)")" "42"
+check "the document previewed instead of being refused" "$(e2e_read "$DL" "String(document.querySelectorAll('.xml-view .row').length > 0)")" "true"
+check "no error message" "$(e2e_read "$DL" "String(document.querySelectorAll('.xml-view .error').length)")" "0"
 # The reference is shown as the characters the author typed. Expanding it is
 # what produced tens of millions of characters from a 794-byte file, so both
 # halves matter: the text is there, and the pane did not grow.
-check "the entity reference was not expanded" "$(evl "$DL" "String((document.querySelector('.xml-view')||{}).textContent.includes('&lol8;'))")" "true"
-check "the pane did not blow up" "$(evl "$DL" "String((document.querySelector('.xml-view')||{}).textContent.length < 4000)")" "true"
+check "the entity reference was not expanded" "$(e2e_read "$DL" "String((document.querySelector('.xml-view')||{}).textContent.includes('&lol8;'))")" "true"
+check "the pane did not blow up" "$(e2e_read "$DL" "String((document.querySelector('.xml-view')||{}).textContent.length < 4000)")" "true"
 evl "$DL" "__auto.setViewMode('source')" >/dev/null
 sleep 2
-check "the source view still works for it" "$(evl "$DL" "String(__auto.getViewMode())")" "source"
+check "the source view still works for it" "$(e2e_read "$DL" "String(__auto.getViewMode())")" "source"
 
 echo "=== Q. no node of the hostile markdown document reaches the screen ==="
 evl "$DL" "window.__mdPwned = undefined" >/dev/null
@@ -1427,25 +1427,25 @@ evl "$DL" "__auto.setViewMode('markdown')" >/dev/null
 sleep 2
 # Premise: the hostile document really did render, otherwise every assertion
 # below is vacuously true.
-check "the hostile document rendered" "$(evl "$DL" "String(document.querySelectorAll('.markdown-view .blocks > *').length > 0)")" "true"
-check "no script element was inserted" "$(evl "$DL" "String(document.querySelectorAll('.markdown-view script').length)")" "0"
-check "no image element was inserted" "$(evl "$DL" "String(document.querySelectorAll('.markdown-view img').length)")" "0"
-check "no anchor element was inserted" "$(evl "$DL" "String(document.querySelectorAll('.markdown-view a').length)")" "0"
-check "nothing from the document ran" "$(evl "$DL" "String(window.__mdPwned === undefined)")" "true"
-check "the script tag is visible as text" "$(evl "$DL" "String((document.querySelector('.markdown-view')||{}).textContent.includes('<script>'))")" "true"
+check "the hostile document rendered" "$(e2e_read "$DL" "String(document.querySelectorAll('.markdown-view .blocks > *').length > 0)")" "true"
+check "no script element was inserted" "$(e2e_read "$DL" "String(document.querySelectorAll('.markdown-view script').length)")" "0"
+check "no image element was inserted" "$(e2e_read "$DL" "String(document.querySelectorAll('.markdown-view img').length)")" "0"
+check "no anchor element was inserted" "$(e2e_read "$DL" "String(document.querySelectorAll('.markdown-view a').length)")" "0"
+check "nothing from the document ran" "$(e2e_read "$DL" "String(window.__mdPwned === undefined)")" "true"
+check "the script tag is visible as text" "$(e2e_read "$DL" "String((document.querySelector('.markdown-view')||{}).textContent.includes('<script>'))")" "true"
 
 echo "=== R. markdown is not held to the JSON/XML preview ceiling ==="
 evl "$DL" "__auto.openTab('$WORK/huge.md')" >/dev/null
 # huge.json (section F) proved a fixed sleep reads the previous tab and
 # passes for the wrong reason; wait for the active tab to actually be this one.
 e2e_wait_eval "$DL" "String(__auto.activeContentLength() > 10000000)" "true"
-check "the big markdown tab is the active one" "$(evl "$DL" "String(__auto.activeContentLength() > 10000000)")" "true"
+check "the big markdown tab is the active one" "$(e2e_read "$DL" "String(__auto.activeContentLength() > 10000000)")" "true"
 check "switcher still shown" "$(mode_option_count)" "2"
 check "markdown option is not disabled, unlike json/xml past their ceiling" "$(disabled_count)" "0"
 evl "$DL" "__auto.setViewMode('markdown')" >/dev/null
 sleep 2
-check "switched to the preview" "$(evl "$DL" "String(__auto.getViewMode())")" "markdown"
-check "blocks actually rendered" "$(evl "$DL" "String(document.querySelectorAll('.markdown-view .blocks > *').length > 0)")" "true"
+check "switched to the preview" "$(e2e_read "$DL" "String(__auto.getViewMode())")" "markdown"
+check "blocks actually rendered" "$(e2e_read "$DL" "String(document.querySelectorAll('.markdown-view .blocks > *').length > 0)")" "true"
 
 echo "=== S. a wide document renders a windowful of rows, not all of them ==="
 open_and_confirm "$WORK/wide.xml"
@@ -1453,18 +1453,18 @@ evl "$DL" "__auto.setViewMode('xml')" >/dev/null
 e2e_wait_eval "$DL" "String(document.querySelectorAll('.xml-view .row').length > 0)" "true"
 # The root is a depth-0 row and starts open, so all 20,000 children are visible
 # rows. Without virtualization every one of them would be in the DOM.
-check "only a windowful is in the DOM" "$(evl "$DL" "String(document.querySelectorAll('.xml-view .row').length < 500)")" "true"
+check "only a windowful is in the DOM" "$(e2e_read "$DL" "String(document.querySelectorAll('.xml-view .row').length < 500)")" "true"
 # ...but the scrollbar has to know they exist, otherwise "few rows" would also
 # be what a broken view that lost the children looks like.
-check "the scrollbar spans all of them" "$(evl "$DL" "String(document.querySelector('.xml-view .spacer').offsetHeight > 300000)")" "true"
+check "the scrollbar spans all of them" "$(e2e_read "$DL" "String(document.querySelector('.xml-view .spacer').offsetHeight > 300000)")" "true"
 # Collapsing the root is the discriminating half: the pane must actually shrink
 # to one row, which a view that was ignoring the expansion state could not do.
 evl "$DL" "document.querySelectorAll('.xml-view .row .twisty')[0].click()" >/dev/null
 sleep 2
-check "collapsing the root leaves one row" "$(evl "$DL" "String(document.querySelectorAll('.xml-view .row').length)")" "1"
-check "and that row reports its twenty thousand children" "$(evl "$DL" "String(document.querySelectorAll('.xml-view .row .summary')[0].textContent)")" "20000"
-check "the scrollbar shrank with it" "$(evl "$DL" "String(document.querySelector('.xml-view .spacer').offsetHeight < 1000)")" "true"
-check "the window still answers" "$(evl "$DL" "String(6*7)")" "42"
+check "collapsing the root leaves one row" "$(e2e_read "$DL" "String(document.querySelectorAll('.xml-view .row').length)")" "1"
+check "and that row reports its twenty thousand children" "$(e2e_read "$DL" "String(document.querySelectorAll('.xml-view .row .summary')[0].textContent)")" "20000"
+check "the scrollbar shrank with it" "$(e2e_read "$DL" "String(document.querySelector('.xml-view .spacer').offsetHeight < 1000)")" "true"
+check "the window still answers" "$(e2e_read "$DL" "String(6*7)")" "42"
 evl "$DL" "__auto.setViewMode('source')" >/dev/null
 sleep 2
 

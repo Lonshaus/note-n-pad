@@ -165,7 +165,7 @@ open_doc
 # interrupt or normal exit restores it (and kills the app) instead of leaving
 # settings.json flipped. The trap looks the doc label up live so it works after
 # the restart below reassigns DL.
-ORIG_LANG=$(evl "$DL" "String(__auto.getLanguage())")
+ORIG_LANG=$(e2e_read "$DL" "String(__auto.getLanguage())")
 echo "original language: $ORIG_LANG"
 restore_lang() {
   trap '' INT TERM
@@ -201,23 +201,23 @@ evl "$DL" "window.__TAURI_INTERNALS__.invoke('show_settings_window')" >/dev/null
 e2e_wait_until _settings_auto_ready
 evl "settings" "__auto.setLanguage('zh-TW')" >/dev/null
 e2e_wait_eval "settings" "String(__auto.getSettings().resolvedLocale)" "zh-TW"
-check "resolvedLocale for zh-TW" "$(evl "settings" "String(__auto.getSettings().resolvedLocale)")" "zh-TW"
+check "resolvedLocale for zh-TW" "$(e2e_read "settings" "String(__auto.getSettings().resolvedLocale)")" "zh-TW"
 evl "settings" "__auto.setLanguage('en')" >/dev/null
 e2e_wait_eval "settings" "String(__auto.getSettings().resolvedLocale)" "en"
-check "resolvedLocale for en" "$(evl "settings" "String(__auto.getSettings().resolvedLocale)")" "en"
+check "resolvedLocale for en" "$(e2e_read "settings" "String(__auto.getSettings().resolvedLocale)")" "en"
 evl "settings" "__auto.setLanguage('ja')" >/dev/null
 e2e_wait_eval "settings" "String(__auto.getSettings().resolvedLocale)" "ja"
-check "resolvedLocale for ja" "$(evl "settings" "String(__auto.getSettings().resolvedLocale)")" "ja"
+check "resolvedLocale for ja" "$(e2e_read "settings" "String(__auto.getSettings().resolvedLocale)")" "ja"
 
 echo "=== system mode resolves to the host locale ==="
 # Derive the expected locale from the host UI language with the same prefix rule
 # the app's resolveLocale uses, so the assertion tracks whatever machine runs it
 # instead of hard-coding one host.
-HOST_LOCALE=$(evl "settings" "(()=>{const l=(navigator.language||'').toLowerCase();return l.startsWith('zh')?'zh-TW':l.startsWith('ja')?'ja':'en';})()")
+HOST_LOCALE=$(e2e_read "settings" "(()=>{const l=(navigator.language||'').toLowerCase();return l.startsWith('zh')?'zh-TW':l.startsWith('ja')?'ja':'en';})()")
 echo "host locale resolves to: $HOST_LOCALE"
 evl "settings" "__auto.setLanguage('system')" >/dev/null
 e2e_wait_eval "settings" "String(__auto.getSettings().resolvedLocale)" "$HOST_LOCALE"
-check "system resolves to host locale ($HOST_LOCALE)" "$(evl "settings" "String(__auto.getSettings().resolvedLocale)")" "$HOST_LOCALE"
+check "system resolves to host locale ($HOST_LOCALE)" "$(e2e_read "settings" "String(__auto.getSettings().resolvedLocale)")" "$HOST_LOCALE"
 
 echo "=== cross-window sync (settings-changed broadcast) ==="
 evl "settings" "__auto.setLanguage('en')" >/dev/null
@@ -233,7 +233,7 @@ e2e_wait_setting language ja
 quit_app
 launch
 open_doc
-check "language persisted across restart" "$(evl "$DL" "String(__auto.getLanguage())")" "ja"
+check "language persisted across restart" "$(e2e_read "$DL" "String(__auto.getLanguage())")" "ja"
 check "restored language renders in DOM (ja)" "$(line_ending_label "$DL")" "改行コード"
 
 echo "=== teardown ==="

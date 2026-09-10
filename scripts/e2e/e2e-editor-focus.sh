@@ -188,14 +188,14 @@ trap restore_state EXIT INT TERM
 echo "=== scenario C: open new file, no click, editor is focused ==="
 launch
 open_doc "$WORK/small.txt"
-check "opened as an editable tab" "$(evl "$DL" "String(__auto.isLargeTab())")" "false"
+check "opened as an editable tab" "$(e2e_read "$DL" "String(__auto.isLargeTab())")" "false"
 # No click, no focus op: the load-time handoff must have focused the editor.
-check "editor holds focus right after open" "$(evl "$DL" "String(__auto.editorFocused())")" "true"
+check "editor holds focus right after open" "$(e2e_read "$DL" "String(__auto.editorFocused())")" "true"
 
 echo "=== scenario A setup: dirty the tab, quit to snapshot ==="
 evl "$DL" "__auto.typeText('$MARKER')" >/dev/null
 sleep 1
-check "dirty after typing marker" "$(evl "$DL" "JSON.stringify(__auto.getTabs())" | jq -r '.[]|select(.active)|.dirty')" "true"
+check "dirty after typing marker" "$(e2e_read "$DL" "JSON.stringify(__auto.getTabs())" | jq -r '.[]|select(.active)|.dirty')" "true"
 quit_app
 
 echo "=== scenario A: restore then type via the DOM, no focus op ==="
@@ -219,17 +219,17 @@ until [ "$(evl "$DL" "String(__auto.getContent().includes('$MARKER'))")" = "true
     break
   fi
 done
-check "restored tab holds the marker" "$(evl "$DL" "String(__auto.getContent().includes('$MARKER'))")" "true"
+check "restored tab holds the marker" "$(e2e_read "$DL" "String(__auto.getContent().includes('$MARKER'))")" "true"
 # THE bug: without any focus operation the editor must already own the keyboard,
 # and .cm-content must be the document's activeElement.
-check "editor holds focus after restore" "$(evl "$DL" "String(__auto.editorFocused())")" "true"
-check "cm-content is activeElement" "$(evl "$DL" "String(document.activeElement===document.querySelector('.cm-content'))")" "true"
+check "editor holds focus after restore" "$(e2e_read "$DL" "String(__auto.editorFocused())")" "true"
+check "cm-content is activeElement" "$(e2e_read "$DL" "String(document.activeElement===document.querySelector('.cm-content'))")" "true"
 # Inject text through the real DOM path (execCommand insertText fires the same
 # beforeinput/input CM handles for a keystroke). This is what the WebView dropped.
 evl "$DL" "document.execCommand('insertText',false,'$DOMMARK')" >/dev/null
 sleep 1
-check "DOM-typed text landed in the buffer" "$(evl "$DL" "String(__auto.getContent().includes('$DOMMARK'))")" "true"
-check "tab is dirty after DOM typing" "$(evl "$DL" "JSON.stringify(__auto.getTabs())" | jq -r '.[]|select(.active)|.dirty')" "true"
+check "DOM-typed text landed in the buffer" "$(e2e_read "$DL" "String(__auto.getContent().includes('$DOMMARK'))")" "true"
+check "tab is dirty after DOM typing" "$(e2e_read "$DL" "JSON.stringify(__auto.getTabs())" | jq -r '.[]|select(.active)|.dirty')" "true"
 quit_app
 wipe_test_docs
 
@@ -238,7 +238,7 @@ launch
 open_doc "$WORK/huge.txt"
 evl "$DL" "__auto.typeText('X')" >/dev/null
 sleep 1
-check "huge tab dirty after typing" "$(evl "$DL" "JSON.stringify(__auto.getTabs())" | jq -r '.[]|select(.active)|.dirty')" "true"
+check "huge tab dirty after typing" "$(e2e_read "$DL" "JSON.stringify(__auto.getTabs())" | jq -r '.[]|select(.active)|.dirty')" "true"
 # Close raises the oversized gate (too big to snapshot); the window stays.
 evl "$DL" "window.__TAURI_INTERNALS__.invoke('plugin:window|close')" >/dev/null
 tries=0
@@ -249,17 +249,17 @@ until [ "$(evl "$DL" "String(__auto.oversizedGateVisible())")" = "true" ]; do
     break
   fi
 done
-check "oversized gate visible" "$(evl "$DL" "String(__auto.oversizedGateVisible())")" "true"
+check "oversized gate visible" "$(e2e_read "$DL" "String(__auto.oversizedGateVisible())")" "true"
 # Fire the window-focus handoff path while the gate is up: focus must NOT move to
 # the editor, so a dialog button keeps the keyboard.
 evl "$DL" "__auto.windowFocusGained()" >/dev/null
 sleep 1
-check "gate still up after window focus" "$(evl "$DL" "String(__auto.oversizedGateVisible())")" "true"
-check "editor did NOT steal focus from the gate" "$(evl "$DL" "String(__auto.editorFocused())")" "false"
+check "gate still up after window focus" "$(e2e_read "$DL" "String(__auto.oversizedGateVisible())")" "true"
+check "editor did NOT steal focus from the gate" "$(e2e_read "$DL" "String(__auto.editorFocused())")" "false"
 # Cancel the gate and leave the window open; teardown quits.
 evl "$DL" "__auto.oversizedGateCancel()" >/dev/null
 sleep 1
-check "gate dismissed after cancel" "$(evl "$DL" "String(__auto.oversizedGateVisible())")" "false"
+check "gate dismissed after cancel" "$(e2e_read "$DL" "String(__auto.oversizedGateVisible())")" "false"
 quit_app
 wipe_test_docs
 

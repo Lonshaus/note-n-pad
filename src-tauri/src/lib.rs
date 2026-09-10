@@ -754,6 +754,14 @@ fn handle_window_event(window: &tauri::Window, event: &tauri::WindowEvent) {
   // Drop a destroyed document window's tracked always-on-top state so a later
   // window can't inherit a stale check mark.
   if let tauri::WindowEvent::Destroyed = event {
+    // `destroy()` bypasses `CloseRequested`, so the close-request line above
+    // never fires for a window closed from the frontend. Without this one an
+    // app that goes away mid-run leaves no record of which window went first.
+    log::info!(
+      "window destroyed: window={} event-loop-pass={}",
+      window.label(),
+      EVENT_LOOP_PASS.load(Ordering::Relaxed)
+    );
     if let Some(items) = window.app_handle().try_state::<MenuItems>() {
       items.on_top.lock().unwrap().remove(window.label());
     }
@@ -2634,7 +2642,17 @@ pub fn run() {
       // Closing all windows must not quit the app; only an explicit exit
       // (tray Quit -> app.exit) carries an exit code and is allowed through.
       tauri::RunEvent::ExitRequested { api, code, .. } if code.is_none() => {
+        log::info!("exit requested: code=none, prevented");
         api.prevent_exit();
+      }
+      // Log-only, and deliberately after the guarded arm above so the one that
+      // prevents the exit still matches first: an exit that carries a code is
+      // let through, and without this line it leaves no trace at all.
+      tauri::RunEvent::ExitRequested { code, .. } => {
+        log::info!("exit requested: code={code:?}, allowed");
+      }
+      tauri::RunEvent::Exit => {
+        log::info!("exit");
       }
       // Every `CloseRequested` queued in one event-loop pass is delivered
       // before this fires, no matter how long a handler in between stalls
