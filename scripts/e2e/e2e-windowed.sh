@@ -150,7 +150,7 @@ open_large() {
     fi
     DL=$(doc_label)
   done
-  if [ "$(evl "$DL" "String(__auto.largeConfirmVisible())")" = "true" ]; then
+  if [ "$(e2e_read "$DL" "String(__auto.largeConfirmVisible())")" = "true" ]; then
     evl "$DL" "__auto.largeConfirmAccept()" >/dev/null
     sleep 3
   fi
@@ -257,7 +257,7 @@ done
 # depend on the host system language. A single combined trap restores both the
 # language and the large-open mode (captured just below); it must be the only
 # trap, since a later trap would silently replace this one.
-ORIG_LANG=$(evl "$DL" "String(__auto.getLanguage())")
+ORIG_LANG=$(e2e_read "$DL" "String(__auto.getLanguage())")
 echo "original language: $ORIG_LANG"
 restore_state() {
   trap '' INT TERM
@@ -283,20 +283,20 @@ restore_state() {
 trap restore_state EXIT INT TERM
 evl "$DL" "__auto.setLanguage('zh-TW')" >/dev/null
 sleep 1
-check "bad.log opened read-only" "$(evl "$DL" "String(__auto.isLargeTab())")" "true"
+check "bad.log opened read-only" "$(e2e_read "$DL" "String(__auto.isLargeTab())")" "true"
 # The large-open-mode setting writes the user's real settings.json; capture its
 # value now and restore it on any exit (see edit-mode section and restore_state
 # above), and force 'view' for the whole read-only-then-manual-unlock flow below.
-ORIG_MODE=$(evl "$DL" "String(__auto.getLargeOpenMode())")
+ORIG_MODE=$(e2e_read "$DL" "String(__auto.getLargeOpenMode())")
 echo "original large_open_mode: $ORIG_MODE"
 evl "$DL" "__auto.setLargeOpenMode('view')" >/dev/null
 e2e_wait_setting large_open_mode "view"
-check "lock available before probe" "$(evl "$DL" "String(__auto.largeUnlockAvailable())")" "true"
+check "lock available before probe" "$(e2e_read "$DL" "String(__auto.largeUnlockAvailable())")" "true"
 evl "$DL" "__auto.largeUnlockEdit().then((r)=>{window.__u=r;})" >/dev/null
 sleep 3
-check "unlock refused with UTF-8 reason" "$(evl "$DL" "String(window.__u).includes('UTF-8')")" "true"
-check "lock disabled after refusal" "$(evl "$DL" "String(__auto.largeUnlockAvailable())")" "false"
-check "stayed read-only (not windowed)" "$(evl "$DL" "String(__auto.isWindowedTab())")" "false"
+check "unlock refused with UTF-8 reason" "$(e2e_read "$DL" "String(window.__u).includes('UTF-8')")" "true"
+check "lock disabled after refusal" "$(e2e_read "$DL" "String(__auto.largeUnlockAvailable())")" "false"
+check "stayed read-only (not windowed)" "$(e2e_read "$DL" "String(__auto.isWindowedTab())")" "false"
 evl "$DL" "__auto.closeActiveTab()" >/dev/null
 tries=0
 until [ "$(doc_count)" = "0" ]; do
@@ -320,7 +320,7 @@ until [ "$(evl "$DL" "String(__auto.isLargeTab())")" = "true" ]; do
     break
   fi
 done
-check "big.log opened read-only" "$(evl "$DL" "String(__auto.isLargeTab())")" "true"
+check "big.log opened read-only" "$(e2e_read "$DL" "String(__auto.isLargeTab())")" "true"
 # Wait for the precise line index so scroll math is exact, then view line 3,000,000.
 tries=0
 until [ "$(evl "$DL" "String(__auto.largeInfo().totalLines !== null)")" = "true" ]; do
@@ -332,7 +332,7 @@ until [ "$(evl "$DL" "String(__auto.largeInfo().totalLines !== null)")" = "true"
 done
 evl "$DL" "__auto.largeGoto(3000000)" >/dev/null
 sleep 2
-check "lock available for editable file" "$(evl "$DL" "String(__auto.largeUnlockAvailable())")" "true"
+check "lock available for editable file" "$(e2e_read "$DL" "String(__auto.largeUnlockAvailable())")" "true"
 evl "$DL" "__auto.largeUnlockEdit().then((r)=>{window.__u=r;})" >/dev/null
 tries=0
 until [ "$(evl "$DL" "String(__auto.isWindowedTab())")" = "true" ]; do
@@ -342,11 +342,11 @@ until [ "$(evl "$DL" "String(__auto.isWindowedTab())")" = "true" ]; do
     break
   fi
 done
-check "unlocked into windowed edit in place" "$(evl "$DL" "String(__auto.isWindowedTab())")" "true"
-check "window opened at the viewed position (line 3,000,000)" "$(evl "$DL" "String(__auto.windowedInfo().windowStartLine > 2900000 && __auto.windowedInfo().windowStartLine < 3000000)")" "true"
+check "unlocked into windowed edit in place" "$(e2e_read "$DL" "String(__auto.isWindowedTab())")" "true"
+check "window opened at the viewed position (line 3,000,000)" "$(e2e_read "$DL" "String(__auto.windowedInfo().windowStartLine > 2900000 && __auto.windowedInfo().windowStartLine < 3000000)")" "true"
 
 echo "=== total lines ==="
-check "total lines 5,000,000" "$(evl "$DL" "String(__auto.windowedInfo().totalLines)")" "5000000"
+check "total lines 5,000,000" "$(e2e_read "$DL" "String(__auto.windowedInfo().totalLines)")" "5000000"
 
 echo "=== marker at file head ==="
 evl "$DL" "__auto.windowedGoto(1)" >/dev/null
@@ -359,28 +359,28 @@ e2e_wait_eval "$DL" "String(__auto.getContent().startsWith('0000000001 ') && __a
 # `typeText` inserts at the caret, which a goto leaves on the requested line —
 # not at the window's start, and not where a window-relative reading would put
 # it. Logged rather than asserted so a CI failure says where the marker went.
-echo "head window: caret=$(evl "$DL" "String(__auto.getCursor().line)") start=$(evl "$DL" "String(__auto.windowedInfo().windowStartLine)") head20=$(evl "$DL" "JSON.stringify(__auto.getContent().slice(0,20))")"
-echo "swap trace: $(evl "$DL" "JSON.stringify(__auto.windowedTrace())")"
+echo "head window: caret=$(e2e_read "$DL" "String(__auto.getCursor().line)") start=$(e2e_read "$DL" "String(__auto.windowedInfo().windowStartLine)") head20=$(e2e_read "$DL" "JSON.stringify(__auto.getContent().slice(0,20))")"
+echo "swap trace: $(e2e_read "$DL" "JSON.stringify(__auto.windowedTrace())")"
 evl "$DL" "__auto.typeText('MARKERONE')" >/dev/null
 e2e_wait_eval "$DL" "String(__auto.getContent().startsWith('MARKERONE0000000001 '))" "true"
-check "dirty after head edit" "$(evl "$DL" "String(__auto.windowedInfo().dirty)")" "true"
-check "head window content" "$(evl "$DL" "String(__auto.getContent().startsWith('MARKERONE0000000001 '))")" "true"
+check "dirty after head edit" "$(e2e_read "$DL" "String(__auto.windowedInfo().dirty)")" "true"
+check "head window content" "$(e2e_read "$DL" "String(__auto.getContent().startsWith('MARKERONE0000000001 '))")" "true"
 
 echo "=== deep jump to line 4,800,000 ==="
 evl "$DL" "__auto.windowedGoto(4800000)" >/dev/null
 e2e_wait_eval "$DL" "String(__auto.getContent().includes('0004800000 ') && __auto.windowedInfo().windowStartLine > 4700000)" "true"
-check "window moved deep" "$(evl "$DL" "String(__auto.windowedInfo().windowStartLine > 4700000)")" "true"
-check "deep window has line 4,800,000" "$(evl "$DL" "String(__auto.getContent().includes('0004800000 xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx'))")" "true"
+check "window moved deep" "$(e2e_read "$DL" "String(__auto.windowedInfo().windowStartLine > 4700000)")" "true"
+check "deep window has line 4,800,000" "$(e2e_read "$DL" "String(__auto.getContent().includes('0004800000 xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx'))")" "true"
 
 echo "=== marker deep and save ==="
-echo "deep window: caret=$(evl "$DL" "String(__auto.getCursor().line)") start=$(evl "$DL" "String(__auto.windowedInfo().windowStartLine)") head20=$(evl "$DL" "JSON.stringify(__auto.getContent().slice(0,20))")"
-echo "swap trace: $(evl "$DL" "JSON.stringify(__auto.windowedTrace())")"
+echo "deep window: caret=$(e2e_read "$DL" "String(__auto.getCursor().line)") start=$(e2e_read "$DL" "String(__auto.windowedInfo().windowStartLine)") head20=$(e2e_read "$DL" "JSON.stringify(__auto.getContent().slice(0,20))")"
+echo "swap trace: $(e2e_read "$DL" "JSON.stringify(__auto.windowedTrace())")"
 evl "$DL" "__auto.typeText('MARKERTWO')" >/dev/null
 e2e_wait_eval "$DL" "String(__auto.getContent().includes('MARKERTWO0004800000 '))" "true"
 evl "$DL" "window.__wr=undefined" >/dev/null
 evl "$DL" "__auto.windowedSave().then((r)=>{window.__wr=r;})" >/dev/null
 e2e_wait_eval "$DL" "String(window.__wr!==undefined)" "true"
-check "deep save ok" "$(evl "$DL" "String(window.__wr)")" "ok"
+check "deep save ok" "$(e2e_read "$DL" "String(window.__wr)")" "ok"
 PYOUT=$(python3 - <<PYEOF
 import sys
 lines = open('$WORK/big.log', 'rb').read().split(b'\n')
@@ -449,7 +449,7 @@ sleep 2
 evl "$DL" "window.__wr=undefined" >/dev/null
 evl "$DL" "__auto.windowedSave().then((r)=>{window.__wr=r;})" >/dev/null
 e2e_wait_eval "$DL" "String(window.__wr!==undefined)" "true"
-check "undo save ok" "$(evl "$DL" "String(window.__wr)")" "ok"
+check "undo save ok" "$(e2e_read "$DL" "String(window.__wr)")" "ok"
 if cmp -s "$WORK/big.log" "$WORK/big.orig"; then
   ok "undo restored the original file byte-for-byte"
 else
@@ -462,7 +462,7 @@ sleep 2
 evl "$DL" "window.__wr=undefined" >/dev/null
 evl "$DL" "__auto.windowedSave().then((r)=>{window.__wr=r;})" >/dev/null
 e2e_wait_eval "$DL" "String(window.__wr!==undefined)" "true"
-check "redo save ok" "$(evl "$DL" "String(window.__wr)")" "ok"
+check "redo save ok" "$(e2e_read "$DL" "String(window.__wr)")" "ok"
 check "redo restored MARKERONE" "$(python3 -c "print(b'MARKERONE' in open('$WORK/big.log','rb').read())")" "True"
 
 echo "=== conflict: external change then save ==="
@@ -472,13 +472,13 @@ sleep 1
 evl "$DL" "window.__wr=undefined" >/dev/null
 evl "$DL" "__auto.windowedSave().then((r)=>{window.__wr=r;})" >/dev/null
 e2e_wait_eval "$DL" "String(window.__wr!==undefined)" "true"
-check "fingerprint mismatch detected" "$(evl "$DL" "String(window.__wr)")" "mismatch"
-check "conflict modal visible" "$(evl "$DL" "String(__auto.windowedConflictVisible())")" "true"
+check "fingerprint mismatch detected" "$(e2e_read "$DL" "String(window.__wr)")" "mismatch"
+check "conflict modal visible" "$(e2e_read "$DL" "String(__auto.windowedConflictVisible())")" "true"
 evl "$DL" "window.__wr=undefined" >/dev/null
 evl "$DL" "__auto.windowedSaveForce().then((r)=>{window.__wr=r;})" >/dev/null
 e2e_wait_eval "$DL" "String(window.__wr!==undefined)" "true"
-check "force write ok" "$(evl "$DL" "String(window.__wr)")" "ok"
-check "conflict modal gone after force" "$(evl "$DL" "String(__auto.windowedConflictVisible())")" "false"
+check "force write ok" "$(e2e_read "$DL" "String(window.__wr)")" "ok"
+check "conflict modal gone after force" "$(e2e_read "$DL" "String(__auto.windowedConflictVisible())")" "false"
 # Windowed save is a full-file atomic rewrite (temp + rename), NOT a range
 # splice: forcing past the conflict writes the session's whole document, so the
 # in-session edit lands and the out-of-band append is deliberately overwritten.
@@ -488,11 +488,11 @@ check "out-of-band append overwritten by full rewrite" "$(python3 -c "print(b'EX
 echo "=== oversized quit gate ==="
 evl "$DL" "__auto.typeText('MARKERFOR')" >/dev/null
 sleep 1
-check "dirty before quit" "$(evl "$DL" "String(__auto.windowedInfo().dirty)")" "true"
+check "dirty before quit" "$(e2e_read "$DL" "String(__auto.windowedInfo().dirty)")" "true"
 # quit is vetoed by the oversized gate; the call returns once the window cancels.
 auto '{"id":50,"cmd":"quit"}' >/dev/null 2>&1
 sleep 2
-check "oversized gate visible" "$(evl "$DL" "String(__auto.oversizedGateVisible())")" "true"
+check "oversized gate visible" "$(e2e_read "$DL" "String(__auto.oversizedGateVisible())")" "true"
 # Discard the windowed edits: the session reopens clean, the gate clears, and the
 # pending quit resumes via request_exit, so the process must actually exit.
 evl "$DL" "__auto.oversizedGateDiscard()" >/dev/null 2>&1
@@ -545,21 +545,21 @@ until [ "$(evl "$DL" "String(__auto.isWindowedTab())")" = "true" ]; do
     break
   fi
 done
-check "tab restored straight into windowed editing (fast-path reopen)" "$(evl "$DL" "String(__auto.isWindowedTab())")" "true"
+check "tab restored straight into windowed editing (fast-path reopen)" "$(e2e_read "$DL" "String(__auto.isWindowedTab())")" "true"
 # F1: `isWindowedTab()` alone cannot tell a fast-path reopen from a rescan that
 # merely finished within this poll's timeout — both end with the tab in
 # `windowed`. `windowedRestoreRescanned()` reads `windowed_reopen`'s own
 # `rescanned` flag, so this is the actual assertion that catches the digest
 # silently rounding through the IPC boundary and permanently defeating the
 # fast path (see windowed.rs's `IndexSnapshot`/`parse_digest`).
-check "restart restore took the fast path, not a rescan" "$(evl "$DL" "String(__auto.windowedRestoreRescanned())")" "false"
-check "tab restored, not range" "$(evl "$DL" "String(__auto.isRangeTab())")" "false"
-check "not left in the read-only large view" "$(evl "$DL" "String(__auto.isLargeTab())")" "false"
+check "restart restore took the fast path, not a rescan" "$(e2e_read "$DL" "String(__auto.windowedRestoreRescanned())")" "false"
+check "tab restored, not range" "$(e2e_read "$DL" "String(__auto.isRangeTab())")" "false"
+check "not left in the read-only large view" "$(e2e_read "$DL" "String(__auto.isLargeTab())")" "false"
 # The top-of-viewport line at last quit (reset to 0 by the discard just
 # above, which reopens a fresh session at the on-disk baseline) is persisted as
 # windowed_top_line and fed back through initialTopLine, so the restored window
 # should again cover the start of the file rather than defaulting somewhere else.
-check "restored top line matches the persisted position (0, from the discard reset)" "$(evl "$DL" "String(__auto.windowedInfo().windowStartLine < 50)")" "true"
+check "restored top line matches the persisted position (0, from the discard reset)" "$(e2e_read "$DL" "String(__auto.windowedInfo().windowStartLine < 50)")" "true"
 
 echo "=== edit mode: opens straight into editing ==="
 # With large_open_mode 'edit', opening a large file skips the confirm entirely and
@@ -568,7 +568,7 @@ echo "=== edit mode: opens straight into editing ==="
 # refocusing the restored tab.
 evl "$DL" "__auto.setLargeOpenMode('edit')" >/dev/null
 e2e_wait_setting large_open_mode "edit"
-check "mode set to edit" "$(evl "$DL" "String(__auto.getLargeOpenMode())")" "edit"
+check "mode set to edit" "$(e2e_read "$DL" "String(__auto.getLargeOpenMode())")" "edit"
 BOOT2=$(auto '{"id":1,"cmd":"list_windows"}' | jq -r '.data[]|select(.label|startswith("note-") or startswith("doc-"))|.label' | head -1)
 DOCS_BEFORE=$(doc_labels)
 evl "$BOOT2" "window.__TAURI_INTERNALS__.invoke('open_document_window',{path:'$WORK/big.orig'})" >/dev/null
@@ -585,9 +585,9 @@ e2e_wait_eval "$DLE" "typeof __auto!=='undefined' && typeof __auto.isWindowedTab
 # the longest wait in the suite; the old 30 s bound expired mid-scan on a
 # 2-core VM and reported the still-unfinished state as a failure.
 e2e_wait_eval "$DLE" "String(__auto.isWindowedTab())" "true"
-check "edit mode raises no confirm" "$(evl "$DLE" "String(__auto.largeConfirmVisible())")" "false"
-check "edit mode opens straight into windowed editing" "$(evl "$DLE" "String(__auto.isWindowedTab())")" "true"
-check "not left in read-only large view" "$(evl "$DLE" "String(__auto.isLargeTab())")" "false"
+check "edit mode raises no confirm" "$(e2e_read "$DLE" "String(__auto.largeConfirmVisible())")" "false"
+check "edit mode opens straight into windowed editing" "$(e2e_read "$DLE" "String(__auto.isWindowedTab())")" "true"
+check "not left in read-only large view" "$(e2e_read "$DLE" "String(__auto.isLargeTab())")" "false"
 evl "$DLE" "__auto.closeActiveTab()" >/dev/null
 sleep 2
 evl "$DL" "__auto.setLargeOpenMode('$ORIG_MODE')" >/dev/null 2>&1

@@ -232,7 +232,7 @@ evl "$DL" "__auto.largeConfirmAccept()" >/dev/null
 sleep 2
 check "large tab active" "$(e2e_read "$DL" "String(__auto.isLargeTab())")" "true"
 check "lock available for editable large file (<512MB)" "$(e2e_read "$DL" "String(__auto.largeUnlockAvailable())")" "true"
-check "size reported" "$(evl "$DL" "JSON.stringify(__auto.largeInfo().size)")" "$BIGSIZE"
+check "size reported" "$(e2e_read "$DL" "JSON.stringify(__auto.largeInfo().size)")" "$BIGSIZE"
 check "first line rendered" "$(e2e_read "$DL" "String(__auto.largeVisibleText().includes('line 0000001 '))")" "true"
 
 echo "=== index completes ==="
@@ -246,7 +246,7 @@ until [ "$(evl "$DL" "String(__auto.largeInfo().totalLines !== null)")" = "true"
 done
 # 2400001 = 2.4M newlines + the addressable empty last line, matching how the
 # editor shows a trailing newline.
-check "total lines exact" "$(evl "$DL" "JSON.stringify(__auto.largeInfo().totalLines)")" "2400001"
+check "total lines exact" "$(e2e_read "$DL" "JSON.stringify(__auto.largeInfo().totalLines)")" "2400001"
 
 echo "=== deep jump ==="
 evl "$DL" "void __auto.largeScrollToLine(1999999)" >/dev/null
@@ -284,8 +284,8 @@ until [ "$(evl "$DL" "String(__auto.largeSearchDone())")" = "true" ]; do
     break
   fi
 done
-check "unique query found once" "$(evl "$DL" "JSON.stringify(__auto.largeSearchResults().length)")" "1"
-check "hit line correct (1-based)" "$(evl "$DL" "JSON.stringify(__auto.largeSearchResults()[0]?.line)")" "777"
+check "unique query found once" "$(e2e_read "$DL" "JSON.stringify(__auto.largeSearchResults().length)")" "1"
+check "hit line correct (1-based)" "$(e2e_read "$DL" "JSON.stringify(__auto.largeSearchResults()[0]?.line)")" "777"
 evl "$DL" "__auto.largeSearchJump(0)" >/dev/null
 sleep 2
 check "jump to hit shows content" "$(e2e_read "$DL" "String(__auto.largeVisibleText().includes('line 0000777 '))")" "true"
@@ -298,7 +298,7 @@ until [ "$(evl "$DL" "String(__auto.largeSearchDone())")" = "true" ]; do
     break
   fi
 done
-check "broad query hits capped at 5000" "$(evl "$DL" "JSON.stringify(__auto.largeSearchResults().length)")" "5000"
+check "broad query hits capped at 5000" "$(e2e_read "$DL" "JSON.stringify(__auto.largeSearchResults().length)")" "5000"
 evl "$DL" "__auto.largeSearchClose()" >/dev/null
 check "search closes" "$(e2e_read "$DL" "String(__auto.largeSearchVisible())")" "false"
 
@@ -307,7 +307,7 @@ echo "=== range actions on a file that has gone away ==="
 # buttons used to take that as "nothing to do" and return without a word: the
 # click looked like it had missed the button.
 evl "$DL" "__auto.largeSelectRange(10,20)" >/dev/null
-check "a range is selected" "$(evl "$DL" "JSON.stringify(__auto.largeGetRange())")" '{"startLine":10,"endLine":20}'
+check "a range is selected" "$(e2e_read "$DL" "JSON.stringify(__auto.largeGetRange())")" '{"startLine":10,"endLine":20}'
 check "no error is showing yet" "$(e2e_read "$DL" "String((document.querySelector('.range-error')||{textContent:''}).textContent)")" ""
 mv "$WORK/big.log" "$WORK/big.gone"
 evl "$DL" "__auto.largeRangeEdit()" >/dev/null
@@ -400,8 +400,8 @@ if [ -n "$DL5" ]; then
         ;;
     esac
     echo "full window list: $(auto '{"id":96,"cmd":"list_windows"}' 2>/dev/null)"
-    echo "new window getLargeOpenMode(): $(evl "$DL5" "String(__auto.getLargeOpenMode())" 2>/dev/null)"
-    echo "new window largeInfo(): $(evl "$DL5" "JSON.stringify(__auto.largeInfo())" 2>/dev/null)"
+    echo "new window getLargeOpenMode(): $(e2e_read "$DL5" "String(__auto.getLargeOpenMode())" 2>/dev/null)"
+    echo "new window largeInfo(): $(e2e_read "$DL5" "JSON.stringify(__auto.largeInfo())" 2>/dev/null)"
   fi
   check "ask mode shows confirm" "$(e2e_read "$DL5" "String(__auto.largeConfirmVisible())")" "true"
   evl "$DL5" "__auto.largeConfirmEdit()" >/dev/null
@@ -450,7 +450,7 @@ evl "$DLR" "__auto.setLanguage('$ORIG_LANG')" >/dev/null
 sleep 1
 check "restored without confirm" "$(e2e_read "$DLR" "String(__auto.largeConfirmVisible())")" "false"
 check "restored as large tab" "$(e2e_read "$DLR" "String(__auto.isLargeTab())")" "true"
-check "restored size intact" "$(evl "$DLR" "JSON.stringify(__auto.largeInfo().size)")" "$BIGSIZE"
+check "restored size intact" "$(e2e_read "$DLR" "JSON.stringify(__auto.largeInfo().size)")" "$BIGSIZE"
 check "restored content renders" "$(e2e_read "$DLR" "String(__auto.largeVisibleText().includes('line '))")" "true"
 evl "$DLR" "__auto.closeActiveTab()" >/dev/null
 sleep 2
