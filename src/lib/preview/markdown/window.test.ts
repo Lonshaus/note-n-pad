@@ -4,7 +4,6 @@ import { describe, expect, it } from 'vitest';
 import {
   addRun,
   anchoredScrollTop,
-  averageHeight,
   blockAt,
   blockHeightsFromTops,
   captureScrollAnchor,
@@ -13,26 +12,63 @@ import {
   maxHasSettled,
   measuredBlocks,
   measuredHeight,
+  metricOf,
   offsetOf,
+  type Metric,
   type Run,
 } from './window';
+import type { BlockIndex } from './scan';
+
+/** A block index whose blocks all have the same source length, so `metricOf`
+ *  cannot separate a per-block cost from a per-character one and falls back to
+ *  the flat per-block average these tests were written against. */
+function uniformIndex(blocks: number, len = 40): BlockIndex {
+  const index = new Int32Array(blocks * 2);
+  for (let i = 0; i < blocks; i += 1) {
+    index[i * 2] = i * (len + 1);
+    index[i * 2 + 1] = i * (len + 1) + len;
+  }
+  return index;
+}
+
+/** A block index whose blocks have arbitrary, individually specified source
+ *  lengths, for tests that need block count and character count to vary
+ *  independently. */
+function buildIndex(lengths: number[]): BlockIndex {
+  const index = new Int32Array(lengths.length * 2);
+  let cursor = 0;
+  for (let i = 0; i < lengths.length; i += 1) {
+    index[i * 2] = cursor;
+    cursor += lengths[i] as number;
+    index[i * 2 + 1] = cursor;
+  }
+  return index;
+}
 
 describe('addRun', () => {
   it('records blocks and their measured height', () => {
-    const runs = addRun([], 0, 10, 300);
+    const metric = metricOf([], uniformIndex(10), 28);
+    const runs = addRun([], 0, 10, 300, metric);
     expect(measuredBlocks(runs)).toBe(10);
     expect(measuredHeight(runs)).toBe(300);
   });
 
-  it('merges runs that touch', () => {
-    let runs = addRun([], 0, 10, 300);
-    runs = addRun(runs, 10, 20, 300);
-    expect(runs).toEqual([{ from: 0, to: 20, height: 600 }]);
+  it('keeps touching runs separate', () => {
+    const metric = metricOf([], uniformIndex(20), 28);
+    let runs = addRun([], 0, 10, 300, metric);
+    runs = addRun(runs, 10, 20, 300, metric);
+    expect(runs).toEqual([
+      { from: 0, to: 10, height: 300 },
+      { from: 10, to: 20, height: 300 },
+    ]);
+    expect(heightOf(runs, 20, metric)).toBe(measuredHeight(runs));
+    expect(heightOf(runs, 20, metric)).toBe(600);
   });
 
   it('keeps runs with a gap between them separate', () => {
-    let runs = addRun([], 0, 10, 300);
-    runs = addRun(runs, 15, 20, 150);
+    const metric = metricOf([], uniformIndex(20), 28);
+    let runs = addRun([], 0, 10, 300, metric);
+    runs = addRun(runs, 15, 20, 150, metric);
     expect(runs).toEqual([
       { from: 0, to: 10, height: 300 },
       { from: 15, to: 20, height: 150 },
@@ -40,25 +76,37 @@ describe('addRun', () => {
   });
 
   it('ignores an empty or non-positive measurement', () => {
-    expect(addRun([], 5, 5, 100)).toEqual([]);
-    expect(addRun([], 0, 10, 0)).toEqual([]);
+    const metric = metricOf([], uniformIndex(10), 28);
+    expect(addRun([], 5, 5, 100, metric)).toEqual([]);
+    expect(addRun([], 0, 10, 0, metric)).toEqual([]);
   });
 
   it('never exceeds 64 runs, merging the smallest gap and preserving the total height it had before the merge', () => {
     let runs: Run[] = [];
+    const index = uniformIndex(200);
+    let metric: Metric = metricOf([], index, 28);
     // 65 isolated single-block runs, each 10px, with a one-block gap between
     // every pair except the smallest, which sits at index 40/42.
     for (let i = 0; i < 65; i += 1) {
       const from = i * 2;
-      runs = addRun(runs, from, from + 1, 10);
+      runs = addRun(runs, from, from + 1, 10, metric);
+      metric = metricOf(runs, index, 28);
     }
     expect(runs.length).toBeLessThanOrEqual(64);
     const heightBefore = measuredHeight(runs);
     // Force one more merge: the total must never lose what was already
     // measured, only gain the new block plus a non-negative gap estimate.
-    runs = addRun(runs, 130, 131, 10);
+    runs = addRun(runs, 130, 131, 10, metric);
+    metric = metricOf(runs, index, 28);
     expect(runs.length).toBeLessThanOrEqual(64);
     expect(measuredHeight(runs)).toBeGreaterThanOrEqual(heightBefore + 10);
+    // The gap-merge estimate is priced purely per block here (a uniform
+    // index cannot separate a per-character term), so whatever it added
+    // beyond the new block's own height must be an exact multiple of the
+    // metric's per-block cost.
+    const bridgedCost = measuredHeight(runs) - heightBefore - 10;
+    expect(bridgedCost).toBeGreaterThanOrEqual(0);
+    expect(bridgedCost % metric.perBlock).toBeCloseTo(0, 6);
   });
 });
 
@@ -67,7 +115,8 @@ describe('addRun + isCovered', () => {
     // Mirrors how MarkdownView.measure folds a render window in: it checks
     // isCovered per block and only ever hands addRun the blocks that are
     // actually new, however much the rendered window overlaps a prior one.
-    let runs = addRun([], 0, 20, 600); // window [0, 20), 30px/block
+    const metric = metricOf([], uniformIndex(30), 28);
+    let runs = addRun([], 0, 20, 600, metric); // window [0, 20), 30px/block
     // Next window is [10, 30) — blocks 10-19 are already covered, only
     // 20-29 (each measuring 25px this time) are new.
     const newFrom = 20;
@@ -78,7 +127,7 @@ describe('addRun + isCovered', () => {
         newHeight += 25;
       }
     }
-    runs = addRun(runs, newFrom, newTo, newHeight);
+    runs = addRun(runs, newFrom, newTo, newHeight, metric);
     expect(measuredBlocks(runs)).toBe(30);
     expect(measuredHeight(runs)).toBe(600 + 250);
   });
@@ -86,7 +135,8 @@ describe('addRun + isCovered', () => {
 
 describe('isCovered', () => {
   it('is true only for blocks inside a run', () => {
-    const runs = addRun([], 5, 10, 50);
+    const metric = metricOf([], uniformIndex(10), 28);
+    const runs = addRun([], 5, 10, 50, metric);
     expect(isCovered(runs, 4)).toBe(false);
     expect(isCovered(runs, 5)).toBe(true);
     expect(isCovered(runs, 9)).toBe(true);
@@ -94,14 +144,38 @@ describe('isCovered', () => {
   });
 });
 
-describe('averageHeight', () => {
-  it('returns the seed before anything has been measured', () => {
-    expect(averageHeight([], 28)).toBe(28);
+describe('metricOf', () => {
+  it('recovers both coefficients from two runs with different block/char ratios', () => {
+    // Run A: 5 blocks, each 100 characters long. Run B: 5 blocks, each 5
+    // characters long. Generated from a known perBlock=2, perChar=0.5 so the
+    // fit can be checked against the values that produced the heights.
+    const index = buildIndex([
+      ...Array<number>(5).fill(100),
+      ...Array<number>(5).fill(5),
+    ]);
+    const runs: Run[] = [
+      { from: 0, to: 5, height: 2 * 5 + 0.5 * (5 * 100) },
+      { from: 5, to: 10, height: 2 * 5 + 0.5 * (5 * 5) },
+    ];
+    const metric = metricOf(runs, index, 28);
+    expect(metric.perBlock).toBeCloseTo(2, 6);
+    expect(metric.perChar).toBeCloseTo(0.5, 6);
   });
 
-  it('is the overall mean height per measured block', () => {
-    const runs = addRun(addRun([], 0, 10, 300), 20, 25, 100);
-    expect(averageHeight(runs, 28)).toBe(400 / 15);
+  it('falls back to a single parameter when the fit would come out negative', () => {
+    // More characters correlating with less height contradicts the model —
+    // the two-parameter fit goes negative and metricOf must fall back.
+    const index = buildIndex([
+      ...Array<number>(5).fill(100),
+      ...Array<number>(5).fill(10),
+    ]);
+    const runs: Run[] = [
+      { from: 0, to: 5, height: 50 },
+      { from: 5, to: 10, height: 200 },
+    ];
+    const metric = metricOf(runs, index, 28);
+    expect(metric.perBlock).toBeGreaterThanOrEqual(0);
+    expect(metric.perChar).toBeGreaterThanOrEqual(0);
   });
 });
 
@@ -112,38 +186,56 @@ describe('offsetOf / heightOf', () => {
     // real bottom of the document. heightOf must equal exactly that once the
     // run covering [first, total) is folded in — a mismatch here would mean
     // the pure model disagrees with itself, not a DOM-timing issue.
-    const avg = 667 / 29; // gap [0, 29) unmeasured at this average
-    const runs = addRun([], 29, 40, 1058); // tail run: 11 blocks, 1058px
-    expect(offsetOf(runs, 29, avg)).toBeCloseTo(667, 9);
-    expect(heightOf(runs, 40, avg)).toBeCloseTo(1725, 9);
+    const metric: Metric = {
+      index: uniformIndex(40),
+      perBlock: 667 / 29, // gap [0, 29) unmeasured at this rate
+      perChar: 0,
+    };
+    const runs = addRun([], 29, 40, 1058, metric); // tail run: 11 blocks, 1058px
+    expect(offsetOf(runs, 29, metric)).toBeCloseTo(667, 9);
+    expect(heightOf(runs, 40, metric)).toBeCloseTo(1725, 9);
   });
 
-  it('uses real height for measured blocks and avg for the gaps', () => {
+  it('uses real height for measured blocks and the metric for the gaps', () => {
     // Blocks 0-9 measured at 30px/block, blocks 10-19 unmeasured.
-    const runs = addRun([], 0, 10, 300);
-    const avg = 20;
-    expect(offsetOf(runs, 0, avg)).toBe(0);
-    expect(offsetOf(runs, 5, avg)).toBe(150);
-    expect(offsetOf(runs, 10, avg)).toBe(300);
-    expect(offsetOf(runs, 15, avg)).toBe(300 + 5 * avg);
+    const metric: Metric = {
+      index: uniformIndex(20),
+      perBlock: 20,
+      perChar: 0,
+    };
+    const runs = addRun([], 0, 10, 300, metric);
+    expect(offsetOf(runs, 0, metric)).toBe(0);
+    expect(offsetOf(runs, 5, metric)).toBe(150);
+    expect(offsetOf(runs, 10, metric)).toBe(300);
+    expect(offsetOf(runs, 15, metric)).toBe(300 + 5 * 20);
   });
 
   it('heightOf is offsetOf at the last block, and the two always agree', () => {
-    const runs = addRun([], 3, 8, 250);
     const total = 20;
-    const avg = averageHeight(runs, 28);
-    expect(heightOf(runs, total, avg)).toBe(offsetOf(runs, total, avg));
+    const index = uniformIndex(total);
+    const buildMetric = metricOf([], index, 28);
+    const runs = addRun([], 3, 8, 250, buildMetric);
+    const metric = metricOf(runs, index, 28);
+    expect(heightOf(runs, total, metric)).toBe(offsetOf(runs, total, metric));
   });
 
   it('gives the same document height no matter what window happens to be rendered', () => {
     // This is the property whose absence caused the flicker: heightOf takes
     // no window, so it cannot answer differently depending on where the
     // reader happens to be scrolled.
-    const runs = addRun(addRun([], 0, 20, 600), 40, 45, 100);
-    const avg = averageHeight(runs, 28);
     const total = 50;
-    const fromNearTheTop = heightOf(runs, total, avg);
-    const fromNearTheBottom = heightOf(runs, total, avg);
+    const index = uniformIndex(total);
+    const buildMetric = metricOf([], index, 28);
+    const runs = addRun(
+      addRun([], 0, 20, 600, buildMetric),
+      40,
+      45,
+      100,
+      buildMetric,
+    );
+    const metric = metricOf(runs, index, 28);
+    const fromNearTheTop = heightOf(runs, total, metric);
+    const fromNearTheBottom = heightOf(runs, total, metric);
     expect(fromNearTheTop).toBe(fromNearTheBottom);
   });
 
@@ -155,74 +247,166 @@ describe('offsetOf / heightOf', () => {
     // — the caller filters it out via isCovered, exactly as MarkdownView's
     // measure does — must be a no-op, not a second, disagreeing answer.
     const total = 40;
-    let runs = addRun([], 25, 40, 850); // window reaches the final block
-    const avg1 = averageHeight(runs, 28);
-    const height1 = heightOf(runs, total, avg1);
+    const index = uniformIndex(total);
+    const buildMetric = metricOf([], index, 28);
+    let runs = addRun([], 25, 40, 850, buildMetric); // window reaches the final block
+    const metric1 = metricOf(runs, index, 28);
+    const height1 = heightOf(runs, total, metric1);
     let newHeight = 0;
     for (let i = 30; i < 40; i += 1) {
       if (!isCovered(runs, i)) {
         newHeight += 60; // no block in [30, 40) is actually new
       }
     }
-    runs = addRun(runs, 30, 40, newHeight);
-    const avg2 = averageHeight(runs, 28);
-    const height2 = heightOf(runs, total, avg2);
+    runs = addRun(runs, 30, 40, newHeight, metric1);
+    const metric2 = metricOf(runs, index, 28);
+    const height2 = heightOf(runs, total, metric2);
     expect(height2).toBe(height1);
   });
 });
 
 describe('blockAt', () => {
   it('is the inverse of offsetOf across a run boundary', () => {
-    const runs = addRun([], 0, 10, 300); // 30px/block
-    const avg = 20;
+    const metric: Metric = {
+      index: uniformIndex(10),
+      perBlock: 20,
+      perChar: 0,
+    };
+    const runs = addRun([], 0, 10, 300, metric); // 30px/block
     for (let i = 0; i <= 10; i += 1) {
-      const offset = offsetOf(runs, i, avg);
-      expect(blockAt(runs, offset, avg)).toBe(i);
+      const offset = offsetOf(runs, i, metric);
+      expect(blockAt(runs, offset, metric)).toBe(i);
     }
   });
 
   it('is the inverse of offsetOf inside a gap', () => {
-    const runs = addRun([], 0, 10, 300); // 30px/block, blocks 10+ unmeasured
-    const avg = 20;
-    const offset = offsetOf(runs, 10, avg) + 3 * avg; // 3 blocks into the gap
-    expect(blockAt(runs, offset, avg)).toBe(13);
+    const metric: Metric = {
+      index: uniformIndex(15),
+      perBlock: 20,
+      perChar: 0,
+    };
+    const runs = addRun([], 0, 10, 300, metric); // 30px/block, blocks 10+ unmeasured
+    const offset = offsetOf(runs, 10, metric) + 3 * 20; // 3 blocks into the gap
+    expect(blockAt(runs, offset, metric)).toBe(13);
   });
 
   it('returns zero at or before the start of the document', () => {
-    const runs = addRun([], 5, 10, 100);
-    expect(blockAt(runs, 0, 20)).toBe(0);
+    const metric: Metric = {
+      index: uniformIndex(10),
+      perBlock: 20,
+      perChar: 0,
+    };
+    const runs = addRun([], 5, 10, 100, metric);
+    expect(blockAt(runs, 0, metric)).toBe(0);
+  });
+
+  it('keeps two touching runs separate and each keeps its own density, not a blend', () => {
+    const metric: Metric = { index: uniformIndex(20), perBlock: 1, perChar: 0 };
+    let runs = addRun([], 0, 10, 100, metric); // 10px/block
+    runs = addRun(runs, 10, 20, 1000, metric); // 100px/block
+    expect(offsetOf(runs, 10, metric)).toBe(100);
+    expect(offsetOf(runs, 15, metric)).toBe(100 + 500); // second run's own density
+    for (let i = 0; i <= 20; i += 1) {
+      expect(blockAt(runs, offsetOf(runs, i, metric), metric)).toBe(i);
+    }
+  });
+
+  it('clamps at total for an offset past the end of the document', () => {
+    const metric: Metric = { index: uniformIndex(20), perBlock: 1, perChar: 0 };
+    let runs = addRun([], 0, 10, 100, metric);
+    runs = addRun(runs, 10, 20, 1000, metric);
+    expect(blockAt(runs, 1e9, metric)).toBe(20);
+  });
+
+  it('stays finite and monotonically increasing for a pure per-character fit over zero-character blocks', () => {
+    // All five blocks sit at the same character offset, so every span costs
+    // zero characters — a pure per-character metric must not divide by that.
+    const index: BlockIndex = new Int32Array([0, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
+    const metric: Metric = { index, perBlock: 0, perChar: 2 };
+    const offsets: number[] = [];
+    for (let i = 0; i <= 5; i += 1) {
+      const offset = offsetOf([], i, metric);
+      expect(Number.isFinite(offset)).toBe(true);
+      offsets.push(offset);
+    }
+    for (let i = 1; i < offsets.length; i += 1) {
+      expect(offsets[i] as number).toBeGreaterThan(offsets[i - 1] as number);
+    }
+    const total = heightOf([], 5, metric);
+    expect(Number.isFinite(total)).toBe(true);
+    expect(Number.isFinite(blockAt([], total / 2, metric))).toBe(true);
   });
 });
 
 describe('captureScrollAnchor / anchoredScrollTop', () => {
   it('stays pinned to the new maximum when the total shrinks', () => {
     // Reader was sitting at the (old) real bottom of the scroller.
-    const anchor = captureScrollAnchor(1459, 1459, 30);
+    const runs: Run[] = [];
+    const metric30: Metric = {
+      index: uniformIndex(60),
+      perBlock: 30,
+      perChar: 0,
+    };
+    const anchor = captureScrollAnchor(1459, 1459, runs, metric30);
     expect(anchor.pinnedBottom).toBe(true);
     // The scroller's real range has since settled to a shorter document.
-    const restored = anchoredScrollTop(anchor, 1317, 27);
+    const metric27: Metric = {
+      index: uniformIndex(60),
+      perBlock: 27,
+      perChar: 0,
+    };
+    const restored = anchoredScrollTop(anchor, 1317, runs, metric27);
     expect(restored).toBe(1317);
   });
 
   it('treats a position within one pixel of the maximum as pinned', () => {
-    const anchor = captureScrollAnchor(1458.4, 1459, 30);
+    const metric30: Metric = {
+      index: uniformIndex(60),
+      perBlock: 30,
+      perChar: 0,
+    };
+    const anchor = captureScrollAnchor(1458.4, 1459, [], metric30);
     expect(anchor.pinnedBottom).toBe(true);
   });
 
   it('keeps the same block under the viewport at a mid-document position', () => {
     // Not at the bottom: scrollTop 300 at 30px/block is 10 blocks down.
-    const anchor = captureScrollAnchor(300, 1459, 30);
+    const runs: Run[] = [];
+    const metric30: Metric = {
+      index: uniformIndex(60),
+      perBlock: 30,
+      perChar: 0,
+    };
+    const anchor = captureScrollAnchor(300, 1459, runs, metric30);
     expect(anchor.pinnedBottom).toBe(false);
+    expect(anchor.block).toBe(10);
+    expect(anchor.fraction).toBeCloseTo(0, 5);
     // The estimate moves to 27px/block; the same 10 blocks should still sit
     // at the top of the viewport.
-    const restored = anchoredScrollTop(anchor, 1155, 27);
+    const metric27: Metric = {
+      index: uniformIndex(60),
+      perBlock: 27,
+      perChar: 0,
+    };
+    const restored = anchoredScrollTop(anchor, 1155, runs, metric27);
     expect(restored).toBeCloseTo(270, 5);
   });
 
   it('clamps the restored position to the new scroll range', () => {
-    const anchor = captureScrollAnchor(300, 1459, 30);
+    const runs: Run[] = [];
+    const metric30: Metric = {
+      index: uniformIndex(60),
+      perBlock: 30,
+      perChar: 0,
+    };
+    const anchor = captureScrollAnchor(300, 1459, runs, metric30);
     // A drastically shorter document than the anchored offset would land in.
-    const restored = anchoredScrollTop(anchor, 0, 27);
+    const metric27: Metric = {
+      index: uniformIndex(60),
+      perBlock: 27,
+      perChar: 0,
+    };
+    const restored = anchoredScrollTop(anchor, 0, runs, metric27);
     expect(restored).toBe(0);
   });
 
@@ -233,9 +417,15 @@ describe('captureScrollAnchor / anchoredScrollTop', () => {
     // 1540, implying a max of 1540 - 514 = 1026) disagrees with the
     // scroller's real range of 1738 - 514 = 1224. The anchor must use 1224.
     const realMax = 1738 - 514;
-    const anchor = captureScrollAnchor(1224, realMax, 56);
+    const runs: Run[] = [];
+    const metric: Metric = {
+      index: uniformIndex(60),
+      perBlock: 56,
+      perChar: 0,
+    };
+    const anchor = captureScrollAnchor(1224, realMax, runs, metric);
     expect(anchor.pinnedBottom).toBe(true);
-    const restored = anchoredScrollTop(anchor, realMax, 56);
+    const restored = anchoredScrollTop(anchor, realMax, runs, metric);
     expect(restored).toBe(1224);
   });
 });
@@ -267,26 +457,48 @@ describe('heightOf invariant: full coverage of [0, total) sums exactly', () => {
   // here would mean the arithmetic itself disagrees with its own data, not
   // that a DOM measurement hasn't landed yet.
   it('one run spanning the whole document', () => {
-    const runs = addRun([], 0, 40, 1043);
-    expect(heightOf(runs, 40, 30)).toBe(measuredHeight(runs));
-    expect(heightOf(runs, 40, 30)).toBe(1043);
+    const metric: Metric = {
+      index: uniformIndex(40),
+      perBlock: 30,
+      perChar: 0,
+    };
+    const runs = addRun([], 0, 40, 1043, metric);
+    expect(heightOf(runs, 40, metric)).toBe(measuredHeight(runs));
+    expect(heightOf(runs, 40, metric)).toBe(1043);
   });
 
-  it('two touching runs merged by normalize into full coverage', () => {
-    let runs = addRun([], 0, 20, 500);
-    runs = addRun(runs, 20, 40, 543);
-    expect(runs).toEqual([{ from: 0, to: 40, height: 1043 }]);
-    expect(heightOf(runs, 40, 30)).toBe(measuredHeight(runs));
-    expect(heightOf(runs, 40, 30)).toBe(1043);
+  it('two touching runs stay separate', () => {
+    const metric: Metric = {
+      index: uniformIndex(40),
+      perBlock: 30,
+      perChar: 0,
+    };
+    let runs = addRun([], 0, 20, 500, metric);
+    runs = addRun(runs, 20, 40, 543, metric);
+    expect(runs).toEqual([
+      { from: 0, to: 20, height: 500 },
+      { from: 20, to: 40, height: 543 },
+    ]);
+    expect(heightOf(runs, 40, metric)).toBe(measuredHeight(runs));
+    expect(heightOf(runs, 40, metric)).toBe(1043);
   });
 
   it('a gap opened by two separate windows, then closed by a third — the real MarkdownView convergence shape', () => {
-    let runs = addRun([], 0, 10, 300); // first window
-    runs = addRun(runs, 20, 40, 743); // a later, non-adjacent window
-    runs = addRun(runs, 10, 20, 200); // the gap in between, discovered last
-    expect(runs).toEqual([{ from: 0, to: 40, height: 1243 }]);
-    expect(heightOf(runs, 40, 30)).toBe(measuredHeight(runs));
-    expect(heightOf(runs, 40, 30)).toBe(1243);
+    const metric: Metric = {
+      index: uniformIndex(40),
+      perBlock: 30,
+      perChar: 0,
+    };
+    let runs = addRun([], 0, 10, 300, metric); // first window
+    runs = addRun(runs, 20, 40, 743, metric); // a later, non-adjacent window
+    runs = addRun(runs, 10, 20, 200, metric); // the gap in between, discovered last
+    expect(runs).toEqual([
+      { from: 0, to: 10, height: 300 },
+      { from: 10, to: 20, height: 200 },
+      { from: 20, to: 40, height: 743 },
+    ]);
+    expect(heightOf(runs, 40, metric)).toBe(measuredHeight(runs));
+    expect(heightOf(runs, 40, metric)).toBe(1243);
   });
 
   it('many small, non-adjacent runs force capRuns to bridge gaps, then every remaining block is folded in for real', () => {
@@ -297,16 +509,20 @@ describe('heightOf invariant: full coverage of [0, total) sums exactly', () => {
     // isCovered-gated, one-block-at-a-time shape MarkdownView.measure
     // produces as its render window shifts and re-measures.
     const total = 200;
+    const index = uniformIndex(total);
     let runs: Run[] = [];
+    let metric: Metric = metricOf([], index, 28);
     const trueHeight = (i: number): number => 10 + (i % 7) * 3; // 10..28
     for (let i = 0; i < total; i += 3) {
       if (!isCovered(runs, i)) {
-        runs = addRun(runs, i, i + 1, trueHeight(i));
+        runs = addRun(runs, i, i + 1, trueHeight(i), metric);
+        metric = metricOf(runs, index, 28);
       }
     }
     for (let i = 0; i < total; i += 1) {
       if (!isCovered(runs, i)) {
-        runs = addRun(runs, i, i + 1, trueHeight(i));
+        runs = addRun(runs, i, i + 1, trueHeight(i), metric);
+        metric = metricOf(runs, index, 28);
       }
     }
     let trueTotal = 0;
@@ -314,25 +530,21 @@ describe('heightOf invariant: full coverage of [0, total) sums exactly', () => {
       trueTotal += trueHeight(i);
     }
     expect(measuredBlocks(runs)).toBe(total);
-    const avg = averageHeight(runs, 28);
     // The literal invariant under investigation: full coverage means
     // heightOf is nothing but the sum of the run heights — always true by
     // heightOf's own definition, so this can never be the failing half.
-    expect(heightOf(runs, total, avg)).toBe(measuredHeight(runs));
+    expect(heightOf(runs, total, metric)).toBe(measuredHeight(runs));
     // The half that actually matters for the live report: does that sum
-    // agree with the true, physical per-block total? It does not — capRuns
-    // bridges a gap using the average measured *so far*, permanently, and
-    // isCovered then refuses to let a later, real measurement of that exact
-    // territory ever correct it, even once every block has genuinely been
-    // measured on its own. This is not a failure of heightOf's arithmetic;
-    // it is `runs` itself carrying a stale estimate that nothing can reach
-    // again. Documented here, not asserted as a bug fix — see the report.
-    // Not a bug fix assertion — a pinned demonstration. This is currently
-    // nonzero (about 15px out of 3782 in this shape): capRuns bridged a gap
-    // using the average measured so far, and isCovered never lets that
-    // territory be re-measured for real afterward, even once every block
-    // genuinely has been. See the report for whether this is worth fixing.
-    expect(Math.abs(heightOf(runs, total, avg) - trueTotal)).toBeGreaterThan(5);
+    // agree with the true, physical per-block total? It still does not —
+    // capRuns still bridges a gap using the metric fit so far, permanently,
+    // and isCovered still refuses to let a later, real measurement of that
+    // exact territory ever correct it. Keeping touching runs separate did
+    // not remove the imperfection, only its size: about 13.6px out of 3782
+    // in this shape (previously about 15px). Not a bug fix assertion — a
+    // pinned demonstration, re-measured against the new metric-based model.
+    const error = Math.abs(heightOf(runs, total, metric) - trueTotal);
+    expect(error).toBeGreaterThan(5);
+    expect(error).toBeLessThan(25);
   });
 });
 

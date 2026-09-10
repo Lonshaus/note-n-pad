@@ -1,26 +1,43 @@
 name: E2E
 
-# Manual trigger, like ci.yml: every suite builds the app, launches it, and
-# drives the real UI, so a full run is tens of minutes.
-#
-# No Windows job: scripts/e2e/lib.sh resolves the app-data directory and the
-# WebView process name for Darwin and Linux only.
+# Automatic on pull requests into master only, where a merge means a version
+# is being released. Everywhere else it stays on demand.
 on:
+  pull_request:
+    branches: [master]
   workflow_dispatch:
     inputs:
       suites:
-        description: 'Suite names, space separated, e.g. "e2e-table e2e-large". Empty runs all.'
+        # Single-select, because GitHub dropdowns are. The run step still
+        # validates the name: an API dispatch can send any string it likes.
+        description: Which suite to run.
         required: false
-        default: ''
-      runners:
-        description: Which runners to use. A failure that shows on both costs ten times more to reproduce on macOS.
-        required: false
-        default: both
+        default: all
         type: choice
         options:
-          - both
+          - all
+          - e2e-close-flush
+          - e2e-editor-focus
+          - e2e-highlight
+          - e2e-i18n
+          - e2e-large
+          - e2e-longline
+          - e2e-range
+          - e2e-table
+          - e2e-view-mode
+          - e2e-windowed
+      runners:
+        # A failure on one platform is far cheaper to reproduce than one that
+        # needs all three.
+        description: Which runners to use.
+        required: false
+        default: all
+        type: choice
+        options:
+          - all
           - ubuntu
           - macos
+          - windows
 
 concurrency:
   group: e2e-${{ github.workflow }}-${{ github.ref }}
@@ -39,7 +56,8 @@ jobs:
         os: >-
           ${{ fromJSON(inputs.runners == 'ubuntu' && '["ubuntu-24.04"]'
           || inputs.runners == 'macos' && '["macos-latest"]'
-          || '["ubuntu-24.04","macos-latest"]') }}
+          || inputs.runners == 'windows' && '["windows-latest"]'
+          || '["ubuntu-24.04","macos-latest","windows-latest"]') }}
     steps:
       - uses: actions/checkout@v7
 
@@ -75,11 +93,17 @@ jobs:
         run: cargo build
 
       - name: Run the E2E suites
+        # Windows runners default to PowerShell, and this script is POSIX.
+        shell: bash
         env:
           # Through the environment, never interpolated into the script.
           SUITES: ${{ inputs.suites }}
         run: |
           set -u -o pipefail
+          # The dropdown's "all" option and an API dispatch's empty string both mean everything.
+          if [ "$SUITES" = all ]; then
+            SUITES=''
+          fi
           if [ -z "$SUITES" ]; then
             scripts="$(ls scripts/e2e/e2e-*.sh)"
           else
@@ -119,11 +143,18 @@ jobs:
             echo "::endgroup::"
           done
 
+          # The app's own output goes to $OUT/dev-<suite>.log, which is outside
+          # the upload path; without it a failed launch shows only the socket
+          # refusing connections. $OUT also holds the multi-hundred-MB fixtures,
+          # so copy the logs out rather than uploading the directory.
+          out="$(bash -c '. scripts/e2e/lib.sh; printf %s "$OUT"')"
+          cp "$out"/dev-*.log e2e-logs/ 2>/dev/null || true
+
           cat e2e-logs/summary.txt >>"$GITHUB_STEP_SUMMARY"
           [ -z "$failed" ] || { echo "failed:$failed" >&2; exit 1; }
 
       - name: Upload logs
-        if: failure()
+        if: always()
         uses: actions/upload-artifact@v7
         with:
           name: e2e-logs-${{ matrix.os }}

@@ -1,9 +1,10 @@
 name: CI
 
-# Manual trigger only: a three-platform matrix run costs about 18 billable
-# minutes (GitHub weights private-repo minutes by platform — Linux 1x,
-# Windows 2x, macOS 10x), so it runs when asked for rather than on every push.
+# Pull requests rather than pushes: a branch is pushed many times while it is
+# being worked on, and only the state that is about to be merged has to be
+# green.
 on:
+  pull_request:
   workflow_dispatch:
 
 # Cancel superseded runs on the same ref to save CI minutes.

@@ -17,6 +17,12 @@
 /// in every build after them. An older build opens the plain Default apps list
 /// and ignores the parameter, so the row is hidden there rather than sending
 /// the user somewhere that does not answer the question.
+///
+/// The `test` arm keeps the predicate compiled where its only caller is the
+/// test module: without it a release build for any other platform has no
+/// caller at all, and `cargo clippy -D warnings` fails the whole run on dead
+/// code.
+#[cfg(any(target_os = "windows", test))]
 pub fn parameter_supported(build: u32, ubr: u32) -> bool {
   build >= 22631 || (build == 22621 && ubr >= 1555) || (build == 22000 && ubr >= 1817)
 }

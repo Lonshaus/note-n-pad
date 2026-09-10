@@ -14,6 +14,7 @@ WORK="$OUT/i18n-fixture"
 PASS=0
 FAIL=0
 mkdir -p "$OUT"
+: >"$OUT/dev-i18n.log"
 
 ok() {
   PASS=$((PASS + 1))
@@ -50,7 +51,7 @@ doc_label() {
   auto '{"id":3,"cmd":"list_windows"}' | jq -r '.data[]|select(.label|startswith("doc-"))|.label' | head -1
 }
 evl() {
-  auto "{\"id\":9,\"cmd\":\"eval\",\"label\":\"$1\",\"js\":$(jq -Rn --arg js "$2" '$js')}" | jq -r '.data'
+  auto "{\"id\":$(e2e_next_id),\"cmd\":\"eval\",\"label\":\"$1\",\"js\":$(jq -Rn --arg js "$2" '$js')}" | jq -r '.data'
 }
 # A real Ctrl-C sends SIGINT to the whole process group, so app and node get
 # interrupted at the same time. If the automation port is already dead by the
@@ -81,22 +82,30 @@ _settings_auto_ready() {
   [ "$(evl settings "String(typeof __auto)")" = "object" ]
 }
 launch() {
-  NOTE_N_PAD_AUTOMATION=1 npm run tauri dev >"$OUT/dev-i18n.log" 2>&1 &
+  e2e_require_clean_slate
+  NOTE_N_PAD_AUTOMATION=1 npm run tauri dev >>"$OUT/dev-i18n.log" 2>&1 &
+  e2e_report_port_holders
   local tries=0
-  until nc -z 127.0.0.1 45678 2>/dev/null; do
+  until e2e_automation_up; do
     sleep 1
     tries=$((tries + 1))
     if [ "$tries" -gt 240 ]; then
+      e2e_report_port_holders
       echo "FATAL: automation port never opened"
       exit 1
     fi
   done
+  e2e_require_automation_listener "$OUT/dev-i18n.log"
+  # The dev server binds 1420 while the app is coming up, so this is the
+  # first moment a leftover holding it is visible; the app answering on
+  # the automation port does not mean vite got its port.
+  e2e_report_port_holders
   sleep 4
 }
 quit_app() {
   auto '{"id":99,"cmd":"quit"}' >/dev/null 2>&1
   local tries=0
-  while pgrep -x note-n-pad >/dev/null 2>&1; do
+  while e2e_app_running; do
     sleep 1
     tries=$((tries + 1))
     if [ "$tries" -gt 20 ]; then
@@ -131,7 +140,7 @@ for f in "$STORE"/*.json; do
   if [ "$(jq -r '.kind' "$f" 2>/dev/null)" = "document" ]; then
     FP=$(jq -r '.file_path // empty' "$f" 2>/dev/null)
     case "$FP" in
-      *note-n-pad-e2e/*)
+      *note-n-pad-e2e*)
         rm -f "$f"
         echo "preflight: removed scratchpad snapshot ($FP)"
         ;;
@@ -156,7 +165,7 @@ open_doc
 # interrupt or normal exit restores it (and kills the app) instead of leaving
 # settings.json flipped. The trap looks the doc label up live so it works after
 # the restart below reassigns DL.
-ORIG_LANG=$(evl "$DL" "String(__auto.getLanguage())")
+ORIG_LANG=$(e2e_read "$DL" "String(__auto.getLanguage())")
 echo "original language: $ORIG_LANG"
 restore_lang() {
   trap '' INT TERM
@@ -192,23 +201,23 @@ evl "$DL" "window.__TAURI_INTERNALS__.invoke('show_settings_window')" >/dev/null
 e2e_wait_until _settings_auto_ready
 evl "settings" "__auto.setLanguage('zh-TW')" >/dev/null
 e2e_wait_eval "settings" "String(__auto.getSettings().resolvedLocale)" "zh-TW"
-check "resolvedLocale for zh-TW" "$(evl "settings" "String(__auto.getSettings().resolvedLocale)")" "zh-TW"
+check "resolvedLocale for zh-TW" "$(e2e_read "settings" "String(__auto.getSettings().resolvedLocale)")" "zh-TW"
 evl "settings" "__auto.setLanguage('en')" >/dev/null
 e2e_wait_eval "settings" "String(__auto.getSettings().resolvedLocale)" "en"
-check "resolvedLocale for en" "$(evl "settings" "String(__auto.getSettings().resolvedLocale)")" "en"
+check "resolvedLocale for en" "$(e2e_read "settings" "String(__auto.getSettings().resolvedLocale)")" "en"
 evl "settings" "__auto.setLanguage('ja')" >/dev/null
 e2e_wait_eval "settings" "String(__auto.getSettings().resolvedLocale)" "ja"
-check "resolvedLocale for ja" "$(evl "settings" "String(__auto.getSettings().resolvedLocale)")" "ja"
+check "resolvedLocale for ja" "$(e2e_read "settings" "String(__auto.getSettings().resolvedLocale)")" "ja"
 
 echo "=== system mode resolves to the host locale ==="
 # Derive the expected locale from the host UI language with the same prefix rule
 # the app's resolveLocale uses, so the assertion tracks whatever machine runs it
 # instead of hard-coding one host.
-HOST_LOCALE=$(evl "settings" "(()=>{const l=(navigator.language||'').toLowerCase();return l.startsWith('zh')?'zh-TW':l.startsWith('ja')?'ja':'en';})()")
+HOST_LOCALE=$(e2e_read "settings" "(()=>{const l=(navigator.language||'').toLowerCase();return l.startsWith('zh')?'zh-TW':l.startsWith('ja')?'ja':'en';})()")
 echo "host locale resolves to: $HOST_LOCALE"
 evl "settings" "__auto.setLanguage('system')" >/dev/null
 e2e_wait_eval "settings" "String(__auto.getSettings().resolvedLocale)" "$HOST_LOCALE"
-check "system resolves to host locale ($HOST_LOCALE)" "$(evl "settings" "String(__auto.getSettings().resolvedLocale)")" "$HOST_LOCALE"
+check "system resolves to host locale ($HOST_LOCALE)" "$(e2e_read "settings" "String(__auto.getSettings().resolvedLocale)")" "$HOST_LOCALE"
 
 echo "=== cross-window sync (settings-changed broadcast) ==="
 evl "settings" "__auto.setLanguage('en')" >/dev/null
@@ -224,7 +233,7 @@ e2e_wait_setting language ja
 quit_app
 launch
 open_doc
-check "language persisted across restart" "$(evl "$DL" "String(__auto.getLanguage())")" "ja"
+check "language persisted across restart" "$(e2e_read "$DL" "String(__auto.getLanguage())")" "ja"
 check "restored language renders in DOM (ja)" "$(line_ending_label "$DL")" "改行コード"
 
 echo "=== teardown ==="
@@ -235,7 +244,7 @@ for f in "$STORE"/*.json; do
   if [ "$(jq -r '.kind' "$f" 2>/dev/null)" = "document" ]; then
     FP=$(jq -r '.file_path // empty' "$f" 2>/dev/null)
     case "$FP" in
-      *note-n-pad-e2e/*)
+      *note-n-pad-e2e*)
         rm -f "$f"
         echo "cleaned: $f"
         ;;

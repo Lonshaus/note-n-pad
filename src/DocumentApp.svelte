@@ -1180,8 +1180,10 @@
             })),
           switchTab: (i: number) => void documentWindow.switchTo(i),
           openTab: (p: string) => void documentWindow.openTab(p),
+          openTabSettled: (p: string) => documentWindow.openTab(p),
           newTab: () => void documentWindow.newTab(),
           closeActiveTab: () => closeActive(),
+          openFailed: () => documentWindow.openFailed,
           toggleLineEnding: () => documentWindow.toggleLineEnding(),
           setEncoding: (label: string) =>
             void documentWindow.setEncoding(label),

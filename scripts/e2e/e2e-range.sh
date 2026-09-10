@@ -17,6 +17,7 @@ WORK="$OUT/range-fixture"
 PASS=0
 FAIL=0
 mkdir -p "$OUT"
+: >"$OUT/dev-range.log"
 
 ok() {
   PASS=$((PASS + 1))
@@ -53,25 +54,33 @@ doc_label() {
   auto '{"id":3,"cmd":"list_windows"}' | jq -r '.data[]|select(.label|startswith("doc-"))|.label' | head -1
 }
 evl() {
-  auto "{\"id\":9,\"cmd\":\"eval\",\"label\":\"$1\",\"js\":$(jq -Rn --arg js "$2" '$js')}" | jq -r '.data'
+  auto "{\"id\":$(e2e_next_id),\"cmd\":\"eval\",\"label\":\"$1\",\"js\":$(jq -Rn --arg js "$2" '$js')}" | jq -r '.data'
 }
 launch() {
-  NOTE_N_PAD_AUTOMATION=1 npm run tauri dev >"$OUT/dev-range.log" 2>&1 &
+  e2e_require_clean_slate
+  NOTE_N_PAD_AUTOMATION=1 npm run tauri dev >>"$OUT/dev-range.log" 2>&1 &
+  e2e_report_port_holders
   local tries=0
-  until nc -z 127.0.0.1 45678 2>/dev/null; do
+  until e2e_automation_up; do
     sleep 1
     tries=$((tries + 1))
     if [ "$tries" -gt 240 ]; then
+      e2e_report_port_holders
       echo "FATAL: automation port never opened"
       exit 1
     fi
   done
+  e2e_require_automation_listener "$OUT/dev-range.log"
+  # The dev server binds 1420 while the app is coming up, so this is the
+  # first moment a leftover holding it is visible; the app answering on
+  # the automation port does not mean vite got its port.
+  e2e_report_port_holders
   sleep 4
 }
 quit_app() {
   auto '{"id":99,"cmd":"quit"}' >/dev/null 2>&1
   local tries=0
-  while pgrep -x note-n-pad >/dev/null 2>&1; do
+  while e2e_app_running; do
     sleep 1
     tries=$((tries + 1))
     if [ "$tries" -gt 20 ]; then
@@ -99,7 +108,7 @@ open_large() {
     fi
     DL=$(doc_label)
   done
-  if [ "$(evl "$DL" "String(__auto.largeConfirmVisible())")" = "true" ]; then
+  if [ "$(e2e_read "$DL" "String(__auto.largeConfirmVisible())")" = "true" ]; then
     evl "$DL" "__auto.largeConfirmAccept()" >/dev/null
     sleep 2
   fi
@@ -129,7 +138,7 @@ rm -rf "$WORK"
 mkdir -p "$WORK"
 python3 - <<PYEOF
 lines = 2400000
-with open('$WORK/big.log', 'w') as f:
+with open('$WORK/big.log', 'w', newline='') as f:
     for i in range(1, lines + 1):
         f.write(f'line {i:07d} abcdefghijklmnopqrstuvwxyz0123456789\n')
 PYEOF
@@ -142,7 +151,7 @@ open_large "$WORK/big.log"
 # Pin the UI language so the text assertions below never depend on the host
 # system language; restore the user's real preference on exit or interrupt. The
 # trap looks the doc label up live because the restart section reassigns DL.
-ORIG_LANG=$(evl "$DL" "String(__auto.getLanguage())")
+ORIG_LANG=$(e2e_read "$DL" "String(__auto.getLanguage())")
 echo "original language: $ORIG_LANG"
 restore_lang() {
   trap '' INT TERM
@@ -174,20 +183,21 @@ until [ "$(evl "$DL" "String(__auto.largeInfo().totalLines !== null)")" = "true"
   fi
 done
 evl "$DL" "__auto.largeSelectRange(100, 200)" >/dev/null
-check "range recorded" "$(evl "$DL" "JSON.stringify(__auto.largeGetRange())")" '{"startLine":100,"endLine":200}'
+check "range recorded" "$(e2e_read "$DL" "JSON.stringify(__auto.largeGetRange())")" '{"startLine":100,"endLine":200}'
 evl "$DL" "__auto.largeRangeEdit()" >/dev/null
 sleep 3
-check "range tab opened" "$(evl "$DL" "String(__auto.isRangeTab())")" "true"
-check "content starts at line 100" "$(evl "$DL" "String(__auto.getContent().startsWith('line 0000100 '))")" "true"
-check "content ends at line 200" "$(evl "$DL" "String(__auto.getContent().trimEnd().endsWith('line 0000200 abcdefghijklmnopqrstuvwxyz0123456789'))")" "true"
+check "range tab opened" "$(e2e_read "$DL" "String(__auto.isRangeTab())")" "true"
+check "content starts at line 100" "$(e2e_read "$DL" "String(__auto.getContent().startsWith('line 0000100 '))")" "true"
+check "content ends at line 200" "$(e2e_read "$DL" "String(__auto.getContent().trimEnd().endsWith('line 0000200 abcdefghijklmnopqrstuvwxyz0123456789'))")" "true"
 
 echo "=== edit and splice back ==="
 evl "$DL" "__auto.typeText('EDITED>>')" >/dev/null
 sleep 1
-RES=$(evl "$DL" "'pending'")
-SAVE=$(evl "$DL" "__auto.rangeSave().then((r)=>{window.__rangeSaveResult=r;}) && 'started'")
-sleep 3
-check "splice result ok" "$(evl "$DL" "String(window.__rangeSaveResult)")" "ok"
+RES=$(e2e_read "$DL" "'pending'")
+evl "$DL" "window.__rangeSaveResult=undefined" >/dev/null
+SAVE=$(evl "$DL" "__auto.rangeSave().then((r)=>{window.__rangeSaveResult=r;},(e)=>{window.__rangeSaveResult='ERR '+String(e);}) && 'started'")
+e2e_wait_eval "$DL" "String(window.__rangeSaveResult!==undefined)" "true"
+check "splice result ok" "$(e2e_read "$DL" "String(window.__rangeSaveResult)")" "ok"
 python3 - <<PYEOF
 lines = open('$WORK/big.log', 'rb').read().split(b'\n')
 l99 = lines[98]
@@ -212,30 +222,31 @@ PYEOF
 check "original file spliced precisely" "$PYOUT" "True"
 NEW_SIZE=$(file_size "$WORK/big.log")
 check "size grew by 8 bytes" "$((NEW_SIZE - ORIG_SIZE))" "8"
-check "tab clean after splice" "$(evl "$DL" "JSON.stringify(__auto.getTabs())" | jq -r '.[]|select(.active)|.dirty')" "false"
+check "tab clean after splice" "$(e2e_read "$DL" "JSON.stringify(__auto.getTabs())" | jq -r '.[]|select(.active)|.dirty')" "false"
 
 echo "=== conflict flow ==="
 printf 'external change\n' >>"$WORK/big.log"
 evl "$DL" "__auto.typeText('AGAIN>>')" >/dev/null
 sleep 1
-evl "$DL" "__auto.rangeSave().then((r)=>{window.__rangeSaveResult=r;})" >/dev/null
-sleep 3
-check "mismatch detected" "$(evl "$DL" "String(window.__rangeSaveResult)")" "mismatch"
-check "conflict modal shown" "$(evl "$DL" "String(__auto.rangeConflictVisible())")" "true"
+evl "$DL" "window.__rangeSaveResult=undefined" >/dev/null
+evl "$DL" "__auto.rangeSave().then((r)=>{window.__rangeSaveResult=r;},(e)=>{window.__rangeSaveResult='ERR '+String(e);})" >/dev/null
+e2e_wait_eval "$DL" "String(window.__rangeSaveResult!==undefined)" "true"
+check "mismatch detected" "$(e2e_read "$DL" "String(window.__rangeSaveResult)")" "mismatch"
+check "conflict modal shown" "$(e2e_read "$DL" "String(__auto.rangeConflictVisible())")" "true"
 evl "$DL" "__auto.rangeConflictForce()" >/dev/null
 sleep 3
 check "force write landed" "$(python3 -c "
 data = open('$WORK/big.log','rb').read()
 print(b'AGAIN>>' in data and b'external change' in data)
 ")" "True"
-check "modal gone after force" "$(evl "$DL" "String(__auto.rangeConflictVisible())")" "false"
+check "modal gone after force" "$(e2e_read "$DL" "String(__auto.rangeConflictVisible())")" "false"
 
 echo "=== byte-faithful save-as ==="
 evl "$DL" "__auto.rangeSaveAsBytes('$WORK/slice.bin')" >/dev/null
 sleep 2
 CMP=$(python3 - <<PYEOF
 import json
-info = json.loads('''$(evl "$DL" "JSON.stringify(__auto.rangeInfo())")''')
+info = json.loads('''$(e2e_read "$DL" "JSON.stringify(__auto.rangeInfo())")''')
 src = open('$WORK/big.log', 'rb').read()
 sl = open('$WORK/slice.bin', 'rb').read()
 print(src[info['startByte']:info['endByte']] == sl)
@@ -272,16 +283,17 @@ until [ "$(evl "$DL" "String(__auto.getTabs().length)")" = "2" ]; do
     break
   fi
 done
-RIDX=$(evl "$DL" "JSON.stringify(__auto.getTabs())" | jq -r 'to_entries[]|select(.value.path=="")|.key' | head -1)
+RIDX=$(e2e_read "$DL" "JSON.stringify(__auto.getTabs())" | jq -r 'to_entries[]|select(.value.path=="")|.key' | head -1)
 check "range tab present after restart" "$([ -n "$RIDX" ] && echo yes)" "yes"
 evl "$DL" "__auto.switchTab(${RIDX:-0})" >/dev/null
 sleep 2
-check "range tab restored" "$(evl "$DL" "String(__auto.isRangeTab())")" "true"
-check "restored dirty" "$(evl "$DL" "JSON.stringify(__auto.getTabs())" | jq -r '.[]|select(.active)|.dirty')" "true"
-check "restored content keeps edit" "$(evl "$DL" "String(__auto.getContent().includes('DIRTY>>'))")" "true"
-evl "$DL" "__auto.rangeSave().then((r)=>{window.__rangeSaveResult=r;})" >/dev/null
-sleep 3
-check "restored tab splices ok" "$(evl "$DL" "String(window.__rangeSaveResult)")" "ok"
+check "range tab restored" "$(e2e_read "$DL" "String(__auto.isRangeTab())")" "true"
+check "restored dirty" "$(e2e_read "$DL" "JSON.stringify(__auto.getTabs())" | jq -r '.[]|select(.active)|.dirty')" "true"
+check "restored content keeps edit" "$(e2e_read "$DL" "String(__auto.getContent().includes('DIRTY>>'))")" "true"
+evl "$DL" "window.__rangeSaveResult=undefined" >/dev/null
+evl "$DL" "__auto.rangeSave().then((r)=>{window.__rangeSaveResult=r;},(e)=>{window.__rangeSaveResult='ERR '+String(e);})" >/dev/null
+e2e_wait_eval "$DL" "String(window.__rangeSaveResult!==undefined)" "true"
+check "restored tab splices ok" "$(e2e_read "$DL" "String(window.__rangeSaveResult)")" "ok"
 
 echo "=== teardown ==="
 evl "$DL" "__auto.setLanguage('$ORIG_LANG')" >/dev/null

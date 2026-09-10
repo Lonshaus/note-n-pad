@@ -18,6 +18,7 @@ WORK="$OUT/highlight-fixture"
 PASS=0
 FAIL=0
 mkdir -p "$OUT"
+: >"$OUT/dev-highlight.log"
 
 ok() {
   PASS=$((PASS + 1))
@@ -54,25 +55,33 @@ doc_label() {
   auto '{"id":3,"cmd":"list_windows"}' | jq -r '.data[]|select(.label|startswith("doc-"))|.label' | head -1
 }
 evl() {
-  auto "{\"id\":9,\"cmd\":\"eval\",\"label\":\"$1\",\"js\":$(jq -Rn --arg js "$2" '$js')}" | jq -r '.data'
+  auto "{\"id\":$(e2e_next_id),\"cmd\":\"eval\",\"label\":\"$1\",\"js\":$(jq -Rn --arg js "$2" '$js')}" | jq -r '.data'
 }
 launch() {
-  NOTE_N_PAD_AUTOMATION=1 npm run tauri dev >"$OUT/dev-highlight.log" 2>&1 &
+  e2e_require_clean_slate
+  NOTE_N_PAD_AUTOMATION=1 npm run tauri dev >>"$OUT/dev-highlight.log" 2>&1 &
+  e2e_report_port_holders
   local tries=0
-  until nc -z 127.0.0.1 45678 2>/dev/null; do
+  until e2e_automation_up; do
     sleep 1
     tries=$((tries + 1))
     if [ "$tries" -gt 240 ]; then
+      e2e_report_port_holders
       echo "FATAL: automation port never opened"
       exit 1
     fi
   done
+  e2e_require_automation_listener "$OUT/dev-highlight.log"
+  # The dev server binds 1420 while the app is coming up, so this is the
+  # first moment a leftover holding it is visible; the app answering on
+  # the automation port does not mean vite got its port.
+  e2e_report_port_holders
   sleep 4
 }
 quit_app() {
   auto '{"id":99,"cmd":"quit"}' >/dev/null 2>&1
   local tries=0
-  while pgrep -x note-n-pad >/dev/null 2>&1; do
+  while e2e_app_running; do
     sleep 1
     tries=$((tries + 1))
     if [ "$tries" -gt 20 ]; then
@@ -88,7 +97,7 @@ for f in "$STORE"/*.json; do
   if [ "$(jq -r '.kind' "$f" 2>/dev/null)" = "document" ]; then
     FP=$(jq -r '.file_path // empty' "$f" 2>/dev/null)
     case "$FP" in
-      *note-n-pad-e2e/*)
+      *note-n-pad-e2e*)
         rm -f "$f"
         echo "preflight: removed scratchpad snapshot ($FP)"
         ;;
@@ -107,7 +116,7 @@ mkdir -p "$WORK"
 python3 - <<PYEOF
 import json
 n = 150000
-with open('$WORK/nested.json', 'w') as f:
+with open('$WORK/nested.json', 'w', newline='') as f:
     f.write('[\n')
     for i in range(n):
         obj = {'id': i, 'name': f'item-{i}', 'tags': ['a', 'b', 'c'],
@@ -138,11 +147,11 @@ until [ -n "$DL" ] && [ "$(evl "$DL" "typeof __auto!=='undefined' && typeof __au
 done
 
 echo "=== baseline (flag off) ==="
-ORIG_FLAG=$(evl "$DL" "String(__auto.getWorkerHighlight())")
+ORIG_FLAG=$(e2e_read "$DL" "String(__auto.getWorkerHighlight())")
 echo "original flag: $ORIG_FLAG"
 # Pin the UI language so text assertions never depend on the host system
 # language; restored alongside the flag below.
-ORIG_LANG=$(evl "$DL" "String(__auto.getLanguage())")
+ORIG_LANG=$(e2e_read "$DL" "String(__auto.getLanguage())")
 echo "original language: $ORIG_LANG"
 # The flag writes the user's real settings.json; make sure an interrupt between
 # enable and teardown still restores it and the language (and kills the app)
@@ -173,8 +182,8 @@ evl "$DL" "__auto.setLanguage('zh-TW')" >/dev/null
 sleep 1
 evl "$DL" "__auto.setWorkerHighlight(false)" >/dev/null
 sleep 1
-check "worker inactive when off" "$(evl "$DL" "String(__auto.workerHighlightActive())")" "false"
-check "no tok spans when off" "$(evl "$DL" "String(document.querySelectorAll('.cm-content [class*=tok-]').length)")" "0"
+check "worker inactive when off" "$(e2e_read "$DL" "String(__auto.workerHighlightActive())")" "false"
+check "no tok spans when off" "$(e2e_read "$DL" "String(document.querySelectorAll('.cm-content [class*=tok-]').length)")" "0"
 
 echo "=== enable and color ==="
 evl "$DL" "__auto.setWorkerHighlight(true)" >/dev/null
@@ -186,7 +195,7 @@ until [ "$(evl "$DL" "String(__auto.workerHighlightActive())")" = "true" ]; do
     break
   fi
 done
-check "worker active when on" "$(evl "$DL" "String(__auto.workerHighlightActive())")" "true"
+check "worker active when on" "$(e2e_read "$DL" "String(__auto.workerHighlightActive())")" "true"
 TOKN=0
 tries=0
 until [ "$TOKN" != "0" ] && [ "$TOKN" != "null" ]; do
@@ -205,20 +214,20 @@ fi
 
 echo "=== UI responsiveness during/after parse ==="
 T0=$(date +%s.%N)
-PONG=$(evl "$DL" "'pong'")
+PONG=$(e2e_read "$DL" "'pong'")
 T1=$(date +%s.%N)
 RT=$(python3 -c "print(round($T1-$T0,2))")
 check "eval roundtrip responsive" "$(python3 -c "print($RT < 2.0)")" "True"
 evl "$DL" "document.querySelector('.cm-content').focus()" >/dev/null
 evl "$DL" "__auto.typeText('E2E_MARK')" >/dev/null
 sleep 1
-check "typing lands while highlighting" "$(evl "$DL" "String(__auto.getContent().includes('E2E_MARK'))")" "true"
+check "typing lands while highlighting" "$(e2e_read "$DL" "String(__auto.getContent().includes('E2E_MARK'))")" "true"
 
 echo "=== disable cleans up ==="
 evl "$DL" "__auto.setWorkerHighlight(false)" >/dev/null
 sleep 2
-check "worker inactive after off" "$(evl "$DL" "String(__auto.workerHighlightActive())")" "false"
-check "tok spans removed" "$(evl "$DL" "String(document.querySelectorAll('.cm-content [class*=tok-]').length)")" "0"
+check "worker inactive after off" "$(e2e_read "$DL" "String(__auto.workerHighlightActive())")" "false"
+check "tok spans removed" "$(e2e_read "$DL" "String(document.querySelectorAll('.cm-content [class*=tok-]').length)")" "0"
 
 echo "=== teardown ==="
 evl "$DL" "__auto.setWorkerHighlight($ORIG_FLAG)" >/dev/null
@@ -229,7 +238,7 @@ for f in "$STORE"/*.json; do
   if [ "$(jq -r '.kind' "$f" 2>/dev/null)" = "document" ]; then
     FP=$(jq -r '.file_path // empty' "$f" 2>/dev/null)
     case "$FP" in
-      *note-n-pad-e2e/*)
+      *note-n-pad-e2e*)
         rm -f "$f"
         echo "cleaned: $f"
         ;;

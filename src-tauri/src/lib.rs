@@ -754,6 +754,14 @@ fn handle_window_event(window: &tauri::Window, event: &tauri::WindowEvent) {
   // Drop a destroyed document window's tracked always-on-top state so a later
   // window can't inherit a stale check mark.
   if let tauri::WindowEvent::Destroyed = event {
+    // `destroy()` bypasses `CloseRequested`, so the close-request line above
+    // never fires for a window closed from the frontend. Without this one an
+    // app that goes away mid-run leaves no record of which window went first.
+    log::info!(
+      "window destroyed: window={} event-loop-pass={}",
+      window.label(),
+      EVENT_LOOP_PASS.load(Ordering::Relaxed)
+    );
     if let Some(items) = window.app_handle().try_state::<MenuItems>() {
       items.on_top.lock().unwrap().remove(window.label());
     }
@@ -1942,6 +1950,11 @@ mod shortcut_rows_tests {
 /// swap its menu.
 const TRAY_ID: &str = "main";
 
+/// Side of the menu bar template icon, in pixels. The bytes beside it are raw
+/// RGBA and carry no header to read this from, so a test asserts the two agree.
+#[cfg(target_os = "macos")]
+const TRAY_TEMPLATE_SIZE: u32 = 44;
+
 /// Rebuild the app and tray menus in `locale` after a language change. The
 /// managed `MenuItems` handles are swapped for the fresh menu's, then the
 /// current focus state is re-applied so enable/disable keeps working. The
@@ -2117,8 +2130,23 @@ fn build_tray(
 ) -> Result<(), Box<dyn std::error::Error>> {
   let menu = build_tray_menu(app, locale)?;
   record_tray_menu(&menu);
-  TrayIconBuilder::with_id(TRAY_ID)
-    .icon(app.default_window_icon().unwrap().clone())
+  let tray = TrayIconBuilder::with_id(TRAY_ID);
+  // The menu bar draws its items in one colour, picked from the bar's own
+  // appearance; a template image is how an app hands it a shape to colour.
+  // The window icon cannot serve here — it is full colour on a white plate,
+  // which the bar renders as a white square beside the system's own symbols.
+  #[cfg(target_os = "macos")]
+  let tray = tray
+    .icon(tauri::image::Image::new(
+      include_bytes!("../icons/tray-macos-template.rgba"),
+      TRAY_TEMPLATE_SIZE,
+      TRAY_TEMPLATE_SIZE,
+    ))
+    .icon_as_template(true);
+  // Elsewhere a tray icon is expected to be the app's own, in colour.
+  #[cfg(not(target_os = "macos"))]
+  let tray = tray.icon(app.default_window_icon().unwrap().clone());
+  tray
     .menu(&menu)
     .show_menu_on_left_click(true)
     .on_menu_event(move |app, event| match event.id.as_ref() {
@@ -2614,7 +2642,17 @@ pub fn run() {
       // Closing all windows must not quit the app; only an explicit exit
       // (tray Quit -> app.exit) carries an exit code and is allowed through.
       tauri::RunEvent::ExitRequested { api, code, .. } if code.is_none() => {
+        log::info!("exit requested: code=none, prevented");
         api.prevent_exit();
+      }
+      // Log-only, and deliberately after the guarded arm above so the one that
+      // prevents the exit still matches first: an exit that carries a code is
+      // let through, and without this line it leaves no trace at all.
+      tauri::RunEvent::ExitRequested { code, .. } => {
+        log::info!("exit requested: code={code:?}, allowed");
+      }
+      tauri::RunEvent::Exit => {
+        log::info!("exit");
       }
       // Every `CloseRequested` queued in one event-loop pass is delivered
       // before this fires, no matter how long a handler in between stalls
@@ -2688,6 +2726,18 @@ mod tests {
   };
   use std::collections::HashMap;
   use std::time::{Duration, Instant};
+
+  // Raw RGBA carries no header, so an icon regenerated at another size reaches
+  // `Image::new` as a buffer that does not match the dimensions handed with it.
+  #[cfg(target_os = "macos")]
+  #[test]
+  fn tray_template_bytes_match_its_declared_size() {
+    let side = super::TRAY_TEMPLATE_SIZE as usize;
+    assert_eq!(
+      include_bytes!("../icons/tray-macos-template.rgba").len(),
+      side * side * 4
+    );
+  }
 
   #[test]
   fn classifies_window_labels() {
