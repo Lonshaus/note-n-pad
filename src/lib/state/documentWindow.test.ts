@@ -1351,3 +1351,175 @@ describe('saveActive line endings in the write_file_encoded payload', () => {
     expect(out.split(/\r\n/).join('\n')).toBe('one\ntwo\nthree');
   });
 });
+
+/** Full `load_settings` payload, so `settingsState.init()` resolves `ready` —
+ *  every open awaits it inside `route`. `ask_long_line_open` is false so a plain
+ *  open pushes its tab instead of staging the long-line gate. */
+function loadedSettings(): Record<string, unknown> {
+  return {
+    settings: {
+      theme: 'x',
+      interface_mode: 'system',
+      editor_font_size: 14,
+      editor_word_wrap: true,
+      editor_line_numbers: true,
+      worker_highlight: false,
+      large_open_mode: 'ask',
+      ask_long_line_open: false,
+      preview_local_resources: false,
+      open_target: 'tab',
+      editor_font_family: '',
+      default_line_ending: 'LF',
+      default_encoding: 'UTF-8',
+      new_note_shortcut: 'x',
+      snapshot_dir: null,
+      default_sticky_width: 280,
+      default_sticky_height: 230,
+      language: 'system',
+      show_tray_icon: true,
+      open_workspace_on_startup: false,
+    },
+    repaired_fields: [],
+    snapshot_dir_unavailable: false,
+  };
+}
+
+/** Yield until `done()` holds, or give up after a bounded number of turns. Used
+ *  to park on a state the code under test reaches in its own microtasks rather
+ *  than guessing how many awaits deep it is. */
+async function until(done: () => boolean): Promise<void> {
+  for (let i = 0; i < 200 && !done(); i += 1) {
+    await new Promise((resolve) => setTimeout(resolve, 0));
+  }
+  expect(done()).toBe(true);
+}
+
+// A fresh window loads its file asynchronously, and an open that arrives while
+// it is still awaiting must not be undone by init's own tab selection. This
+// reproduces the ordering that reached CI: the second open's switchTo lands
+// first, init's trailing write lands second and pointed the window back at tab
+// 0, where a .txt host tab reports no table and no rows.
+describe('init does not reset the active tab over a concurrent open', () => {
+  it('leaves the window on the tab the second open switched to', async () => {
+    documentWindow.tabs.length = 0;
+    documentWindow.activeIndex = 0;
+    let release: (() => void) | null = null;
+    let upserts = 0;
+    mockInvoke.mockImplementation(((cmd: string) => {
+      switch (cmd) {
+        case 'load_settings':
+          return Promise.resolve(loadedSettings());
+        case 'list_notes':
+          return Promise.resolve([]);
+        case 'read_file_auto':
+          return Promise.resolve({
+            content: 'x',
+            encoding: 'UTF-8',
+            lossy: false,
+            had_bom: false,
+          });
+        case 'upsert_note':
+          upserts += 1;
+          // Gate the first upsert only: openNormal pushes and switches before
+          // it, so init parks here with the host tab already at index 0.
+          if (upserts === 1) {
+            return new Promise<null>((resolve) => {
+              release = (): void => resolve(null);
+            });
+          }
+          return Promise.resolve(null);
+        default:
+          return Promise.resolve(null);
+      }
+    }) as typeof invoke);
+    await settingsState.init();
+
+    const initDone = documentWindow.init('g-race', '/tmp/host.txt', null);
+    await until(() => release !== null);
+    // Not awaited: its switchTo parks on `lastSave`, which is the very promise
+    // the gate holds, so awaiting it here would deadlock. `tabs.push` and the
+    // synchronous head of switchTo run in one turn, so a second tab appearing
+    // is the pin.
+    const secondDone = documentWindow.openTab('/tmp/second.csv');
+    await until(() => documentWindow.tabs.length === 2);
+    release!();
+    await Promise.all([initDone, secondDone]);
+
+    expect(documentWindow.tabs[0]?.path).toBe('/tmp/host.txt');
+    expect(documentWindow.tabs[1]?.path).toBe('/tmp/second.csv');
+    expect(documentWindow.activeIndex).toBe(1);
+  });
+});
+
+// The other half of the same statement: init's write was also what kicked the
+// lazy reopen, and a fresh window's first tab can be an adopted orphan carrying
+// a windowed restore. `switchTo(0)` returns early there, so without an explicit
+// kick nothing ever reopens it and the window renders blank forever.
+describe('a fresh window that adopts an orphaned windowed tab still restores it', () => {
+  it('calls windowed_reopen for the adopted tab', async () => {
+    documentWindow.tabs.length = 0;
+    documentWindow.activeIndex = 0;
+    mockInvoke.mockImplementation(((cmd: string) => {
+      switch (cmd) {
+        case 'load_settings':
+          return Promise.resolve(loadedSettings());
+        case 'list_notes':
+          return Promise.resolve([
+            baseNote({
+              id: 'orphan-1',
+              file_path: '/tmp/adopted.log',
+              window_group: 'g-dead',
+              large: 150 * 1024 * 1024,
+              windowed_index: { checkpoints: [[0, 0]], total_newlines: 7 },
+              windowed_fp_size: 150 * 1024 * 1024,
+              windowed_fp_mtime: 1_700_000_000_000,
+              windowed_digest: 'adopted',
+            }),
+          ]);
+        case 'live_doc_groups':
+          return Promise.resolve([]);
+        case 'windowed_reopen':
+          return new Promise(() => {});
+        default:
+          return Promise.resolve(null);
+      }
+    }) as typeof invoke);
+    await settingsState.init();
+    // The spy's history is not cleared between tests in this file, and earlier
+    // tests already record windowed_reopen calls, so clear it here or this
+    // assertion can match one of theirs.
+    mockInvoke.mockClear();
+
+    await documentWindow.init('g-new', '/tmp/adopted.log', null);
+
+    expect(mockInvoke).toHaveBeenCalledWith('windowed_reopen', {
+      path: '/tmp/adopted.log',
+      index: { checkpoints: [[0, 0]], total_newlines: 7 },
+      fingerprint: { size: 150 * 1024 * 1024, mtime_ms: 1_700_000_000_000 },
+      digest: 'adopted',
+    });
+  });
+});
+
+// The moved write still does its original job. The starting activeIndex differs
+// from the expected position so the assertion cannot pass on a leftover value.
+describe('init still selects the stored tab when restoring a window group', () => {
+  it('resolves initialTab against the restored entries', async () => {
+    documentWindow.tabs.length = 0;
+    documentWindow.activeIndex = 0;
+    mockInvoke.mockImplementation(((cmd: string) => {
+      if (cmd === 'list_notes') {
+        return Promise.resolve([
+          baseNote({ id: 'a', file_path: '/tmp/a.txt', tab_index: 4 }),
+          baseNote({ id: 'b', file_path: '/tmp/b.txt', tab_index: 9 }),
+        ]);
+      }
+      return Promise.resolve(null);
+    }) as typeof invoke);
+
+    await documentWindow.init('g1', null, null, 9);
+
+    expect(documentWindow.tabs.length).toBe(2);
+    expect(documentWindow.activeIndex).toBe(1);
+  });
+});

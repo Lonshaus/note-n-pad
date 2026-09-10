@@ -969,22 +969,28 @@ class DocumentWindowState {
         height: lowest.height,
       };
       this.nextIndex = Math.max(...entries.map((e) => e.tab_index)) + 1;
+      // Writing `activeIndex` (even to its already-current value of 0) is what
+      // kicks off the lazy reopen if the initial active tab is itself a
+      // restored windowed tab — see the `activeIndex` setter. `initialTab` is a
+      // stored `tab_index`, not an array position: closes and reorders make the
+      // two diverge, so it is resolved against the restored entries.
+      this.activeIndex = resolveTabPosition(
+        entries.map((e) => e.tab_index),
+        initialTab,
+      );
     } else if (initialPath !== null) {
       // A fresh window opened for one file routes through the same open gate, so
       // an over-threshold file prompts before loading (and may leave the window
       // empty if cancelled — DocumentApp collapses it then).
       this.nextIndex = 0;
       await this.openTab(initialPath);
+      // `switchTo(0)` returns early when the index is already active, so the
+      // setter — and the restore it kicks — never fires for a fresh window's
+      // first tab, which an adopted orphan can be. Kick it directly: writing
+      // `activeIndex` here would instead reset a tab that another open switched
+      // to while this init was awaiting, leaving the window on the wrong tab.
+      this.ensureWindowedRestore(this.activeTab);
     }
-    // Writing `activeIndex` (even to its already-current value of 0) is what
-    // kicks off the lazy reopen if the initial active tab is itself a
-    // restored windowed tab — see the `activeIndex` setter. `initialTab` is a
-    // stored `tab_index`, not an array position: closes and reorders make the
-    // two diverge, so it is resolved against the restored entries.
-    this.activeIndex = resolveTabPosition(
-      entries.map((e) => e.tab_index),
-      initialTab,
-    );
     this.ready = true;
   }
 
