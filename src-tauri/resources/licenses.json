@@ -1,7 +1,7 @@
 {
   "inputs": {
     "cargoLock": "0bd39745d7df77a183d9571f9eb8bde0c6f142902c834c434a463f1d61ded499",
-    "npmLock": "0911ef925c5f929e8d36e3686e8d302f565db82c8875ea1b493afcc684015a5a"
+    "npmLock": "f77a58bcf663a74d70855d99387188afd3e28fc9c9979b2ff280e7747f6fe2f3"
   },
   "texts": [
     "Copyright (C) Jonas Schievink <jonasschievink@gmail.com>\n\nPermission to use, copy, modify, and/or distribute this software for\nany purpose with or without fee is hereby granted.\n\nTHE SOFTWARE IS PROVIDED \"AS IS\" AND THE AUTHOR DISCLAIMS ALL WARRANTIES\nWITH REGARD TO THIS SOFTWARE INCLUDING ALL IMPLIED WARRANTIES OF\nMERCHANTABILITY AND FITNESS. IN NO EVENT SHALL THE AUTHOR BE LIABLE FOR\nANY SPECIAL, DIRECT, INDIRECT, OR CONSEQUENTIAL DAMAGES OR ANY DAMAGES\nWHATSOEVER RESULTING FROM LOSS OF USE, DATA OR PROFITS, WHETHER IN\nAN ACTION OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION, ARISING OUT\nOF OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.\n",
@@ -4320,7 +4320,7 @@
     },
     {
       "name": "@codemirror/state",
-      "version": "6.7.1",
+      "version": "6.7.2",
       "ecosystem": "npm",
       "license": "MIT",
       "repository": "https://code.haverbeke.berlin/codemirror/state",
@@ -4346,7 +4346,7 @@
     },
     {
       "name": "@codemirror/view",
-      "version": "6.43.6",
+      "version": "6.43.11",
       "ecosystem": "npm",
       "license": "MIT",
       "repository": "https://code.haverbeke.berlin/codemirror/view",
