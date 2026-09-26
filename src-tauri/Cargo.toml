@@ -1,6 +1,6 @@
 [package]
 name = "note-n-pad"
-version = "1.0.0"
+version = "1.0.1"
 description = "Sticky notes and a plain-text editor"
 authors = ["Lonshaus"]
 license = "GPL-3.0-only"
@@ -105,3 +105,10 @@ gio = "0.18"
 
 [dev-dependencies]
 tempfile = "3.27.0"
+
+# Build scripts and proc-macros only run on the build machine. Stripping their
+# debug info in release uses rustc's bundled objcopy, which on macOS 27 writes a
+# dylib dyld refuses to load, so the build fails with E0463. The shipped binary
+# is unaffected by this section.
+[profile.release.build-override]
+strip = false
