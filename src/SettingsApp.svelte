@@ -1677,6 +1677,9 @@
     padding-top: 0.5rem;
   }
   .theme-option {
+    /* overflow: hidden drops a flex item's minimum height to 0, so a list
+       taller than its box would squash every row instead of scrolling. */
+    flex: 0 0 auto;
     padding: 0.32rem 0.6rem;
     border: none;
     border-radius: 5px;

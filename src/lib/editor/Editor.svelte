@@ -15,10 +15,13 @@
     syntaxHighlighting,
     defaultHighlightStyle,
   } from '@codemirror/language';
-  import { searchKeymap } from '@codemirror/search';
+  import {
+    gotoLine,
+    selectNextOccurrence,
+    selectSelectionMatches,
+  } from '@codemirror/search';
   import { basicSetup } from 'codemirror';
   import { oneDark } from '@codemirror/theme-one-dark';
-  import { searchWithInSelection } from './searchPanel';
   import { readCspNonce } from '../util/cspNonce';
 
   interface Props {
@@ -39,6 +42,10 @@
     onview,
   }: Props = $props();
 
+  // Sticky notes have no search: swallow Mod-f, F3 and Shift-F3 so neither
+  // the search panel nor a WebView2 find bar can open from a sticky.
+  const stickyNoSearch = () => true;
+
   // Paper-note editor: writing surface only, no gutters/line numbers/active-line.
   // Keeps the language + theme compartments so highlighting still works.
   const minimalSetup: Extension = [
@@ -47,8 +54,20 @@
     highlightSpecialChars(),
     syntaxHighlighting(defaultHighlightStyle, { fallback: true }),
     EditorView.lineWrapping,
-    searchWithInSelection,
-    keymap.of([...defaultKeymap, ...historyKeymap, ...searchKeymap]),
+    keymap.of([
+      ...defaultKeymap,
+      ...historyKeymap,
+      { key: 'Mod-Alt-g', run: gotoLine },
+      { key: 'Mod-d', run: selectNextOccurrence, preventDefault: true },
+      { key: 'Mod-Shift-l', run: selectSelectionMatches },
+      { key: 'Mod-f', run: stickyNoSearch },
+      {
+        key: 'F3',
+        run: stickyNoSearch,
+        shift: stickyNoSearch,
+        preventDefault: true,
+      },
+    ]),
   ];
 
   let container: HTMLDivElement;
