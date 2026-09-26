@@ -13,6 +13,7 @@
     scrollAxisHeight,
   } from '../util/largeView';
   import { moveResultCursor, parseGotoRange } from '../util/largeSearch';
+  import { matchSegments } from '../util/matchSegments';
   import {
     RANGE_EDIT_MAX,
     rangeWithinLimit,
@@ -159,6 +160,9 @@
   let gotoInput = $state<HTMLInputElement | null>(null);
   let searchQuery = $state('');
   let searchCase = $state(false);
+  // The query and case the shown results were searched with, for highlighting.
+  let resultQuery = $state('');
+  let resultCase = $state(false);
   let queryInput = $state<HTMLInputElement | null>(null);
   let results = $state<SearchResult[]>([]);
   let cursor = $state(-1);
@@ -519,6 +523,8 @@
       return;
     }
     resetSearch();
+    resultQuery = query;
+    resultCase = searchCase;
     const id = crypto.randomUUID();
     currentSearchId = id;
     searching = true;
@@ -939,7 +945,11 @@
               onkeydown={onSearchKeydown}
             >
               <span class="rline">{r.line}</span>
-              <span class="rprev">{r.preview}</span>
+              <span class="rprev"
+                >{#each matchSegments(r.preview, resultQuery, resultCase) as seg, j (j)}{#if seg.hit}<mark
+                      class="rhit">{seg.text}</mark
+                    >{:else}{seg.text}{/if}{/each}</span
+              >
             </button>
           {/each}
         </div>
@@ -1101,6 +1111,9 @@
     border-radius: 5px;
   }
   .search-result {
+    /* overflow: hidden drops a flex item's minimum height to 0, so a long
+       result list would shrink every row to a sliver instead of scrolling. */
+    flex: 0 0 auto;
     display: flex;
     gap: 0.6rem;
     align-items: baseline;
@@ -1120,6 +1133,11 @@
   }
   .search-result.active {
     background: color-mix(in srgb, var(--accent) 25%, transparent);
+  }
+  .rhit {
+    background: color-mix(in srgb, var(--accent) 40%, transparent);
+    color: inherit;
+    border-radius: 2px;
   }
   .rline {
     flex: 0 0 auto;

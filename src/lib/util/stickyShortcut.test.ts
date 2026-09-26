@@ -31,7 +31,7 @@ function key(
 }
 
 describe('matchStickyShortcut on Linux', () => {
-  it('matches bare Ctrl+Q/W/S/F', () => {
+  it('matches bare Ctrl+Q/W/S', () => {
     expect(matchStickyShortcut(key('q', { ctrlKey: true }), 'linux')).toBe(
       'quit',
     );
@@ -40,9 +40,6 @@ describe('matchStickyShortcut on Linux', () => {
     );
     expect(matchStickyShortcut(key('s', { ctrlKey: true }), 'linux')).toBe(
       'save',
-    );
-    expect(matchStickyShortcut(key('f', { ctrlKey: true }), 'linux')).toBe(
-      'find',
     );
   });
 
@@ -56,9 +53,9 @@ describe('matchStickyShortcut on Linux', () => {
     ).toBeNull();
   });
 
-  it('does not swallow Ctrl+Alt+F (find-replace accelerator)', () => {
+  it('does not map Ctrl+F to any shortcut (stickies have no search)', () => {
     expect(
-      matchStickyShortcut(key('f', { ctrlKey: true, altKey: true }), 'linux'),
+      matchStickyShortcut(key('f', { ctrlKey: true }), 'linux'),
     ).toBeNull();
   });
 
@@ -82,21 +79,15 @@ describe('matchStickyShortcut on Linux', () => {
 });
 
 describe('matchStickyShortcut on Windows', () => {
-  it('matches Ctrl+Q as quit', () => {
-    expect(matchStickyShortcut(key('q', { ctrlKey: true }), 'windows')).toBe(
-      'quit',
-    );
-  });
-
-  it('does not match close/save/find (menu accelerators already handle these)', () => {
+  it('never matches; the global keydown listener in main.ts owns these shortcuts', () => {
+    expect(
+      matchStickyShortcut(key('q', { ctrlKey: true }), 'windows'),
+    ).toBeNull();
     expect(
       matchStickyShortcut(key('w', { ctrlKey: true }), 'windows'),
     ).toBeNull();
     expect(
       matchStickyShortcut(key('s', { ctrlKey: true }), 'windows'),
-    ).toBeNull();
-    expect(
-      matchStickyShortcut(key('f', { ctrlKey: true }), 'windows'),
     ).toBeNull();
   });
 });
@@ -113,16 +104,15 @@ describe('matchStickyShortcut on macOS', () => {
 });
 
 describe('matchStickyShortcut with an unrecognized/empty os guess', () => {
-  it('fails closed: no shortcut fires for any of Ctrl+Q/W/S/F', () => {
+  it('fails closed: no shortcut fires for any of Ctrl+Q/W/S', () => {
     expect(matchStickyShortcut(key('q', { ctrlKey: true }), '')).toBeNull();
     expect(matchStickyShortcut(key('w', { ctrlKey: true }), '')).toBeNull();
     expect(matchStickyShortcut(key('s', { ctrlKey: true }), '')).toBeNull();
-    expect(matchStickyShortcut(key('f', { ctrlKey: true }), '')).toBeNull();
   });
 
   it('end-to-end: an unrecognized UA guesses no shortcuts, not every shortcut', () => {
     // Before the fix, guessOsFromUserAgent fell back to 'linux' for any
-    // unrecognized UA — the branch matchStickyShortcut fires all four
+    // unrecognized UA — the branch matchStickyShortcut fires all three
     // shortcuts on. This reproduces the real pipeline (guess -> match) to
     // prove the fallback fails closed instead of open.
     const guessedOs = guessOsFromUserAgent('') ?? '';
@@ -134,9 +124,6 @@ describe('matchStickyShortcut with an unrecognized/empty os guess', () => {
     ).toBeNull();
     expect(
       matchStickyShortcut(key('s', { ctrlKey: true }), guessedOs),
-    ).toBeNull();
-    expect(
-      matchStickyShortcut(key('f', { ctrlKey: true }), guessedOs),
     ).toBeNull();
   });
 });
