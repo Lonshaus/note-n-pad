@@ -2,7 +2,7 @@
   "$schema": "../node_modules/@tauri-apps/cli/config.schema.json",
   "productName": "Note&Pad",
   "mainBinaryName": "Note&Pad",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "identifier": "net.lonshaus.note-n-pad",
   "build": {
     "frontendDist": "../dist",

@@ -260,9 +260,11 @@ pub(crate) fn menu_bar_belongs(label: &str) -> bool {
 /// sticky note. No-op on macOS, where the menu bar is never part of the window,
 /// and on document/workspace windows, which are the one place the bar belongs.
 ///
-/// On Windows the bar is only hidden (`hide_menu`): the window keeps the menu,
-/// so its accelerators (Save, Find …) still fire — they are dispatched via the
-/// menu's global HACCEL app-wide, unaffected by the bar's visibility.
+/// On Windows the bar is only hidden (`hide_menu`): the window keeps the menu
+/// itself, but its accelerators do *not* fire from that alone — WebView2
+/// keyboard input never reaches Tauri's `TranslateAcceleratorW` msg_hook, so a
+/// menu accelerator only runs while a webview has focus via the frontend's
+/// keydown listener calling `trigger_menu_accelerator` (see `lib.rs`).
 ///
 /// On Linux the menu is removed outright (`remove_menu`), not just hidden.
 /// GTK's `show()` is a `show_all()`, which recursively re-shows every hidden
