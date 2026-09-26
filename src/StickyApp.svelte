@@ -36,13 +36,6 @@
   } from './lib/util/editorClipboard';
   import type { EditorView } from '@codemirror/view';
   import { undo, redo, selectAll } from '@codemirror/commands';
-  import {
-    openSearchPanel,
-    closeSearchPanel,
-    findNext,
-    findPrevious,
-    searchPanelOpen,
-  } from '@codemirror/search';
 
   interface RunningApp {
     name: string;
@@ -254,42 +247,13 @@
     stickyNote.updateContent(v);
   }
 
-  // The sticky's CodeMirror view, supplied by EditorShell so find commands run
-  // against the real editor. Stickies are find-only (no Find and Replace).
+  // The sticky's CodeMirror view, supplied by EditorShell for the edit actions
+  // below. Stickies have no search at all (no Find, no Find and Replace).
   let editorView: EditorView | null = null;
 
-  function openFind(): void {
-    if (editorView !== null) {
-      openSearchPanel(editorView);
-    }
-  }
-
-  function findNextMatch(): void {
-    if (editorView !== null) {
-      findNext(editorView);
-    }
-  }
-
-  function findPrevMatch(): void {
-    if (editorView !== null) {
-      findPrevious(editorView);
-    }
-  }
-
-  function closeFind(): void {
-    if (editorView !== null) {
-      closeSearchPanel(editorView);
-    }
-  }
-
-  function isSearchOpen(): boolean {
-    return editorView !== null && searchPanelOpen(editorView.state);
-  }
-
   // Menu accelerators arrive from the Rust menu as a string payload. Save routes
-  // to the sticky's save-and-convert flow; find actions drive the search panel.
-  // New Tab, Open and Find and Replace never reach an enabled sticky menu item,
-  // so they are ignored here.
+  // to the sticky's save-and-convert flow. New Tab, Open, Find and Find and
+  // Replace never reach an enabled sticky menu item, so they are ignored here.
   function runMenuAction(action: string): void {
     if (isEditAction(action) && editorView !== null) {
       const view = editorView;
@@ -319,37 +283,13 @@
       case 'save':
         void saveAndConvert();
         break;
-      case 'find':
-        openFind();
-        break;
-      case 'find-next':
-        findNextMatch();
-        break;
-      case 'find-prev':
-        findPrevMatch();
-        break;
     }
   }
 
-  // Linux and Windows only. On Linux a sticky has no menu at all —
-  // `detach_menu_unless_document` in windows.rs removes the inherited bar
-  // outright — so nothing dispatches its Quit/Close/Save/Find accelerators
-  // and this handler is the only source of all four. On Windows the menu
-  // accelerators dispatch app-wide via the menu's HACCEL regardless of the
-  // drawn bar, so save/close/find already work there; only Quit does not
-  // (see `matchStickyShortcut`'s platform policy), which is why this handler
-  // stays wired for Windows too. macOS gets everything from the real system
-  // menu bar, so this is a no-op there. Checked against
-  // `event.defaultPrevented` so it never double-fires Ctrl+F: the editor's
-  // own `searchKeymap` (Editor.svelte) already binds Mod-f and calls
-  // preventDefault when focus is inside the editor; this only picks up the
-  // case where focus is elsewhere and CodeMirror never saw the key.
-  // `matchStickyShortcut` requires Ctrl as the *sole* modifier, so this never
-  // intercepts Ctrl+Shift+S (save-as), Ctrl+Alt+F (find-replace), or an
-  // AltGr keypress (reported as ctrlKey+altKey) — see its own doc comment.
-  // On Windows, if the native menu accelerator also fires Quit, this would
-  // invoke `request_exit` a second time; `QUIT_IN_FLIGHT` on the backend
-  // already makes the second call a no-op, so this is safe either way.
+  // Linux only: a sticky there has no menu (`detach_menu_unless_document`), so
+  // this is the only source of its Quit/Close/Save shortcuts. Windows
+  // shortcuts go through the global listener in `main.ts`, and macOS through
+  // the system menu bar, so `matchStickyShortcut` returns null on both.
   function onStickyKeydown(event: KeyboardEvent): void {
     if ((!platform.isLinux && !platform.isWindows) || event.defaultPrevented) {
       return;
@@ -368,9 +308,6 @@
         break;
       case 'save':
         runMenuAction('save');
-        break;
-      case 'find':
-        openFind();
         break;
     }
   }
@@ -497,10 +434,6 @@
           clickPin: togglePin,
           setPaper: pickPaper,
           openCloseFlow: requestClose,
-          openFind: () => openFind(),
-          findNext: () => findNextMatch(),
-          searchPanelOpen: () => isSearchOpen(),
-          closeFind: () => closeFind(),
         }),
       );
     }

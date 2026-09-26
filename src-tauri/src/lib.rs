@@ -503,7 +503,7 @@ struct MenuFlags {
 }
 
 /// Map a focused-window kind to which mode-dependent items are enabled. Document
-/// windows get everything; stickies are find-only (no replace) and cannot open or
+/// windows get everything; stickies have no search at all and cannot open or
 /// tab; the workspace closes (which hides it) and opens -- it holds no document
 /// of its own, but it is the one window a user can be left with when no document
 /// is up, and greying Open there leaves no way into a file from inside the app;
@@ -512,7 +512,7 @@ fn menu_flags(kind: FocusKind) -> MenuFlags {
   // Order: new_tab, open, save, close, find, find_replace, find_next, find_prev.
   let (nt, op, sv, cl, fd, fr, nx, pv) = match kind {
     FocusKind::Doc => (true, true, true, true, true, true, true, true),
-    FocusKind::Sticky => (false, false, true, true, true, false, true, true),
+    FocusKind::Sticky => (false, false, true, true, false, false, false, false),
     FocusKind::Workspace => (false, true, false, true, false, false, false, false),
     FocusKind::Settings | FocusKind::About | FocusKind::None => {
       (false, false, false, false, false, false, false, false)
@@ -847,47 +847,79 @@ pub(crate) fn escape_menu_label(label: &str) -> String {
 
 /// Every menu command that carries a keyboard accelerator: the submenu it
 /// lives in (`None` for the unlocalized "Note&Pad" brand submenu), the
-/// command's own label key, and its accelerator in Tauri's `CmdOrCtrl+…`
-/// syntax. `build_menu` looks up each accelerator here instead of hard-coding
-/// the string inline, and the Keyboard Shortcuts window (`get_shortcuts`)
-/// renders this same table, so the live menu and the shortcuts list can never
-/// drift apart.
-const ACCELERATOR_TABLE: &[(Option<i18n::Key>, i18n::Key, &str)] = &[
-  (None, i18n::Key::Quit, "CmdOrCtrl+Q"),
-  (None, i18n::Key::Settings, "CmdOrCtrl+,"),
+/// command's own label key, its menu item id, and its accelerator in Tauri's
+/// `CmdOrCtrl+…` syntax. `build_menu` looks up each id and accelerator here
+/// instead of hard-coding the strings inline, the Keyboard Shortcuts window
+/// (`get_shortcuts`) renders this same table, and on Windows
+/// `trigger_menu_accelerator` resolves a keypress through it, so the live
+/// menu, the shortcuts list and the keyboard path can never drift apart.
+const ACCELERATOR_TABLE: &[(Option<i18n::Key>, i18n::Key, &str, &str)] = &[
+  (None, i18n::Key::Quit, "quit", "CmdOrCtrl+Q"),
+  (None, i18n::Key::Settings, "settings", "CmdOrCtrl+,"),
   (
     Some(i18n::Key::FileMenu),
     i18n::Key::NewSticky,
+    "new-sticky",
     "CmdOrCtrl+N",
   ),
-  (Some(i18n::Key::FileMenu), i18n::Key::NewTab, "CmdOrCtrl+T"),
-  (Some(i18n::Key::FileMenu), i18n::Key::Open, "CmdOrCtrl+O"),
-  (Some(i18n::Key::FileMenu), i18n::Key::Save, "CmdOrCtrl+S"),
+  (
+    Some(i18n::Key::FileMenu),
+    i18n::Key::NewTab,
+    "new-tab",
+    "CmdOrCtrl+T",
+  ),
+  (
+    Some(i18n::Key::FileMenu),
+    i18n::Key::Open,
+    "open",
+    "CmdOrCtrl+O",
+  ),
+  (
+    Some(i18n::Key::FileMenu),
+    i18n::Key::Save,
+    "save",
+    "CmdOrCtrl+S",
+  ),
   (
     Some(i18n::Key::FileMenu),
     i18n::Key::SaveAs,
+    "save-as",
     "CmdOrCtrl+Shift+S",
   ),
-  (Some(i18n::Key::FileMenu), i18n::Key::Close, "CmdOrCtrl+W"),
-  (Some(i18n::Key::EditMenu), i18n::Key::Find, "CmdOrCtrl+F"),
+  (
+    Some(i18n::Key::FileMenu),
+    i18n::Key::Close,
+    "close",
+    "CmdOrCtrl+W",
+  ),
+  (
+    Some(i18n::Key::EditMenu),
+    i18n::Key::Find,
+    "find",
+    "CmdOrCtrl+F",
+  ),
   (
     Some(i18n::Key::EditMenu),
     i18n::Key::FindReplace,
+    "find-replace",
     "CmdOrCtrl+Alt+F",
   ),
   (
     Some(i18n::Key::EditMenu),
     i18n::Key::FindNext,
+    "find-next",
     "CmdOrCtrl+G",
   ),
   (
     Some(i18n::Key::EditMenu),
     i18n::Key::FindPrev,
+    "find-prev",
     "CmdOrCtrl+Shift+G",
   ),
   (
     Some(i18n::Key::ViewMenu),
     i18n::Key::Workspace,
+    "workspace",
     "CmdOrCtrl+Shift+E",
   ),
 ];
@@ -916,8 +948,29 @@ const NON_MENU_SHORTCUTS: &[(i18n::Key, i18n::Key, &str)] = &[
 fn accelerator(item: i18n::Key) -> Option<&'static str> {
   ACCELERATOR_TABLE
     .iter()
-    .find(|(_, key, _)| *key == item)
-    .map(|(_, _, accel)| *accel)
+    .find(|(_, key, _, _)| *key == item)
+    .map(|(_, _, _, accel)| *accel)
+}
+
+/// The menu item id `ACCELERATOR_TABLE` records for an accelerated `item`.
+/// Panics on a key the table does not carry: every caller is a `build_menu`
+/// construction site for an item that is in the table, so a miss is a
+/// programming error the menu-building tests hit immediately.
+fn menu_id(item: i18n::Key) -> &'static str {
+  ACCELERATOR_TABLE
+    .iter()
+    .find(|(_, key, _, _)| *key == item)
+    .map(|(_, _, id, _)| *id)
+    .expect("menu_id called for a key with no ACCELERATOR_TABLE row")
+}
+
+/// The menu item id whose accelerator is exactly `accelerator` (Tauri's
+/// `CmdOrCtrl+…` syntax, as `ACCELERATOR_TABLE` spells it), or `None`.
+fn menu_id_for_accelerator(accelerator: &str) -> Option<&'static str> {
+  ACCELERATOR_TABLE
+    .iter()
+    .find(|(_, _, _, accel)| *accel == accelerator)
+    .map(|(_, _, id, _)| *id)
 }
 
 #[cfg(test)]
@@ -950,7 +1003,7 @@ mod accelerator_table_tests {
     // no `Hash` impl, so this dedups with a plain (and, at 13 rows, cheap)
     // O(n²) scan rather than adding one just for this test.
     let mut seen: Vec<Key> = Vec::new();
-    for (_, item, _) in ACCELERATOR_TABLE {
+    for (_, item, _, _) in ACCELERATOR_TABLE {
       assert!(
         !seen.contains(item),
         "{item:?} appears more than once in ACCELERATOR_TABLE"
@@ -963,7 +1016,7 @@ mod accelerator_table_tests {
   fn every_accelerator_is_well_formed() {
     // Every token but the last must be one of the three modifiers this app
     // actually uses; the last token is the key itself and must be non-empty.
-    for (_, item, accel) in ACCELERATOR_TABLE {
+    for (_, item, _, accel) in ACCELERATOR_TABLE {
       let tokens: Vec<&str> = accel.split('+').collect();
       let (key, mods) = tokens
         .split_last()
@@ -1000,7 +1053,7 @@ fn build_menu(
   let s = settings::app_settings(app);
   let quit = MenuItem::with_id(
     app,
-    "quit",
+    menu_id(i18n::Key::Quit),
     tr(i18n::Key::Quit),
     true,
     accelerator(i18n::Key::Quit),
@@ -1009,7 +1062,7 @@ fn build_menu(
   let about = MenuItem::with_id(app, "about", tr(i18n::Key::About), true, None::<&str>)?;
   let settings_item = MenuItem::with_id(
     app,
-    "settings",
+    menu_id(i18n::Key::Settings),
     tr(i18n::Key::Settings),
     true,
     accelerator(i18n::Key::Settings),
@@ -1032,21 +1085,21 @@ fn build_menu(
   // document window closes its active tab (not the whole window).
   let new_sticky = MenuItem::with_id(
     app,
-    "new-sticky",
+    menu_id(i18n::Key::NewSticky),
     tr(i18n::Key::NewSticky),
     true,
     accelerator(i18n::Key::NewSticky),
   )?;
   let new_tab = MenuItem::with_id(
     app,
-    "new-tab",
+    menu_id(i18n::Key::NewTab),
     tr(i18n::Key::NewTab),
     false,
     accelerator(i18n::Key::NewTab),
   )?;
   let open = MenuItem::with_id(
     app,
-    "open",
+    menu_id(i18n::Key::Open),
     tr(i18n::Key::Open),
     false,
     accelerator(i18n::Key::Open),
@@ -1055,21 +1108,21 @@ fn build_menu(
   populate_recent(app, &open_recent, locale, &s.recent_files)?;
   let save = MenuItem::with_id(
     app,
-    "save",
+    menu_id(i18n::Key::Save),
     tr(i18n::Key::Save),
     false,
     accelerator(i18n::Key::Save),
   )?;
   let save_as = MenuItem::with_id(
     app,
-    "save-as",
+    menu_id(i18n::Key::SaveAs),
     tr(i18n::Key::SaveAs),
     false,
     accelerator(i18n::Key::SaveAs),
   )?;
   let close = MenuItem::with_id(
     app,
-    "close",
+    menu_id(i18n::Key::Close),
     tr(i18n::Key::Close),
     false,
     accelerator(i18n::Key::Close),
@@ -1112,28 +1165,28 @@ fn build_menu(
   // which emits `menu-action` to the focused window.
   let find = MenuItem::with_id(
     app,
-    "find",
+    menu_id(i18n::Key::Find),
     tr(i18n::Key::Find),
     false,
     accelerator(i18n::Key::Find),
   )?;
   let find_replace = MenuItem::with_id(
     app,
-    "find-replace",
+    menu_id(i18n::Key::FindReplace),
     tr(i18n::Key::FindReplace),
     false,
     accelerator(i18n::Key::FindReplace),
   )?;
   let find_next = MenuItem::with_id(
     app,
-    "find-next",
+    menu_id(i18n::Key::FindNext),
     tr(i18n::Key::FindNext),
     false,
     accelerator(i18n::Key::FindNext),
   )?;
   let find_prev = MenuItem::with_id(
     app,
-    "find-prev",
+    menu_id(i18n::Key::FindPrev),
     tr(i18n::Key::FindPrev),
     false,
     accelerator(i18n::Key::FindPrev),
@@ -1309,7 +1362,7 @@ fn build_menu(
   // View menu: the Workspace (moved here from Window) and the Line Numbers toggle.
   let workspace = MenuItem::with_id(
     app,
-    "workspace",
+    menu_id(i18n::Key::Workspace),
     tr(i18n::Key::Workspace),
     true,
     accelerator(i18n::Key::Workspace),
@@ -1503,65 +1556,249 @@ fn build_app_menu(
     syntax_pin: Mutex::new(None),
   });
   install_menu(app, menu)?;
-  app.on_menu_event(|app, event| {
-    let id = event.id.as_ref();
-    match id {
-      "quit" => flush_then_exit(app),
-      "new-sticky" => {
-        let store = app.state::<NoteStore>();
-        let _ = windows::new_sticky(app, &store);
-      }
-      "new-tab" | "open" | "save" | "save-as" | "show-in-finder" | "copy-path" | "find"
-      | "find-replace" | "find-next" | "find-prev" | "undo" | "redo" | "cut" | "copy" | "paste"
-      | "select-all" => {
-        emit_to_focused(app, "menu-action", id.to_string());
-      }
-      "line-ending-lf" => emit_to_focused(app, "menu-action", "set-line-ending:LF".to_string()),
-      "line-ending-crlf" => emit_to_focused(app, "menu-action", "set-line-ending:CRLF".to_string()),
-      "word-wrap" => toggle_word_wrap(app),
-      "line-numbers" => toggle_line_numbers(app),
-      "always-on-top" => toggle_always_on_top(app),
-      "recent-clear" => clear_recent(app),
-      "workspace" => {
-        let _ = windows::show_workspace(app);
-      }
-      "settings" => {
-        let _ = windows::show_settings(app);
-      }
-      "about" => {
-        let _ = windows::show_about(app);
-      }
-      "help-documentation" => {
-        navigation::open_externally("https://github.com/Lonshaus/note-n-pad");
-      }
-      "help-report-issue" => {
-        navigation::open_externally("https://github.com/Lonshaus/note-n-pad/issues");
-      }
-      "help-keyboard-shortcuts" => {
-        let _ = windows::show_shortcuts(app);
-      }
-      "help-acknowledgements" => {
-        let _ = windows::show_acknowledgements(app);
-      }
-      "help-privacy" => {
-        let _ = windows::show_privacy(app);
-      }
-      "close" => {
-        // Route Close to the focused window; its frontend decides tab-vs-window.
-        emit_to_focused(app, "menu-close", ());
-      }
-      _ if id.starts_with("enc:") => {
-        emit_to_focused(app, "menu-action", format!("set-encoding:{}", &id[4..]));
-      }
-      _ if id.starts_with("lang:") => {
-        emit_to_focused(app, "menu-action", format!("set-language:{}", &id[5..]));
-      }
-      _ if id.starts_with("recent:") => open_recent(app, id),
-      _ if id.starts_with("ctx:") => ctx_menu::route_ctx_event(app, id),
-      _ => {}
-    }
-  });
+  app.on_menu_event(|app, event| handle_menu_id(app, event.id.as_ref()));
   Ok(())
+}
+
+/// Run the menu command `id`. The menu-event handler above and the Windows
+/// keyboard path (`trigger_menu_accelerator`) both land here, so a shortcut
+/// always does exactly what clicking its menu item does.
+fn handle_menu_id(app: &tauri::AppHandle, id: &str) {
+  match id {
+    "quit" => flush_then_exit(app),
+    "new-sticky" => {
+      let store = app.state::<NoteStore>();
+      let _ = windows::new_sticky(app, &store);
+    }
+    "new-tab" | "open" | "save" | "save-as" | "show-in-finder" | "copy-path" | "find"
+    | "find-replace" | "find-next" | "find-prev" | "undo" | "redo" | "cut" | "copy" | "paste"
+    | "select-all" => {
+      emit_to_focused(app, "menu-action", id.to_string());
+    }
+    "line-ending-lf" => emit_to_focused(app, "menu-action", "set-line-ending:LF".to_string()),
+    "line-ending-crlf" => emit_to_focused(app, "menu-action", "set-line-ending:CRLF".to_string()),
+    "word-wrap" => toggle_word_wrap(app),
+    "line-numbers" => toggle_line_numbers(app),
+    "always-on-top" => toggle_always_on_top(app),
+    "recent-clear" => clear_recent(app),
+    "workspace" => {
+      let _ = windows::show_workspace(app);
+    }
+    "settings" => {
+      let _ = windows::show_settings(app);
+    }
+    "about" => {
+      let _ = windows::show_about(app);
+    }
+    "help-documentation" => {
+      navigation::open_externally("https://github.com/Lonshaus/note-n-pad");
+    }
+    "help-report-issue" => {
+      navigation::open_externally("https://github.com/Lonshaus/note-n-pad/issues");
+    }
+    "help-keyboard-shortcuts" => {
+      let _ = windows::show_shortcuts(app);
+    }
+    "help-acknowledgements" => {
+      let _ = windows::show_acknowledgements(app);
+    }
+    "help-privacy" => {
+      let _ = windows::show_privacy(app);
+    }
+    "close" => {
+      // Route Close to the focused window; its frontend decides tab-vs-window.
+      emit_to_focused(app, "menu-close", ());
+    }
+    _ if id.starts_with("enc:") => {
+      emit_to_focused(app, "menu-action", format!("set-encoding:{}", &id[4..]));
+    }
+    _ if id.starts_with("lang:") => {
+      emit_to_focused(app, "menu-action", format!("set-language:{}", &id[5..]));
+    }
+    _ if id.starts_with("recent:") => open_recent(app, id),
+    _ if id.starts_with("ctx:") => ctx_menu::route_ctx_event(app, id),
+    _ => {}
+  }
+}
+
+/// Whether menu item `id` (an `ACCELERATOR_TABLE` id) is enabled for a
+/// `kind`-focused window — the same rule `MenuItems::apply` uses to
+/// enable/disable the live item, recomputed here rather than read off the
+/// built menu, since `Menu::get` does not recurse into submenus. Keeps
+/// `trigger_menu_accelerator` from ever doing more than clicking the
+/// (possibly greyed) menu item would.
+fn accelerator_enabled(id: &str, kind: FocusKind) -> bool {
+  let f = menu_flags(kind);
+  match id {
+    "new-tab" => f.new_tab,
+    "open" => f.open,
+    "save" => f.save,
+    "close" => f.close,
+    "find" => f.find,
+    "find-replace" => f.find_replace,
+    "find-next" => f.find_next,
+    "find-prev" => f.find_prev,
+    // Document-only, mirroring `save_as.set_enabled(is_doc)` in `MenuItems::apply`.
+    "save-as" => kind == FocusKind::Doc,
+    // Never toggled by focus kind.
+    "quit" | "settings" | "new-sticky" | "workspace" => true,
+    _ => false,
+  }
+}
+
+/// Windows-only keyboard path: WebView2 keyboard input never reaches Tauri's
+/// `TranslateAcceleratorW` msg_hook, so menu accelerators cannot fire while a
+/// webview has focus. The frontend's Windows-only keydown listener
+/// (`main.ts`) calls this instead of relying on the native accelerator table.
+/// Must be `(async)`: `handle_menu_id` can build a window (new-sticky,
+/// settings, workspace), and a synchronous command that builds a window
+/// deadlocks the Windows UI thread it runs on (see
+/// `window_command_threading_tests` in `windows.rs`). Returns whether the
+/// accelerator actually ran, so the caller can tell an unrecognized
+/// accelerator apart from a recognized-but-disabled one.
+#[tauri::command(async)]
+fn trigger_menu_accelerator(
+  app: tauri::AppHandle,
+  window: tauri::Window,
+  accelerator: String,
+) -> bool {
+  let Some(id) = menu_id_for_accelerator(&accelerator) else {
+    return false;
+  };
+  if !accelerator_enabled(id, focus_kind(window.label())) {
+    return false;
+  }
+  handle_menu_id(&app, id);
+  true
+}
+
+/// Every accelerator in `ACCELERATOR_TABLE`, for the Windows frontend keydown
+/// listener to match against. Deliberately narrower than `get_shortcuts`,
+/// which also carries `NON_MENU_SHORTCUTS` (frontend-only bindings such as
+/// Ctrl+L) that must never be intercepted by `trigger_menu_accelerator`.
+#[tauri::command]
+fn get_menu_accelerators() -> Vec<String> {
+  ACCELERATOR_TABLE
+    .iter()
+    .map(|(_, _, _, accel)| (*accel).to_string())
+    .collect()
+}
+
+#[cfg(test)]
+mod menu_accelerator_command_tests {
+  use super::{accelerator_enabled, menu_id_for_accelerator, FocusKind, ACCELERATOR_TABLE};
+
+  // Reads the source because the failure mode is a deadlock, with nothing to
+  // assert at runtime. Same style as `window_command_threading_tests` in
+  // `windows.rs`.
+  const SOURCE: &str = include_str!("lib.rs");
+
+  const NON_DOC_KINDS: &[FocusKind] = &[
+    FocusKind::Sticky,
+    FocusKind::Workspace,
+    FocusKind::Settings,
+    FocusKind::About,
+    FocusKind::None,
+  ];
+
+  const ALL_KINDS: &[FocusKind] = &[
+    FocusKind::Doc,
+    FocusKind::Sticky,
+    FocusKind::Workspace,
+    FocusKind::Settings,
+    FocusKind::About,
+    FocusKind::None,
+  ];
+
+  #[test]
+  fn trigger_menu_accelerator_is_async() {
+    let at = SOURCE
+      .find("fn trigger_menu_accelerator")
+      .expect("trigger_menu_accelerator no longer exists in lib.rs");
+    let attribute = SOURCE[..at].trim_end();
+    assert!(
+      attribute.ends_with("#[tauri::command(async)]"),
+      "trigger_menu_accelerator must be #[tauri::command(async)]: a blocking \
+       command that builds a window deadlocks the Windows UI thread"
+    );
+  }
+
+  #[test]
+  fn every_table_id_round_trips_through_lookup() {
+    for (_, _, id, accel) in ACCELERATOR_TABLE {
+      assert_eq!(menu_id_for_accelerator(accel), Some(*id));
+    }
+  }
+
+  #[test]
+  fn save_resolves_via_lookup() {
+    assert_eq!(menu_id_for_accelerator("CmdOrCtrl+S"), Some("save"));
+  }
+
+  #[test]
+  fn non_table_combos_resolve_to_none() {
+    assert_eq!(menu_id_for_accelerator("CmdOrCtrl+Z"), None);
+    assert_eq!(menu_id_for_accelerator("CmdOrCtrl+L"), None);
+  }
+
+  #[test]
+  fn ids_are_unique() {
+    let mut seen: Vec<&str> = Vec::new();
+    for (_, _, id, _) in ACCELERATOR_TABLE {
+      assert!(!seen.contains(id), "{id} appears more than once");
+      seen.push(id);
+    }
+  }
+
+  #[test]
+  fn save_is_enabled_only_for_doc_and_sticky() {
+    assert!(accelerator_enabled("save", FocusKind::Doc));
+    assert!(accelerator_enabled("save", FocusKind::Sticky));
+    for kind in [
+      FocusKind::Workspace,
+      FocusKind::Settings,
+      FocusKind::About,
+      FocusKind::None,
+    ] {
+      assert!(!accelerator_enabled("save", kind));
+    }
+  }
+
+  #[test]
+  fn new_tab_and_open_are_disabled_for_sticky() {
+    assert!(!accelerator_enabled("new-tab", FocusKind::Sticky));
+    assert!(!accelerator_enabled("open", FocusKind::Sticky));
+  }
+
+  #[test]
+  fn save_as_is_doc_only() {
+    assert!(accelerator_enabled("save-as", FocusKind::Doc));
+    for kind in NON_DOC_KINDS {
+      assert!(!accelerator_enabled("save-as", *kind));
+    }
+  }
+
+  #[test]
+  fn find_is_disabled_for_sticky() {
+    for id in ["find", "find-replace", "find-next", "find-prev"] {
+      assert!(accelerator_enabled(id, FocusKind::Doc));
+      assert!(!accelerator_enabled(id, FocusKind::Sticky));
+    }
+  }
+
+  #[test]
+  fn always_on_items_are_enabled_for_every_kind() {
+    for id in ["quit", "settings", "new-sticky", "workspace"] {
+      for kind in ALL_KINDS {
+        assert!(accelerator_enabled(id, *kind));
+      }
+    }
+  }
+
+  #[test]
+  fn unknown_id_is_disabled() {
+    assert!(!accelerator_enabled("not-a-real-id", FocusKind::Doc));
+  }
 }
 
 /// Toggle the global word-wrap setting from the Format menu, persisting it so
@@ -1793,7 +2030,7 @@ struct ShortcutRow {
 fn shortcut_rows(locale: i18n::Locale) -> Vec<ShortcutRow> {
   let menu_rows = ACCELERATOR_TABLE
     .iter()
-    .map(|(section, item, accel)| ShortcutRow {
+    .map(|(section, item, _, accel)| ShortcutRow {
       section: section.map_or_else(
         || "Note&Pad".to_string(),
         |key| i18n::tr(locale, key).to_string(),
@@ -1865,7 +2102,7 @@ mod shortcut_rows_tests {
   fn no_accelerator_is_claimed_by_both_tables() {
     // A shared accelerator string would mean a menu command and a non-menu
     // command both claim the same chord.
-    for (_, _, menu_accel) in super::ACCELERATOR_TABLE {
+    for (_, _, _, menu_accel) in super::ACCELERATOR_TABLE {
       for (_, _, non_menu_accel) in NON_MENU_SHORTCUTS {
         assert_ne!(
           menu_accel, non_menu_accel,
@@ -1899,7 +2136,7 @@ mod shortcut_rows_tests {
     // (`None` is the unlocalized "Note&Pad" brand submenu) plus
     // `NON_MENU_SHORTCUTS`'s section-key column.
     let mut section_keys: Vec<Option<Key>> = Vec::new();
-    for (section, _, _) in super::ACCELERATOR_TABLE {
+    for (section, _, _, _) in super::ACCELERATOR_TABLE {
       if !section_keys.contains(section) {
         section_keys.push(*section);
       }
@@ -2583,6 +2820,8 @@ pub fn run() {
       windows::show_acknowledgements_window,
       windows::show_privacy_window,
       get_shortcuts,
+      get_menu_accelerators,
+      trigger_menu_accelerator,
       shortcut::set_new_note_shortcut,
       windows::focus_note_window,
       windows::focus_doc_tab,
@@ -2757,10 +2996,11 @@ mod tests {
   }
 
   #[test]
-  fn sticky_is_find_only_without_tabs() {
+  fn sticky_has_no_search_and_no_tabs() {
     let f = menu_flags(FocusKind::Sticky);
-    assert!(f.save && f.close && f.find && f.find_next && f.find_prev);
-    assert!(!f.new_tab && !f.open && !f.find_replace);
+    assert!(f.save && f.close);
+    assert!(!f.new_tab && !f.open);
+    assert!(!f.find && !f.find_replace && !f.find_next && !f.find_prev);
   }
 
   #[test]
