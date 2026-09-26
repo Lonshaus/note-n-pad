@@ -12,17 +12,13 @@ import type { ViewMode } from '../util/viewModes';
 // behind that guard, this whole module is dropped from the production bundle
 // (verified by the absence of `__auto` in dist).
 
-/** Sticky-only actions wired to the toolbar handlers of StickyApp. Stickies are
- *  find-only, so there is no openFindReplace. */
+/** Sticky-only actions wired to the toolbar handlers of StickyApp. Stickies
+ *  have no search at all. */
 export interface StickyHooks {
   getTitle: () => string;
   clickPin: () => void;
   setPaper: (name: string) => void;
   openCloseFlow: () => void;
-  openFind: () => void;
-  findNext: () => void;
-  searchPanelOpen: () => boolean;
-  closeFind: () => void;
 }
 
 function typeText(text: string): void {
@@ -49,10 +45,6 @@ export function installStickyAuto(hooks: StickyHooks): void {
     clickPin: hooks.clickPin,
     setPaper: hooks.setPaper,
     openCloseFlow: hooks.openCloseFlow,
-    openFind: hooks.openFind,
-    findNext: hooks.findNext,
-    searchPanelOpen: hooks.searchPanelOpen,
-    closeFind: hooks.closeFind,
   };
 }
 
