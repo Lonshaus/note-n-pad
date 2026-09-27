@@ -53,17 +53,15 @@ macOSとWindowsに対応した、軽量なデスクトップテキストエデ�
 
 ## 入手方法
 
-以下のストアで配信予定です。
+Note&Pad は以下のストアで入手できます。
 
-- **Steam** — macOS と Windows（リンクは後日掲載）
-- **Mac App Store** — macOS（リンクは後日掲載）
-- **Microsoft Store** — Windows（リンクは後日掲載）
+- [Steam](https://store.steampowered.com/app/5326730/) — macOS と Windows
+- [Mac App Store](https://apps.apple.com/app/id6804605248) — macOS
+- [Microsoft Store](https://apps.microsoft.com/detail/9NVXQ3L8R923) — Windows
 
 macOS は 13.3 以降、Windows は 10 64 ビット以降が必要です。
 
 アップデートは購入したストアから配信されます。
-
-ソースコードから自分でビルドすることも可能です。手順は [BUILDING.ja.md](BUILDING.ja.md) を参照してください。
 
 ## ライセンス
 
