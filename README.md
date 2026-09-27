@@ -53,17 +53,15 @@ Built around one goal: open fast, stay reliable, find what you need. Daily notes
 
 ## Getting It
 
-The app will be available from:
+Note&Pad is available from:
 
-- **Steam** — macOS and Windows (link to follow)
-- **Mac App Store** — macOS (link to follow)
-- **Microsoft Store** — Windows (link to follow)
+- [Steam](https://store.steampowered.com/app/5326730/) — macOS and Windows
+- [Mac App Store](https://apps.apple.com/app/id6804605248) — macOS
+- [Microsoft Store](https://apps.microsoft.com/detail/9NVXQ3L8R923) — Windows
 
 macOS 13.3 or later, or Windows 10 64-bit or later.
 
 Updates arrive through the store you bought it from.
-
-You can also build it from source; see [BUILDING.md](BUILDING.md) for the steps.
 
 ## License
 
