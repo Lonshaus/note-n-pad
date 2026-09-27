@@ -53,17 +53,15 @@
 
 ## 取得方式
 
-應用程式將於以下商店上架：
+Note&Pad 可在以下商店取得：
 
-- **Steam** — macOS 與 Windows（連結待補）
-- **Mac App Store** — macOS（連結待補）
-- **Microsoft Store** — Windows（連結待補）
+- [Steam](https://store.steampowered.com/app/5326730/) — macOS 與 Windows
+- [Mac App Store](https://apps.apple.com/app/id6804605248) — macOS
+- [Microsoft Store](https://apps.microsoft.com/detail/9NVXQ3L8R923) — Windows
 
 macOS 需要 13.3 以上，Windows 需要 10 64 位元以上。
 
 更新由購買的商店派送。
-
-也可以自行從原始碼建置，步驟見 [BUILDING.zh-TW.md](BUILDING.zh-TW.md)。
 
 ## 授權
 
