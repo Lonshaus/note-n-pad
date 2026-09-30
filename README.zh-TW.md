@@ -59,7 +59,7 @@ Note&Pad 可在以下商店取得：
 - [Mac App Store](https://apps.apple.com/app/id6804605248) — macOS
 - [Microsoft Store](https://apps.microsoft.com/detail/9NVXQ3L8R923) — Windows
 
-macOS 13.3 或是，64 位元 Windows 10 以上版本。
+macOS 13.3，或是 64 位元 Windows 10 以上版本。
 
 更新由購買的商店派送。
 
