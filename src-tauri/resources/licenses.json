@@ -1,7 +1,7 @@
 {
   "inputs": {
     "cargoLock": "82e854b824d28be831bc1d537790c9d701d0cbfc894650f27cccc8b3dd92ffe5",
-    "npmLock": "1afc07fa53318e97d840eb001672964dcf5358fed12b36624ad47a988a36876c"
+    "npmLock": "90214324524911e83e22d3830f467dd3d4ee7e88c41600cda1066b941752eaeb"
   },
   "texts": [
     "Copyright (C) Jonas Schievink <jonasschievink@gmail.com>\n\nPermission to use, copy, modify, and/or distribute this software for\nany purpose with or without fee is hereby granted.\n\nTHE SOFTWARE IS PROVIDED \"AS IS\" AND THE AUTHOR DISCLAIMS ALL WARRANTIES\nWITH REGARD TO THIS SOFTWARE INCLUDING ALL IMPLIED WARRANTIES OF\nMERCHANTABILITY AND FITNESS. IN NO EVENT SHALL THE AUTHOR BE LIABLE FOR\nANY SPECIAL, DIRECT, INDIRECT, OR CONSEQUENTIAL DAMAGES OR ANY DAMAGES\nWHATSOEVER RESULTING FROM LOSS OF USE, DATA OR PROFITS, WHETHER IN\nAN ACTION OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION, ARISING OUT\nOF OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.\n",
@@ -4400,10 +4400,10 @@
     },
     {
       "name": "@lezer/common",
-      "version": "1.5.2",
+      "version": "1.5.3",
       "ecosystem": "npm",
       "license": "MIT",
-      "repository": "https://github.com/lezer-parser/common",
+      "repository": "https://code.haverbeke.berlin/lezer/common",
       "authors": [
         "Marijn Haverbeke"
       ],
@@ -4452,10 +4452,10 @@
     },
     {
       "name": "@lezer/highlight",
-      "version": "1.2.3",
+      "version": "1.2.5",
       "ecosystem": "npm",
       "license": "MIT",
-      "repository": "https://github.com/lezer-parser/highlight",
+      "repository": "https://code.haverbeke.berlin/lezer/highlight",
       "authors": [
         "Marijn Haverbeke"
       ],
@@ -4569,10 +4569,10 @@
     },
     {
       "name": "@lezer/rust",
-      "version": "1.0.2",
+      "version": "1.0.3",
       "ecosystem": "npm",
       "license": "MIT",
-      "repository": "https://github.com/lezer-parser/rust",
+      "repository": "https://code.haverbeke.berlin/lezer/rust",
       "authors": [
         "Marijn Haverbeke"
       ],
