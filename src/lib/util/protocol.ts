@@ -12,6 +12,11 @@
  *  of one string. */
 export const READ_ONLY_DESTINATION = 'read-only-destination';
 
+/** `read_file_auto`, `read_file_as` and `read_range` answer with exactly this
+ *  when the path does not exist; any other read error keeps its message
+ *  (protocol value, matches the Rust `fs_ops::FILE_NOT_FOUND` constant). */
+export const FILE_NOT_FOUND = 'file-not-found';
+
 /** Why the core could not load one file in a data folder. Matches the Rust
  *  `fs_ops::SkipReason`; the wording for each case lives in the locales. */
 export type SkipReason =

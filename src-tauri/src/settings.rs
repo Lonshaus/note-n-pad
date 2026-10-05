@@ -761,6 +761,11 @@ pub fn save_settings(app: AppHandle, settings: serde_json::Value) -> Result<(), 
     save_to(&path, &merged)?;
     (current, merged)
   };
+  if current.project_roots != merged.project_roots {
+    for root in &merged.project_roots {
+      crate::grants::remember(root);
+    }
+  }
   let app_for_main = app.clone();
   if let Err(e) = app.run_on_main_thread(move || {
     // Rebuild the native menus when the UI language changed; the WebView

@@ -1,7 +1,7 @@
 // Copyright © 2026 Lonshaus
 // SPDX-License-Identifier: GPL-3.0-only
 
-use crate::fs_ops::write_bytes_atomic;
+use crate::fs_ops::{read_error, write_bytes_atomic};
 use encoding_rs::Encoding;
 use serde::Serialize;
 use std::path::Path;
@@ -227,13 +227,13 @@ pub fn encode_text(content: &str, label: &str, with_bom: bool) -> Result<Vec<u8>
 
 #[tauri::command]
 pub fn read_file_auto(path: String) -> Result<Decoded, String> {
-  let bytes = std::fs::read(&path).map_err(|e| e.to_string())?;
+  let bytes = std::fs::read(&path).map_err(|e| read_error(&e))?;
   Ok(decode_auto(&bytes))
 }
 
 #[tauri::command]
 pub fn read_file_as(path: String, encoding: String) -> Result<Decoded, String> {
-  let bytes = std::fs::read(&path).map_err(|e| e.to_string())?;
+  let bytes = std::fs::read(&path).map_err(|e| read_error(&e))?;
   decode_as(&bytes, &encoding)
 }
 
@@ -255,6 +255,36 @@ pub fn write_file_encoded(
 mod tests {
   use super::*;
   use tempfile::tempdir;
+
+  #[test]
+  fn read_commands_report_missing_file_as_protocol_value() {
+    let dir = tempdir().unwrap();
+    let p = dir.path().join("gone.txt").to_string_lossy().into_owned();
+    assert_eq!(read_file_auto(p.clone()).unwrap_err(), "file-not-found");
+    assert_eq!(
+      read_file_as(p, "UTF-8".to_string()).unwrap_err(),
+      "file-not-found"
+    );
+  }
+
+  #[cfg(unix)]
+  #[test]
+  fn read_commands_report_unreadable_file_with_other_error() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("locked.txt");
+    std::fs::write(&path, b"x").unwrap();
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o000)).unwrap();
+    if std::fs::read(&path).is_ok() {
+      // Running as root: permissions are not enforced.
+      return;
+    }
+    let p = path.to_string_lossy().into_owned();
+    let a = read_file_auto(p.clone()).unwrap_err();
+    let b = read_file_as(p, "UTF-8".to_string()).unwrap_err();
+    assert_ne!(a, "file-not-found");
+    assert_ne!(b, "file-not-found");
+  }
 
   #[test]
   fn bom_sniff_utf8() {
