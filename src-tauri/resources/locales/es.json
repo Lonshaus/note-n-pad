@@ -203,6 +203,7 @@
     "status.longLine.disabled": "Líneas largas: resaltado de sintaxis desactivado",
     "status.longLine.reason": "Este archivo tiene una línea muy larga; analizarla en cada pulsación ralentiza la escritura.",
     "doc.openFailed": "No se pudo abrir «{name}». Es posible que el archivo se haya movido o eliminado, o que su nombre contenga caracteres que esta app no admite.",
+    "doc.restoreUnreadable": "No se pudo leer {names}. Ábrelos de nuevo para continuar.",
     "doc.revealFailed": "No se pudo mostrar «{name}». Es posible que el archivo se haya movido o eliminado.",
     "doc.saveFailed": "No se pudo guardar «{name}»: {error}",
     "doc.saveReadOnly": "«{name}» es de solo lectura, así que no se guardó nada. Cambie los permisos del archivo para poder guardarlo.",

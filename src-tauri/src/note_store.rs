@@ -1012,8 +1012,16 @@ pub fn upsert_note(
   seq: u64,
 ) -> Result<(), String> {
   let id = note.id.clone();
+  let paths = [
+    note.file_path.clone(),
+    note.project.clone(),
+    note.range_source.clone(),
+  ];
   if store.upsert_ordered(note, seq)? {
     emit_store_changed(&app, Some(&id));
+    for path in paths.iter().flatten() {
+      crate::grants::remember(path);
+    }
   }
   Ok(())
 }

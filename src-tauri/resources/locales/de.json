@@ -203,6 +203,7 @@
     "status.longLine.disabled": "Lange Zeilen: Syntaxhervorhebung deaktiviert",
     "status.longLine.reason": "Diese Datei hat eine sehr lange Zeile; sie bei jedem Tastendruck zu parsen verlangsamt die Eingabe.",
     "doc.openFailed": "„{name}“ konnte nicht geöffnet werden. Die Datei wurde möglicherweise verschoben oder gelöscht, oder ihr Dateiname enthält Zeichen, die diese App nicht unterstützt.",
+    "doc.restoreUnreadable": "{names} konnte nicht gelesen werden. Öffne die Dateien erneut, um fortzufahren.",
     "doc.revealFailed": "„{name}“ konnte nicht angezeigt werden. Die Datei wurde möglicherweise verschoben oder gelöscht.",
     "doc.saveFailed": "„{name}“ konnte nicht gespeichert werden: {error}",
     "doc.saveReadOnly": "„{name}“ ist schreibgeschützt, daher wurde nichts gespeichert. Ändern Sie die Dateiberechtigungen, um sie zu speichern.",

@@ -203,6 +203,7 @@
     "status.longLine.disabled": "Linhas longas: realce de sintaxe desativado",
     "status.longLine.reason": "Este arquivo tem uma linha muito longa; analisá-la a cada tecla deixa a digitação lenta.",
     "doc.openFailed": "Não foi possível abrir “{name}”. O arquivo pode ter sido movido ou excluído, ou o nome dele contém caracteres que este app não suporta.",
+    "doc.restoreUnreadable": "Não foi possível ler {names}. Abra os arquivos novamente para continuar.",
     "doc.revealFailed": "Não foi possível mostrar “{name}”. O arquivo pode ter sido movido ou excluído.",
     "doc.saveFailed": "Não foi possível salvar “{name}”: {error}",
     "doc.saveReadOnly": "“{name}” é somente leitura, portanto nada foi salvo. Altere as permissões do arquivo para salvá-lo.",

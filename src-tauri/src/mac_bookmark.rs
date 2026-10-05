@@ -26,6 +26,13 @@ use std::path::{Path, PathBuf};
 /// the caller then has only the path, which is what every build had before this
 /// existed.
 pub fn encode(path: &Path) -> Option<String> {
+  try_encode(path)
+    .map_err(|e| log::warn!("no security-scoped bookmark for {}: {e}", path.display()))
+    .ok()
+}
+
+/// `encode` without the warning, for a caller that rate-limits its own logging.
+pub fn try_encode(path: &Path) -> Result<String, String> {
   #[cfg(target_os = "macos")]
   {
     mac::encode(path)
@@ -33,7 +40,7 @@ pub fn encode(path: &Path) -> Option<String> {
   #[cfg(not(target_os = "macos"))]
   {
     let _ = path;
-    None
+    Err("bookmarks exist only on macOS".to_string())
   }
 }
 
@@ -66,16 +73,16 @@ mod mac {
     Some(NSURL::fileURLWithPath(&NSString::from_str(path.to_str()?)))
   }
 
-  pub(super) fn encode(path: &Path) -> Option<String> {
-    let data = url(path)?
+  pub(super) fn encode(path: &Path) -> Result<String, String> {
+    let data = url(path)
+      .ok_or_else(|| "path is not valid UTF-8".to_string())?
       .bookmarkDataWithOptions_includingResourceValuesForKeys_relativeToURL_error(
         NSURLBookmarkCreationOptions::WithSecurityScope,
         None,
         None,
       )
-      .map_err(|e| log::warn!("no security-scoped bookmark for {}: {e}", path.display()))
-      .ok()?;
-    Some(
+      .map_err(|e| e.to_string())?;
+    Ok(
       data
         .base64EncodedStringWithOptions(NSDataBase64EncodingOptions::empty())
         .to_string(),
@@ -107,10 +114,10 @@ mod mac {
         std::ptr::null_mut(),
       )
     }
-    .map_err(|e| log::warn!("stored snapshot-folder bookmark did not resolve: {e}"))
+    .map_err(|e| log::warn!("stored bookmark did not resolve: {e}"))
     .ok()?;
     if !unsafe { resolved.startAccessingSecurityScopedResource() } {
-      log::warn!("resolved the snapshot-folder bookmark but was refused access");
+      log::warn!("resolved a stored bookmark but was refused access");
       return None;
     }
     let path = PathBuf::from(resolved.path()?.to_string());
