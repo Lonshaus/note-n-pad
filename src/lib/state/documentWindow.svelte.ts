@@ -12,7 +12,11 @@ import {
   restoredLanguage,
 } from '../editor/language';
 import { beautifyJson, softWrapLongLines } from '../util/longLine';
-import { resolveTabPosition } from '../util/openDocuments';
+import {
+  UnreadableRestore,
+  activePositionAfterRestore,
+  restoreOutcome,
+} from '../util/restoreOutcome';
 import { saveDialogOptions, suggestedName } from '../util/saveDialog';
 import { Text } from '@codemirror/state';
 import {
@@ -414,12 +418,20 @@ class DocumentWindowState {
    *  named in bytes this side cannot address. Reported rather than opened as a
    *  blank tab, which would save over a path the user never chose. */
   openFailed = $state<string | null>(null);
+  /** Paths of restored clean tabs that exist but could not be read. They are
+   *  not opened (a blank tab would pass for the file); reported once. */
+  restoreUnreadable = $state<string[]>([]);
   /** True when the most recent snapshot write did not reach disk. `upsertTab`
    *  never lets a write's rejection propagate (see its own comment), so this
    *  is the only surviving signal that a save failed; cleared by the next
    *  write that succeeds. No UI reads this yet (see the follow-up issue) —
    *  it exists so a failure is not swallowed into nothing. */
   snapshotFailed = $state(false);
+
+  /** Dismiss the unreadable-restore report. */
+  dismissRestoreUnreadable(): void {
+    this.restoreUnreadable = [];
+  }
 
   /** Dismiss the failed-open report. */
   dismissOpenFailed(): void {
@@ -722,6 +734,7 @@ class DocumentWindowState {
       const startByte = snap.range_start ?? 0;
       const endByte = snap.range_end ?? 0;
       let diskSlice: string | null = null;
+      let rangeReadError: string | null = null;
       try {
         const r = await invoke<RangeRead>('read_range', {
           path: source,
@@ -729,8 +742,12 @@ class DocumentWindowState {
           end: endByte,
         });
         diskSlice = r.text;
-      } catch {
+      } catch (e) {
         diskSlice = null;
+        rangeReadError = String(e);
+      }
+      if (restoreOutcome(snap.dirty, rangeReadError) === 'unreadable') {
+        throw new UnreadableRestore(source);
       }
       const normalizedSlice =
         diskSlice !== null ? normalizeToLf(diskSlice) : null;
@@ -860,6 +877,7 @@ class DocumentWindowState {
     // A restored tab reads with its stored encoding; a fresh open auto-detects.
     // Decode strips any BOM but preserves the file's line endings.
     let decoded: Decoded | null = null;
+    let readError: string | null = null;
     try {
       decoded = snap?.encoding
         ? await invoke<Decoded>('read_file_as', {
@@ -867,8 +885,15 @@ class DocumentWindowState {
             encoding: snap.encoding,
           })
         : await invoke<Decoded>('read_file_auto', { path });
-    } catch {
+    } catch (e) {
       decoded = null;
+      readError = String(e);
+    }
+    if (
+      snap !== null &&
+      restoreOutcome(snap.dirty, readError) === 'unreadable'
+    ) {
+      throw new UnreadableRestore(path);
     }
     const fileExists = decoded !== null;
     // A fresh open names a file that is supposed to be there; a restore does
@@ -958,8 +983,21 @@ class DocumentWindowState {
     if (entries.length > 0) {
       // Restore: adopt the project the group's tabs were saved with.
       this.project = entries[0]!.project;
+      const dropped = new Set<number>();
       for (const entry of entries) {
-        this.tabs.push(await this.loadTab(entry.file_path ?? '', entry));
+        try {
+          this.tabs.push(await this.loadTab(entry.file_path ?? '', entry));
+        } catch (e) {
+          if (!(e instanceof UnreadableRestore)) {
+            throw e;
+          }
+          // Deleted so the note is not retried (and re-reported) every launch.
+          // A failed delete only means the notice repeats next launch; it must
+          // not abort restoring the rest of the window.
+          await invoke('delete_note', { id: entry.id }).catch(() => {});
+          this.restoreUnreadable.push(e.path);
+          dropped.add(entry.tab_index);
+        }
       }
       const lowest = entries[0]!;
       this.bounds = {
@@ -974,8 +1012,9 @@ class DocumentWindowState {
       // restored windowed tab — see the `activeIndex` setter. `initialTab` is a
       // stored `tab_index`, not an array position: closes and reorders make the
       // two diverge, so it is resolved against the restored entries.
-      this.activeIndex = resolveTabPosition(
+      this.activeIndex = activePositionAfterRestore(
         entries.map((e) => e.tab_index),
+        dropped,
         initialTab,
       );
     } else if (initialPath !== null) {
@@ -1312,7 +1351,19 @@ class DocumentWindowState {
    *  orphan's old group keeps only its remaining tabs (restored as usual next
    *  launch). */
   private async adoptOrphan(path: string, note: NoteSnapshot): Promise<void> {
-    const tab = await this.loadTab(path, note);
+    let tab: DocTab;
+    try {
+      tab = await this.loadTab(path, note);
+    } catch (e) {
+      if (!(e instanceof UnreadableRestore)) {
+        throw e;
+      }
+      // Reported like any other failed open; the stale record would only fail
+      // the same way next time.
+      await invoke('delete_note', { id: note.id }).catch(() => {});
+      this.openFailed = path;
+      return;
+    }
     tab.tabIndex = this.nextIndex++;
     this.tabs.push(tab);
     await this.switchTo(this.tabs.length - 1);
