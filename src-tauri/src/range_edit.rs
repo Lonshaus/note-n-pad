@@ -175,7 +175,7 @@ fn splice_at(
 /// an edit tab that would corrupt the file on write-back. Rejects ranges larger
 /// than `READ_RANGE_MAX` as a defensive backstop.
 fn read_range_at(path: &Path, start: u64, end: u64) -> Result<ReadRange, String> {
-  let meta = fs::metadata(path).map_err(|e| e.to_string())?;
+  let meta = fs::metadata(path).map_err(|e| crate::fs_ops::read_error(&e))?;
   let size = meta.len();
   if start > end || end > size {
     return Err("range out of bounds".to_string());
@@ -184,7 +184,7 @@ fn read_range_at(path: &Path, start: u64, end: u64) -> Result<ReadRange, String>
   if len > READ_RANGE_MAX {
     return Err("range exceeds maximum readable size".to_string());
   }
-  let mut file = File::open(path).map_err(|e| e.to_string())?;
+  let mut file = File::open(path).map_err(|e| crate::fs_ops::read_error(&e))?;
   file
     .seek(SeekFrom::Start(start))
     .map_err(|e| e.to_string())?;
@@ -277,6 +277,29 @@ pub fn copy_range(path: String, start: u64, end: u64, dest: String) -> Result<()
 mod tests {
   use super::*;
   use tempfile::tempdir;
+
+  #[test]
+  fn read_range_missing_file_is_protocol_value() {
+    let dir = tempdir().unwrap();
+    let p = dir.path().join("gone.txt").to_string_lossy().into_owned();
+    assert_eq!(read_range(p, 0, 0).unwrap_err(), "file-not-found");
+  }
+
+  #[cfg(unix)]
+  #[test]
+  fn read_range_unreadable_file_is_other_error() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("locked.txt");
+    fs::write(&path, b"abc").unwrap();
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o000)).unwrap();
+    if fs::read(&path).is_ok() {
+      // Running as root: permissions are not enforced.
+      return;
+    }
+    let err = read_range(path.to_string_lossy().into_owned(), 0, 3).unwrap_err();
+    assert_ne!(err, "file-not-found");
+  }
 
   /// Write `content` to a fresh file in `dir` and return its path.
   fn write_file(dir: &Path, name: &str, content: &[u8]) -> std::path::PathBuf {

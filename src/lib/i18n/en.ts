@@ -286,6 +286,8 @@ export const en = {
     'This file has a very long line; parsing it on every keystroke would slow typing.',
   'doc.openFailed':
     'Couldn’t open “{name}”. The file may have been moved or deleted, or its name may contain characters this app doesn’t support.',
+  'doc.restoreUnreadable':
+    'Couldn’t read {names}. Open them again to continue.',
   'doc.revealFailed':
     'Couldn’t show “{name}”. The file may have been moved or deleted.',
   'doc.saveFailed': 'Couldn’t save “{name}”: {error}',

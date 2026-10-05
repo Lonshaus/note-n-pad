@@ -203,6 +203,7 @@
     "status.longLine.disabled": "Długie wiersze: podświetlanie składni wyłączone",
     "status.longLine.reason": "Ten plik ma bardzo długi wiersz; analizowanie go przy każdym naciśnięciu spowalnia pisanie.",
     "doc.openFailed": "Nie można otworzyć „{name}”. Plik mógł zostać przeniesiony lub usunięty albo jego nazwa zawiera znaki, których ta aplikacja nie obsługuje.",
+    "doc.restoreUnreadable": "Nie można odczytać: {names}. Otwórz pliki ponownie, aby kontynuować.",
     "doc.revealFailed": "Nie można pokazać „{name}”. Plik mógł zostać przeniesiony lub usunięty.",
     "doc.saveFailed": "Nie można zapisać „{name}”: {error}",
     "doc.saveReadOnly": "Plik „{name}” jest tylko do odczytu, więc nic nie zapisano. Zmień uprawnienia pliku, aby go zapisać.",

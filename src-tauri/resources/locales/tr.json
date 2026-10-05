@@ -203,6 +203,7 @@
     "status.longLine.disabled": "Uzun satırlar: sözdizimi vurgusu kapatıldı",
     "status.longLine.reason": "Bu dosyada çok uzun bir satır var; her tuş vuruşunda ayrıştırmak yazmayı yavaşlatır.",
     "doc.openFailed": "“{name}” açılamadı. Dosya taşınmış ya da silinmiş olabilir veya adı bu uygulamanın desteklemediği karakterler içeriyor olabilir.",
+    "doc.restoreUnreadable": "{names} okunamadı. Devam etmek için dosyaları yeniden açın.",
     "doc.revealFailed": "“{name}” gösterilemedi. Dosya taşınmış ya da silinmiş olabilir.",
     "doc.saveFailed": "“{name}” kaydedilemedi: {error}",
     "doc.saveReadOnly": "“{name}” salt okunur olduğundan hiçbir şey kaydedilmedi. Kaydetmek için dosyanın izinlerini değiştirin.",
