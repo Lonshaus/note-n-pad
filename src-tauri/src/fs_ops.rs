@@ -28,6 +28,20 @@ const RENAME_RETRY_DELAY: Duration = Duration::from_millis(50);
 /// so the frontend can say why instead of showing a raw errno. Protocol value.
 pub const READ_ONLY_DESTINATION: &str = "read-only-destination";
 
+/// A read of a path that does not exist answers with exactly this; every other
+/// read error keeps its message. Protocol value.
+pub const FILE_NOT_FOUND: &str = "file-not-found";
+
+/// Error text for a failed read: the protocol value for NotFound, else the
+/// io message.
+pub fn read_error(e: &std::io::Error) -> String {
+  if e.kind() == std::io::ErrorKind::NotFound {
+    FILE_NOT_FOUND.to_string()
+  } else {
+    e.to_string()
+  }
+}
+
 /// Why one file in a data folder was not loaded. Only the case is named here;
 /// the wording belongs to the frontend, so snapshots, themes and locales all
 /// report through the same set.

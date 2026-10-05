@@ -268,6 +268,7 @@ export const zhTW = {
     '這個檔案有超長的行，每次按鍵都要同步解析會拖慢輸入。',
   'doc.openFailed':
     '無法開啟「{name}」。這個檔案可能已被移動或刪除，或是檔案名稱含有這個應用程式不支援的字元。',
+  'doc.restoreUnreadable': '無法讀取 {names}。請重新開啟檔案。',
   'doc.revealFailed': '無法顯示「{name}」。這個檔案可能已被移動或刪除。',
   'doc.saveFailed': '無法儲存「{name}」：{error}',
   'doc.saveReadOnly':
