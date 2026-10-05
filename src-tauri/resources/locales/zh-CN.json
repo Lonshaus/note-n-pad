@@ -203,6 +203,7 @@
     "status.longLine.disabled": "超长行：语法着色已停用",
     "status.longLine.reason": "这个文件有超长的行，每次按键都要同步解析会拖慢输入。",
     "doc.openFailed": "无法打开「{name}」。这个文件可能已被移动或删除，或者文件名含有这个应用不支持的字符。",
+    "doc.restoreUnreadable": "无法读取 {names}。请重新打开文件。",
     "doc.revealFailed": "无法显示「{name}」。这个文件可能已被移动或删除。",
     "doc.saveFailed": "无法保存「{name}」：{error}",
     "doc.saveReadOnly": "「{name}」为只读文件，因此未保存任何内容。请更改文件权限后再保存。",

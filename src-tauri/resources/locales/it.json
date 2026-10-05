@@ -203,6 +203,7 @@
     "status.longLine.disabled": "Righe lunghe: evidenziazione della sintassi disattivata",
     "status.longLine.reason": "Questo file ha una riga molto lunga; analizzarla a ogni tasto rallenta la digitazione.",
     "doc.openFailed": "Impossibile aprire «{name}». Il file potrebbe essere stato spostato o eliminato, oppure il suo nome contiene caratteri che questa app non supporta.",
+    "doc.restoreUnreadable": "Impossibile leggere {names}. Riaprili per continuare.",
     "doc.revealFailed": "Impossibile mostrare «{name}». Il file potrebbe essere stato spostato o eliminato.",
     "doc.saveFailed": "Impossibile salvare «{name}»: {error}",
     "doc.saveReadOnly": "«{name}» è di sola lettura, quindi non è stato salvato nulla. Modifica i permessi del file per salvarlo.",

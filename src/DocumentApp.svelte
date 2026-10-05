@@ -287,6 +287,15 @@
     }
   }
 
+  // Same collapse: a restored window whose every tab was unreadable has nothing
+  // left once the report is closed.
+  function onRestoreUnreadableClose(): void {
+    documentWindow.dismissRestoreUnreadable();
+    if (documentWindow.tabs.length === 0) {
+      void win.destroy();
+    }
+  }
+
   // Unlike the failed-open report above, the tab whose encoding change failed
   // stays open with its previous content — there is nothing to collapse.
   function onEncodingFailedClose(): void {
@@ -642,6 +651,7 @@
       pendingLongLine !== null ||
       windowedError !== null ||
       documentWindow.openFailed !== null ||
+      documentWindow.restoreUnreadable.length > 0 ||
       documentWindow.saveFailed !== null ||
       documentWindow.rangeConflict !== null ||
       documentWindow.windowedConflict !== null,
@@ -1011,7 +1021,8 @@
           documentWindow.tabs.length,
           documentWindow.pendingLargeOpen !== null,
           documentWindow.pendingLongLineOpen !== null,
-          documentWindow.openFailed !== null,
+          documentWindow.openFailed !== null ||
+            documentWindow.restoreUnreadable.length > 0,
         )
       ) {
         void win.destroy();
@@ -1673,6 +1684,17 @@
       })}
       cancelLabel={t('common.close')}
       oncancel={onOpenFailedClose}
+    />
+  {/if}
+
+  {#if documentWindow.restoreUnreadable.length > 0}
+    <!-- Report only, like the failed open above: the files were not reopened. -->
+    <ConfirmModal
+      message={t('doc.restoreUnreadable', {
+        names: documentWindow.restoreUnreadable.map(tabName).join(', '),
+      })}
+      cancelLabel={t('common.close')}
+      oncancel={onRestoreUnreadableClose}
     />
   {/if}
 

@@ -17,6 +17,7 @@ mod file_ops;
 mod flush;
 mod fonts;
 mod fs_ops;
+mod grants;
 mod i18n;
 #[cfg(target_os = "windows")]
 mod jumplist;
@@ -1871,7 +1872,10 @@ fn clear_recent(app: &tauri::AppHandle) {
 /// the frontend `add_recent_file` command.
 pub(crate) fn record_recent(app: &tauri::AppHandle, path: &str) {
   match settings::push_recent_file(app, path) {
-    Ok(recent) => refresh_recent_menu(app, &recent),
+    Ok(recent) => {
+      grants::remember(path);
+      refresh_recent_menu(app, &recent);
+    }
     Err(e) => log::warn!("failed to record recent file: {e}"),
   }
 }
@@ -2635,16 +2639,17 @@ pub fn run() {
       let fallback = note_store::SnapshotFallback::default();
       let dir =
         note_store::startup_snapshot_dir(handle, &settings::app_settings(handle), &fallback)?;
+      let fallback_active = fallback.in_use();
       app.manage(fallback);
       // `NoteStore::load` only fails when `dir` exists but cannot be listed
       // (e.g. permissions). Falling back to an empty store for the same `dir`
       // is safe: nothing on disk is touched, and every write into `dir` would
       // fail the same way, so no data is destroyed by starting empty.
-      let (store, snapshot_skips) = match NoteStore::load_reporting(dir.clone()) {
-        Ok(loaded) => loaded,
+      let (store, snapshot_skips, store_load_ok) = match NoteStore::load_reporting(dir.clone()) {
+        Ok((store, skips)) => (store, skips, true),
         Err(e) => {
           log::warn!("failed to load snapshot store from {}: {e}", dir.display());
-          (NoteStore::empty(dir), Vec::new())
+          (NoteStore::empty(dir), Vec::new(), false)
         }
       };
       let notes = store.list();
@@ -2653,6 +2658,22 @@ pub fn run() {
       // held here until the report window asks for it.
       let had_snapshot_skips = !snapshot_skips.is_empty();
       app.manage(note_store::StartupSkips::holding(snapshot_skips));
+      // Grants must be live before any window reads a restored path.
+      match handle.path().app_data_dir() {
+        Ok(app_data) => {
+          let settings_report =
+            settings::settings_path(handle).and_then(|p| settings::load_from_with_report(&p));
+          let keep = grants::prune_set(
+            store_load_ok,
+            fallback_active,
+            had_snapshot_skips,
+            &settings_report,
+            &notes,
+          );
+          grants::restore_all(&app_data, keep.as_ref());
+        }
+        Err(e) => log::warn!("grants: no app data dir: {e}"),
+      }
       app.manage(FlushGate::default());
       app.manage(ctx_menu::CtxPending::default());
       app.manage(large_file::LargeFileState::default());

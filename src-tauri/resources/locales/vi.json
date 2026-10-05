@@ -203,6 +203,7 @@
     "status.longLine.disabled": "Dòng dài: đã tắt tô sáng cú pháp",
     "status.longLine.reason": "Tệp này có một dòng rất dài; phân tích nó sau mỗi lần gõ sẽ làm chậm việc nhập.",
     "doc.openFailed": "Không mở được “{name}”. Tệp có thể đã bị di chuyển hoặc xoá, hoặc tên tệp chứa ký tự mà ứng dụng này không hỗ trợ.",
+    "doc.restoreUnreadable": "Không đọc được {names}. Hãy mở lại các tệp để tiếp tục.",
     "doc.revealFailed": "Không hiển thị được “{name}”. Tệp có thể đã bị di chuyển hoặc xoá.",
     "doc.saveFailed": "Không lưu được “{name}”: {error}",
     "doc.saveReadOnly": "“{name}” chỉ đọc nên không có gì được lưu. Hãy thay đổi quyền của tệp để lưu vào đó.",

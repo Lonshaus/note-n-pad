@@ -203,6 +203,7 @@
     "status.longLine.disabled": "Lignes longues : coloration syntaxique désactivée",
     "status.longLine.reason": "Ce fichier contient une ligne très longue ; l’analyser à chaque frappe ralentit la saisie.",
     "doc.openFailed": "Impossible d’ouvrir « {name} ». Le fichier a peut-être été déplacé ou supprimé, ou son nom contient des caractères que cette application ne prend pas en charge.",
+    "doc.restoreUnreadable": "Impossible de lire {names}. Rouvrez les fichiers pour continuer.",
     "doc.revealFailed": "Impossible d’afficher « {name} ». Le fichier a peut-être été déplacé ou supprimé.",
     "doc.saveFailed": "Impossible d’enregistrer « {name} » : {error}",
     "doc.saveReadOnly": "« {name} » est en lecture seule, rien n’a donc été enregistré. Modifiez les permissions du fichier pour l’enregistrer.",
