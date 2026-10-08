@@ -3,12 +3,51 @@
 
 use std::str::FromStr;
 use tauri::AppHandle;
-use tauri_plugin_global_shortcut::{GlobalShortcutExt, Shortcut};
+use tauri_plugin_global_shortcut::{Code, GlobalShortcutExt, Modifiers, Shortcut};
 
 /// Parse and validate an accelerator string using the global-shortcut plugin's
 /// own grammar, so what we accept here is exactly what registration accepts.
 pub fn parse_accelerator(accel: &str) -> Result<Shortcut, String> {
   Shortcut::from_str(accel).map_err(|e| format!("invalid shortcut '{accel}': {e}"))
+}
+/// A global shortcut needs Command/Control/Alt, or must be a bare F1-F24.
+pub fn is_allowed_shortcut(shortcut: &Shortcut) -> bool {
+  const F_KEYS: [Code; 24] = [
+    Code::F1,
+    Code::F2,
+    Code::F3,
+    Code::F4,
+    Code::F5,
+    Code::F6,
+    Code::F7,
+    Code::F8,
+    Code::F9,
+    Code::F10,
+    Code::F11,
+    Code::F12,
+    Code::F13,
+    Code::F14,
+    Code::F15,
+    Code::F16,
+    Code::F17,
+    Code::F18,
+    Code::F19,
+    Code::F20,
+    Code::F21,
+    Code::F22,
+    Code::F23,
+    Code::F24,
+  ];
+  if shortcut.mods.is_empty() {
+    return F_KEYS.contains(&shortcut.key);
+  }
+  shortcut
+    .mods
+    .intersects(Modifiers::CONTROL | Modifiers::ALT | Modifiers::SUPER | Modifiers::META)
+}
+/// Whether `accel` parses and satisfies `is_allowed_shortcut`.
+pub fn is_allowed_accelerator(accel: &str) -> bool {
+  parse_accelerator(accel).is_ok_and(|s| is_allowed_shortcut(&s))
 }
 
 /// Re-register the global new-note accelerator atomically enough that runtime
@@ -19,6 +58,11 @@ pub fn parse_accelerator(accel: &str) -> Result<Shortcut, String> {
 #[tauri::command]
 pub fn set_new_note_shortcut(app: AppHandle, shortcut: String) -> Result<(), String> {
   let new = parse_accelerator(&shortcut)?;
+  if !is_allowed_shortcut(&new) {
+    return Err(format!(
+      "shortcut '{shortcut}' needs Command, Control or Alt (or be a bare F1-F24)"
+    ));
+  }
   let current = crate::settings::app_settings(&app).new_note_shortcut;
   if shortcut == current {
     return Ok(());
@@ -42,7 +86,7 @@ pub fn set_new_note_shortcut(app: AppHandle, shortcut: String) -> Result<(), Str
 
 #[cfg(test)]
 mod tests {
-  use super::parse_accelerator;
+  use super::{is_allowed_accelerator, parse_accelerator};
 
   #[test]
   fn accepts_valid_accelerators() {
@@ -60,5 +104,32 @@ mod tests {
   fn rejects_garbage() {
     assert!(parse_accelerator("").is_err());
     assert!(parse_accelerator("NotAKey").is_err());
+  }
+
+  #[test]
+  fn allows_modified_combos_and_bare_function_keys() {
+    for accel in [
+      "CmdOrCtrl+Shift+N",
+      "CmdOrCtrl+Alt+M",
+      "Alt+J",
+      "Ctrl+J",
+      "F5",
+      "F24",
+    ] {
+      assert!(is_allowed_accelerator(accel), "should allow {accel}");
+    }
+  }
+
+  #[test]
+  fn rejects_unmodified_and_shift_only_combos() {
+    for accel in ["Enter", "N", "Shift+N", "Shift+F5", "Shift+Enter", "Space"] {
+      assert!(!is_allowed_accelerator(accel), "should reject {accel}");
+    }
+  }
+
+  #[test]
+  fn rejects_unparseable_accelerators() {
+    assert!(!is_allowed_accelerator(""));
+    assert!(!is_allowed_accelerator("NotAKey"));
   }
 }

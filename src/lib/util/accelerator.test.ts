@@ -3,6 +3,7 @@
 
 import { describe, expect, it } from 'vitest';
 import {
+  isValidRecordedShortcut,
   keyEventToAccelerator,
   formatAccelerator,
   formatAcceleratorSymbols,
@@ -79,6 +80,119 @@ describe('keyEventToAccelerator', () => {
 
   it('rejects unknown keys', () => {
     expect(keyEventToAccelerator(mk('Dead', { metaKey: true }))).toBeNull();
+  });
+});
+/** A keydown with a physical `code`, for the platform-aware paths. */
+function mkCode(
+  key: string,
+  code: string,
+  mods: Partial<
+    Pick<KeyboardEvent, 'metaKey' | 'ctrlKey' | 'altKey' | 'shiftKey'>
+  > = {},
+): KeyboardEvent {
+  return { ...mk(key, mods), code } as KeyboardEvent;
+}
+
+describe('keyEventToAccelerator platform paths', () => {
+  it('macOS reads the key from code when Option substitutes the character', () => {
+    expect(
+      keyEventToAccelerator(mkCode('∆', 'KeyJ', { altKey: true }), 'macos'),
+    ).toBe('Alt+J');
+  });
+
+  it('macOS records a dead key from code', () => {
+    expect(
+      keyEventToAccelerator(mkCode('Dead', 'KeyE', { altKey: true }), 'macos'),
+    ).toBe('Alt+E');
+  });
+
+  it('macOS keeps Control distinct from Command', () => {
+    expect(
+      keyEventToAccelerator(
+        mkCode('j', 'KeyJ', { ctrlKey: true, altKey: true }),
+        'macos',
+      ),
+    ).toBe('Ctrl+Alt+J');
+    expect(
+      keyEventToAccelerator(
+        mkCode('j', 'KeyJ', { metaKey: true, altKey: true }),
+        'macos',
+      ),
+    ).toBe('CmdOrCtrl+Alt+J');
+    expect(
+      keyEventToAccelerator(
+        mkCode('j', 'KeyJ', { metaKey: true, ctrlKey: true }),
+        'macos',
+      ),
+    ).toBe('CmdOrCtrl+Ctrl+J');
+  });
+
+  it('macOS maps digit and punctuation codes', () => {
+    expect(
+      keyEventToAccelerator(mkCode('¡', 'Digit1', { altKey: true }), 'macos'),
+    ).toBe('Alt+1');
+    expect(
+      keyEventToAccelerator(mkCode('≤', 'Comma', { altKey: true }), 'macos'),
+    ).toBe('Alt+,');
+  });
+
+  it('macOS still takes non-character keys from key', () => {
+    expect(
+      keyEventToAccelerator(mkCode('F5', 'F5', { metaKey: true }), 'macos'),
+    ).toBe('CmdOrCtrl+F5');
+  });
+
+  it('macOS ignores a bare modifier press', () => {
+    expect(
+      keyEventToAccelerator(
+        mkCode('Alt', 'AltLeft', { altKey: true }),
+        'macos',
+      ),
+    ).toBeNull();
+  });
+
+  it('Windows serializes Ctrl as CmdOrCtrl', () => {
+    expect(
+      keyEventToAccelerator(
+        mkCode('j', 'KeyJ', { ctrlKey: true, altKey: true }),
+        'windows',
+      ),
+    ).toBe('CmdOrCtrl+Alt+J');
+  });
+
+  it('Windows takes the key from key, not code (AZERTY)', () => {
+    expect(
+      keyEventToAccelerator(
+        mkCode('a', 'KeyQ', { ctrlKey: true, altKey: true }),
+        'windows',
+      ),
+    ).toBe('CmdOrCtrl+Alt+A');
+  });
+});
+
+describe('isValidRecordedShortcut', () => {
+  it('accepts Command, Control or Alt combos', () => {
+    for (const a of [
+      'CmdOrCtrl+N',
+      'Ctrl+Alt+J',
+      'Alt+J',
+      'CmdOrCtrl+Shift+N',
+    ]) {
+      expect(isValidRecordedShortcut(a), a).toBe(true);
+    }
+  });
+
+  it('accepts a bare F1-F24 only', () => {
+    expect(isValidRecordedShortcut('F1')).toBe(true);
+    expect(isValidRecordedShortcut('F24')).toBe(true);
+    expect(isValidRecordedShortcut('F25')).toBe(false);
+    expect(isValidRecordedShortcut('Shift+F5')).toBe(false);
+  });
+
+  it('rejects Shift-only and unmodified keys', () => {
+    for (const a of ['Shift+N', 'N', 'Enter', 'Shift+Enter', 'Space']) {
+      expect(isValidRecordedShortcut(a), a).toBe(false);
+    }
   });
 });
 
