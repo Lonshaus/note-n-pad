@@ -489,6 +489,7 @@
   <div
     class="toolbar"
     class:active={sliderActive || showSwatches || showPinMenu}
+    class:mac={platform.isMacOS}
     data-tauri-drag-region
   >
     <span class="pin-group" use:dismissOn={() => (showPinMenu = false)}>
@@ -914,6 +915,20 @@
     margin-top: -4px;
     border-radius: 50%;
     background: var(--sticky-accent);
+  }
+  /* macOS mirrors the strip: close and opacity on the left, palette and pin
+     on the right, swatches left of the palette button. */
+  .toolbar.mac,
+  .toolbar.mac .palette-group {
+    flex-direction: row-reverse;
+  }
+  .toolbar.mac .opacity-group {
+    margin-left: 0;
+    margin-right: auto;
+  }
+  .toolbar.mac .pin-menu {
+    left: auto;
+    right: 0;
   }
   .close {
     width: 18px;
