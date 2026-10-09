@@ -52,6 +52,9 @@ pub struct AppSettings {
   pub default_sticky_width: f64,
   #[serde(default = "default_sticky_height")]
   pub default_sticky_height: f64,
+  /// The paper last picked on a sticky; new stickies start with it.
+  #[serde(default = "default_sticky_paper")]
+  pub default_sticky_paper: String,
   #[serde(default = "default_editor_font_size")]
   pub editor_font_size: f64,
   #[serde(default = "default_editor_word_wrap")]
@@ -150,6 +153,13 @@ fn default_sticky_height() -> f64 {
   230.0
 }
 
+/// Must match `PAPERS` in `StickyApp.svelte` (see `sticky_papers_match_the_ui`).
+pub const STICKY_PAPERS: [&str; 6] = ["classic", "white", "pink", "blue", "green", "graphite"];
+
+fn default_sticky_paper() -> String {
+  "classic".to_string()
+}
+
 fn default_editor_font_size() -> f64 {
   13.0
 }
@@ -229,6 +239,7 @@ impl Default for AppSettings {
       snapshot_dir_bookmark: None,
       default_sticky_width: default_sticky_width(),
       default_sticky_height: default_sticky_height(),
+      default_sticky_paper: default_sticky_paper(),
       editor_font_size: default_editor_font_size(),
       editor_word_wrap: default_editor_word_wrap(),
       editor_line_numbers: default_editor_line_numbers(),
@@ -340,10 +351,17 @@ fn repair(settings: &mut AppSettings) -> Vec<String> {
   if !(180.0..=4000.0).contains(&settings.default_sticky_width) {
     settings.default_sticky_width = default_sticky_width();
     repaired.push("default_sticky_width".to_string());
+  } else if settings.default_sticky_width < crate::windows::STICKY_MIN_WIDTH {
+    // Valid under the old 180 minimum: raise it, nothing to report.
+    settings.default_sticky_width = crate::windows::STICKY_MIN_WIDTH;
   }
   if !(140.0..=4000.0).contains(&settings.default_sticky_height) {
     settings.default_sticky_height = default_sticky_height();
     repaired.push("default_sticky_height".to_string());
+  }
+  if !STICKY_PAPERS.contains(&settings.default_sticky_paper.as_str()) {
+    settings.default_sticky_paper = default_sticky_paper();
+    repaired.push("default_sticky_paper".to_string());
   }
   if !(260.0..=4000.0).contains(&settings.workspace_width) {
     settings.workspace_width = default_workspace_width();
@@ -381,10 +399,16 @@ fn validate(settings: &AppSettings) -> Result<(), String> {
     return Err("new_note_shortcut must not be empty".to_string());
   }
   // Matches the sticky window's min size and a sane upper bound.
-  if !(180.0..=4000.0).contains(&settings.default_sticky_width)
+  if !(crate::windows::STICKY_MIN_WIDTH..=4000.0).contains(&settings.default_sticky_width)
     || !(140.0..=4000.0).contains(&settings.default_sticky_height)
   {
     return Err("default sticky size out of range".to_string());
+  }
+  if !STICKY_PAPERS.contains(&settings.default_sticky_paper.as_str()) {
+    return Err(format!(
+      "unknown sticky paper: {}",
+      settings.default_sticky_paper
+    ));
   }
   // Matches the workspace window's min size and a sane upper bound.
   if !(260.0..=4000.0).contains(&settings.workspace_width)
@@ -540,6 +564,12 @@ fn tolerant_settings(
       obj,
       "default_sticky_height",
       default_sticky_height,
+      &mut dropped,
+    ),
+    default_sticky_paper: field_or_default(
+      obj,
+      "default_sticky_paper",
+      default_sticky_paper,
       &mut dropped,
     ),
     editor_font_size: field_or_default(
@@ -897,6 +927,74 @@ mod tests {
   }
 
   #[test]
+  fn a_sticky_width_below_the_new_minimum_is_raised_without_a_report() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("settings.json");
+    for (stored, expected, reported) in [
+      (200.0, 280.0, false),
+      (100.0, 280.0, true),
+      (300.0, 300.0, false),
+    ] {
+      std::fs::write(&path, format!(r#"{{"default_sticky_width": {stored}}}"#)).unwrap();
+      let (settings, repaired) = load_from_with_report(&path).unwrap();
+      assert_eq!(settings.default_sticky_width, expected, "{stored}");
+      assert_eq!(
+        repaired.contains(&"default_sticky_width".to_string()),
+        reported,
+        "{stored}"
+      );
+    }
+    let narrow = |w| AppSettings {
+      default_sticky_width: w,
+      ..AppSettings::default()
+    };
+    assert!(validate(&narrow(279.0)).is_err());
+    assert!(validate(&narrow(280.0)).is_ok());
+  }
+
+  #[test]
+  fn sticky_paper_defaults_to_classic_and_unknown_is_repaired() {
+    assert_eq!(load_json("{}").default_sticky_paper, "classic");
+    assert_eq!(
+      load_json(r#"{"default_sticky_paper": "pink"}"#).default_sticky_paper,
+      "pink"
+    );
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("settings.json");
+    std::fs::write(&path, r#"{"default_sticky_paper": "neon"}"#).unwrap();
+    let (settings, repaired) = load_from_with_report(&path).unwrap();
+    assert_eq!(settings.default_sticky_paper, "classic");
+    assert!(repaired.contains(&"default_sticky_paper".to_string()));
+  }
+
+  #[test]
+  fn validate_rejects_an_unknown_sticky_paper() {
+    let patched = merge_settings(
+      &AppSettings::default(),
+      &serde_json::json!({ "default_sticky_paper": "green" }),
+    )
+    .unwrap();
+    assert_eq!(patched.default_sticky_paper, "green");
+    assert!(validate(&patched).is_ok());
+    let bad = AppSettings {
+      default_sticky_paper: "neon".into(),
+      ..AppSettings::default()
+    };
+    assert!(validate(&bad).is_err());
+  }
+
+  #[test]
+  fn sticky_papers_match_the_ui() {
+    const UI: &str = include_str!("../../src/StickyApp.svelte");
+    let line = UI
+      .lines()
+      .find(|l| l.contains("const PAPERS = ["))
+      .expect("PAPERS in StickyApp.svelte");
+    let expected = format!("[{}]", STICKY_PAPERS.map(|p| format!("'{p}'")).join(", "));
+    assert!(line.contains(&expected), "{line}");
+  }
+
+  #[test]
   fn save_load_roundtrip() {
     let dir = tempdir().unwrap();
     let path = dir.path().join("settings.json");
@@ -909,6 +1007,7 @@ mod tests {
       snapshot_dir_bookmark: Some("Ym9va21hcms=".into()),
       default_sticky_width: 491.0,
       default_sticky_height: 353.0,
+      default_sticky_paper: "pink".into(),
       editor_font_size: 16.0,
       editor_word_wrap: false,
       editor_line_numbers: false,
