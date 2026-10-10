@@ -50,19 +50,22 @@ export function matchMenuAccelerator(
   if (!event.ctrlKey || event.metaKey) {
     return null;
   }
-  let candidate = keyEventToAccelerator(event as KeyboardEvent);
+  let candidate = keyEventToAccelerator(event as KeyboardEvent, 'windows');
   if (candidate === null) {
     const fromCode = keyFromCode(event.code);
     if (fromCode !== null) {
       // Copy fields explicitly: a DOM event's properties are prototype
       // getters, which object spread would drop.
-      candidate = keyEventToAccelerator({
-        ctrlKey: event.ctrlKey,
-        shiftKey: event.shiftKey,
-        altKey: event.altKey,
-        metaKey: event.metaKey,
-        key: fromCode,
-      } as KeyboardEvent);
+      candidate = keyEventToAccelerator(
+        {
+          ctrlKey: event.ctrlKey,
+          shiftKey: event.shiftKey,
+          altKey: event.altKey,
+          metaKey: event.metaKey,
+          key: fromCode,
+        } as KeyboardEvent,
+        'windows',
+      );
     }
   }
   if (candidate === null || !table.includes(candidate)) {

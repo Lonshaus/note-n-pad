@@ -1,8 +1,8 @@
 // Copyright © 2026 Lonshaus
 // SPDX-License-Identifier: GPL-3.0-only
 // Convert a browser keydown into a Tauri/global-hotkey accelerator string. The
-// token grammar matches the plugin's own parser (CmdOrCtrl / Alt / Shift, then a
-// single key), so anything this produces round-trips through registration.
+// token grammar matches the plugin's own parser (CmdOrCtrl / Ctrl / Alt / Shift,
+// then a single key), so anything this produces round-trips through registration.
 
 const ARROWS: Record<string, string> = {
   ArrowUp: 'Up',
@@ -27,6 +27,32 @@ const NAMED = new Set([
 
 // Punctuation the plugin accepts as a literal token (e.g. the CmdOrCtrl+, combo).
 const PUNCT = new Set([',', '.', '/', '\\', '`', '-', '=', ';', "'", '[', ']']);
+// Physical-key names for the punctuation set above (macOS code path).
+const CODE_PUNCT: Record<string, string> = {
+  Comma: ',',
+  Period: '.',
+  Slash: '/',
+  Backslash: '\\',
+  Backquote: '`',
+  Minus: '-',
+  Equal: '=',
+  Semicolon: ';',
+  Quote: "'",
+  BracketLeft: '[',
+  BracketRight: ']',
+};
+/** The key at a physical `code`, or null if unsupported. */
+function keyFromCode(code: string): string | null {
+  const letter = /^Key([A-Z])$/.exec(code);
+  if (letter !== null) {
+    return letter[1] ?? null;
+  }
+  const digit = /^Digit([0-9])$/.exec(code);
+  if (digit !== null) {
+    return digit[1] ?? null;
+  }
+  return CODE_PUNCT[code] ?? null;
+}
 
 /** Normalize the event's main key, or null when it carries no real key (a bare
  *  modifier press). */
@@ -60,15 +86,28 @@ function normalizeKey(e: KeyboardEvent): string | null {
   return null;
 }
 
-/** Serialize a keydown to an accelerator string, or null when it is not a usable
- *  combo. Modifier order is fixed so the same chord always serializes the same. */
-export function keyEventToAccelerator(e: KeyboardEvent): string | null {
-  const key = normalizeKey(e);
+/** Serialize a keydown to an accelerator, or null if unusable. On macOS with a
+ *  modifier held the key comes from `e.code`, and Control stays apart from Command. */
+export function keyEventToAccelerator(
+  e: KeyboardEvent,
+  os: string = '',
+): string | null {
+  const mac = os === 'macos';
+  const anyModifier = e.metaKey || e.ctrlKey || e.altKey || e.shiftKey;
+  const key =
+    (mac && anyModifier ? keyFromCode(e.code ?? '') : null) ?? normalizeKey(e);
   if (key === null) {
     return null;
   }
   const parts: string[] = [];
-  if (e.metaKey || e.ctrlKey) {
+  if (mac) {
+    if (e.metaKey) {
+      parts.push('CmdOrCtrl');
+    }
+    if (e.ctrlKey) {
+      parts.push('Ctrl');
+    }
+  } else if (e.metaKey || e.ctrlKey) {
     parts.push('CmdOrCtrl');
   }
   if (e.altKey) {
@@ -79,6 +118,14 @@ export function keyEventToAccelerator(e: KeyboardEvent): string | null {
   }
   parts.push(key);
   return parts.join('+');
+}
+/** A global shortcut needs Command/Control/Alt, or must be a bare F1-F24. */
+export function isValidRecordedShortcut(accel: string): boolean {
+  const { mods, key } = tokenize(accel);
+  if (mods.length === 0) {
+    return /^F([1-9]|1[0-9]|2[0-4])$/.test(key);
+  }
+  return mods.some((m) => m === 'CmdOrCtrl' || m === 'Ctrl' || m === 'Alt');
 }
 
 /** Format an accelerator string for display, resolving the platform-agnostic

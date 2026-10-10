@@ -169,6 +169,18 @@ describe('matchMenuAccelerator on Windows', () => {
   });
 });
 
+describe('matchMenuAccelerator key source', () => {
+  it('reads the key from key, not code, on a non-US layout', () => {
+    expect(
+      matchMenuAccelerator(
+        key('z', { ctrlKey: true, code: 'KeyW' }),
+        'windows',
+        ['CmdOrCtrl+Z', 'CmdOrCtrl+W'],
+      ),
+    ).toBe('CmdOrCtrl+Z');
+  });
+});
+
 describe('matchMenuAccelerator off Windows', () => {
   it('never matches on macOS', () => {
     expect(
