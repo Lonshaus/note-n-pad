@@ -20,6 +20,7 @@
   import { open, save, ask } from '@tauri-apps/plugin-dialog';
   import { debounce } from './lib/util/debounce';
   import {
+    isValidRecordedShortcut,
     keyEventToAccelerator,
     formatAccelerator,
   } from './lib/util/accelerator';
@@ -198,9 +199,9 @@
       recorderEl?.blur();
       return;
     }
-    const accel = keyEventToAccelerator(e);
+    const accel = keyEventToAccelerator(e, platform.os);
     // A bare modifier press is ignored; keep waiting for a full combo.
-    if (accel === null) {
+    if (accel === null || !isValidRecordedShortcut(accel)) {
       return;
     }
     void applyShortcut(accel);
@@ -878,6 +879,11 @@
             shortcutError = '';
           }}
           onblur={() => (recording = false)}
+          onclick={() => {
+            recorderEl?.focus();
+            recording = true;
+            shortcutError = '';
+          }}
           onkeydown={onRecorderKeydown}
         >
           {recording
@@ -1396,6 +1402,12 @@
     color: inherit;
     font: inherit;
     text-align: center;
+    appearance: textfield;
+  }
+  .num::-webkit-inner-spin-button,
+  .num::-webkit-outer-spin-button {
+    appearance: none;
+    margin: 0;
   }
   .recorder {
     align-self: flex-start;
