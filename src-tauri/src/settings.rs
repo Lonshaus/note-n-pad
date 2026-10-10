@@ -333,7 +333,7 @@ pub fn load_or_default_for_write(path: &Path) -> Result<AppSettings, String> {
 /// out-of-range counterpart of the same silent-reset family).
 fn repair(settings: &mut AppSettings) -> Vec<String> {
   let mut repaired = Vec::new();
-  if settings.new_note_shortcut.trim().is_empty() {
+  if !crate::shortcut::is_allowed_accelerator(settings.new_note_shortcut.trim()) {
     settings.new_note_shortcut = default_new_note_shortcut();
     repaired.push("new_note_shortcut".to_string());
   }
@@ -377,8 +377,8 @@ fn repair(settings: &mut AppSettings) -> Vec<String> {
 }
 
 fn validate(settings: &AppSettings) -> Result<(), String> {
-  if settings.new_note_shortcut.trim().is_empty() {
-    return Err("new_note_shortcut must not be empty".to_string());
+  if !crate::shortcut::is_allowed_accelerator(settings.new_note_shortcut.trim()) {
+    return Err("new_note_shortcut needs a modifier or must be a bare F1-F24".to_string());
   }
   // Matches the sticky window's min size and a sane upper bound.
   if !(180.0..=4000.0).contains(&settings.default_sticky_width)
@@ -783,6 +783,9 @@ pub fn save_settings(app: AppHandle, settings: serde_json::Value) -> Result<(), 
       // tab's file name and is owned by the frontend.
       crate::windows::retitle_sticky_windows(&app_for_main, locale);
     }
+    if current.interface_mode != merged.interface_mode {
+      crate::apply_app_theme(&app_for_main, &merged.interface_mode);
+    }
     // Show or hide the tray/status-bar icon when the preference changed.
     if current.show_tray_icon != merged.show_tray_icon {
       crate::set_tray_visible(&app_for_main, merged.show_tray_icon);
@@ -894,6 +897,33 @@ mod tests {
     assert_eq!(settings.default_line_ending, "CRLF");
     assert_eq!(settings.open_target, "window");
     assert_eq!(settings.default_encoding, "Big5");
+  }
+
+  fn load_report(text: &str) -> (AppSettings, Vec<String>) {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("settings.json");
+    std::fs::write(&path, text).unwrap();
+    load_from_with_report(&path).unwrap()
+  }
+
+  #[test]
+  fn an_invalid_stored_shortcut_is_reset_and_reported() {
+    for bad in ["Enter", "Shift+N", "NotAKey"] {
+      let text = format!(r#"{{"new_note_shortcut": "{bad}"}}"#);
+      let (settings, repaired) = load_report(&text);
+      assert_eq!(settings.new_note_shortcut, "CmdOrCtrl+Shift+N", "{bad}");
+      assert_eq!(repaired, vec!["new_note_shortcut".to_string()], "{bad}");
+    }
+  }
+
+  #[test]
+  fn a_valid_stored_shortcut_is_left_alone() {
+    for good in ["CmdOrCtrl+Shift+N", "CmdOrCtrl+Alt+M"] {
+      let text = format!(r#"{{"new_note_shortcut": "{good}"}}"#);
+      let (settings, repaired) = load_report(&text);
+      assert_eq!(settings.new_note_shortcut, good);
+      assert!(repaired.is_empty());
+    }
   }
 
   #[test]

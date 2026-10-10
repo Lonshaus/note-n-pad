@@ -1064,6 +1064,17 @@ pub fn retitle_fixed_windows(app: &AppHandle, locale: crate::i18n::Locale) {
 fn is_sticky_window_label(label: &str) -> bool {
   label.starts_with("note-")
 }
+/// Repaint every open non-sticky window's native background in the current
+/// interface mode; macOS draws the title bar from it, not from the app theme.
+#[cfg(target_os = "macos")]
+pub fn refresh_chrome_background(app: &AppHandle) {
+  let color = chrome_background(app);
+  for (label, win) in app.webview_windows() {
+    if !is_sticky_window_label(&label) {
+      let _ = win.set_background_color(Some(color));
+    }
+  }
+}
 
 /// Retitle every open sticky window after a language change. Unlike the fixed
 /// singleton windows above, a sticky's label is dynamic (`note-{uuid}`), so it

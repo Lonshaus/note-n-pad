@@ -644,6 +644,20 @@ fn same_pass_disposition(
     _ => SamePassDisposition::Nothing,
   }
 }
+/// Native theme for an interface mode: `None` follows the system.
+fn native_theme_for(mode: &str) -> Option<tauri::Theme> {
+  match mode {
+    "light" => Some(tauri::Theme::Light),
+    "dark" => Some(tauri::Theme::Dark),
+    _ => None,
+  }
+}
+/// Force the title bars and native menus to the chosen interface mode.
+pub(crate) fn apply_app_theme(app: &tauri::AppHandle, mode: &str) {
+  app.set_theme(native_theme_for(mode));
+  #[cfg(target_os = "macos")]
+  windows::refresh_chrome_background(app);
+}
 
 /// The app's single window-event handler: keeps the menu's focus-dependent
 /// items in sync and, for document windows, intercepts the OS close so their
@@ -668,7 +682,10 @@ fn handle_window_event(window: &tauri::Window, event: &tauri::WindowEvent) {
   // firing `ThemeChanged` at all once `preferred_theme` is `Some`.
   #[cfg(target_os = "windows")]
   if let tauri::WindowEvent::ThemeChanged(_) = event {
-    window.app_handle().set_theme(None);
+    let app = window.app_handle();
+    if settings::app_settings(app).interface_mode == "system" {
+      app.set_theme(None);
+    }
   }
   if let tauri::WindowEvent::CloseRequested { api, .. } = event {
     let kind = focus_kind(window.label());
@@ -2620,6 +2637,8 @@ pub fn run() {
         );
         std::process::exit(1);
       }
+      // Before any window exists, so restored windows paint the right title bar.
+      apply_app_theme(handle, &settings::app_settings(handle).interface_mode);
       // Seed the 10 bundled default themes into app data on first run only;
       // a themes dir that already exists (even emptied by the user) is left
       // untouched so deleted defaults never come back.
@@ -2980,6 +2999,14 @@ pub fn run() {
 
 #[cfg(test)]
 mod tests {
+  #[test]
+  fn native_theme_follows_interface_mode() {
+    assert_eq!(super::native_theme_for("light"), Some(tauri::Theme::Light));
+    assert_eq!(super::native_theme_for("dark"), Some(tauri::Theme::Dark));
+    assert_eq!(super::native_theme_for("system"), None);
+    assert_eq!(super::native_theme_for("bogus"), None);
+  }
+
   use super::{
     escape_menu_label, focus_kind, is_batch_close, menu_flags, record_close_and_check_batch,
     same_pass_disposition, should_forget_tabs, FocusKind, SamePassDisposition, BATCH_CLOSE_WINDOW,
