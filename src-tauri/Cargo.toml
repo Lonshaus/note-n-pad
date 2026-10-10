@@ -1,6 +1,6 @@
 [package]
 name = "note-n-pad"
-version = "1.0.2"
+version = "1.0.3"
 description = "Sticky notes and a plain-text editor"
 authors = ["Lonshaus"]
 license = "GPL-3.0-only"
