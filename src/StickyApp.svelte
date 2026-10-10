@@ -78,9 +78,33 @@
   const paper = $derived(stickyNote.note?.paper ?? 'classic');
 
   function pickPaper(name: string): void {
-    stickyNote.setPaper(name);
     // The last picked paper becomes the default for new stickies.
-    showSwatches = false;
+    stickyNote.setPaper(name);
+  }
+
+  // Popover dismissal: a press outside `node` (its trigger included) or Escape.
+  function dismissOn(
+    node: HTMLElement,
+    close: () => void,
+  ): { destroy: () => void } {
+    const onPointer = (e: PointerEvent): void => {
+      if (!node.contains(e.target as Node)) {
+        close();
+      }
+    };
+    const onKey = (e: KeyboardEvent): void => {
+      if (e.key === 'Escape') {
+        close();
+      }
+    };
+    document.addEventListener('pointerdown', onPointer, true);
+    document.addEventListener('keydown', onKey, true);
+    return {
+      destroy() {
+        document.removeEventListener('pointerdown', onPointer, true);
+        document.removeEventListener('keydown', onKey, true);
+      },
+    };
   }
 
   // Reflect the resolved theme onto the document root. The sticky card itself
@@ -367,6 +391,10 @@
     const unlistenFocus = win.onFocusChanged(({ payload: focused }) => {
       if (focused) {
         focusEditorIfIdle(editorView, showModal);
+      } else {
+        // Popovers close when the sticky loses focus, like a press outside.
+        showSwatches = false;
+        showPinMenu = false;
       }
     });
 
@@ -463,7 +491,7 @@
     class:active={sliderActive || showSwatches || showPinMenu}
     data-tauri-drag-region
   >
-    <span class="pin-group">
+    <span class="pin-group" use:dismissOn={() => (showPinMenu = false)}>
       <button
         class="tool pin"
         class:pinned={pinMode === 'top'}
@@ -546,43 +574,45 @@
         </div>
       {/if}
     </span>
-    <button
-      class="tool palette"
-      title={t('sticky.paperColor')}
-      aria-label={t('sticky.paperColor')}
-      onclick={() => (showSwatches = !showSwatches)}
-    >
-      <svg
-        viewBox="0 0 24 24"
-        width="15"
-        height="15"
-        fill="none"
-        stroke="currentColor"
-        stroke-width="1.8"
-        stroke-linecap="round"
-        stroke-linejoin="round"
+    <span class="palette-group" use:dismissOn={() => (showSwatches = false)}>
+      <button
+        class="tool palette"
+        title={t('sticky.paperColor')}
+        aria-label={t('sticky.paperColor')}
+        onclick={() => (showSwatches = !showSwatches)}
       >
-        <path
-          d="M12 3a9 9 0 0 0 0 18c1 0 1.5-.8 1.5-1.6 0-1.4 1.1-2 2.2-2H18a3 3 0 0 0 3-3 8.4 8.4 0 0 0-9-8.4z"
-        />
-        <circle cx="7.5" cy="11" r="1" fill="currentColor" stroke="none" />
-        <circle cx="12" cy="8" r="1" fill="currentColor" stroke="none" />
-        <circle cx="16" cy="11" r="1" fill="currentColor" stroke="none" />
-      </svg>
-    </button>
-    {#if showSwatches}
-      <div class="swatches">
-        {#each PAPERS as name (name)}
-          <button
-            class="swatch paper-{name}"
-            class:current={paper === name}
-            title={name}
-            aria-label={name}
-            onclick={() => pickPaper(name)}
-          ></button>
-        {/each}
-      </div>
-    {/if}
+        <svg
+          viewBox="0 0 24 24"
+          width="15"
+          height="15"
+          fill="none"
+          stroke="currentColor"
+          stroke-width="1.8"
+          stroke-linecap="round"
+          stroke-linejoin="round"
+        >
+          <path
+            d="M12 3a9 9 0 0 0 0 18c1 0 1.5-.8 1.5-1.6 0-1.4 1.1-2 2.2-2H18a3 3 0 0 0 3-3 8.4 8.4 0 0 0-9-8.4z"
+          />
+          <circle cx="7.5" cy="11" r="1" fill="currentColor" stroke="none" />
+          <circle cx="12" cy="8" r="1" fill="currentColor" stroke="none" />
+          <circle cx="16" cy="11" r="1" fill="currentColor" stroke="none" />
+        </svg>
+      </button>
+      {#if showSwatches}
+        <div class="swatches">
+          {#each PAPERS as name (name)}
+            <button
+              class="swatch paper-{name}"
+              class:current={paper === name}
+              title={name}
+              aria-label={name}
+              onclick={() => pickPaper(name)}
+            ></button>
+          {/each}
+        </div>
+      {/if}
+    </span>
     <span class="opacity-group">
       <span class="drop" aria-hidden="true" title={t('sticky.opacity')}>
         <svg
@@ -787,7 +817,8 @@
     display: flex;
     flex-direction: column;
     min-width: 130px;
-    max-height: 220px;
+    /* Fits a short sticky: the list scrolls instead of being clipped. */
+    max-height: min(220px, calc(100vh - 40px));
     overflow-y: auto;
     padding: 3px;
     border-radius: 6px;
@@ -827,6 +858,11 @@
     height: 1px;
     margin: 3px 4px;
     background: var(--sticky-track);
+  }
+  .palette-group {
+    display: flex;
+    align-items: center;
+    gap: 0.3rem;
   }
   .swatches {
     display: flex;
