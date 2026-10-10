@@ -195,7 +195,10 @@ class StickyNoteState {
       return;
     }
     this.note.paper = paper;
+    // Immediate, so a new sticky made right after copies the new paper.
     this.persist();
+    this.persist.flush();
+    void settingsState.save({ default_sticky_paper: paper });
   }
 
   /** Push any pending upsert and wait until it reaches disk. */

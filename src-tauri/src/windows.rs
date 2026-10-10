@@ -7,6 +7,8 @@ use tauri::{AppHandle, Emitter, Manager, State, WebviewUrl, WebviewWindowBuilder
 
 const DEFAULT_WIDTH: f64 = 280.0;
 const DEFAULT_HEIGHT: f64 = 230.0;
+/// Narrowest sticky that fits its toolbar with the color row open.
+pub const STICKY_MIN_WIDTH: f64 = 280.0;
 const CASCADE_STEP: f64 = 28.0;
 /// The sticky card's corner radius, matching `border-radius` on `.card` in
 /// `StickyApp.svelte`. macOS clips the window's layer to it; a mismatch shows
@@ -502,15 +504,21 @@ pub fn apply_opacity(window: &tauri::WebviewWindow, value: f64) -> Result<(), St
   Ok(())
 }
 
+/// The focused sticky window and its note id, if a sticky has focus.
+fn focused_sticky(app: &AppHandle) -> Option<(String, tauri::WebviewWindow)> {
+  app.webview_windows().into_iter().find_map(|(label, win)| {
+    let id = label.strip_prefix("note-")?.to_string();
+    win.is_focused().unwrap_or(false).then_some((id, win))
+  })
+}
+
 /// Position for a new sticky: offset from the focused sticky, else a cascade
 /// stepped by how many stickies already exist.
 fn cascade_position(app: &AppHandle) -> (f64, f64) {
-  for (label, win) in app.webview_windows() {
-    if label.starts_with("note-") && win.is_focused().unwrap_or(false) {
-      if let (Ok(pos), Ok(scale)) = (win.outer_position(), win.scale_factor()) {
-        let logical = pos.to_logical::<f64>(scale);
-        return (logical.x + CASCADE_STEP, logical.y + CASCADE_STEP);
-      }
+  if let Some((_, win)) = focused_sticky(app) {
+    if let (Ok(pos), Ok(scale)) = (win.outer_position(), win.scale_factor()) {
+      let logical = pos.to_logical::<f64>(scale);
+      return (logical.x + CASCADE_STEP, logical.y + CASCADE_STEP);
     }
   }
   let count = app
@@ -520,6 +528,11 @@ fn cascade_position(app: &AppHandle) -> (f64, f64) {
     .count() as f64;
   let base = 120.0 + count * CASCADE_STEP;
   (base, base)
+}
+
+/// A sticky saved under an older, narrower minimum opens at the current one.
+fn sticky_open_width(stored: Option<f64>) -> f64 {
+  stored.unwrap_or(DEFAULT_WIDTH).max(STICKY_MIN_WIDTH)
 }
 
 /// Open a frameless sticky window for `note` at its saved bounds (or a cascade
@@ -556,9 +569,9 @@ pub fn create_sticky_window(app: &AppHandle, note: &NoteSnapshot) -> Result<(), 
     .visible(false)
     .decorations(false)
     .always_on_top(on_top)
-    .min_inner_size(180.0, 140.0)
+    .min_inner_size(STICKY_MIN_WIDTH, 140.0)
     .inner_size(
-      note.width.unwrap_or(DEFAULT_WIDTH),
+      sticky_open_width(note.width),
       note.height.unwrap_or(DEFAULT_HEIGHT),
     );
   // Tauri's own way to clear the window layer. macOS is excluded because there
@@ -704,24 +717,36 @@ pub fn create_document_window(
   )
 }
 
-/// Create a blank note in the store and open its sticky window.
-pub fn new_sticky(app: &AppHandle, store: &NoteStore) -> Result<NoteSnapshot, String> {
-  // New stickies inherit the last-picked paper and last-resized sticky size.
-  let defaults = crate::settings::app_settings(app);
-  let note = NoteSnapshot {
-    id: uuid::Uuid::new_v4().to_string(),
+/// Size and paper for a new sticky: the focused sticky's, else the last-resized
+/// size and last-picked paper.
+fn sticky_template(
+  focused: Option<(f64, f64, String)>,
+  defaults: &crate::settings::AppSettings,
+) -> (f64, f64, String) {
+  focused.unwrap_or_else(|| {
+    (
+      defaults.default_sticky_width,
+      defaults.default_sticky_height,
+      defaults.default_sticky_paper.clone(),
+    )
+  })
+}
+
+fn blank_sticky(id: String, width: f64, height: f64, paper: String) -> NoteSnapshot {
+  NoteSnapshot {
+    id,
     content: String::new(),
     file_path: None,
     language: None,
     explicit: false,
     x: None,
     y: None,
-    width: Some(defaults.default_sticky_width),
-    height: Some(defaults.default_sticky_height),
+    width: Some(width),
+    height: Some(height),
     pin_mode: "none".to_string(),
     pin_app: None,
     opacity: 1.0,
-    paper: "classic".to_string(),
+    paper,
     kind: "sticky".to_string(),
     dirty: false,
     window_group: None,
@@ -742,7 +767,20 @@ pub fn new_sticky(app: &AppHandle, store: &NoteStore) -> Result<NoteSnapshot, St
     windowed_fp_mtime: None,
     windowed_digest: None,
     windowed_top_line: None,
-  };
+  }
+}
+
+/// Create a blank note in the store and open its sticky window.
+pub fn new_sticky(app: &AppHandle, store: &NoteStore) -> Result<NoteSnapshot, String> {
+  let focused = focused_sticky(app).and_then(|(id, win)| {
+    let size = win
+      .inner_size()
+      .ok()?
+      .to_logical::<f64>(win.scale_factor().ok()?);
+    Some((size.width, size.height, store.get(&id)?.paper))
+  });
+  let (width, height, paper) = sticky_template(focused, &crate::settings::app_settings(app));
+  let note = blank_sticky(uuid::Uuid::new_v4().to_string(), width, height, paper);
   store.upsert(note.clone())?;
   create_sticky_window(app, &note)?;
   crate::note_store::emit_store_changed(app, Some(&note.id));
@@ -1263,6 +1301,36 @@ mod tests {
     filter_live_groups, fixed_window_titles, is_sticky_window_label, validate_sticky_action,
     DocTabInfo, DocWindowTabs,
   };
+
+  #[test]
+  fn a_sticky_opens_no_narrower_than_the_minimum() {
+    assert_eq!(super::sticky_open_width(None), 280.0);
+    assert_eq!(super::sticky_open_width(Some(200.0)), 280.0);
+    assert_eq!(super::sticky_open_width(Some(300.0)), 300.0);
+  }
+
+  #[test]
+  fn a_new_sticky_copies_the_focused_sticky_else_the_remembered_defaults() {
+    let defaults = crate::settings::AppSettings {
+      default_sticky_paper: "pink".into(),
+      default_sticky_width: 300.0,
+      default_sticky_height: 200.0,
+      ..Default::default()
+    };
+    assert_eq!(
+      super::sticky_template(Some((190.0, 150.0, "blue".into())), &defaults),
+      (190.0, 150.0, "blue".to_string())
+    );
+    assert_eq!(
+      super::sticky_template(None, &defaults),
+      (300.0, 200.0, "pink".to_string())
+    );
+    let note = super::blank_sticky("n1".into(), 190.0, 150.0, "blue".into());
+    assert_eq!(note.paper, "blue");
+    assert_eq!(note.width, Some(190.0));
+    assert_eq!(note.height, Some(150.0));
+    assert_eq!(note.kind, "sticky");
+  }
 
   #[test]
   fn menu_item_tops_count_the_rows_they_sit_on() {
