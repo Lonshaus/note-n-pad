@@ -4,72 +4,46 @@
 // accelerator table, so a menu accelerator has to be matched here and run
 // through the `trigger_menu_accelerator` command instead. See `main.ts`.
 
-import { keyEventToAccelerator } from './accelerator';
-
-/** The subset of `KeyboardEvent` this matcher needs, kept minimal so it is
- *  trivial to call with a plain object in tests. */
-interface KeyLike {
-  ctrlKey: boolean;
-  shiftKey: boolean;
-  altKey: boolean;
-  metaKey: boolean;
+import { functionKey, eventKeyName, type KeyLike } from './accelerator';
+/** A keydown plus the flag the matcher uses to leave handled events alone. */
+interface MenuKeyLike extends KeyLike {
   defaultPrevented: boolean;
-  key: string;
-  code: string;
 }
-
-// Physical key names for the table's non-letter keys.
-const CODE_KEYS: Record<string, string> = { Comma: ',' };
-
-/** The US-layout key at `code`'s position, or null. A native accelerator
- *  matches the virtual-key code, so on a non-Latin layout Ctrl+S still means
- *  save even though `key` reports a local letter. */
-function keyFromCode(code: string): string | null {
-  const letter = /^Key([A-Z])$/.exec(code);
-  if (letter !== null) {
-    return letter[1] ?? null;
-  }
-  return CODE_KEYS[code] ?? null;
-}
-
-/** Match a keydown against `table` (a list of `CmdOrCtrl+…` accelerator
- *  strings, as `ACCELERATOR_TABLE` spells them), returning the matching table
- *  entry or null. Only active on Windows (`os === 'windows'`): macOS and
- *  Linux menu accelerators already fire through the platform's own
- *  mechanism, so this must never intercept a keydown there. Requires Ctrl
- *  (not Cmd/Meta) and an event CodeMirror or another handler hasn't already
- *  claimed via `preventDefault`. */
+/** Match a keydown against `table` (the canonical accelerators of the native
+ *  menu items, as the Rust core lists them), returning the matching entry or
+ *  null. Only active on Windows (`os === 'windows'`): macOS and Linux menu
+ *  accelerators already fire through the platform's own mechanism, so this
+ *  must never intercept a keydown there. Needs at least one modifier or an
+ *  F key, and an event CodeMirror or another handler hasn't already claimed
+ *  via `preventDefault`. */
 export function matchMenuAccelerator(
-  event: KeyLike,
+  event: MenuKeyLike,
   os: string,
   table: readonly string[],
 ): string | null {
   if (os !== 'windows' || event.defaultPrevented) {
     return null;
   }
-  if (!event.ctrlKey || event.metaKey) {
+  const key = eventKeyName(event);
+  if (key === null) {
     return null;
   }
-  let candidate = keyEventToAccelerator(event as KeyboardEvent, 'windows');
-  if (candidate === null) {
-    const fromCode = keyFromCode(event.code);
-    if (fromCode !== null) {
-      // Copy fields explicitly: a DOM event's properties are prototype
-      // getters, which object spread would drop.
-      candidate = keyEventToAccelerator(
-        {
-          ctrlKey: event.ctrlKey,
-          shiftKey: event.shiftKey,
-          altKey: event.altKey,
-          metaKey: event.metaKey,
-          key: fromCode,
-        } as KeyboardEvent,
-        'windows',
-      );
-    }
+  const parts: string[] = [];
+  if (event.ctrlKey) {
+    parts.push('Ctrl');
   }
-  if (candidate === null || !table.includes(candidate)) {
+  if (event.altKey) {
+    parts.push('Alt');
+  }
+  if (event.shiftKey) {
+    parts.push('Shift');
+  }
+  if (event.metaKey) {
+    parts.push('Win');
+  }
+  if (parts.length === 0 && functionKey(key) === null) {
     return null;
   }
-  return candidate;
+  const candidate = [...parts, key].join('+');
+  return table.includes(candidate) ? candidate : null;
 }

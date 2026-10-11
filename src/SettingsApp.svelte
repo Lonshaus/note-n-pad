@@ -19,11 +19,7 @@
   import { getColor, setColor } from './lib/theme/themeColor';
   import { open, save, ask } from '@tauri-apps/plugin-dialog';
   import { debounce } from './lib/util/debounce';
-  import {
-    isValidRecordedShortcut,
-    keyEventToAccelerator,
-    formatAccelerator,
-  } from './lib/util/accelerator';
+  import { recordAccelerator, formatAccelerator } from './lib/util/accelerator';
   import {
     FONT_CANDIDATES,
     availableFonts,
@@ -199,12 +195,30 @@
       recorderEl?.blur();
       return;
     }
-    const accel = keyEventToAccelerator(e, platform.os);
-    // A bare modifier press is ignored; keep waiting for a full combo.
-    if (accel === null || !isValidRecordedShortcut(accel)) {
+    void recordShortcut(e);
+  }
+  /** The letter the keyboard layout types on a physical key (macOS). */
+  async function layoutChar(code: string): Promise<string | null> {
+    return await invoke<string | null>('layout_char_for_code', { code });
+  }
+
+  async function recordShortcut(e: KeyboardEvent): Promise<void> {
+    // The global shortcut registers by physical key, so it is recorded that way.
+    const result = await recordAccelerator(e, {
+      os: platform.os,
+      scope: 'global',
+      layoutChar,
+    });
+    // Ended (blur) while the lookup ran: the keystroke no longer belongs here.
+    if (!recording) {
       return;
     }
-    void applyShortcut(accel);
+    // A bare modifier press, or a combo the shortcut rules refuse, is ignored;
+    // keep waiting for a usable one.
+    if (result.status !== 'ok') {
+      return;
+    }
+    await applyShortcut(result.accel);
   }
 
   async function applyShortcut(accel: string): Promise<void> {
