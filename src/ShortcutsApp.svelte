@@ -16,6 +16,7 @@
   /** One row from the Rust `get_shortcuts` command, already translated into
    *  the current locale. */
   interface ShortcutRow {
+    id: string;
     section: string;
     label: string;
     accelerator: string;
@@ -24,10 +25,14 @@
   let rows = $state<ShortcutRow[]>([]);
 
   /** Rows grouped by section, in the order sections first appear — the same
-   *  order `ACCELERATOR_TABLE` lists them in on the Rust side. */
+   *  order the shortcut registry lists them in on the Rust side. Rows with no
+   *  key in effect are left out. */
   let sections: { section: string; rows: ShortcutRow[] }[] = $derived.by(() => {
     const groups: { section: string; rows: ShortcutRow[] }[] = [];
     for (const row of rows) {
+      if (row.accelerator === '') {
+        continue;
+      }
       const group = groups.find((g) => g.section === row.section);
       if (group === undefined) {
         groups.push({ section: row.section, rows: [row] });
@@ -81,7 +86,7 @@
     <section>
       <h2>{group.section}</h2>
       <ul>
-        {#each group.rows as row (row.label)}
+        {#each group.rows as row (row.id)}
           <li>
             <span class="label">{row.label}</span>
             <span class="accel"

@@ -387,12 +387,15 @@ export class SettingsState {
     this.snapshotDir = dir;
     await this.refreshResolvedSnapshotDir();
   }
-
-  /** Re-register the global new-note shortcut. Throws (propagated to the caller)
-   *  when the accelerator is invalid or cannot be registered, leaving the old
+  /** Set the global new-note shortcut through the shortcut registry, which
+   *  checks it against every other shortcut. Throws (propagated to the caller)
+   *  when the accelerator is refused or cannot be registered, leaving the old
    *  one in place; the local field is updated only on success. */
   async setNewNoteShortcut(accelerator: string): Promise<void> {
-    await invoke<void>('set_new_note_shortcut', { shortcut: accelerator });
+    await invoke<void>('set_shortcut', {
+      id: 'global.new-sticky',
+      accel: accelerator,
+    });
     this.newNoteShortcut = accelerator;
   }
 

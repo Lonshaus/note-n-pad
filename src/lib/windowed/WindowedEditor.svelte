@@ -21,8 +21,10 @@
     keymap,
     type ViewUpdate,
   } from '@codemirror/view';
-  import { defaultKeymap } from '@codemirror/commands';
   import { varEditorTheme } from '../editor/editorTheme';
+  import { keymapExtension } from '../editor/keymap';
+  import { shortcutsState } from '../state/shortcuts.svelte';
+  import { platform } from '../state/platform.svelte';
   import { cssFontFamily } from '../util/font';
   import {
     byteLength,
@@ -153,6 +155,13 @@
   const themeCompartment = new Compartment();
   const gutterCompartment = new Compartment();
   const readOnlyCompartment = new Compartment();
+  const keymapCompartment = new Compartment();
+  // The rebindable commands' keys, rebuilt whenever the shortcuts change.
+  function currentKeymap(): Extension {
+    return keymapExtension('windowed', platform.os, (id) =>
+      shortcutsState.accel(id),
+    );
+  }
 
   // The gutter renders global line numbers by adding the window's start line to
   // CM's local (1-based) line number. The closure reads the live windowStartLine,
@@ -181,7 +190,6 @@
     dropCursor(),
     highlightActiveLine(),
     keymap.of([
-      ...defaultKeymap,
       {
         key: 'Mod-z',
         preventDefault: true,
@@ -209,6 +217,7 @@
         // Required in every view, see the note in Editor.svelte.
         EditorView.cspNonce.of(readCspNonce()),
         coreSetup,
+        keymapCompartment.of(currentKeymap()),
         gutterCompartment.of(gutterExtension(showLineNumbers)),
         wrapCompartment.of(wordWrap ? EditorView.lineWrapping : []),
         themeCompartment.of(varEditorTheme(dark)),
@@ -777,6 +786,18 @@
     if (view !== undefined) {
       view.dispatch({
         effects: gutterCompartment.reconfigure(gutterExtension(on)),
+      });
+    }
+  });
+  // Rebind the customizable commands when the effective shortcuts change.
+  $effect(() => {
+    const accels = shortcutsState.accelerators;
+    const os = platform.os;
+    if (view !== undefined) {
+      view.dispatch({
+        effects: keymapCompartment.reconfigure(
+          keymapExtension('windowed', os, (id) => accels[id] ?? null),
+        ),
       });
     }
   });

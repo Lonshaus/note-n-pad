@@ -615,25 +615,16 @@ pub fn create_sticky_window(app: &AppHandle, note: &NoteSnapshot) -> Result<(), 
 
 const DOC_DEFAULT_WIDTH: f64 = 800.0;
 const DOC_DEFAULT_HEIGHT: f64 = 600.0;
-
-/// Build a normal-chrome document window labeled `doc-{group}`, carrying the
-/// window group (and, for a fresh open, an initial file path and project root)
-/// in the URL so the frontend can load every tab in the group and restore it.
-fn build_document_window(
-  app: &AppHandle,
+/// The URL a document window loads, carrying the window group (and, for a fresh
+/// open, an initial file path and project root) so the frontend can load every
+/// tab in the group and restore it.
+fn document_window_query(
   group: &str,
   initial_path: Option<&str>,
   project: Option<&str>,
   tab: Option<i64>,
-  bounds: WindowBounds,
-) -> Result<(), String> {
-  let WindowBounds {
-    x,
-    y,
-    width,
-    height,
-  } = bounds;
-  let label = format!("doc-{group}");
+  blank: bool,
+) -> String {
   let mut query = format!("index.html?mode=document&group={}", percent_encode(group));
   if let Some(path) = initial_path {
     query.push_str(&format!("&path={}", percent_encode(path)));
@@ -648,6 +639,30 @@ fn build_document_window(
   if let Some(tab) = tab {
     query.push_str(&format!("&tab={tab}"));
   }
+  // A new window with nothing stored asks the frontend for one blank tab.
+  if blank {
+    query.push_str("&blank=1");
+  }
+  query
+}
+/// Build a normal-chrome document window labeled `doc-{group}`.
+fn build_document_window(
+  app: &AppHandle,
+  group: &str,
+  initial_path: Option<&str>,
+  project: Option<&str>,
+  tab: Option<i64>,
+  blank: bool,
+  bounds: WindowBounds,
+) -> Result<(), String> {
+  let WindowBounds {
+    x,
+    y,
+    width,
+    height,
+  } = bounds;
+  let label = format!("doc-{group}");
+  let query = document_window_query(group, initial_path, project, tab, blank);
   let url = WebviewUrl::App(query.into());
   // Set a real title at birth so macOS never shows its own empty-title
   // placeholder (e.g. "無題" on Japanese systems) before the frontend loads and
@@ -684,6 +699,26 @@ pub fn open_document(app: &AppHandle, path: &str, project: Option<&str>) -> Resu
     Some(path),
     project,
     None,
+    false,
+    WindowBounds {
+      x: None,
+      y: None,
+      width: DOC_DEFAULT_WIDTH,
+      height: DOC_DEFAULT_HEIGHT,
+    },
+  )
+}
+/// Open a fresh document window holding one blank tab, minting a new window
+/// group. The tab is created by the frontend, which stores it on first edit.
+pub fn new_blank_document(app: &AppHandle) -> Result<(), String> {
+  let group = uuid::Uuid::new_v4().to_string();
+  build_document_window(
+    app,
+    &group,
+    None,
+    None,
+    None,
+    true,
     WindowBounds {
       x: None,
       y: None,
@@ -708,6 +743,7 @@ pub fn create_document_window(
     None,
     None,
     tab,
+    false,
     WindowBounds {
       x: plan.x,
       y: plan.y,
@@ -1550,5 +1586,22 @@ mod window_command_threading_tests {
     let attribute = SOURCE[..at].trim_end();
     assert!(attribute.ends_with("#[tauri::command]"));
     assert!(!attribute.ends_with("#[tauri::command(async)]"));
+  }
+}
+
+#[cfg(test)]
+mod document_window_query_tests {
+  use super::document_window_query;
+
+  #[test]
+  fn a_blank_window_asks_for_one_blank_tab() {
+    let query = document_window_query("g1", None, None, None, true);
+    assert_eq!(query, "index.html?mode=document&group=g1&blank=1");
+  }
+
+  #[test]
+  fn restored_and_file_windows_never_ask_for_a_blank_tab() {
+    assert!(!document_window_query("g1", None, None, Some(2), false).contains("blank"));
+    assert!(!document_window_query("g1", Some("/a b.txt"), None, None, false).contains("blank"));
   }
 }
