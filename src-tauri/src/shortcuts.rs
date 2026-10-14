@@ -1840,7 +1840,7 @@ pub fn shortcut_rows(
       ShortcutRow {
         id: row.id,
         section: row.section.map_or_else(
-          || "Note&Pad".to_string(),
+          || crate::edition::app_name().to_string(),
           |key| i18n::tr(locale, key).to_string(),
         ),
         label: label_text(row.label, locale),
@@ -3432,7 +3432,7 @@ mod tests {
     assert_eq!(save.section, "File");
     assert!(!save.customizable);
     let quit = rows.iter().find(|row| row.id == "menu.quit").unwrap();
-    assert_eq!(quit.section, "Note&Pad");
+    assert_eq!(quit.section, crate::edition::app_name());
     let new = rows.iter().find(|row| row.id == "menu.new").unwrap();
     assert_eq!(new.label, "New Sticky / New Window");
     let zh = shortcut_rows(&r, i18n::Locale::ZhTw, OTHER);

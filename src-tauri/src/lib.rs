@@ -986,9 +986,10 @@ fn build_menu(
     accel("settings"),
   )?;
   // Brand name; not localized (macOS shows the app name as the first submenu).
+  // "Note&Pad Lite" in the Lite build.
   let app_menu = Submenu::with_items(
     app,
-    escape_menu_label("Note&Pad"),
+    escape_menu_label(edition::app_name()),
     true,
     &[
       &about,

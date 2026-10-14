@@ -75,3 +75,97 @@ describe('Info.plist document types', () => {
     expect(plist).toContain('<key>CFBundleDevelopmentRegion</key>');
   });
 });
+
+describe('Info.lite.plist document types', () => {
+  const liteConf = JSON.parse(
+    fs.readFileSync(
+      path.join(REPO_ROOT, 'src-tauri', 'tauri.lite.conf.json'),
+      'utf8',
+    ),
+  );
+  const litePlist = fs.readFileSync(
+    path.join(REPO_ROOT, 'src-tauri', 'Info.lite.plist'),
+    'utf8',
+  );
+
+  it('is up to date with the Lite association list', () => {
+    // Adding an extension to tauri.lite.conf.json without running
+    // `node scripts/gen-doc-types.mjs --lite` fails here.
+    expect(readDocTypes(litePlist)).toBe(buildDocTypes(liteConf));
+  });
+
+  it('declares exactly the kept extensions, each once', () => {
+    const declared = [
+      ...readDocTypes(litePlist).matchAll(
+        /<key>CFBundleTypeExtensions<\/key>\n\s*<array>([\s\S]*?)<\/array>/g,
+      ),
+    ].flatMap((m) => [...m[1].matchAll(/<string>([^<]+)</g)].map((e) => e[1]));
+    expect(declared.sort()).toEqual(
+      [
+        ...['txt', 'text', 'log', 'conf', 'ini', 'cfg', 'mbox'],
+        ...['md', 'markdown', 'mkd'],
+        ...['csv', 'tsv'],
+      ].sort(),
+    );
+  });
+
+  it('only narrows the full list: nothing the full app lacks', () => {
+    const full = new Set(conf.bundle.fileAssociations.flatMap((a) => a.ext));
+    for (const association of liteConf.bundle.fileAssociations) {
+      for (const ext of association.ext) {
+        expect(full.has(ext), ext).toBe(true);
+      }
+    }
+  });
+
+  it('holds nothing but the document types, so the base keeps the rest', () => {
+    // Merged after the base plist, it replaces only the keys it names.
+    const keys = [...litePlist.matchAll(/^ {4}<key>([^<]+)<\/key>/gm)].map(
+      (m) => m[1],
+    );
+    expect(keys).toEqual(['CFBundleDocumentTypes']);
+    expect(litePlist).not.toContain('CFBundleLocalizations');
+  });
+
+  it('is what the Lite config merges, after the base plist', () => {
+    expect(liteConf.bundle.macOS.infoPlist).toBe('Info.lite.plist');
+  });
+});
+
+describe('the Lite bundle config', () => {
+  const liteConf = JSON.parse(
+    fs.readFileSync(
+      path.join(REPO_ROOT, 'src-tauri', 'tauri.lite.conf.json'),
+      'utf8',
+    ),
+  );
+
+  it('has its own identity and the shared version', () => {
+    expect(liteConf.productName).toBe('Note&Pad Lite');
+    expect(liteConf.mainBinaryName).toBe('Note&Pad Lite');
+    expect(liteConf.identifier).toBe('net.lonshaus.note-n-pad-lite');
+    expect(liteConf.identifier).not.toBe(conf.identifier);
+    expect(liteConf.version).toBe(conf.version);
+    expect(liteConf.version).toBe('1.1.0');
+  });
+
+  it('builds the frontend as Lite', () => {
+    expect(liteConf.build.beforeBuildCommand).toBe(
+      'NOTENPAD_LITE=1 npm run build',
+    );
+  });
+
+  it('uses its own icon folder, with the file names of the full set', () => {
+    expect(liteConf.bundle.icon).toEqual(
+      conf.bundle.icon.map((file) => file.replace('icons/', 'icons-lite/')),
+    );
+  });
+
+  it('ships the Lite policy folder and not the full one', () => {
+    expect(liteConf.bundle.resources['resources/privacy-lite/*']).toBe(
+      'privacy-lite/',
+    );
+    expect(liteConf.bundle.resources['resources/privacy/*']).toBeNull();
+    expect(conf.bundle.resources['resources/privacy/*']).toBe('privacy/');
+  });
+});
