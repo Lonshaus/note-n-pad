@@ -262,6 +262,9 @@ impl Accel {
   pub fn is_mac_option_typing(&self) -> bool {
     self.mods & ALT != 0 && self.mods & (CTRL | SUPER) == 0 && self.is_character_key()
   }
+  pub fn is_numpad_key(&self) -> bool {
+    self.key.starts_with("Numpad")
+  }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -270,6 +273,16 @@ pub enum Scope {
   Menu,
   Window,
   Editor,
+}
+impl Scope {
+  fn name(self) -> &'static str {
+    match self {
+      Scope::Global => "global",
+      Scope::Menu => "menu",
+      Scope::Window => "window",
+      Scope::Editor => "editor",
+    }
+  }
 }
 /// How a row's display name is built from the dictionary.
 #[derive(Clone, Copy, Debug)]
@@ -969,6 +982,372 @@ const RESERVED: &[(&str, &str, &str, bool)] = &[
   ("fixed.emacs-transpose", "Ctrl+T", "", false),
   ("fixed.emacs-page-down", "Ctrl+V", "", false),
 ];
+/// Which group of "Other fixed keys" a row belongs to. The heading text comes
+/// from the dictionary, the id is what the frontend groups by.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Heading {
+  Cursor,
+  Editing,
+  Emacs,
+}
+
+impl Heading {
+  pub const fn id(self) -> &'static str {
+    match self {
+      Heading::Cursor => "cursor",
+      Heading::Editing => "editing",
+      Heading::Emacs => "emacs",
+    }
+  }
+
+  const fn key(self) -> Key {
+    match self {
+      Heading::Cursor => Key::FxHdCursor,
+      Heading::Editing => Key::FxHdEditing,
+      Heading::Emacs => Key::FxHdEmacs,
+    }
+  }
+}
+/// A read-only row of the "Other fixed keys" list. It never takes part in
+/// conflict checking itself: `aliases` names the `RESERVED` entries whose keys
+/// the row shows, so a `conflict:<id>` for any of them still finds its row.
+pub struct OtherRow {
+  pub id: &'static str,
+  pub heading: Heading,
+  pub label: Label,
+  /// Display keys on macOS, `None` when the row does not exist there.
+  pub mac: Option<&'static [&'static str]>,
+  /// Display keys on Windows and Linux, `None` when the row does not exist.
+  pub other: Option<&'static [&'static str]>,
+  pub aliases: &'static [&'static str],
+}
+
+const fn one(key: Key) -> Label {
+  Label::One(key)
+}
+
+const fn both(
+  id: &'static str,
+  heading: Heading,
+  label: Label,
+  keys: &'static [&'static str],
+  aliases: &'static [&'static str],
+) -> OtherRow {
+  OtherRow {
+    id,
+    heading,
+    label,
+    mac: Some(keys),
+    other: Some(keys),
+    aliases,
+  }
+}
+
+const fn split(
+  id: &'static str,
+  heading: Heading,
+  label: Label,
+  mac: Option<&'static [&'static str]>,
+  other: Option<&'static [&'static str]>,
+  aliases: &'static [&'static str],
+) -> OtherRow {
+  OtherRow {
+    id,
+    heading,
+    label,
+    mac,
+    other,
+    aliases,
+  }
+}
+
+use Heading::{Cursor, Editing, Emacs};
+/// The "Other fixed keys" list, in display order. Keys are canonical text.
+/// Sources: the `RESERVED` entries (through `aliases`) and CodeMirror's
+/// standard keymap for the bare keys.
+pub const OTHER_ROWS: &[OtherRow] = &[
+  both(
+    "other.cursor-left",
+    Cursor,
+    one(Key::FxCursorLeft),
+    &["ArrowLeft"],
+    &[],
+  ),
+  both(
+    "other.cursor-right",
+    Cursor,
+    one(Key::FxCursorRight),
+    &["ArrowRight"],
+    &[],
+  ),
+  both(
+    "other.cursor-up",
+    Cursor,
+    one(Key::FxCursorUp),
+    &["ArrowUp"],
+    &[],
+  ),
+  both(
+    "other.cursor-down",
+    Cursor,
+    one(Key::FxCursorDown),
+    &["ArrowDown"],
+    &[],
+  ),
+  split(
+    "other.word-left",
+    Cursor,
+    one(Key::FxWordLeft),
+    Some(&["Alt+ArrowLeft"]),
+    Some(&["Ctrl+ArrowLeft"]),
+    &["fixed.group-left"],
+  ),
+  split(
+    "other.word-right",
+    Cursor,
+    one(Key::FxWordRight),
+    Some(&["Alt+ArrowRight"]),
+    Some(&["Ctrl+ArrowRight"]),
+    &["fixed.group-right"],
+  ),
+  split(
+    "other.syntax-left",
+    Cursor,
+    one(Key::FxSyntaxLeft),
+    Some(&["Ctrl+ArrowLeft"]),
+    Some(&["Alt+ArrowLeft"]),
+    &["fixed.syntax-left"],
+  ),
+  split(
+    "other.syntax-right",
+    Cursor,
+    one(Key::FxSyntaxRight),
+    Some(&["Ctrl+ArrowRight"]),
+    Some(&["Alt+ArrowRight"]),
+    &["fixed.syntax-right"],
+  ),
+  split(
+    "other.line-start",
+    Cursor,
+    one(Key::FxLineStart),
+    Some(&["Home", "Cmd+ArrowLeft"]),
+    Some(&["Home"]),
+    &["fixed.line-boundary-left"],
+  ),
+  split(
+    "other.line-end",
+    Cursor,
+    one(Key::FxLineEnd),
+    Some(&["End", "Cmd+ArrowRight"]),
+    Some(&["End"]),
+    &["fixed.line-boundary-right"],
+  ),
+  split(
+    "other.page-up",
+    Cursor,
+    one(Key::FxPageUp),
+    Some(&["PageUp", "Ctrl+ArrowUp"]),
+    Some(&["PageUp"]),
+    &["fixed.page-up-arrow"],
+  ),
+  split(
+    "other.page-down",
+    Cursor,
+    one(Key::FxPageDown),
+    Some(&["PageDown", "Ctrl+ArrowDown"]),
+    Some(&["PageDown"]),
+    &["fixed.page-down-arrow"],
+  ),
+  split(
+    "other.doc-start",
+    Cursor,
+    one(Key::FxDocStart),
+    Some(&["Cmd+ArrowUp", "Cmd+Home"]),
+    Some(&["Ctrl+Home"]),
+    &["fixed.doc-start-arrow", "fixed.doc-start-home"],
+  ),
+  split(
+    "other.doc-end",
+    Cursor,
+    one(Key::FxDocEnd),
+    Some(&["Cmd+ArrowDown", "Cmd+End"]),
+    Some(&["Ctrl+End"]),
+    &["fixed.doc-end-arrow", "fixed.doc-end-end"],
+  ),
+  both("other.add-shift", Cursor, one(Key::FxAddShift), &[], &[]),
+  both(
+    "other.new-line",
+    Editing,
+    one(Key::FxNewLine),
+    &["Enter"],
+    &[],
+  ),
+  both(
+    "other.delete-left",
+    Editing,
+    one(Key::FxDeleteLeft),
+    &["Backspace"],
+    &[],
+  ),
+  both(
+    "other.delete-right",
+    Editing,
+    one(Key::FxDeleteRight),
+    &["Delete"],
+    &[],
+  ),
+  split(
+    "other.delete-word-left",
+    Editing,
+    one(Key::FxDeleteWordLeft),
+    Some(&["Alt+Backspace"]),
+    Some(&["Ctrl+Backspace"]),
+    &["fixed.delete-group-backward"],
+  ),
+  split(
+    "other.delete-word-right",
+    Editing,
+    one(Key::FxDeleteWordRight),
+    Some(&["Alt+Delete"]),
+    Some(&["Ctrl+Delete"]),
+    &["fixed.delete-group-forward"],
+  ),
+  split(
+    "other.delete-to-start",
+    Editing,
+    one(Key::FxDeleteToStart),
+    Some(&["Cmd+Backspace"]),
+    None,
+    &["fixed.delete-line-start"],
+  ),
+  split(
+    "other.delete-to-end",
+    Editing,
+    one(Key::FxDeleteToEnd),
+    Some(&["Cmd+Delete"]),
+    None,
+    &["fixed.delete-line-end"],
+  ),
+  both(
+    "other.find-next",
+    Editing,
+    one(Key::FindNext),
+    &["F3"],
+    &["fixed.find-next-f3"],
+  ),
+  split(
+    "other.redo-large",
+    Editing,
+    one(Key::FxRedoLarge),
+    None,
+    Some(&["Ctrl+Shift+Z"]),
+    &["fixed.windowed-redo"],
+  ),
+  split(
+    "emacs.cursor-left",
+    Emacs,
+    one(Key::FxCursorLeft),
+    Some(&["Ctrl+B"]),
+    None,
+    &["fixed.emacs-char-left"],
+  ),
+  split(
+    "emacs.cursor-right",
+    Emacs,
+    one(Key::FxCursorRight),
+    Some(&["Ctrl+F"]),
+    None,
+    &["fixed.emacs-char-right"],
+  ),
+  split(
+    "emacs.cursor-up",
+    Emacs,
+    one(Key::FxCursorUp),
+    Some(&["Ctrl+P"]),
+    None,
+    &["fixed.emacs-line-up"],
+  ),
+  split(
+    "emacs.cursor-down",
+    Emacs,
+    one(Key::FxCursorDown),
+    Some(&["Ctrl+N"]),
+    None,
+    &["fixed.emacs-line-down"],
+  ),
+  split(
+    "emacs.line-start",
+    Emacs,
+    one(Key::FxLineStart),
+    Some(&["Ctrl+A"]),
+    None,
+    &["fixed.emacs-line-start"],
+  ),
+  split(
+    "emacs.line-end",
+    Emacs,
+    one(Key::FxLineEnd),
+    Some(&["Ctrl+E"]),
+    None,
+    &["fixed.emacs-line-end"],
+  ),
+  split(
+    "emacs.delete-right",
+    Emacs,
+    one(Key::FxDeleteRight),
+    Some(&["Ctrl+D"]),
+    None,
+    &["fixed.emacs-delete-forward"],
+  ),
+  split(
+    "emacs.delete-left",
+    Emacs,
+    one(Key::FxDeleteLeft),
+    Some(&["Ctrl+H"]),
+    None,
+    &["fixed.emacs-delete-backward"],
+  ),
+  split(
+    "emacs.delete-to-end",
+    Emacs,
+    one(Key::FxDeleteToEnd),
+    Some(&["Ctrl+K"]),
+    None,
+    &["fixed.emacs-delete-to-end"],
+  ),
+  split(
+    "emacs.delete-word-left",
+    Emacs,
+    one(Key::FxDeleteWordLeft),
+    Some(&["Ctrl+Alt+H"]),
+    None,
+    &["fixed.emacs-delete-group"],
+  ),
+  split(
+    "emacs.split-line",
+    Emacs,
+    one(Key::FxSplitLine),
+    Some(&["Ctrl+O"]),
+    None,
+    &["fixed.emacs-split-line"],
+  ),
+  split(
+    "emacs.transpose",
+    Emacs,
+    one(Key::FxTranspose),
+    Some(&["Ctrl+T"]),
+    None,
+    &["fixed.emacs-transpose"],
+  ),
+  split(
+    "emacs.page-down",
+    Emacs,
+    one(Key::FxPageDown),
+    Some(&["Ctrl+V"]),
+    None,
+    &["fixed.emacs-page-down"],
+  ),
+];
 /// Every reserved key for `platform`, Shift variants expanded.
 fn reserved_accels(platform: Platform) -> Vec<(&'static str, Accel)> {
   let mut out = Vec::new();
@@ -1011,11 +1390,18 @@ pub enum RuleError {
   MacOption,
   /// A Windows/Linux combination the row's handler can never receive.
   Unreachable,
+  /// A numpad key on a row the frontend matches by key name, which has no
+  /// numpad names.
+  NumpadKey,
 }
 
 pub fn rule_violation(row: &Row, accel: &Accel, platform: Platform) -> Option<RuleError> {
   if !accel.has_required_modifier() {
     return Some(RuleError::NeedsModifier);
+  }
+  // Only the global key is registered with the OS, which does fire numpad keys.
+  if accel.is_numpad_key() && row.id != GLOBAL_STICKY_ID {
+    return Some(RuleError::NumpadKey);
   }
   if platform == Platform::MacOS
     && row.scopes.contains(&Scope::Editor)
@@ -1203,6 +1589,7 @@ pub enum SetError {
   NeedsModifier,
   MacOption,
   Unreachable,
+  NumpadKey,
   Conflict(String),
 }
 
@@ -1215,6 +1602,7 @@ impl SetError {
       SetError::NeedsModifier => "needs-modifier".to_string(),
       SetError::MacOption => "mac-option".to_string(),
       SetError::Unreachable => "unreachable".to_string(),
+      SetError::NumpadKey => "unsupported-key".to_string(),
       SetError::Conflict(id) => format!("conflict:{id}"),
     }
   }
@@ -1261,6 +1649,7 @@ fn validate_for(
     Some(RuleError::NeedsModifier) => return Err(SetError::NeedsModifier),
     Some(RuleError::MacOption) => return Err(SetError::MacOption),
     Some(RuleError::Unreachable) => return Err(SetError::Unreachable),
+    Some(RuleError::NumpadKey) => return Err(SetError::NumpadKey),
     None => {}
   }
   match resolved.conflict(accel, row.id) {
@@ -1363,6 +1752,33 @@ pub struct ShortcutRow {
   /// Default canonical key, empty when the row has none.
   pub default: String,
   pub customizable: bool,
+  /// Where the key is handled: "global", "menu", "window" and/or "editor".
+  /// Empty for an "other" row. The recorder applies the rules of these scopes.
+  pub scopes: Vec<&'static str>,
+  /// Keys to display, in order: a registry row's effective key, or the keys of
+  /// a read-only "other" row.
+  pub keys: Vec<String>,
+  /// Every conflict-capable id whose key this row shows besides its own `id`.
+  pub alias_ids: Vec<&'static str>,
+  /// A read-only row of the "Other fixed keys" group.
+  pub other: bool,
+  /// Group id of an "other" row, empty for a registry row.
+  pub heading: &'static str,
+}
+/// The `RESERVED` ids that have a key on `platform`.
+fn reserved_ids_on(platform: Platform) -> Vec<&'static str> {
+  RESERVED
+    .iter()
+    .filter(|(_, mac, other, _)| {
+      let text = if platform == Platform::MacOS {
+        mac
+      } else {
+        other
+      };
+      !text.is_empty()
+    })
+    .map(|(id, ..)| *id)
+    .collect()
 }
 
 pub fn shortcut_rows(
@@ -1370,26 +1786,68 @@ pub fn shortcut_rows(
   locale: i18n::Locale,
   platform: Platform,
 ) -> Vec<ShortcutRow> {
-  ROWS
+  let mut out: Vec<ShortcutRow> = ROWS
     .iter()
     .enumerate()
-    .map(|(i, row)| ShortcutRow {
-      id: row.id,
-      section: row.section.map_or_else(
-        || "Note&Pad".to_string(),
-        |key| i18n::tr(locale, key).to_string(),
-      ),
-      label: label_text(row.label, locale),
-      accelerator: resolved.accels[i]
+    .map(|(i, row)| {
+      let accelerator = resolved.accels[i]
         .as_ref()
         .map(|a| a.canonical(platform))
-        .unwrap_or_default(),
-      default: default_accel(row, platform)
-        .map(|a| a.canonical(platform))
-        .unwrap_or_default(),
-      customizable: row.customizable,
+        .unwrap_or_default();
+      ShortcutRow {
+        id: row.id,
+        section: row.section.map_or_else(
+          || "Note&Pad".to_string(),
+          |key| i18n::tr(locale, key).to_string(),
+        ),
+        label: label_text(row.label, locale),
+        keys: if accelerator.is_empty() {
+          Vec::new()
+        } else {
+          vec![accelerator.clone()]
+        },
+        accelerator,
+        default: default_accel(row, platform)
+          .map(|a| a.canonical(platform))
+          .unwrap_or_default(),
+        customizable: row.customizable,
+        scopes: row.scopes.iter().map(|scope| scope.name()).collect(),
+        alias_ids: Vec::new(),
+        other: false,
+        heading: "",
+      }
     })
-    .collect()
+    .collect();
+  let reserved = reserved_ids_on(platform);
+  for row in OTHER_ROWS {
+    let keys = if platform == Platform::MacOS {
+      row.mac
+    } else {
+      row.other
+    };
+    let Some(keys) = keys else {
+      continue;
+    };
+    out.push(ShortcutRow {
+      id: row.id,
+      section: i18n::tr(locale, row.heading.key()).to_string(),
+      label: label_text(row.label, locale),
+      accelerator: String::new(),
+      default: String::new(),
+      customizable: false,
+      scopes: Vec::new(),
+      keys: keys.iter().map(|k| k.to_string()).collect(),
+      alias_ids: row
+        .aliases
+        .iter()
+        .copied()
+        .filter(|id| reserved.contains(id))
+        .collect(),
+      other: true,
+      heading: row.heading.id(),
+    });
+  }
+  out
 }
 
 #[tauri::command]
@@ -1398,13 +1856,17 @@ pub fn get_shortcuts(app: AppHandle) -> Vec<ShortcutRow> {
   let locale = i18n::current_locale(&settings.language);
   shortcut_rows(&resolve_current(&settings), locale, Platform::current())
 }
+/// The stable code the frontend maps to "another app may be using it".
+fn global_register_error(detail: impl std::fmt::Display) -> String {
+  format!("global-register:{detail}")
+}
 /// Register `accel` as the global new-sticky key.
 fn register_global(app: &AppHandle, accel: &Accel) -> Result<(), String> {
   let shortcut = crate::shortcut::parse_accelerator(&accel.to_tauri())?;
   app
     .global_shortcut()
     .register(shortcut)
-    .map_err(|e| e.to_string())
+    .map_err(global_register_error)
 }
 
 fn unregister_global(app: &AppHandle, accel: &Accel) {
@@ -2584,6 +3046,46 @@ mod tests {
   }
 
   #[test]
+  fn numpad_keys_are_refused_for_every_row_but_the_global_key() {
+    for platform in [OTHER, MAC] {
+      let r = defaults(platform);
+      for row in ["editor.fold", "menu.workspace", "window.next-tab"] {
+        assert_eq!(
+          plan_set(&r, row, Some("Ctrl+Numpad1"), platform),
+          Err(SetError::NumpadKey),
+          "{row}"
+        );
+      }
+      let global = plan_set(&r, GLOBAL_STICKY_ID, Some("Ctrl+Alt+Numpad1"), platform).unwrap();
+      assert_eq!(global.new_note_shortcut, "Ctrl+Alt+Numpad1");
+    }
+    assert_eq!(SetError::NumpadKey.code(), "unsupported-key");
+  }
+
+  #[test]
+  fn stored_numpad_overrides_are_repaired_but_the_global_numpad_key_is_kept() {
+    for platform in [OTHER, MAC] {
+      let r = resolve(
+        "Ctrl+Alt+Numpad1",
+        &map(&[
+          ("editor.fold", "Ctrl+Numpad1"),
+          ("menu.workspace", "Ctrl+Numpad1"),
+        ]),
+        platform,
+      );
+      assert!(r.overrides.is_empty());
+      assert_eq!(
+        r.repaired,
+        vec![
+          "shortcut_overrides.menu.workspace",
+          "shortcut_overrides.editor.fold"
+        ]
+      );
+      assert_eq!(r.new_note_shortcut, "Ctrl+Alt+Numpad1");
+    }
+  }
+
+  #[test]
   fn unreachable_stored_overrides_are_repaired_off_mac() {
     let r = resolve(
       "",
@@ -2752,12 +3254,16 @@ mod tests {
   fn the_list_carries_effective_and_default_keys() {
     let r = resolve("", &map(&[("editor.fold", "Ctrl+Alt+K")]), OTHER);
     let rows = shortcut_rows(&r, i18n::Locale::En, OTHER);
-    assert_eq!(rows.len(), ROWS.len());
+    assert_eq!(rows.iter().filter(|row| !row.other).count(), ROWS.len());
     let fold = rows.iter().find(|row| row.id == "editor.fold").unwrap();
     assert_eq!(fold.accelerator, "Ctrl+Alt+K");
     assert_eq!(fold.default, "Ctrl+Shift+[");
     assert!(fold.customizable);
     assert_eq!(fold.label, "Fold");
+    assert_eq!(fold.scopes, vec!["editor"]);
+    assert_eq!(fold.keys, vec!["Ctrl+Alt+K"]);
+    let global = rows.iter().find(|row| row.id == GLOBAL_STICKY_ID).unwrap();
+    assert_eq!(global.scopes, vec!["global"]);
     let save = rows.iter().find(|row| row.id == "menu.save").unwrap();
     assert_eq!(save.section, "File");
     assert!(!save.customizable);
@@ -2779,10 +3285,11 @@ mod tests {
     let r = defaults(OTHER);
     for locale in locales {
       let rows = shortcut_rows(&r, locale, OTHER);
-      let mut seen: HashMap<(String, String), &str> = HashMap::new();
+      let mut seen: HashMap<(bool, String, String), &str> = HashMap::new();
       for row in &rows {
         assert!(!row.label.is_empty(), "{locale:?} {}", row.id);
-        if let Some(other) = seen.insert((row.section.clone(), row.label.clone()), row.id) {
+        let slot = (row.other, row.section.clone(), row.label.clone());
+        if let Some(other) = seen.insert(slot, row.id) {
           panic!(
             "{locale:?}: {} and {other} share the name {:?} in section {:?}",
             row.id, row.label, row.section
@@ -2812,6 +3319,216 @@ mod tests {
         attribute.ends_with("#[tauri::command]"),
         "{name} must be a plain #[tauri::command], not (async)"
       );
+    }
+  }
+  // ---- "Other fixed keys" ------------------------------------------------
+  /// The confirmed "Other fixed keys" list, typed out independently of
+  /// `OTHER_ROWS`: (id, macOS keys, Windows/Linux keys), keys separated by a
+  /// space. `-` means the row does not exist on that platform; empty means it
+  /// has no key of its own.
+  const EXPECTED_OTHER: &[(&str, &str, &str)] = &[
+    ("other.cursor-left", "ArrowLeft", "ArrowLeft"),
+    ("other.cursor-right", "ArrowRight", "ArrowRight"),
+    ("other.cursor-up", "ArrowUp", "ArrowUp"),
+    ("other.cursor-down", "ArrowDown", "ArrowDown"),
+    ("other.word-left", "Alt+ArrowLeft", "Ctrl+ArrowLeft"),
+    ("other.word-right", "Alt+ArrowRight", "Ctrl+ArrowRight"),
+    ("other.syntax-left", "Ctrl+ArrowLeft", "Alt+ArrowLeft"),
+    ("other.syntax-right", "Ctrl+ArrowRight", "Alt+ArrowRight"),
+    ("other.line-start", "Home Cmd+ArrowLeft", "Home"),
+    ("other.line-end", "End Cmd+ArrowRight", "End"),
+    ("other.page-up", "PageUp Ctrl+ArrowUp", "PageUp"),
+    ("other.page-down", "PageDown Ctrl+ArrowDown", "PageDown"),
+    ("other.doc-start", "Cmd+ArrowUp Cmd+Home", "Ctrl+Home"),
+    ("other.doc-end", "Cmd+ArrowDown Cmd+End", "Ctrl+End"),
+    ("other.add-shift", "", ""),
+    ("other.new-line", "Enter", "Enter"),
+    ("other.delete-left", "Backspace", "Backspace"),
+    ("other.delete-right", "Delete", "Delete"),
+    ("other.delete-word-left", "Alt+Backspace", "Ctrl+Backspace"),
+    ("other.delete-word-right", "Alt+Delete", "Ctrl+Delete"),
+    ("other.delete-to-start", "Cmd+Backspace", "-"),
+    ("other.delete-to-end", "Cmd+Delete", "-"),
+    ("other.find-next", "F3", "F3"),
+    ("other.redo-large", "-", "Ctrl+Shift+Z"),
+    ("emacs.cursor-left", "Ctrl+B", "-"),
+    ("emacs.cursor-right", "Ctrl+F", "-"),
+    ("emacs.cursor-up", "Ctrl+P", "-"),
+    ("emacs.cursor-down", "Ctrl+N", "-"),
+    ("emacs.line-start", "Ctrl+A", "-"),
+    ("emacs.line-end", "Ctrl+E", "-"),
+    ("emacs.delete-right", "Ctrl+D", "-"),
+    ("emacs.delete-left", "Ctrl+H", "-"),
+    ("emacs.delete-to-end", "Ctrl+K", "-"),
+    ("emacs.delete-word-left", "Ctrl+Alt+H", "-"),
+    ("emacs.split-line", "Ctrl+O", "-"),
+    ("emacs.transpose", "Ctrl+T", "-"),
+    ("emacs.page-down", "Ctrl+V", "-"),
+  ];
+
+  #[test]
+  fn the_other_rows_are_the_confirmed_list_on_each_platform() {
+    for (platform, index) in [(MAC, 1), (OTHER, 2)] {
+      let rows = shortcut_rows(&defaults(platform), i18n::Locale::En, platform);
+      let got: Vec<(&str, String)> = rows
+        .iter()
+        .filter(|row| row.other)
+        .map(|row| (row.id, row.keys.join(" ")))
+        .collect();
+      let want: Vec<(&str, String)> = EXPECTED_OTHER
+        .iter()
+        .filter_map(|entry| {
+          let keys = if index == 1 { entry.1 } else { entry.2 };
+          (keys != "-").then(|| (entry.0, keys.to_string()))
+        })
+        .collect();
+      assert_eq!(got, want, "{platform:?}");
+      // Read-only: no effective key of their own, never customizable.
+      assert!(rows
+        .iter()
+        .filter(|row| row.other)
+        .all(|row| !row.customizable && row.accelerator.is_empty()));
+    }
+  }
+
+  #[test]
+  fn the_other_rows_follow_the_confirmed_headings_and_names() {
+    let rows = shortcut_rows(&defaults(MAC), i18n::Locale::En, MAC);
+    let name = |id: &str| {
+      let row = rows.iter().find(|row| row.id == id).unwrap();
+      (row.section.clone(), row.label.clone(), row.heading)
+    };
+    assert_eq!(
+      name("other.doc-start"),
+      (
+        "Cursor Movement".to_string(),
+        "Cursor Document Start".to_string(),
+        "cursor"
+      )
+    );
+    assert_eq!(name("emacs.transpose").0, "Emacs-style Keys");
+    let zh = shortcut_rows(&defaults(MAC), i18n::Locale::ZhTw, MAC);
+    let row = zh.iter().find(|row| row.id == "emacs.transpose").unwrap();
+    assert_eq!(row.label, "調換字母");
+    assert_eq!(row.section, "Emacs 式按鍵");
+    let ja = shortcut_rows(&defaults(MAC), i18n::Locale::Ja, MAC);
+    let row = ja.iter().find(|row| row.id == "other.add-shift").unwrap();
+    assert_eq!(row.label, "⇧ を加えると選択");
+  }
+
+  #[test]
+  fn every_row_and_heading_has_a_name_in_all_fifteen_locales() {
+    use i18n::Locale::*;
+    let locales = [
+      ZhTw, ZhCn, Ja, En, Ru, Es, PtBr, De, Fr, Ko, Pl, Tr, It, Th, Vi,
+    ];
+    for locale in locales {
+      for platform in [MAC, OTHER] {
+        for row in shortcut_rows(&defaults(platform), locale, platform) {
+          assert!(!row.label.trim().is_empty(), "{locale:?} {} label", row.id);
+          assert!(
+            !row.section.trim().is_empty(),
+            "{locale:?} {} section",
+            row.id
+          );
+        }
+      }
+    }
+  }
+
+  #[test]
+  fn every_conflict_capable_id_resolves_to_exactly_one_row() {
+    for platform in [MAC, OTHER] {
+      let rows = shortcut_rows(&defaults(platform), i18n::Locale::En, platform);
+      let mut ids: Vec<&str> = ROWS.iter().map(|row| row.id).collect();
+      ids.extend(reserved_accels(platform).iter().map(|(id, _)| *id));
+      ids.sort_unstable();
+      ids.dedup();
+      for id in ids {
+        let owners: Vec<&ShortcutRow> = rows
+          .iter()
+          .filter(|row| row.id == id || row.alias_ids.contains(&id))
+          .collect();
+        assert_eq!(
+          owners.len(),
+          1,
+          "{platform:?}: {id} has {} rows",
+          owners.len()
+        );
+        assert!(!owners[0].label.is_empty(), "{platform:?}: {id}");
+      }
+    }
+  }
+
+  #[test]
+  fn merged_rows_carry_every_reserved_id_they_show() {
+    let rows = shortcut_rows(&defaults(MAC), i18n::Locale::En, MAC);
+    let owner = |id: &str| {
+      rows
+        .iter()
+        .find(|row| row.id == id || row.alias_ids.contains(&id))
+        .map(|row| row.id)
+    };
+    assert_eq!(owner("fixed.doc-start-home"), Some("other.doc-start"));
+    assert_eq!(owner("fixed.doc-start-arrow"), Some("other.doc-start"));
+    assert_eq!(owner("fixed.line-boundary-left"), Some("other.line-start"));
+    assert_eq!(owner("fixed.page-up-arrow"), Some("other.page-up"));
+    assert_eq!(
+      owner("fixed.emacs-delete-group"),
+      Some("emacs.delete-word-left")
+    );
+    let merged = rows.iter().find(|row| row.id == "other.doc-start").unwrap();
+    assert_eq!(
+      merged.alias_ids,
+      vec!["fixed.doc-start-arrow", "fixed.doc-start-home"]
+    );
+    // A platform without the key does not list its id.
+    let other = shortcut_rows(&defaults(OTHER), i18n::Locale::En, OTHER);
+    let merged = other
+      .iter()
+      .find(|row| row.id == "other.doc-start")
+      .unwrap();
+    assert_eq!(merged.alias_ids, vec!["fixed.doc-start-home"]);
+  }
+
+  #[test]
+  fn a_refused_global_registration_carries_its_stable_code() {
+    assert_eq!(
+      global_register_error("already registered"),
+      "global-register:already registered"
+    );
+    // `register_global` must route the plugin's error through it.
+    let at = include_str!("shortcuts.rs")
+      .find("fn register_global")
+      .unwrap();
+    let body = &include_str!("shortcuts.rs")[at..at + 400];
+    assert!(body.contains(".map_err(global_register_error)"));
+  }
+
+  #[test]
+  fn the_shortcuts_overview_window_is_gone() {
+    let removed = [
+      ["show", "_shortcuts"].concat(),
+      ["help-keyboard", "-shortcuts"].concat(),
+      ["mode=", "shortcuts"].concat(),
+      ["Keyboard", "Shortcuts"].concat(),
+      ["\"short", "cuts\""].concat(),
+    ];
+    for (file, source) in [
+      ("lib.rs", include_str!("lib.rs")),
+      ("windows.rs", include_str!("windows.rs")),
+      ("i18n.rs", include_str!("i18n.rs")),
+      (
+        "capabilities/default.json",
+        include_str!("../capabilities/default.json"),
+      ),
+    ] {
+      for needle in &removed {
+        assert!(
+          !source.contains(needle.as_str()),
+          "{file} still has {needle}"
+        );
+      }
     }
   }
   // ---- keyboard layout lookup -------------------------------------------

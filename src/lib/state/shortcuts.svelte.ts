@@ -13,6 +13,17 @@ export interface ShortcutRow {
   /** The default key; empty when the row has none. */
   default: string;
   customizable: boolean;
+  /** Where the key is handled: global, menu, window and/or editor. Empty for
+   *  an "other" row. */
+  scopes: string[];
+  /** The keys to show, canonical text, in order. */
+  keys: string[];
+  /** Other conflict-capable ids whose key this row shows. */
+  alias_ids: string[];
+  /** A read-only row of the "Other fixed keys" group. */
+  other: boolean;
+  /** Group id of an "other" row, empty for a registry row. */
+  heading: string;
 }
 /** The effective shortcuts, mirrored from the Rust registry. The core owns the
  *  data; this only caches it and keeps it current across `settings-changed`. */

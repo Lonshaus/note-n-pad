@@ -1026,34 +1026,8 @@ pub fn show_about_window(app: AppHandle) -> Result<(), String> {
   show_about(&app)
 }
 
-/// Open (or focus) the singleton Keyboard Shortcuts window: system chrome,
-/// resizable so a long shortcut list can be scrolled or the window grown.
-pub fn show_shortcuts(app: &AppHandle) -> Result<(), String> {
-  if let Some(win) = app.get_webview_window("shortcuts") {
-    reveal(&win);
-    return Ok(());
-  }
-  let locale = crate::i18n::current_locale(&crate::settings::app_settings(app).language);
-  let url = WebviewUrl::App("index.html?mode=shortcuts".into());
-  let window = WebviewWindowBuilder::new(app, "shortcuts", url)
-    .title(crate::i18n::tr(locale, crate::i18n::Key::KeyboardShortcuts))
-    .visible(false)
-    .background_color(chrome_background(app))
-    .inner_size(420.0, 560.0)
-    .build()
-    .map_err(|e| e.to_string())?;
-  detach_menu_unless_document(&window);
-  show_after_grace(window);
-  Ok(())
-}
-
-#[tauri::command(async)]
-pub fn show_shortcuts_window(app: AppHandle) -> Result<(), String> {
-  show_shortcuts(&app)
-}
-
 /// Open (or focus) the singleton Acknowledgements window: system chrome,
-/// resizable and wider than the shortcuts window since licence text runs long.
+/// resizable and wide since licence text runs long.
 pub fn show_acknowledgements(app: &AppHandle) -> Result<(), String> {
   if let Some(win) = app.get_webview_window("acknowledgements") {
     reveal(&win);
@@ -1109,12 +1083,11 @@ pub fn show_privacy_window(app: AppHandle) -> Result<(), String> {
 /// from. Doc windows (title is the file name) and stickies (no title bar) are
 /// intentionally not part of this table. Extracted from `retitle_fixed_windows`
 /// so the label-to-key mapping is unit-testable without an `AppHandle`.
-fn fixed_window_titles() -> [(&'static str, crate::i18n::Key); 6] {
+fn fixed_window_titles() -> [(&'static str, crate::i18n::Key); 5] {
   [
     ("workspace", crate::i18n::Key::Workspace),
     ("settings", crate::i18n::Key::SettingsTitle),
     ("about", crate::i18n::Key::About),
-    ("shortcuts", crate::i18n::Key::KeyboardShortcuts),
     ("acknowledgements", crate::i18n::Key::Acknowledgements),
     ("privacy", crate::i18n::Key::PrivacyPolicy),
   ]
@@ -1530,7 +1503,6 @@ mod window_command_threading_tests {
     "show_workspace_window",
     "show_settings_window",
     "show_about_window",
-    "show_shortcuts_window",
     "show_acknowledgements_window",
     "show_privacy_window",
     "focus_note_window",

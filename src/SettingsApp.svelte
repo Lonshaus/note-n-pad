@@ -19,7 +19,21 @@
   import { getColor, setColor } from './lib/theme/themeColor';
   import { open, save, ask } from '@tauri-apps/plugin-dialog';
   import { debounce } from './lib/util/debounce';
-  import { recordAccelerator, formatAccelerator } from './lib/util/accelerator';
+  import { recordAccelerator, formatKeyDisplay } from './lib/util/accelerator';
+  import {
+    shortcutsState,
+    type ShortcutRow,
+  } from './lib/state/shortcuts.svelte';
+  import {
+    groupShortcutRows,
+    recorderScope,
+    shownOtherGroups,
+  } from './lib/util/shortcutRows';
+  import {
+    rejectionMessage,
+    setErrorMessage,
+    type ShortcutMessage,
+  } from './lib/util/shortcutMessages';
   import {
     FONT_CANDIDATES,
     availableFonts,
@@ -33,7 +47,7 @@
   import { localeRegistry } from './lib/i18n/localeRegistry.svelte';
   import LocaleEditor from './lib/i18n/LocaleEditor.svelte';
 
-  type Section = 'sticky' | 'editor' | 'general' | 'language';
+  type Section = 'sticky' | 'editor' | 'shortcuts' | 'general' | 'language';
   // The editor section has two sub-tabs: its own settings, and the theme editor
   // (a theme only colors the editor, so it belongs here, not a top-level tab).
   type EditorTab = 'general' | 'theme';
@@ -49,6 +63,7 @@
     { id: 'general', key: 'settings.section.general' },
     { id: 'sticky', key: 'settings.section.sticky' },
     { id: 'editor', key: 'settings.section.editor' },
+    { id: 'shortcuts', key: 'settings.section.shortcuts' },
     { id: 'language', key: 'settings.section.language' },
   ];
 
@@ -67,11 +82,12 @@
 
   let section = $state<Section>('general');
   let editorTab = $state<EditorTab>('general');
-
-  // Shortcut recorder state.
-  let recording = $state(false);
-  let shortcutError = $state('');
-  let recorderEl = $state<HTMLButtonElement | undefined>(undefined);
+  // Shortcut recorder state: the row being recorded, the last message and the
+  // row it belongs to, and whether the read-only key list is open.
+  let recordingId = $state<string | null>(null);
+  let notice = $state<{ id: string; message: ShortcutMessage } | null>(null);
+  let otherExpanded = $state(false);
+  const shortcutGroups = $derived(groupShortcutRows(shortcutsState.rows));
 
   let snapshotDirError = $state('');
 
@@ -188,49 +204,75 @@
     await switchSnapshotDir(null);
   }
 
-  function onRecorderKeydown(e: KeyboardEvent): void {
+  function onRecorderKeydown(e: KeyboardEvent, row: ShortcutRow): void {
     e.preventDefault();
+    const button = e.currentTarget as HTMLButtonElement;
     // Esc (with no modifiers) cancels recording and restores the display.
     if (e.key === 'Escape' && !e.metaKey && !e.ctrlKey && !e.altKey) {
-      recorderEl?.blur();
+      button.blur();
       return;
     }
-    void recordShortcut(e);
+    void recordShortcut(e, row, button);
   }
   /** The letter the keyboard layout types on a physical key (macOS). */
   async function layoutChar(code: string): Promise<string | null> {
     return await invoke<string | null>('layout_char_for_code', { code });
   }
 
-  async function recordShortcut(e: KeyboardEvent): Promise<void> {
-    // The global shortcut registers by physical key, so it is recorded that way.
+  async function recordShortcut(
+    e: KeyboardEvent,
+    row: ShortcutRow,
+    button: HTMLButtonElement,
+  ): Promise<void> {
     const result = await recordAccelerator(e, {
       os: platform.os,
-      scope: 'global',
+      scope: recorderScope(row.scopes),
       layoutChar,
     });
     // Ended (blur) while the lookup ran: the keystroke no longer belongs here.
-    if (!recording) {
+    if (recordingId !== row.id) {
       return;
     }
-    // A bare modifier press, or a combo the shortcut rules refuse, is ignored;
-    // keep waiting for a usable one.
-    if (result.status !== 'ok') {
+    // A bare modifier press: keep waiting for the rest of the combo.
+    if (result.status === 'ignore') {
       return;
     }
-    await applyShortcut(result.accel);
+    if (result.status === 'rejected') {
+      notice = {
+        id: row.id,
+        message: rejectionMessage(result.reason, platform.isMacOS),
+      };
+      return;
+    }
+    await changeShortcut(row.id, 'set_shortcut', {
+      id: row.id,
+      accel: result.accel,
+    });
+    button.blur();
+  }
+  /** Run a shortcut command; a refusal is shown under the row `id` and the old
+   *  key stays in effect. */
+  async function changeShortcut(
+    id: string,
+    command: 'set_shortcut' | 'reset_shortcut' | 'reset_all_shortcuts',
+    args: Record<string, unknown>,
+  ): Promise<void> {
+    try {
+      await invoke<void>(command, args);
+      notice = null;
+    } catch (err) {
+      notice = {
+        id,
+        message: setErrorMessage(err, platform.isMacOS, shortcutsState.rows),
+      };
+    }
+    await shortcutsState.load();
   }
 
-  async function applyShortcut(accel: string): Promise<void> {
-    try {
-      await settingsState.setNewNoteShortcut(accel);
-      shortcutError = '';
-    } catch (err) {
-      // Registration failed (invalid/conflicting): show it and keep the old one.
-      shortcutError = String(err);
-    }
-    recording = false;
-    recorderEl?.blur();
+  function keysText(row: ShortcutRow): string {
+    return row.keys
+      .map((k) => formatKeyDisplay(k, platform.isMacOS))
+      .join(', ');
   }
 
   function commitFontSize(raw: string): void {
@@ -319,8 +361,10 @@
         fontFamilies.push(...filtered.map((value) => ({ value })));
       });
     // Reveal the window only after the theme is loaded and applied, so a
-    // dark-theme window never flashes its default white background.
-    void revealWhenThemed();
+    // dark-theme window never flashes its default white background. The
+    // unset-default notice counts as shown only once the reveal succeeded: a
+    // failed reveal leaves it unseen, so it is reported again next launch.
+    void revealWhenThemed().then(() => settingsState.ackUnsetDefaults());
     // DEV-only automation hook; dynamic import keeps it out of production.
     if (import.meta.env.DEV) {
       void import('./lib/dev/auto').then((m) =>
@@ -883,41 +927,6 @@
       {/if}
     {:else if section === 'sticky'}
       <div class="field">
-        <span class="field-label">{t('settings.sticky.newNoteShortcut')}</span>
-        <button
-          class="recorder"
-          class:recording
-          bind:this={recorderEl}
-          onfocus={() => {
-            recording = true;
-            shortcutError = '';
-          }}
-          onblur={() => (recording = false)}
-          onclick={() => {
-            recorderEl?.focus();
-            recording = true;
-            shortcutError = '';
-          }}
-          onkeydown={onRecorderKeydown}
-        >
-          {recording
-            ? t('settings.sticky.recording')
-            : formatAccelerator(
-                settingsState.newNoteShortcut,
-                platform.isMacOS,
-              )}
-        </button>
-        {#if recording}
-          <span class="hint">{t('settings.sticky.recordCancelHint')}</span>
-        {:else}
-          <span class="hint">{t('settings.sticky.recordHint')}</span>
-        {/if}
-        {#if shortcutError !== ''}
-          <span class="error">{t('settings.sticky.shortcutError')}</span>
-        {/if}
-      </div>
-
-      <div class="field">
         <span class="field-label">{t('settings.sticky.defaultSize')}</span>
         <div class="size-row">
           <span class="size-value"
@@ -929,6 +938,105 @@
           </button>
         </div>
       </div>
+    {:else if section === 'shortcuts'}
+      <p class="hint">{t('settings.sticky.recordHint')}</p>
+      <div class="shortcut-actions">
+        <button
+          class="btn"
+          onclick={() => changeShortcut('', 'reset_all_shortcuts', {})}
+        >
+          {t('settings.shortcuts.resetAll')}
+        </button>
+      </div>
+      {#if notice !== null && notice.id === ''}
+        <span class="error">{t(notice.message.key, notice.message.params)}</span
+        >
+      {/if}
+      {#each shortcutGroups.sections as group (group.section)}
+        <section class="shortcut-group">
+          <h2 class="group-title">{group.section}</h2>
+          {#each group.rows as row (row.id)}
+            <div class="shortcut-row">
+              <span class="shortcut-name">{row.label}</span>
+              {#if row.customizable}
+                <button
+                  class="recorder"
+                  class:recording={recordingId === row.id}
+                  onfocus={() => {
+                    recordingId = row.id;
+                    notice = null;
+                  }}
+                  onblur={() => {
+                    if (recordingId === row.id) {
+                      recordingId = null;
+                    }
+                  }}
+                  onclick={(e) => e.currentTarget.focus()}
+                  onkeydown={(e) => onRecorderKeydown(e, row)}
+                >
+                  {#if recordingId === row.id}
+                    {t('settings.sticky.recording')}
+                  {:else if row.accelerator === ''}
+                    {t('settings.shortcuts.notSet')}
+                  {:else}
+                    {formatKeyDisplay(row.accelerator, platform.isMacOS)}
+                  {/if}
+                </button>
+                <button
+                  class="btn"
+                  disabled={row.accelerator === ''}
+                  onclick={() =>
+                    changeShortcut(row.id, 'set_shortcut', {
+                      id: row.id,
+                      accel: null,
+                    })}
+                >
+                  {t('settings.shortcuts.clear')}
+                </button>
+                <button
+                  class="btn"
+                  disabled={row.accelerator === row.default}
+                  onclick={() =>
+                    changeShortcut(row.id, 'reset_shortcut', { id: row.id })}
+                >
+                  {t('settings.shortcuts.reset')}
+                </button>
+              {:else}
+                <span class="shortcut-keys">{keysText(row)}</span>
+                <span class="badge">{t('settings.shortcuts.system')}</span>
+              {/if}
+            </div>
+            {#if notice !== null && notice.id === row.id}
+              <span class="error"
+                >{t(notice.message.key, notice.message.params)}</span
+              >
+            {:else if recordingId === row.id}
+              <span class="hint">{t('settings.sticky.recordCancelHint')}</span>
+            {/if}
+          {/each}
+        </section>
+      {/each}
+      <section class="shortcut-group">
+        <button
+          class="group-toggle"
+          aria-expanded={otherExpanded}
+          onclick={() => (otherExpanded = !otherExpanded)}
+        >
+          <span class="chevron" aria-hidden="true"
+            >{otherExpanded ? '▾' : '▸'}</span
+          >
+          {t('settings.shortcuts.otherGroup')}
+        </button>
+        {#each shownOtherGroups(shortcutGroups.otherGroups, otherExpanded) as group (group.heading)}
+          <h2 class="group-title">{group.section}</h2>
+          {#each group.rows as row (row.id)}
+            <div class="shortcut-row">
+              <span class="shortcut-name">{row.label}</span>
+              <span class="shortcut-keys">{keysText(row)}</span>
+            </div>
+          {/each}
+        {/each}
+      </section>
     {:else if section === 'editor' && editorTab === 'general'}
       <label class="toggle">
         <input
@@ -1468,6 +1576,65 @@
   }
   .size-value {
     font-variant-numeric: tabular-nums;
+  }
+  .shortcut-actions {
+    display: flex;
+    gap: 0.5rem;
+  }
+  .shortcut-group {
+    display: flex;
+    flex-direction: column;
+    gap: 0.35rem;
+  }
+  .group-title {
+    margin: 0.4rem 0 0.1rem;
+    font-size: 0.78rem;
+    font-weight: 600;
+    opacity: 0.6;
+  }
+  .shortcut-row {
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+  }
+  .shortcut-name {
+    flex: 1 1 auto;
+    min-width: 0;
+  }
+  .shortcut-row .recorder {
+    flex: 0 0 auto;
+    min-width: 9rem;
+    padding: 0.3rem 0.5rem;
+  }
+  .shortcut-keys {
+    font-family: ui-monospace, monospace;
+    opacity: 0.7;
+    white-space: nowrap;
+  }
+  .badge {
+    padding: 0.05rem 0.45rem;
+    border: 1px solid var(--topbar-border);
+    border-radius: 999px;
+    font-size: 0.72rem;
+    opacity: 0.6;
+    white-space: nowrap;
+  }
+  .group-toggle {
+    align-self: flex-start;
+    display: inline-flex;
+    align-items: center;
+    gap: 0.35rem;
+    padding: 0.2rem 0;
+    border: none;
+    background: none;
+    color: inherit;
+    font: inherit;
+    font-weight: 600;
+    cursor: default;
+  }
+  .chevron {
+    display: inline-block;
+    width: 0.8rem;
   }
   .btn {
     padding: 0.35rem 0.8rem;

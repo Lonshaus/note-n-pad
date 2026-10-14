@@ -39,6 +39,11 @@ pub struct AppSettings {
   /// cleared the key. Only changed rows are stored; see `shortcuts::resolve`.
   #[serde(default)]
   pub shortcut_overrides: BTreeMap<String, String>,
+  /// Rows whose default key was already reported as taken, so the Settings
+  /// window does not repeat the notice on every launch. See
+  /// `ack_unset_defaults`.
+  #[serde(default)]
+  pub shortcut_unset_notified: Vec<String>,
   /// Absolute path to the folder the user picked to hold the app's `Note&Pad`
   /// snapshots folder, or `None` for the default (the app data dir). See
   /// `note_store::resolve_snapshot_dir` for how this resolves to the actual
@@ -245,6 +250,7 @@ impl Default for AppSettings {
       language: default_language(),
       new_note_shortcut: default_new_note_shortcut(),
       shortcut_overrides: BTreeMap::new(),
+      shortcut_unset_notified: Vec::new(),
       snapshot_dir: default_snapshot_dir(),
       snapshot_dir_bookmark: None,
       default_sticky_width: default_sticky_width(),
@@ -362,6 +368,7 @@ fn repair(settings: &mut AppSettings) -> Vec<String> {
     keys
       .unset_defaults
       .into_iter()
+      .filter(|id| !settings.shortcut_unset_notified.contains(id))
       .map(|id| format!("shortcut_defaults.{id}")),
   );
   if !(180.0..=4000.0).contains(&settings.default_sticky_width) {
@@ -573,6 +580,12 @@ fn tolerant_settings(
       &mut dropped,
     ),
     shortcut_overrides: field_or_default(obj, "shortcut_overrides", BTreeMap::new, &mut dropped),
+    shortcut_unset_notified: field_or_default(
+      obj,
+      "shortcut_unset_notified",
+      Vec::new,
+      &mut dropped,
+    ),
     snapshot_dir: field_or_default(obj, "snapshot_dir", default_snapshot_dir, &mut dropped),
     snapshot_dir_bookmark: field_or_default(obj, "snapshot_dir_bookmark", || None, &mut dropped),
     default_sticky_width: field_or_default(
@@ -750,6 +763,9 @@ pub fn app_settings(app: &AppHandle) -> AppSettings {
 pub struct LoadedSettings {
   pub settings: AppSettings,
   pub repaired_fields: Vec<String>,
+  /// Rows whose default key is taken and not yet acknowledged; the Settings
+  /// window passes them to `ack_unset_defaults` once it has shown the notice.
+  pub unset_defaults_to_notify: Vec<String>,
   /// The chosen snapshot folder could not be used on this launch and the
   /// default one is in use instead. The setting itself is left alone, so the
   /// chosen folder is used again as soon as it works.
@@ -759,9 +775,15 @@ pub struct LoadedSettings {
 #[tauri::command]
 pub fn load_settings(app: AppHandle) -> Result<LoadedSettings, String> {
   let (settings, repaired_fields) = load_from_with_report(&settings_path(&app)?)?;
+  let unset_defaults_to_notify = repaired_fields
+    .iter()
+    .filter_map(|field| field.strip_prefix("shortcut_defaults."))
+    .map(str::to_string)
+    .collect();
   Ok(LoadedSettings {
     settings,
     repaired_fields,
+    unset_defaults_to_notify,
     snapshot_dir_unavailable: app
       .try_state::<crate::note_store::SnapshotFallback>()
       .is_some_and(|state| state.in_use()),
@@ -786,6 +808,33 @@ pub fn language_changed(old: &str, new: &str) -> bool {
 /// merging both. The lock turns that back into the one-at-a-time sequence the
 /// merge logic already assumes.
 static SETTINGS_WRITE_LOCK: Mutex<()> = Mutex::new(());
+/// Record that the notice for these unset default keys was shown. Keeps only
+/// ids that are still unset, so a row that loses its key again is reported
+/// again. Writes only when the stored list changes.
+fn ack_unset_defaults_at(path: &Path, ids: &[String]) -> Result<(), String> {
+  let _guard = SETTINGS_WRITE_LOCK.lock().unwrap();
+  let mut settings = load_or_default_for_write(path)?;
+  let still_unset = crate::shortcuts::resolve_current(&settings).unset_defaults;
+  let mut next: Vec<String> = settings
+    .shortcut_unset_notified
+    .iter()
+    .chain(ids)
+    .filter(|id| still_unset.contains(id))
+    .cloned()
+    .collect();
+  next.sort();
+  next.dedup();
+  if next == settings.shortcut_unset_notified {
+    return Ok(());
+  }
+  settings.shortcut_unset_notified = next;
+  save_to(path, &settings)
+}
+
+#[tauri::command(async)]
+pub fn ack_unset_defaults(app: AppHandle, ids: Vec<String>) -> Result<(), String> {
+  ack_unset_defaults_at(&settings_path(&app)?, &ids)
+}
 
 /// Off the UI thread: `settings_path` reads the app-data dir and the
 /// load/merge/write below round-trips the whole settings file. The write
@@ -1013,6 +1062,65 @@ mod tests {
       load_report(r#"{"shortcut_overrides": {"editor.fold": "CmdOrCtrl+Alt+G"}}"#);
     assert_eq!(repaired, vec!["shortcut_defaults.goto-line".to_string()]);
   }
+  /// Write a settings file whose global key is the default of `goto-line`.
+  fn write_with_global_key(path: &Path, key: &str) {
+    let text = serde_json::json!({ "new_note_shortcut": key }).to_string();
+    std::fs::write(path, text).unwrap();
+  }
+
+  fn goto_line_default() -> String {
+    crate::shortcuts::default_canonical("goto-line", crate::shortcuts::Platform::current())
+  }
+
+  #[test]
+  fn an_unset_default_is_reported_until_it_is_acknowledged() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("settings.json");
+    write_with_global_key(&path, &goto_line_default());
+    let ids = vec!["goto-line".to_string()];
+    let reported = vec!["shortcut_defaults.goto-line".to_string()];
+    // Loading never writes, so it keeps reporting.
+    let before = std::fs::read_to_string(&path).unwrap();
+    assert_eq!(load_from_with_report(&path).unwrap().1, reported);
+    assert_eq!(load_from_with_report(&path).unwrap().1, reported);
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), before);
+    ack_unset_defaults_at(&path, &ids).unwrap();
+    let (settings, repaired) = load_from_with_report(&path).unwrap();
+    assert!(repaired.is_empty());
+    assert_eq!(settings.shortcut_unset_notified, ids);
+    // Clearing the global key frees the default; the ack drops the id.
+    write_with_global_key(&path, "");
+    let text = std::fs::read_to_string(&path).unwrap();
+    let mut value: serde_json::Value = serde_json::from_str(&text).unwrap();
+    value["shortcut_unset_notified"] = serde_json::json!(ids);
+    std::fs::write(&path, value.to_string()).unwrap();
+    ack_unset_defaults_at(&path, &[]).unwrap();
+    assert!(load_from(&path).unwrap().shortcut_unset_notified.is_empty());
+    // Taking the key again reports the row again.
+    write_with_global_key(&path, &goto_line_default());
+    assert_eq!(load_from_with_report(&path).unwrap().1, reported);
+  }
+
+  #[test]
+  fn acknowledging_leaves_the_file_alone_when_nothing_changes() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("settings.json");
+    write_with_global_key(&path, "");
+    let before = std::fs::read_to_string(&path).unwrap();
+    ack_unset_defaults_at(&path, &["goto-line".to_string()]).unwrap();
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), before);
+  }
+
+  #[test]
+  fn a_file_without_the_notified_list_loads_with_it_empty() {
+    let (settings, repaired) = load_report(r#"{"theme": "paper"}"#);
+    assert!(settings.shortcut_unset_notified.is_empty());
+    assert!(repaired.is_empty());
+    let (settings, repaired) = load_report(r#"{"theme": "paper", "shortcut_unset_notified": "x"}"#);
+    assert_eq!(settings.theme, "paper");
+    assert!(settings.shortcut_unset_notified.is_empty());
+    assert_eq!(repaired, vec!["shortcut_unset_notified".to_string()]);
+  }
 
   #[test]
   fn a_wrongly_typed_override_map_costs_only_that_field() {
@@ -1146,6 +1254,7 @@ mod tests {
         "editor.fold".to_string(),
         canonical("CmdOrCtrl+Alt+K"),
       )]),
+      shortcut_unset_notified: Vec::new(),
       snapshot_dir: Some("/Volumes/Cloud/Note&Pad".into()),
       snapshot_dir_bookmark: Some("Ym9va21hcms=".into()),
       default_sticky_width: 491.0,
