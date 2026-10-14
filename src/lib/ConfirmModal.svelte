@@ -1,8 +1,55 @@
-<script lang="ts">
+<script module lang="ts">
   // Copyright © 2026 Lonshaus
   // SPDX-License-Identifier: GPL-3.0-only
+  // Every mounted modal of this window. They share one z-index, so the last in
+  // DOM order is the one drawn on top and the only one that may take the keys.
+  const mounted = new Set<HTMLElement>();
+  // What held focus before the first modal opened.
+  let restoreTo: Element | null = null;
 
+  function topmost(): HTMLElement | undefined {
+    let top: HTMLElement | undefined;
+    for (const el of mounted) {
+      if (
+        top === undefined ||
+        (top.compareDocumentPosition(el) & Node.DOCUMENT_POSITION_FOLLOWING) !==
+          0
+      ) {
+        top = el;
+      }
+    }
+    return top;
+  }
+  // The primary button when there is one, otherwise the Cancel/Close button.
+  function defaultButton(modal: HTMLElement): HTMLElement | null {
+    return (
+      modal.querySelector<HTMLElement>('.btn.primary') ??
+      modal.querySelector<HTMLElement>('[data-cancel]')
+    );
+  }
+  /** True while any dialog is mounted; outer Esc handlers yield to it. */
+  export function isModalOpen(): boolean {
+    return mounted.size > 0;
+  }
+  /** Put keyboard focus inside the topmost dialog. Returns false when no dialog
+   *  is mounted. Focus already inside it stays put (a button reached with Tab
+   *  keeps it); from anywhere else (BODY, the editor, a lower dialog) it goes
+   *  to the default button. */
+  export function focusTopmostModal(): boolean {
+    const top = topmost();
+    if (top === undefined) {
+      return false;
+    }
+    if (!top.contains(document.activeElement)) {
+      defaultButton(top)?.focus();
+    }
+    return true;
+  }
+</script>
+
+<script lang="ts">
   import { onMount } from 'svelte';
+  import { modalActsOnEscape } from './util/popupEscape';
 
   interface Props {
     message: string;
@@ -41,43 +88,104 @@
     oncancel,
   }: Props = $props();
 
-  let cancelButton: HTMLButtonElement;
+  let root: HTMLElement;
+  let busy = false;
 
   // Single choke point every onprimary/onsecondary/ontertiary click runs
   // through: awaits whatever the handler returns and catches a rejection that
   // would otherwise be unhandled. The handler itself remains responsible for
   // reporting the failure somewhere the user can see (e.g. a `*Failed` state
   // field) — this only guarantees the rejection is never silently lost.
+  // A second activation while the handler is still running is ignored.
   function fire(handler: (() => void | Promise<void>) | undefined): void {
-    if (handler === undefined) {
+    if (handler === undefined || busy) {
       return;
     }
+    busy = true;
     void (async (): Promise<void> => {
       try {
         await handler();
       } catch (e) {
         console.error(e);
+      } finally {
+        busy = false;
       }
     })();
   }
-
-  // A blocking dialog must own the keyboard: grab focus on mount (which blurs the
-  // editor behind it, so keystrokes can't leak into the document) and restore it
-  // to whatever held focus before when the dialog closes. Focusing the cancel
-  // button — the non-destructive default — also makes the dialog keyboard-operable.
+  // A blocking dialog must own the keyboard: the topmost one grabs focus on
+  // mount (which blurs the editor behind it, so keystrokes can't leak into the
+  // document) and focus returns to whatever held it before once the last one
+  // closes. Focus starts on the default button so Enter activates it.
   onMount(() => {
-    const previous = document.activeElement;
-    cancelButton.focus();
+    if (mounted.size === 0) {
+      restoreTo = document.activeElement;
+    }
+    mounted.add(root);
+    if (topmost() === root) {
+      defaultButton(root)?.focus();
+    }
     return () => {
-      if (previous instanceof HTMLElement) {
-        previous.focus();
+      mounted.delete(root);
+      const next = topmost();
+      if (next === undefined) {
+        if (restoreTo instanceof HTMLElement) {
+          restoreTo.focus();
+        }
+        restoreTo = null;
+      } else if (!next.contains(document.activeElement)) {
+        defaultButton(next)?.focus();
       }
     };
   });
+  // Esc cancels the topmost dialog, Enter and Space activate the focused
+  // button natively. A dialog underneath ignores all three, so a button
+  // reached there with Tab cannot be pressed from the keyboard.
+  function onkeydown(e: KeyboardEvent): void {
+    const isTop = topmost() === root;
+    if (e.key === 'Escape') {
+      if (!modalActsOnEscape(e)) {
+        return;
+      }
+      e.preventDefault();
+      e.stopPropagation();
+      if (isTop) {
+        oncancel();
+      }
+    } else if (e.key === 'Tab') {
+      // Focus never leaves the dialog: Tab cycles through its own buttons.
+      e.preventDefault();
+      if (!isTop || e.isComposing) {
+        return;
+      }
+      const buttons = [...root.querySelectorAll<HTMLElement>('button')];
+      const at = buttons.findIndex((b) => b === document.activeElement);
+      const last = buttons.length - 1;
+      const next = e.shiftKey
+        ? at <= 0
+          ? last
+          : at - 1
+        : (at + 1) % (last + 1);
+      buttons[next]?.focus();
+    } else if (!isTop && (e.key === 'Enter' || e.key === ' ')) {
+      e.preventDefault();
+    }
+  }
+  // A press on the dim area must not pull focus off the dialog's button, or
+  // Esc and Enter would stop reaching the dialog.
+  function onbackdropmousedown(e: MouseEvent): void {
+    if (e.target === e.currentTarget) {
+      e.preventDefault();
+    }
+  }
 </script>
 
-<div class="modal-backdrop">
-  <div class="modal">
+<div
+  class="modal-backdrop"
+  role="presentation"
+  bind:this={root}
+  onmousedown={onbackdropmousedown}
+>
+  <div class="modal" role="dialog" aria-modal="true" tabindex="-1" {onkeydown}>
     <p>{message}</p>
     <div class="modal-actions">
       {#if primaryLabel !== undefined && onprimary !== undefined}
@@ -95,9 +203,7 @@
           >{tertiaryLabel}</button
         >
       {/if}
-      <button class="btn" bind:this={cancelButton} onclick={oncancel}
-        >{cancelLabel}</button
-      >
+      <button class="btn" data-cancel onclick={oncancel}>{cancelLabel}</button>
     </div>
   </div>
 </div>

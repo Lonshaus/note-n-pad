@@ -243,6 +243,7 @@ fn show_after_grace(window: tauri::WebviewWindow) {
       let _ = window.show();
       let _ = window.set_focus();
       detach_menu_unless_document(&window);
+      focus_launch_window_after(&window, false);
     }
   });
 }
@@ -692,6 +693,14 @@ fn build_document_window(
 /// records the path in the recent-files menu via `add_recent_file`). A `project`
 /// root, when given, tags every tab opened in the fresh window.
 pub fn open_document(app: &AppHandle, path: &str, project: Option<&str>) -> Result<(), String> {
+  open_document_labeled(app, path, project).map(|_| ())
+}
+/// `open_document`, returning the new window's label.
+pub fn open_document_labeled(
+  app: &AppHandle,
+  path: &str,
+  project: Option<&str>,
+) -> Result<String, String> {
   let group = uuid::Uuid::new_v4().to_string();
   build_document_window(
     app,
@@ -706,7 +715,8 @@ pub fn open_document(app: &AppHandle, path: &str, project: Option<&str>) -> Resu
       width: DOC_DEFAULT_WIDTH,
       height: DOC_DEFAULT_HEIGHT,
     },
-  )
+  )?;
+  Ok(format!("doc-{group}"))
 }
 /// Open a fresh document window holding one blank tab, minting a new window
 /// group. The tab is created by the frontend, which stores it on first edit.
@@ -839,6 +849,23 @@ pub fn new_sticky_note(app: AppHandle, store: State<NoteStore>) -> Result<NoteSn
 pub fn open_document_window(app: AppHandle, path: String) -> Result<(), String> {
   open_document(&app, &path, None)
 }
+/// A document window is about to destroy itself without ever showing a document.
+/// When it was opened for a launch's file and nothing else is on screen, the
+/// app would be left windowless, so the fallback sticky opens instead.
+#[tauri::command(async)]
+pub fn launch_window_collapsing(app: AppHandle, store: State<NoteStore>, label: String) {
+  let recorded = crate::launch_windows::take(&label);
+  let others = app
+    .webview_windows()
+    .keys()
+    .filter(|l| **l != label)
+    .count();
+  if crate::launch_windows::collapse_needs_fallback(recorded, others) {
+    if let Err(e) = new_sticky(&app, &store) {
+      log::warn!("failed to open the fallback sticky after a launch window collapsed: {e}");
+    }
+  }
+}
 
 /// Open a document window for a group that already exists in the store, exactly
 /// as a startup restore would. Used by the sticky-to-document conversion (the
@@ -877,7 +904,23 @@ pub fn reveal_self(window: tauri::WebviewWindow) -> Result<(), String> {
   window.show().map_err(|e| e.to_string())?;
   window.set_focus().map_err(|e| e.to_string())?;
   detach_menu_unless_document(&window);
+  focus_launch_window_after(&window, true);
   Ok(())
+}
+/// After the startup workspace is revealed, give focus back to the window of a
+/// file the app was launched with.
+fn focus_launch_window_after(window: &tauri::WebviewWindow, consume: bool) {
+  if window.label() != "workspace" {
+    return;
+  }
+  let Some(label) = crate::launch_windows::focus_target(consume) else {
+    return;
+  };
+  if let Some(target) = window.app_handle().get_webview_window(&label) {
+    if target.is_visible().unwrap_or(false) {
+      let _ = target.set_focus();
+    }
+  }
 }
 
 const WORKSPACE_MIN_WIDTH: f64 = 260.0;
@@ -1499,6 +1542,7 @@ mod window_command_threading_tests {
   const MUST_RUN_OFF_THE_MAIN_THREAD: &[&str] = &[
     "new_sticky_note",
     "open_document_window",
+    "launch_window_collapsing",
     "open_document_group",
     "show_workspace_window",
     "show_settings_window",

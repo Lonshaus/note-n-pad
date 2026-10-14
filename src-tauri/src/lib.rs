@@ -22,6 +22,7 @@ mod i18n;
 #[cfg(target_os = "windows")]
 mod jumplist;
 mod large_file;
+mod launch_windows;
 mod licenses;
 mod linux_clipboard;
 mod linux_desktop_actions;
@@ -2308,12 +2309,14 @@ where
           .is_ok()
         {
           windows::reveal(&window);
+          launch_windows::record_routed_if_starting(window.label());
           continue;
         }
       }
     }
-    if let Err(err) = windows::open_document(app, &path, None) {
-      log::warn!("could not open {path} handed over by the shell: {err}");
+    match windows::open_document_labeled(app, &path, None) {
+      Ok(label) => launch_windows::record_if_starting(&label),
+      Err(err) => log::warn!("could not open {path} handed over by the shell: {err}"),
     }
   }
 }
@@ -2364,6 +2367,19 @@ fn handle_second_launch(app: &tauri::AppHandle, argv: Vec<String>) {
 fn handle_first_launch(app: &tauri::AppHandle) {
   let argv: Vec<String> = std::env::args().collect();
   apply_launch_action(app, cmdline::parse_args(&argv));
+}
+/// Whether the launch hands the app files to open. Windows and Linux read them
+/// off the command line; macOS has already received them as `RunEvent::Opened`
+/// by the time `setup` runs, and that handler has opened their windows.
+#[cfg(any(target_os = "windows", target_os = "linux"))]
+fn launch_carries_files_at_startup() -> bool {
+  let argv: Vec<String> = std::env::args().collect();
+  launch_windows::launch_carries_files_in_argv(&argv)
+}
+
+#[cfg(target_os = "macos")]
+fn launch_carries_files_at_startup() -> bool {
+  launch_windows::opened_any()
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -2535,6 +2551,7 @@ pub fn run() {
       // `.expect` on `build()` below, so one window that refuses to build would
       // panic the whole launch and leave no way back in.
       let mut opened = 0usize;
+      let launch_has_files = launch_carries_files_at_startup();
       for note in &notes {
         if note.kind != "document" {
           match windows::create_sticky_window(handle, note) {
@@ -2551,7 +2568,8 @@ pub fn run() {
       }
       // A fresh install has nothing to restore, and so does a store whose every
       // window failed above. Either way the app must not sit there windowless.
-      if opened == 0 {
+      // A launch that carries files gets its window from those files instead.
+      if launch_windows::fallback_needed_at_setup(opened, launch_has_files) {
         if let Err(e) = windows::new_sticky(handle, &store) {
           log::warn!("failed to open the fallback sticky: {e}");
         }
@@ -2608,12 +2626,22 @@ pub fn run() {
       // rather than being buried; as the explicitly requested window it does
       // take focus, which is the expected behavior for this opt-in.
       if startup.open_workspace_on_startup {
+        if launch_has_files {
+          launch_windows::focus_launch_window_after_workspace();
+        }
         let _ = windows::show_workspace(handle);
       }
       // Whatever the app was launched with, applied after the restore above so
       // a requested window opens on top rather than behind the restored ones.
       #[cfg(any(target_os = "windows", target_os = "linux"))]
       handle_first_launch(handle);
+      // The files' windows could not be built: do not leave the app windowless.
+      if opened == 0 && launch_has_files && !launch_windows::opened_any() {
+        if let Err(e) = windows::new_sticky(handle, &store) {
+          log::warn!("failed to open the fallback sticky: {e}");
+        }
+      }
+      launch_windows::finish_startup();
       // Main thread: the only place GTK/AppKit may be read.
       platform::prime_dark_preference();
       // Debug-only E2E automation socket; inert unless NOTE_N_PAD_AUTOMATION=1.
@@ -2660,6 +2688,8 @@ pub fn run() {
       privacy::read_privacy_policy,
       windows::new_sticky_note,
       windows::open_document_window,
+      windows::launch_window_collapsing,
+      launch_windows::launch_window_loaded,
       windows::open_document_group,
       set_menu_lists,
       add_recent_file,

@@ -84,6 +84,7 @@
   import { formatFileSize } from './lib/util/format';
   import { textFromString } from './lib/util/text';
   import { focusEditorIfIdle } from './lib/util/editorFocus';
+  import { focusTopmostModal, isModalOpen } from './lib/ConfirmModal.svelte';
   import { t } from './lib/i18n';
   import { isOrdinaryTab } from './lib/state/heldTab';
   import { remountTopLine } from './lib/util/largeIndex';
@@ -284,13 +285,23 @@
         }
       : null,
   );
+  // Close a window that never showed a document. The core hears of it first: a
+  // window opened for the launch's file may be the only one the app has.
+  async function collapseWindow(): Promise<void> {
+    try {
+      await invoke('launch_window_collapsing', { label: win.label });
+    } catch (err) {
+      console.warn('launch_window_collapsing failed', err);
+    }
+    await win.destroy();
+  }
 
   function onLargeCancel(): void {
     documentWindow.cancelLargeOpen();
     // A window opened solely for this file has no other tab; close it rather
     // than leave an empty shell.
     if (documentWindow.tabs.length === 0) {
-      void win.destroy();
+      void collapseWindow();
     }
   }
 
@@ -301,7 +312,7 @@
   function onLongLineCancel(): void {
     documentWindow.cancelLongLineOpen();
     if (documentWindow.tabs.length === 0) {
-      void win.destroy();
+      void collapseWindow();
     }
   }
 
@@ -310,7 +321,7 @@
   function onOpenFailedClose(): void {
     documentWindow.dismissOpenFailed();
     if (documentWindow.tabs.length === 0) {
-      void win.destroy();
+      void collapseWindow();
     }
   }
 
@@ -718,6 +729,16 @@
   function liveView(): EditorView | null {
     return activeOrdinary ? heldView : null;
   }
+  // Path of a reveal that could not be carried out, awaiting the user's
+  // acknowledgement. A tab outlives the file it was opened from, and a reveal
+  // that quietly does nothing (or, on Windows, opens some unrelated folder) is
+  // indistinguishable from a broken menu item.
+  let revealFailed = $state<string | null>(null);
+  // Path of a large-file tab whose background line-index scan failed (open
+  // error or a mid-scan I/O error), awaiting the user's acknowledgement. A
+  // failed scan used to leave the status bar spinning "indexing…" forever
+  // with no other sign anything had gone wrong.
+  let indexFailed = $state<string | null>(null);
 
   // Any dialog/modal currently up. The automatic focus handoff is suppressed
   // while one is open so a gate/confirm keeps the keyboard.
@@ -731,7 +752,10 @@
       documentWindow.restoreUnreadable.length > 0 ||
       documentWindow.saveFailed !== null ||
       documentWindow.rangeConflict !== null ||
-      documentWindow.windowedConflict !== null,
+      documentWindow.windowedConflict !== null ||
+      documentWindow.encodingFailed !== null ||
+      revealFailed !== null ||
+      indexFailed !== null,
   );
 
   // Hand keyboard focus to the active editor when the window regains focus, so a
@@ -812,7 +836,7 @@
       return;
     }
     untrack(() => {
-      if (!anyModalOpen) {
+      if (!anyModalOpen && !focusTopmostModal()) {
         target.focus();
       }
     });
@@ -951,18 +975,6 @@
     }
   }
 
-  // Path of a reveal that could not be carried out, awaiting the user's
-  // acknowledgement. A tab outlives the file it was opened from, and a reveal
-  // that quietly does nothing (or, on Windows, opens some unrelated folder) is
-  // indistinguishable from a broken menu item.
-  let revealFailed = $state<string | null>(null);
-
-  // Path of a large-file tab whose background line-index scan failed (open
-  // error or a mid-scan I/O error), awaiting the user's acknowledgement. A
-  // failed scan used to leave the status bar spinning "indexing…" forever
-  // with no other sign anything had gone wrong.
-  let indexFailed = $state<string | null>(null);
-
   // Reveal the active tab's file in the OS file browser (File > Show in Finder).
   function showActiveInFinder(): void {
     const path = active?.path;
@@ -1001,7 +1013,7 @@
         isOverlay: showJson || showXml || showMarkdown,
         isViewer: active?.large !== undefined && active.windowed === undefined,
         fieldFocused: isNativeUndoField(document.activeElement),
-        modalOpen: anyModalOpen,
+        modalOpen: isModalOpen(),
       });
       if (surface === 'field') {
         if (action === 'select-all') {
@@ -1263,7 +1275,7 @@
             documentWindow.restoreUnreadable.length > 0,
         )
       ) {
-        void win.destroy();
+        void collapseWindow();
       }
     })();
 
@@ -2109,8 +2121,12 @@
       primaryLabel={t('doc.conflict.writeAnyway')}
       secondaryLabel={t('doc.conflict.saveAsNew')}
       cancelLabel={t('common.cancel')}
-      onprimary={() => void documentWindow.rangeConflictForce()}
-      onsecondary={() => void documentWindow.rangeConflictSaveAs()}
+      onprimary={async () => {
+        await documentWindow.rangeConflictForce();
+      }}
+      onsecondary={async () => {
+        await documentWindow.rangeConflictSaveAs();
+      }}
       oncancel={() => documentWindow.rangeConflictCancel()}
     />
   {/if}
@@ -2121,8 +2137,12 @@
       primaryLabel={t('doc.conflict.writeAnyway')}
       secondaryLabel={t('doc.conflict.saveAsNew')}
       cancelLabel={t('common.cancel')}
-      onprimary={() => void documentWindow.windowedConflictForce()}
-      onsecondary={() => void documentWindow.windowedConflictSaveAs()}
+      onprimary={async () => {
+        await documentWindow.windowedConflictForce();
+      }}
+      onsecondary={async () => {
+        await documentWindow.windowedConflictSaveAs();
+      }}
       oncancel={() => documentWindow.windowedConflictCancel()}
     />
   {/if}
@@ -2149,8 +2169,12 @@
       primaryLabel={t('common.save')}
       secondaryLabel={t('doc.oversized.discard')}
       cancelLabel={t('common.cancel')}
-      onprimary={() => void oversizedSave()}
-      onsecondary={() => void oversizedDiscard()}
+      onprimary={async () => {
+        await oversizedSave();
+      }}
+      onsecondary={async () => {
+        await oversizedDiscard();
+      }}
       oncancel={oversizedCancel}
     />
   {/if}
