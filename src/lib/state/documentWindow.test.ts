@@ -1958,3 +1958,82 @@ describe('where a windowed tab was looking is remembered per tab', () => {
     expect(documentWindow.viewCaret('other')).toBeUndefined();
   });
 });
+
+describe('runWindowedOp (a whole-file operation outliving its editor)', () => {
+  function windowedTab(sessionId: number): DocTab {
+    return baseTab({
+      id: `op-tab-${sessionId}`,
+      path: '/tmp/huge.log',
+      windowed: {
+        sessionId,
+        totalBytes: 1000,
+        totalLines: 10,
+        fingerprint: null,
+        dirty: false,
+        topLine: 0,
+      },
+    });
+  }
+
+  it('keeps the session gate pending until the totals and dirty flag are recorded', async () => {
+    documentWindow.tabs.length = 0;
+    const tab = windowedTab(31);
+    documentWindow.tabs.push(tab);
+    documentWindow.activeIndex = 0;
+    let finish: (r: {
+      total_bytes: number;
+      total_lines: number;
+    }) => void = () => {};
+    const run = (): Promise<{ total_bytes: number; total_lines: number }> =>
+      new Promise((resolve) => {
+        finish = resolve;
+      });
+    const op = documentWindow.runWindowedOp(31, run, () => true);
+    const gate = documentWindow.windowedGate(31);
+    expect(gate.pending()).toBe(true);
+    expect(gate.canApply()).toBe(false);
+    // An editor mounted now (a tab switched away and back) waits to read.
+    const read = vi.fn(() => Promise.resolve(tab.windowed?.totalBytes));
+    const mounted = gate.whenIdle(read);
+    await Promise.resolve();
+    expect(read).not.toHaveBeenCalled();
+    finish({ total_bytes: 5000, total_lines: 77 });
+    await op;
+    // The read happens only after the tab learned the replaced totals.
+    await expect(mounted).resolves.toBe(5000);
+    expect(tab.windowed?.totalLines).toBe(77);
+    expect(tab.windowed?.dirty).toBe(true);
+    expect(gate.pending()).toBe(false);
+  });
+
+  it('leaves the tab clean when the operation changed nothing', async () => {
+    documentWindow.tabs.length = 0;
+    const tab = windowedTab(32);
+    documentWindow.tabs.push(tab);
+    documentWindow.activeIndex = 0;
+    await documentWindow.runWindowedOp(
+      32,
+      () => Promise.resolve({ count: 0, total_bytes: 1000, total_lines: 10 }),
+      (r) => r.count > 0,
+    );
+    expect(tab.windowed?.dirty).toBe(false);
+    expect(documentWindow.windowedGate(32).pending()).toBe(false);
+  });
+
+  it('opens the gate again when the operation fails', async () => {
+    documentWindow.tabs.length = 0;
+    const tab = windowedTab(33);
+    documentWindow.tabs.push(tab);
+    documentWindow.activeIndex = 0;
+    await expect(
+      documentWindow.runWindowedOp(
+        33,
+        () => Promise.reject(new Error('disk full')),
+        () => true,
+      ),
+    ).rejects.toThrow('disk full');
+    await documentWindow.windowedGate(33).whenIdle(() => Promise.resolve());
+    expect(documentWindow.windowedGate(33).canApply()).toBe(true);
+    expect(tab.windowed?.dirty).toBe(false);
+  });
+});

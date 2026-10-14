@@ -4,6 +4,7 @@
 
   import { onMount } from 'svelte';
   import { invoke } from '@tauri-apps/api/core';
+  import { listen, type UnlistenFn } from '@tauri-apps/api/event';
   import {
     Compartment,
     EditorState,
@@ -52,15 +53,31 @@
     SWAP_THRESHOLD_LINES,
   } from '../util/windowedEdit';
   import {
+    fitsWindow,
     gotoSelection,
+    insideWindow,
     selectionAfterChange,
     selectionAfterSwap,
     toGlobalSelection,
+    windowStartFor,
     type LinePos,
     type LineSelection,
   } from '../util/windowSelection';
   import { focusEditorIfIdle } from '../util/editorFocus';
   import { readCspNonce } from '../util/cspNonce';
+  import { parseGotoRange, moveResultCursor } from '../util/largeSearch';
+  import {
+    endOfMatch,
+    formatReplaced,
+    gotoRangeSelection,
+    hitSelection,
+    orderedPositions,
+    textMatchesQuery,
+    type FindHit,
+  } from '../util/windowedFind';
+  import type { OpGate } from '../util/windowedGate';
+  import { matchWindowShortcut } from '../util/windowShortcut';
+  import FindPanels, { type FindResult } from '../large/FindPanels.svelte';
   import { t } from '../i18n';
 
   /** Result of a Rust `windowed_read`: the window text plus its global byte span,
@@ -82,13 +99,45 @@
 
   /** Result of a Rust `windowed_undo`/`windowed_redo`: the global-byte edits just
    *  applied (in application order), the 0-based line of the first edit's start
-   *  (for a jump-to-change window reload), and the live file totals. */
+   *  (for a jump-to-change window reload), and the live file totals. A replace
+   *  all undone or redone has no edits: `reload_only` says to reload the window. */
   interface UndoResult {
     edits: { start: number; end: number; text: string }[];
     first_line: number;
     total_bytes: number;
     total_lines: number;
+    reload_only: boolean;
   }
+  /** Result of a Rust `windowed_replace_all`. */
+  interface ReplaceAllResult {
+    count: number;
+    total_bytes: number;
+    total_lines: number;
+  }
+  /** What a whole-file operation reports back. */
+  interface OpTotals {
+    total_bytes: number;
+    total_lines: number;
+  }
+  /** A results-list row streamed by the Rust `windowed_search`. `line` is
+   *  0-based and `col` counts UTF-16 units. */
+  interface SearchHitPayload {
+    search_id: string;
+    offset: number;
+    line: number;
+    col: number;
+    preview: string;
+  }
+
+  interface SearchDonePayload {
+    search_id: string;
+    hits: number;
+    truncated: boolean;
+    stale: boolean;
+    error: boolean;
+  }
+  /** A result row with the column its hit starts at. */
+  type EditResult = FindResult & { col: number };
 
   interface Props {
     sessionId: number;
@@ -130,6 +179,17 @@
     }) => void;
     // An apply/read failed: the editor has locked to avoid state divergence.
     onerror: (message: string) => void;
+    // The session's pending-operation gate: a replace all (or its undo or redo)
+    // can still be running when this editor mounts.
+    gate: OpGate;
+    // Runs a whole-file operation on the session through the state layer, which
+    // keeps the gate and the tab's totals and dirty flag right even if this
+    // editor is gone by the time it finishes.
+    runop: <T extends OpTotals>(
+      sessionId: number,
+      run: () => Promise<T>,
+      changed: (result: T) => boolean,
+    ) => Promise<T>;
     // The global 0-based line at the top of the viewport, once per frame while
     // scrolling, so a remount can open at the same place.
     ontopline?: (line: number) => void;
@@ -151,6 +211,8 @@
     onapplied,
     onstatus,
     onerror,
+    gate,
+    runop,
     ontopline,
   }: Props = $props();
 
@@ -188,6 +250,13 @@
   // Terminal: an apply/read failed, so the buffer no longer matches the file.
   // The editor goes read-only and no further edits or swaps are attempted.
   let locked = false;
+  // Set once the editor is unmounted, so work that outlives it stops touching it.
+  let gone = false;
+  // Whole-file work in flight (replace all, undo, redo): while it counts, the
+  // editor is read-only and typed input is dropped.
+  let holds = 0;
+  // Counts every edit and undo, so a find can tell the content moved under it.
+  let editSeq = 0;
   // True while a programmatic window swap replaces the document, so the update
   // listener does not mistake the replacement for a user edit, and the scroll
   // handler ignores the scroll-position changes the swap causes.
@@ -206,6 +275,8 @@
   // edit opens a new undo group or coalesces into the current one.
   let lastApplyTime = 0;
   let lastEditKind: string | null = null;
+  // Set for the one edit a Replace makes, so it opens its own undo group.
+  let forceNewGroup = false;
   let prevComposing = false;
 
   const wrapCompartment = new Compartment();
@@ -237,7 +308,28 @@
       ? [EditorState.readOnly.of(true), EditorView.editable.of(false)]
       : [];
   }
-
+  function isReadOnly(): boolean {
+    return locked || swapping || holds > 0 || gate.readOnly();
+  }
+  function syncReadOnly(): void {
+    view?.dispatch({
+      effects: readOnlyCompartment.reconfigure(readOnlyExtension(isReadOnly())),
+    });
+  }
+  // Keep the editor read-only until the returned function is called. Typed
+  // input is dropped meanwhile.
+  function hold(): () => void {
+    holds += 1;
+    syncReadOnly();
+    let released = false;
+    return () => {
+      if (!released) {
+        released = true;
+        holds -= 1;
+        syncReadOnly();
+      }
+    };
+  }
   // The document span of the lines fully on screen, or null when none is.
   function visibleSpan(v: EditorView): { from: number; to: number } | null {
     // clientHeight leaves out a horizontal scrollbar covering the last line.
@@ -319,6 +411,7 @@
     }),
     EditorState.transactionFilter.of(narrowNativeSelectAll),
     keymap.of([
+      { key: 'Escape', run: closeBox },
       { key: 'Mod-a', preventDefault: true, run: selectVisible },
       {
         key: 'Mod-z',
@@ -355,7 +448,7 @@
         gutterCompartment.of(gutterExtension(showLineNumbers)),
         wrapCompartment.of(wordWrap ? EditorView.lineWrapping : []),
         themeCompartment.of(varEditorTheme(dark)),
-        readOnlyCompartment.of(readOnlyExtension(locked || swapping)),
+        readOnlyCompartment.of(readOnlyExtension(isReadOnly())),
         // setState tears down the DOM of the old window while the browser
         // selection still points into it, so the selection collapses and the
         // DOM observer syncs that wreckage back as a plain 'select'
@@ -375,7 +468,7 @@
         // document mid-swap, and the update listener would drop that change.
         EditorState.transactionFilter.of((tr) =>
           rejectDuringSwap(
-            swapping,
+            swapping || holds > 0,
             tr.docChanged,
             tr.annotation(Transaction.userEvent),
           )
@@ -501,15 +594,21 @@
     const now = Date.now();
     const composing = view?.composing ?? false;
     const kind = editKind(update);
-    const newGroup = decideNewGroup(
-      { time: lastApplyTime, kind: lastEditKind, composing: prevComposing },
-      {
-        time: now,
-        kind,
-        composing,
-        compositionStart: composing && !prevComposing,
-      },
-    );
+    // A Replace is a step of its own, however soon it follows other typing.
+    const newGroup =
+      forceNewGroup ||
+      decideNewGroup(
+        { time: lastApplyTime, kind: lastEditKind, composing: prevComposing },
+        {
+          time: now,
+          kind,
+          composing,
+          compositionStart: composing && !prevComposing,
+        },
+      );
+    forceNewGroup = false;
+    editSeq += 1;
+    scheduleResultsRefresh();
     lastApplyTime = now;
     lastEditKind = kind;
     prevComposing = composing;
@@ -522,6 +621,12 @@
   ): void {
     applyChain = applyChain.then(async () => {
       if (locked) {
+        return;
+      }
+      if (!gate.canApply()) {
+        // Unreachable while the editor is read-only; refusing here would leave
+        // the typed text out of the core, so say so instead of drifting.
+        lock(t('editor.locked.write', { detail: 'busy' }));
         return;
       }
       let res: ApplyResult;
@@ -550,28 +655,38 @@
     if (locked || swapping) {
       return;
     }
+    const release = hold();
     applyChain = applyChain.then(async () => {
-      if (locked || view === undefined) {
-        return;
-      }
-      let res: UndoResult;
       try {
-        res = await invoke<UndoResult>(
-          dir === 'undo' ? 'windowed_undo' : 'windowed_redo',
-          { sessionId },
-        );
-      } catch (e) {
-        const msg = String(e);
-        if (
-          msg.includes('nothing-to-undo') ||
-          msg.includes('nothing-to-redo')
-        ) {
+        if (locked || view === undefined) {
           return;
         }
-        lock(t('editor.locked.undo', { detail: msg }));
-        return;
+        let res: UndoResult;
+        try {
+          res = await runop(
+            sessionId,
+            () =>
+              invoke<UndoResult>(
+                dir === 'undo' ? 'windowed_undo' : 'windowed_redo',
+                { sessionId },
+              ),
+            (r) => r.reload_only,
+          );
+        } catch (e) {
+          const msg = String(e);
+          if (
+            msg.includes('nothing-to-undo') ||
+            msg.includes('nothing-to-redo')
+          ) {
+            return;
+          }
+          lock(t('editor.locked.undo', { detail: msg }));
+          return;
+        }
+        applyUndoResult(res);
+      } finally {
+        release();
       }
-      applyUndoResult(res);
     });
   }
 
@@ -581,6 +696,16 @@
   // so reload the window at the change (standard editor jump-to-undo behaviour).
   function applyUndoResult(res: UndoResult): void {
     if (view === undefined) {
+      return;
+    }
+    editSeq += 1;
+    scheduleResultsRefresh();
+    if (res.reload_only) {
+      // A replace all undone or redone: the state layer has recorded the totals
+      // and the dirty flag; the window shows the content as it is now.
+      totalLines = res.total_lines;
+      totalBytes = res.total_bytes;
+      void reloadWindow();
       return;
     }
     // Marks the tab dirty and records the fresh totals (v1: an undo back to the
@@ -641,7 +766,10 @@
   // Load the window covering `target` (0-based global line). `mode` decides how the
   // scroll position is set afterward: 'preserve' keeps the line at the viewport top
   // fixed (no visual jump — used by scroll-triggered swaps), 'goto' scrolls the
-  // target line to the top (used by an explicit jump).
+  // target line to the top (used by an explicit jump), 'reveal' keeps the global
+  // selection like 'preserve' and scrolls its head into view, 'reload' keeps the
+  // view where it is but reads the window again even if it covers the same lines
+  // (the content under it changed).
   // Enter/leave the swap phase. The whole swap — including the awaits inside
   // loadWindow — runs with the editor read-only: a keystroke landing between the
   // apply flush and the setState would be applied against the old window's byte
@@ -664,19 +792,18 @@
     }
     swapping = false;
     if (!locked) {
-      view?.dispatch({
-        effects: readOnlyCompartment.reconfigure(readOnlyExtension(false)),
-      });
+      syncReadOnly();
       // A pointer selection made after the swap's setState was not tracked.
       if (view !== undefined) {
         trackSelection(view.state, false);
       }
     }
+    notifySettled();
   }
 
   async function loadWindow(
     target: number,
-    mode: 'preserve' | 'goto',
+    mode: 'preserve' | 'goto' | 'reveal' | 'reload',
   ): Promise<void> {
     if (view === undefined || locked || swapping) {
       traceSwap({
@@ -724,7 +851,8 @@
       }
       // Capture the anchor and the cursor's global position against the OLD
       // window before the vars are overwritten.
-      const anchor = mode === 'preserve' ? captureAnchor() : null;
+      const anchor =
+        mode === 'preserve' || mode === 'reload' ? captureAnchor() : null;
       // Selection moves made while the swap was waiting on the read were not
       // tracked (the swap ignores the listener); fold them in against the old
       // window before the window variables change. An undo applied meanwhile
@@ -782,6 +910,13 @@
           if (view !== undefined) {
             if (mode === 'goto') {
               scrollLineToTop(target);
+            } else if (mode === 'reveal') {
+              view.dispatch({
+                effects: EditorView.scrollIntoView(
+                  view.state.selection.main.head,
+                  { y: 'center' },
+                ),
+              });
             } else if (anchor !== null) {
               restoreAnchor(anchor);
             }
@@ -875,6 +1010,7 @@
       view === undefined ||
       swapInFlight ||
       swapping ||
+      holds > 0 ||
       locked ||
       view.composing
     ) {
@@ -926,23 +1062,504 @@
       }
     });
   }
+  // --- Find, replace and go to line ------------------------------------------
+  // The search itself runs in the Rust core over the edited content. Every
+  // selection set here is the global selection, then a window load that reveals
+  // it (never a selection dispatched straight into CodeMirror, which a later
+  // window swap would overwrite with the old global selection).
+  // Cap on results-list rows, as in the viewer.
+  const SEARCH_MAX = 5000;
+  // How long after the last edit the results list is searched again.
+  const REFRESH_MS = 500;
+
+  let panel = $state<'none' | 'goto' | 'search'>('none');
+  let panels = $state<ReturnType<typeof FindPanels> | null>(null);
+  let gotoValue = $state('');
+  let findQuery = $state('');
+  let findCase = $state(false);
+  let replaceText = $state('');
+  // The query and case the shown results were searched with.
+  let resultQuery = $state('');
+  let resultCase = $state(false);
+  let results = $state<EditResult[]>([]);
+  let cursor = $state(-1);
+  let searching = $state(false);
+  let searchFinished = $state(false);
+  let searchFailed = $state(false);
+  let truncated = $state(false);
+  // A line under the results: the outcome of the last replace or find.
+  let statusNote = $state('');
+  // Id of the running results search; hits and done for any other id are
+  // ignored.
+  let currentSearchId: string | null = null;
+  let refreshTimer: ReturnType<typeof setTimeout> | undefined;
+  let unlistenHit: UnlistenFn | null = null;
+  let unlistenDone: UnlistenFn | null = null;
+
+  const searchStatus = $derived(
+    statusNote !== ''
+      ? statusNote
+      : searching
+        ? t('large.search.searching', { count: results.length })
+        : searchFailed
+          ? t('large.search.failed')
+          : searchFinished
+            ? t('large.search.results', { count: results.length }) +
+              (truncated ? t('large.search.truncatedSuffix') : '')
+            : '',
+  );
+  // Callers waiting for no swap to run.
+  let settleWaiters: (() => void)[] = [];
+  function isSettled(): boolean {
+    return !swapping;
+  }
+  function notifySettled(): void {
+    if (!isSettled()) {
+      return;
+    }
+    const waiting = settleWaiters;
+    settleWaiters = [];
+    for (const wake of waiting) {
+      wake();
+    }
+  }
+  function releaseSettleWaiters(): void {
+    const waiting = settleWaiters;
+    settleWaiters = [];
+    for (const wake of waiting) {
+      wake();
+    }
+  }
+  // Resolves once no window swap is running, so a window load is never skipped
+  // because a swap is in flight. False when the editor cannot take the
+  // operation: it is gone, locked, or busy with whole-file work.
+  async function settled(): Promise<boolean> {
+    while (!isSettled() && !gone) {
+      await new Promise<void>((resolve) => settleWaiters.push(resolve));
+    }
+    return view !== undefined && !locked && !gone && holds === 0;
+  }
+  // Like `settled`, and takes the input hold in the same step, so nothing can
+  // start in between. Null when the editor cannot take the operation.
+  async function settledHold(): Promise<(() => void) | null> {
+    for (;;) {
+      if (!(await settled())) {
+        return null;
+      }
+      const release = hold();
+      if (isSettled()) {
+        return release;
+      }
+      release();
+    }
+  }
+  // Run `run` after every edit typed so far has reached the core, and keep
+  // later edits behind it.
+  function behindApplies<T>(run: () => Promise<T>): Promise<T> {
+    const result = applyChain.then(run);
+    applyChain = result.then(
+      () => undefined,
+      () => undefined,
+    );
+    return result;
+  }
+  // Read the window again where it is: the content under it changed.
+  function reloadWindow(): Promise<void> {
+    return loadWindow(windowStartLine + MARGIN_LINES, 'reload');
+  }
+
+  function cancelSearch(): void {
+    if (currentSearchId !== null) {
+      const id = currentSearchId;
+      currentSearchId = null;
+      void invoke('windowed_search_cancel', { searchId: id });
+    }
+  }
+  function resetResults(): void {
+    cancelSearch();
+    results = [];
+    cursor = -1;
+    searching = false;
+    searchFinished = false;
+    searchFailed = false;
+    truncated = false;
+  }
+  // Start a fresh results search. Each run gets a unique id, cancelling the
+  // previous one.
+  function runSearch(
+    query: string = findQuery,
+    caseSensitive: boolean = findCase,
+  ): void {
+    if (query === '') {
+      return;
+    }
+    resetResults();
+    statusNote = '';
+    resultQuery = query;
+    resultCase = caseSensitive;
+    const id = crypto.randomUUID();
+    currentSearchId = id;
+    searching = true;
+    void behindApplies(() =>
+      invoke('windowed_search', {
+        sessionId,
+        query,
+        caseSensitive,
+        maxResults: SEARCH_MAX,
+        searchId: id,
+      }),
+    ).catch(() => {
+      if (currentSearchId === id) {
+        searching = false;
+        searchFailed = true;
+      }
+    });
+  }
+  // An edit makes the list out of date: cancel the scan and search again once
+  // the edits stop. Only while the find bar shows a list.
+  function scheduleResultsRefresh(): void {
+    if (panel !== 'search' || (!searching && !searchFinished)) {
+      return;
+    }
+    cancelSearch();
+    clearTimeout(refreshTimer);
+    refreshTimer = setTimeout(() => {
+      if (panel === 'search' && !gone) {
+        runSearch(resultQuery, resultCase);
+      }
+    }, REFRESH_MS);
+  }
+
+  async function listenForResults(isDisposed: () => boolean): Promise<void> {
+    const hit = await listen<SearchHitPayload>('windowed-search-hit', (e) => {
+      if (e.payload.search_id !== currentSearchId) {
+        return;
+      }
+      results.push({
+        line: e.payload.line + 1,
+        col: e.payload.col,
+        preview: e.payload.preview,
+      });
+    });
+    const done = await listen<SearchDonePayload>(
+      'windowed-search-done',
+      (e) => {
+        if (e.payload.search_id !== currentSearchId) {
+          return;
+        }
+        searching = false;
+        if (e.payload.error) {
+          searchFailed = true;
+        } else if (!e.payload.stale) {
+          searchFinished = true;
+          truncated = e.payload.truncated;
+        }
+      },
+    );
+    if (isDisposed()) {
+      hit();
+      done();
+      return;
+    }
+    unlistenHit = hit;
+    unlistenDone = done;
+  }
+  // Select a hit: the global selection, then the window that shows it.
+  async function showHit(hit: FindHit): Promise<void> {
+    globalSel = hitSelection(hit);
+    await loadWindow(hit.start.line, 'reveal');
+  }
+  // Find the next (or previous) hit from the caret, over the content as the core
+  // has it: queued behind the edits already typed. Looks again once if more was
+  // typed meanwhile.
+  async function findStep(backward: boolean): Promise<void> {
+    const query = findQuery;
+    if (query === '') {
+      openFind();
+      return;
+    }
+    for (let attempt = 0; attempt < 2; attempt += 1) {
+      if (!(await settled())) {
+        return;
+      }
+      const { first, last } = orderedPositions(globalSel);
+      const from = backward ? first : last;
+      const seq = editSeq;
+      let hit: FindHit | null;
+      try {
+        hit = await behindApplies(() =>
+          invoke<FindHit | null>('windowed_find', {
+            sessionId,
+            query,
+            caseSensitive: findCase,
+            line: from.line,
+            col: from.col,
+            backward,
+          }),
+        );
+      } catch {
+        statusNote = t('large.search.failed');
+        return;
+      }
+      if (seq !== editSeq) {
+        continue;
+      }
+      if (hit === null) {
+        statusNote = t('large.search.results', { count: 0 });
+        return;
+      }
+      if (!(await settled())) {
+        return;
+      }
+      statusNote = '';
+      await showHit(hit);
+      return;
+    }
+  }
+  // Replace the hit the selection covers, then go on to the next one. Acts on
+  // the global selection: when that is outside the window the window is brought
+  // to it first, and what is selected must still match the query. If it does
+  // not, Replace acts as Find Next.
+  async function replaceOne(): Promise<void> {
+    const query = findQuery;
+    if (query === '') {
+      openFind();
+      return;
+    }
+    if (!(await settled())) {
+      return;
+    }
+    let v = view;
+    if (v === undefined) {
+      return;
+    }
+    if (!insideWindow(globalSel, windowStartLine, v.state.doc.lines)) {
+      if (!fitsWindow(globalSel)) {
+        void findStep(false);
+        return;
+      }
+      await loadWindow(
+        windowStartFor(globalSel, totalLines) + MARGIN_LINES,
+        'reveal',
+      );
+      if (!(await settled())) {
+        return;
+      }
+      v = view;
+      if (v === undefined) {
+        return;
+      }
+    }
+    const main = v.state.selection.main;
+    if (
+      main.empty ||
+      !textMatchesQuery(v.state.sliceDoc(main.from, main.to), query, findCase)
+    ) {
+      void findStep(false);
+      return;
+    }
+    // The normal edit path: a user-annotated transaction, which the
+    // outside-window filter lets through because the selection is inside the
+    // window now, and which reaches the core like typing and undoes like it.
+    forceNewGroup = true;
+    v.dispatch({
+      changes: { from: main.from, to: main.to, insert: replaceText },
+      selection: { anchor: main.from + replaceText.length },
+      userEvent: 'replace',
+    });
+    void findStep(false);
+  }
+  // Replace every hit in the core as one undoable step. The editor is
+  // read-only from here until the window has been read again, and nothing typed
+  // meanwhile is queued.
+  async function replaceAll(): Promise<void> {
+    const query = findQuery;
+    if (query === '') {
+      openFind();
+      return;
+    }
+    const release = await settledHold();
+    if (release === null) {
+      return;
+    }
+    try {
+      const res = await behindApplies(() =>
+        runop(
+          sessionId,
+          () =>
+            invoke<ReplaceAllResult>('windowed_replace_all', {
+              sessionId,
+              query,
+              caseSensitive: findCase,
+              replacement: replaceText,
+            }),
+          (r) => r.count > 0,
+        ),
+      );
+      if (gone) {
+        return;
+      }
+      totalLines = res.total_lines;
+      totalBytes = res.total_bytes;
+      cancelSearch();
+      results = [];
+      cursor = -1;
+      searching = false;
+      searchFinished = false;
+      statusNote = formatReplaced(t('cm.replacedMany'), res.count);
+      if (res.count > 0) {
+        editSeq += 1;
+        await reloadWindow();
+      }
+    } catch (e) {
+      if (!gone) {
+        lock(t('editor.locked.write', { detail: String(e) }));
+      }
+    } finally {
+      release();
+    }
+  }
+
+  async function jumpToResult(index: number): Promise<void> {
+    const r = results[index];
+    if (r === undefined) {
+      return;
+    }
+    cursor = index;
+    if (!(await settled())) {
+      return;
+    }
+    const start = { line: r.line - 1, col: r.col };
+    await showHit({ start, end: endOfMatch(start, resultQuery) });
+  }
+
+  function stepResult(delta: number): void {
+    const next = moveResultCursor(cursor, results.length, delta);
+    if (next >= 0) {
+      void jumpToResult(next);
+    }
+  }
+  // Enter in the query field looks up the list when the query changed, and goes
+  // to the next hit; Shift+Enter goes to the previous one.
+  function searchOrNext(backward: boolean): void {
+    if (
+      findQuery !== resultQuery ||
+      findCase !== resultCase ||
+      (!searching && !searchFinished)
+    ) {
+      runSearch();
+    }
+    void findStep(backward);
+  }
+
+  function onSearchKeydown(e: KeyboardEvent): void {
+    if (e.key === 'Escape') {
+      e.preventDefault();
+      closePanel();
+    } else if (e.key === 'ArrowDown') {
+      e.preventDefault();
+      stepResult(1);
+    } else if (e.key === 'ArrowUp') {
+      e.preventDefault();
+      stepResult(-1);
+    } else if (e.key === 'Enter') {
+      e.preventDefault();
+      if (panels?.isReplaceFocused() === true) {
+        void replaceOne();
+      } else if (panels?.isQueryFocused() === true) {
+        searchOrNext(e.shiftKey);
+      } else {
+        stepResult(1);
+      }
+    }
+  }
+
+  function openGoto(): void {
+    resetResults();
+    panel = 'goto';
+    gotoValue = '';
+    requestAnimationFrame(() => panels?.focusGoto());
+  }
+
+  function closePanel(): void {
+    if (panel === 'none') {
+      return;
+    }
+    if (panel === 'search') {
+      resetResults();
+      clearTimeout(refreshTimer);
+      statusNote = '';
+    }
+    panel = 'none';
+    view?.focus();
+  }
+
+  async function submitGoto(): Promise<void> {
+    const target = parseGotoRange(gotoValue, totalLines);
+    closePanel();
+    if (target === null || !(await settled())) {
+      return;
+    }
+    if (target.kind === 'line') {
+      globalSel = gotoSelection(target.line);
+      await loadWindow(target.line, 'reveal');
+    } else {
+      // A range is selected only as far as one window holds.
+      globalSel = gotoRangeSelection(target.range.start, target.range.end);
+      await loadWindow(target.range.start, 'reveal');
+    }
+  }
+
+  function onGotoKeydown(e: KeyboardEvent): void {
+    if (e.key === 'Escape') {
+      e.preventDefault();
+      closePanel();
+    } else if (e.key === 'Enter') {
+      e.preventDefault();
+      void submitGoto();
+    }
+  }
+  // The shortcut registry's `goto-line` key opens the goto box. Find and its
+  // relatives are native menu accelerators (they never reach this listener),
+  // so DocumentApp routes them to the exports below.
+  function onWindowKeydown(e: KeyboardEvent): void {
+    const accel = shortcutsState.accel('goto-line');
+    if (accel !== null && matchWindowShortcut(e, accel, platform.os)) {
+      e.preventDefault();
+      openGoto();
+    }
+  }
+  // Esc closes whichever box is open, from the editor too.
+  function closeBox(): boolean {
+    if (panel === 'none') {
+      return false;
+    }
+    closePanel();
+    return true;
+  }
 
   onMount(() => {
     let disposed = false;
     const caret = initialCaret;
     void (async (): Promise<void> => {
-      totalLines = initialTotalLines;
-      const target = Math.min(
-        Math.max(0, initialTopLine),
-        Math.max(0, totalLines - 1),
-      );
-      const w = nextWindow(target, totalLines, WINDOW_LINES, MARGIN_LINES);
+      let target = 0;
       let res: WindowRead;
       try {
-        res = await invoke<WindowRead>('windowed_read', {
-          sessionId,
-          startLine: w.startLine,
-          endLine: w.endLine,
+        // A replace all (or its undo) may still be running from before this
+        // editor mounted: the first read waits for it, so it never shows
+        // content that is about to change.
+        res = await gate.whenIdle(() => {
+          totalLines = initialTotalLines;
+          target = Math.min(
+            Math.max(0, initialTopLine),
+            Math.max(0, totalLines - 1),
+          );
+          const w = nextWindow(target, totalLines, WINDOW_LINES, MARGIN_LINES);
+          return invoke<WindowRead>('windowed_read', {
+            sessionId,
+            startLine: w.startLine,
+            endLine: w.endLine,
+          });
         });
       } catch (e) {
         onerror(t('editor.locked.read', { detail: String(e) }));
@@ -996,6 +1613,7 @@
         requestAnimationFrame(() => scrollLineToTop(target));
       }
       v.scrollDOM.addEventListener('scroll', onScroll);
+      window.addEventListener('keydown', onWindowKeydown);
       reportSelection();
       // Claim keyboard focus on load so an unlocked/restored windowed tab types
       // without a click.
@@ -1004,8 +1622,16 @@
         void import('../dev/editorRegistry').then((m) => m.setActiveView(v));
       }
     })();
+    void listenForResults(() => disposed);
     return () => {
       disposed = true;
+      gone = true;
+      releaseSettleWaiters();
+      cancelSearch();
+      clearTimeout(refreshTimer);
+      unlistenHit?.();
+      unlistenDone?.();
+      window.removeEventListener('keydown', onWindowKeydown);
       if (selRaf !== 0) {
         cancelAnimationFrame(selRaf);
       }
@@ -1088,6 +1714,28 @@
   } {
     return { windowStartLine, totalLines, totalBytes };
   }
+  // Menu surface: Find, Find and Replace, Find Next, Find Previous.
+  export function openFind(): void {
+    panel = 'search';
+    requestAnimationFrame(() => panels?.focusQuery());
+  }
+  export function openFindReplace(): void {
+    panel = 'search';
+    requestAnimationFrame(() => panels?.focusReplace());
+  }
+  export function findNext(): void {
+    void findStep(false);
+  }
+  export function findPrevious(): void {
+    void findStep(true);
+  }
+  // Whether the find bar or the goto box is open.
+  export function panelOpen(): boolean {
+    return panel !== 'none';
+  }
+  export function closeFindPanel(): void {
+    closePanel();
+  }
 
   export function goto(line: number): void {
     void loadWindow(
@@ -1137,14 +1785,40 @@
 </script>
 
 <div
-  class="editor"
+  class="windowed-wrap"
   style="--doc-font-size: {fontSize}px; --doc-font-family: {cssFontFamily(
     fontFamily,
   )}"
-  bind:this={container}
-></div>
+>
+  <div class="editor" bind:this={container}></div>
+  <FindPanels
+    bind:this={panels}
+    {panel}
+    bind:gotoValue
+    ongotokeydown={onGotoKeydown}
+    bind:query={findQuery}
+    bind:caseSensitive={findCase}
+    bind:replacement={replaceText}
+    showReplace
+    status={searchStatus}
+    {results}
+    {cursor}
+    {resultQuery}
+    {resultCase}
+    onsearch={() => searchOrNext(false)}
+    onjump={(i) => void jumpToResult(i)}
+    onclose={closePanel}
+    onsearchkeydown={onSearchKeydown}
+    onreplace={() => void replaceOne()}
+    onreplaceall={() => void replaceAll()}
+  />
+</div>
 
 <style>
+  .windowed-wrap {
+    position: relative;
+    height: 100%;
+  }
   .editor {
     height: 100%;
     overflow: hidden;
