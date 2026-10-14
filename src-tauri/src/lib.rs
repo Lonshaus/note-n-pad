@@ -957,6 +957,21 @@ pub(crate) fn escape_menu_label(label: &str) -> String {
   label.replace('&', "&&")
 }
 
+/// The Help menu's items in order, by menu id and label. "Full Version Features"
+/// sits between Report an Issue and Acknowledgements and exists only in lite.
+fn help_menu_entries(lite: bool) -> Vec<(&'static str, i18n::Key)> {
+  let mut entries = vec![
+    ("help-documentation", i18n::Key::Documentation),
+    ("help-report-issue", i18n::Key::ReportIssue),
+  ];
+  if lite {
+    entries.push(("help-full-features", i18n::Key::FullFeatures));
+  }
+  entries.push(("help-acknowledgements", i18n::Key::Acknowledgements));
+  entries.push(("help-privacy", i18n::Key::PrivacyPolicy));
+  entries
+}
+
 /// Build the menu bar in `locale`, returning the built menu (not yet installed;
 /// see `install_menu`) alongside the mode-dependent item handles.
 /// App/File/Edit/Format/View/Window submenus: File/Edit/Format custom items
@@ -1367,42 +1382,12 @@ fn build_menu(
   #[cfg(target_os = "macos")]
   let _ = window_menu.set_as_windows_menu_for_nsapp();
   // Help menu: Documentation and Report an Issue open the browser (routed to
-  // `tauri_plugin_opener` in the menu-event handler); Acknowledgements and
-  // Privacy Policy each open our own window.
-  let documentation = MenuItem::with_id(
-    app,
-    "help-documentation",
-    tr(i18n::Key::Documentation),
-    true,
-    accel("help-documentation"),
-  )?;
-  let report_issue = MenuItem::with_id(
-    app,
-    "help-report-issue",
-    tr(i18n::Key::ReportIssue),
-    true,
-    accel("help-report-issue"),
-  )?;
-  let acknowledgements = MenuItem::with_id(
-    app,
-    "help-acknowledgements",
-    tr(i18n::Key::Acknowledgements),
-    true,
-    accel("help-acknowledgements"),
-  )?;
-  let privacy = MenuItem::with_id(
-    app,
-    "help-privacy",
-    tr(i18n::Key::PrivacyPolicy),
-    true,
-    accel("help-privacy"),
-  )?;
-  let help_menu = Submenu::with_items(
-    app,
-    tr(i18n::Key::HelpMenu),
-    true,
-    &[&documentation, &report_issue, &acknowledgements, &privacy],
-  )?;
+  // `tauri_plugin_opener` in the menu-event handler); Full Version Features
+  // (Lite only), Acknowledgements and Privacy Policy each open our own window.
+  let help_menu = Submenu::new(app, tr(i18n::Key::HelpMenu), true)?;
+  for (id, key) in help_menu_entries(edition::is_lite()) {
+    help_menu.append(&MenuItem::with_id(app, id, tr(key), true, accel(id))?)?;
+  }
   // On macOS this also gets the system-inserted menu search field; Windows and
   // Linux have no equivalent, so the menu there is just the menu.
   #[cfg(target_os = "macos")]
@@ -1557,6 +1542,9 @@ fn handle_menu_id(app: &tauri::AppHandle, id: &str) {
     "help-acknowledgements" => {
       let _ = windows::show_acknowledgements(app);
     }
+    "help-full-features" => {
+      let _ = windows::show_edition(app);
+    }
     "help-privacy" => {
       let _ = windows::show_privacy(app);
     }
@@ -1608,6 +1596,7 @@ fn accelerator_enabled(id: &str, kind: FocusKind) -> bool {
     | "help-documentation"
     | "help-report-issue"
     | "help-acknowledgements"
+    | "help-full-features"
     | "help-privacy" => true,
     _ => false,
   }
@@ -1948,6 +1937,69 @@ fn syntax_entries(languages: &[String], current: Option<&str>, lite: bool) -> Ve
     vec![None]
   } else {
     syntax_order(languages, current)
+  }
+}
+
+#[cfg(test)]
+mod help_menu_tests {
+  use super::{accelerator_enabled, help_menu_entries, FocusKind};
+  use crate::i18n::Key;
+
+  fn ids(lite: bool) -> Vec<&'static str> {
+    help_menu_entries(lite)
+      .into_iter()
+      .map(|(id, _)| id)
+      .collect()
+  }
+
+  #[test]
+  fn lite_has_full_version_features_between_report_an_issue_and_acknowledgements() {
+    assert_eq!(
+      ids(true),
+      vec![
+        "help-documentation",
+        "help-report-issue",
+        "help-full-features",
+        "help-acknowledgements",
+        "help-privacy",
+      ]
+    );
+    assert!(help_menu_entries(true).contains(&("help-full-features", Key::FullFeatures)));
+  }
+
+  #[test]
+  fn full_never_has_it() {
+    assert_eq!(
+      ids(false),
+      vec![
+        "help-documentation",
+        "help-report-issue",
+        "help-acknowledgements",
+        "help-privacy",
+      ]
+    );
+  }
+
+  #[test]
+  fn the_item_works_from_every_window() {
+    for kind in [
+      FocusKind::Doc,
+      FocusKind::Sticky,
+      FocusKind::Workspace,
+      FocusKind::Settings,
+      FocusKind::About,
+      FocusKind::None,
+    ] {
+      assert!(accelerator_enabled("help-full-features", kind));
+    }
+  }
+
+  #[test]
+  fn the_menu_is_built_from_the_entries() {
+    let source = include_str!("lib.rs");
+    let at = source.find("fn build_menu(").unwrap();
+    let body = &source[at..];
+    assert!(body[..body.find("\n}\n").unwrap()].contains("help_menu_entries(edition::is_lite())"));
   }
 }
 
@@ -2730,6 +2782,7 @@ pub fn run() {
       windows::show_about_window,
       windows::show_acknowledgements_window,
       windows::show_privacy_window,
+      windows::show_edition_window,
       shortcuts::get_shortcuts,
       shortcuts::set_shortcut,
       shortcuts::reset_shortcut,

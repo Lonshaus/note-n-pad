@@ -13,6 +13,7 @@ import AboutApp from './AboutApp.svelte';
 import AcknowledgementsApp from './AcknowledgementsApp.svelte';
 import LoadProblemsApp from './LoadProblemsApp.svelte';
 import PrivacyApp from './PrivacyApp.svelte';
+import EditionApp from './EditionApp.svelte';
 import { platform } from './lib/state/platform.svelte';
 import { shortcutsState } from './lib/state/shortcuts.svelte';
 import { editionState } from './lib/state/edition.svelte';
@@ -34,7 +35,9 @@ const Component =
               ? LoadProblemsApp
               : mode === 'privacy'
                 ? PrivacyApp
-                : StickyApp;
+                : mode === 'edition'
+                  ? EditionApp
+                  : StickyApp;
 
 // Sticky and workspace windows render on an OS-transparent surface; flag the
 // root so the page chrome behind the rounded card stays transparent.

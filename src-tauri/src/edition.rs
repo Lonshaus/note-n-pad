@@ -71,6 +71,20 @@ pub(crate) fn refuse_if(lite: bool, feature: &str) -> Result<(), String> {
   }
 }
 
+/// The refusal for something that exists only in lite; `Ok` when `lite`.
+pub(crate) fn refuse_unless_lite(lite: bool, what: &str) -> Result<(), String> {
+  if lite {
+    Ok(())
+  } else {
+    Err(format!("{what} is only available in the Lite edition"))
+  }
+}
+
+/// Entry-point guard of something that only the Lite edition has.
+pub(crate) fn require_lite(what: &str) -> Result<(), String> {
+  refuse_unless_lite(is_lite(), what)
+}
+
 /// Entry-point guard of a command that belongs to a removed feature.
 pub(crate) fn require_full(feature: &str) -> Result<(), String> {
   refuse_if(is_lite(), feature)
@@ -157,6 +171,9 @@ pub(crate) fn set_lite(app: &AppHandle, lite: bool) -> bool {
       if let Some(window) = app_for_main.get_webview_window("workspace") {
         let _ = window.destroy();
       }
+    } else if let Some(window) = app_for_main.get_webview_window("edition") {
+      // The full version has nothing to compare itself with.
+      let _ = window.destroy();
     }
     let locale =
       crate::i18n::current_locale(&crate::settings::app_settings(&app_for_main).language);
@@ -539,6 +556,27 @@ mod gate_tests {
       &["delete_data_file"],
       "delete_allowed(",
     );
+  }
+
+  #[test]
+  fn refuse_unless_lite_refuses_full_and_lets_lite_through() {
+    assert!(refuse_unless_lite(true, "x").is_ok());
+    assert!(refuse_unless_lite(false, "x").unwrap_err().contains("Lite"));
+  }
+
+  #[test]
+  fn the_full_features_window_refuses_when_full() {
+    assert_guarded(
+      include_str!("windows.rs"),
+      &["show_edition"],
+      "crate::edition::require_lite(",
+    );
+  }
+
+  #[test]
+  fn the_edition_window_closes_when_the_edition_turns_full() {
+    let set_lite = body_of(include_str!("edition.rs"), "set_lite");
+    assert!(set_lite.contains("get_webview_window(\"edition\")"));
   }
 
   #[test]
