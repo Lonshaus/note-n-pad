@@ -3,6 +3,7 @@
   // SPDX-License-Identifier: GPL-3.0-only
 
   import type { XmlNode } from './xml';
+  import { xmlNodeLabel } from './xmlText';
 
   interface Props {
     node: XmlNode;
@@ -17,25 +18,8 @@
   let { node, depth, open, ontoggle }: Props = $props();
 
   const container = $derived(node.childCount > 0);
-
-  // Every value below is a string that came out of the parse layer. Nothing
-  // here is a parsed node, and nothing is inserted as markup.
-  function label(): string {
-    switch (node.kind) {
-      case 'element':
-        return `<${node.name}>`;
-      case 'instruction':
-        return `<?${node.name}?>`;
-      case 'comment':
-        return '<!-- -->';
-      case 'cdata':
-        return 'CDATA';
-      case 'document':
-        return '#document';
-      default:
-        return '';
-    }
-  }
+  // Every value shown below is a string that came out of the parse layer.
+  // Nothing here is a parsed node, and nothing is inserted as markup.
 </script>
 
 <div class="row" style="padding-left: {depth * 1.1}rem">
@@ -49,7 +33,7 @@
   {#if node.kind === 'text'}
     <span class="text">{node.value}</span>
   {:else}
-    <span class="tag {node.kind}">{label()}</span>
+    <span class="tag {node.kind}">{xmlNodeLabel(node)}</span>
     {#each node.attributes as attr (attr.name)}
       <span class="attr-name">{attr.name}</span><span class="eq">=</span><span
         class="attr-value">"{attr.value}"</span
