@@ -9,6 +9,7 @@
     EditorState,
     Transaction,
     type Extension,
+    type Text,
   } from '@codemirror/state';
   import {
     EditorView,
@@ -32,16 +33,30 @@
   import { platform } from '../state/platform.svelte';
   import { cssFontFamily } from '../util/font';
   import {
+    applyBreaks,
     byteLength,
-    byteToCharIndex,
+    byteToChar,
+    charToByte,
     decideNewGroup,
+    detectBreakStyle,
     mapChangesToEdits,
     nextWindow,
+    rejectDuringSwap,
+    replaceBreaks,
+    scanBreaks,
     type RawChange,
     WINDOW_LINES,
     MARGIN_LINES,
     SWAP_THRESHOLD_LINES,
   } from '../util/windowedEdit';
+  import {
+    gotoSelection,
+    selectionAfterChange,
+    selectionAfterSwap,
+    toGlobalSelection,
+    type LinePos,
+    type LineSelection,
+  } from '../util/windowSelection';
   import { focusEditorIfIdle } from '../util/editorFocus';
   import { readCspNonce } from '../util/cspNonce';
   import { t } from '../i18n';
@@ -79,6 +94,9 @@
     // 0-based line the first window should cover, so an in-place unlock continues
     // from the line the user was viewing in the read-only view.
     initialTopLine?: number;
+    // Separator typed line breaks are written with, once detected for the tab.
+    // Undefined until then: the first window's text decides (see onMount).
+    insertLineEnding?: '\r\n' | '\n' | undefined;
     dark: boolean;
     fontSize: number;
     fontFamily: string;
@@ -87,6 +105,12 @@
     // True while any dialog/modal is up in the host window; suppresses the
     // automatic focus handoff so a gate/confirm keeps the keyboard.
     modalOpen?: boolean;
+    // Fired once with the first window's line-ending style when the tab has
+    // none yet (null: no line break in the window). Returns the separator
+    // typed breaks get: the detected one, or the user's default for a null.
+    ondetectending: (
+      style: ReturnType<typeof detectBreakStyle>,
+    ) => '\r\n' | '\n';
     // Fired after each successful apply so the state layer marks the tab dirty and
     // records the fresh totals.
     onapplied: (totalBytes: number, totalLines: number) => void;
@@ -107,12 +131,14 @@
     sessionId,
     initialTotalLines,
     initialTopLine = 0,
+    insertLineEnding,
     dark,
     fontSize,
     fontFamily,
     wordWrap,
     lineNumbers: showLineNumbers,
     modalOpen = false,
+    ondetectending,
     onapplied,
     onstatus,
     onerror,
@@ -127,8 +153,20 @@
   // exclusive.
   let windowStartLine = 0;
   let windowEndLine = 0;
+  // The selection's global ends, which outlive a window swap, and the live
+  // (window-local) selection they were last reconciled with.
+  let globalSel: LineSelection = {
+    anchor: { line: 0, col: 0 },
+    head: { line: 0, col: 0 },
+  };
+  let lastLive: LineSelection = globalSel;
   let windowStartOffset = 0;
   let windowEndOffset = 0;
+  // The loaded window as CodeMirror holds it has every line break as one `\n`;
+  // the file's real separator of each break (in order) lives here, so a position
+  // in the document converts to the right byte offset in the file.
+  let breaks: string[] = [];
+  let insertSep = '\n';
   // Seeded from the prop in onMount, then kept authoritative by every read/apply.
   let totalLines = 0;
   let totalBytes = 0;
@@ -144,6 +182,9 @@
   // listener does not mistake the replacement for a user edit, and the scroll
   // handler ignores the scroll-position changes the swap causes.
   let swapping = false;
+  // Set when an undo or redo changed the document while a swap was running,
+  // which the update listener does not track; the swap folds it in.
+  let docChangedDuringSwap = false;
   // Guards against re-entrant swaps while one is in flight.
   let swapInFlight = false;
   let selRaf = 0;
@@ -246,9 +287,23 @@
             ? []
             : tr,
         ),
+        // Commands that ignore readOnly (insertTab) could still change the
+        // document mid-swap, and the update listener would drop that change.
+        EditorState.transactionFilter.of((tr) =>
+          rejectDuringSwap(
+            swapping,
+            tr.docChanged,
+            tr.annotation(Transaction.userEvent),
+          )
+            ? []
+            : tr,
+        ),
         EditorView.updateListener.of((update) => {
           if (update.docChanged && !swapping && !applyingRemote) {
             handleUserEdit(update);
+          }
+          if (!swapping && (update.docChanged || update.selectionSet)) {
+            trackSelection(update.state, update.docChanged);
           }
           if (update.docChanged || update.selectionSet) {
             reportSelection();
@@ -256,6 +311,37 @@
         }),
       ],
     });
+  }
+
+  function livePos(doc: Text, pos: number): LinePos {
+    const line = doc.lineAt(pos);
+    return { line: line.number - 1, col: pos - line.from };
+  }
+
+  function docPos(doc: Text, pos: LinePos): number {
+    const line = doc.line(pos.line + 1);
+    return line.from + Math.min(pos.col, line.length);
+  }
+
+  function liveSelection(state: EditorState): LineSelection {
+    const main = state.selection.main;
+    return {
+      anchor: livePos(state.doc, main.anchor),
+      head: livePos(state.doc, main.head),
+    };
+  }
+  // Fold the state's live selection into the global one: a document change
+  // replaces it, a selection change replaces the ends the user moved.
+  function trackSelection(state: EditorState, docChanged: boolean): void {
+    const live = liveSelection(state);
+    globalSel = selectionAfterChange(
+      globalSel,
+      lastLive,
+      live,
+      windowStartLine,
+      docChanged,
+    );
+    lastLive = live;
   }
 
   // Report the global caret Ln/Col, coalesced to one update per frame.
@@ -268,11 +354,11 @@
       if (view === undefined) {
         return;
       }
-      const head = view.state.selection.main.head;
-      const line = view.state.doc.lineAt(head);
+      // The global head, which may lie outside the window after a swap.
+      const head = globalSel.head;
       onstatus({
-        line: windowStartLine + line.number,
-        col: head - line.from + 1,
+        line: head.line + 1,
+        col: head.col + 1,
         totalLines,
         windowStartLine,
       });
@@ -316,9 +402,17 @@
     update.changes.iterChanges((fromA, toA, _fromB, _toB, inserted) => {
       changes.push({ fromA, toA, inserted: inserted.toString() });
     });
-    const edits = mapChangesToEdits(windowStartOffset, docBefore, changes);
+    const edits = mapChangesToEdits(
+      windowStartOffset,
+      docBefore,
+      breaks,
+      insertSep,
+      changes,
+    );
+    breaks = applyBreaks(docBefore, breaks, changes, insertSep);
+    const docAfter = update.state.doc.toString();
     windowEndOffset =
-      windowStartOffset + byteLength(update.state.doc.toString());
+      windowStartOffset + charToByte(docAfter, breaks, docAfter.length);
     windowEndLine = windowStartLine + update.state.doc.lines;
     const now = Date.now();
     const composing = view?.composing ?? false;
@@ -425,21 +519,38 @@
       void loadWindow(res.first_line, 'goto');
       return;
     }
+    totalLines = res.total_lines;
+    totalBytes = res.total_bytes;
+    let landed = true;
     applyingRemote = true;
     try {
       for (const e of res.edits) {
         const doc = view.state.doc.toString();
-        const from = byteToCharIndex(doc, e.start - windowStartOffset);
-        const to = byteToCharIndex(doc, e.end - windowStartOffset);
+        const from = byteToChar(doc, breaks, e.start - windowStartOffset);
+        const to = byteToChar(doc, breaks, e.end - windowStartOffset);
+        if (from === null || to === null) {
+          landed = false;
+          break;
+        }
         view.dispatch({ changes: { from, to, insert: e.text } });
+        breaks = replaceBreaks(doc, breaks, from, to, scanBreaks(e.text));
+        if (swapping) {
+          docChangedDuringSwap = true;
+        }
       }
     } finally {
       applyingRemote = false;
     }
-    windowEndOffset = windowStartOffset + byteLength(view.state.doc.toString());
+    if (!landed) {
+      // An edit boundary inside a CRLF has no document position; the window
+      // is reloaded from the core instead of guessing one.
+      void loadWindow(res.first_line, 'goto');
+      return;
+    }
+    const docAfter = view.state.doc.toString();
+    windowEndOffset =
+      windowStartOffset + charToByte(docAfter, breaks, docAfter.length);
     windowEndLine = windowStartLine + view.state.doc.lines;
-    totalLines = res.total_lines;
-    totalBytes = res.total_bytes;
     reportSelection();
   }
 
@@ -455,7 +566,9 @@
   // in the update listener. Read-only closes both gaps honestly (input is briefly
   // refused instead of silently lost). endSwap is idempotent and always restores
   // the flag, so no exit path can wedge the editor in the ignore-edits state.
+  // User document changes are rejected during a swap.
   function beginSwap(): void {
+    docChangedDuringSwap = false;
     swapping = true;
     view?.dispatch({
       effects: readOnlyCompartment.reconfigure(readOnlyExtension(true)),
@@ -470,6 +583,10 @@
       view?.dispatch({
         effects: readOnlyCompartment.reconfigure(readOnlyExtension(false)),
       });
+      // A pointer selection made after the swap's setState was not tracked.
+      if (view !== undefined) {
+        trackSelection(view.state, false);
+      }
     }
   }
 
@@ -524,14 +641,17 @@
       // Capture the anchor and the cursor's global position against the OLD
       // window before the vars are overwritten.
       const anchor = mode === 'preserve' ? captureAnchor() : null;
-      const oldHead = view.state.selection.main.head;
-      const oldLine = view.state.doc.lineAt(oldHead);
-      const cursorGlobal = windowStartLine + (oldLine.number - 1);
-      const cursorCol = oldHead - oldLine.from;
+      // Selection moves made while the swap was waiting on the read were not
+      // tracked (the swap ignores the listener); fold them in against the old
+      // window before the window variables change. An undo applied meanwhile
+      // changed the document, not just the selection.
+      trackSelection(view.state, docChangedDuringSwap);
+      docChangedDuringSwap = false;
 
       windowStartLine = res.start_line;
       windowStartOffset = res.start_offset;
       windowEndOffset = res.end_offset;
+      breaks = scanBreaks(res.text);
       totalLines = res.total_lines;
       totalBytes = res.total_bytes;
 
@@ -540,30 +660,37 @@
       // goes in before the view ever sees the state, so no gap exists between
       // the new document and its selection.
       const fresh = buildState(res.text);
-
-      // Place the cursor at its old global line when that line is still in the
-      // window, otherwise clamp it to the window edge.
-      const cursorTarget = mode === 'goto' ? target : cursorGlobal;
-      const localNo = clamp(
-        cursorTarget - windowStartLine + 1,
-        1,
-        fresh.doc.lines,
+      // A goto puts the caret at the target line. Otherwise the remembered
+      // global selection is intersected with the new window; the global one is
+      // kept so a later swap can bring a clamped end back.
+      if (mode === 'goto') {
+        globalSel = gotoSelection(
+          windowStartLine +
+            clamp(target - windowStartLine, 0, fresh.doc.lines - 1),
+        );
+      }
+      const swapped = selectionAfterSwap(globalSel, {
+        startLine: windowStartLine,
+        lineCount: fresh.doc.lines,
+        lineLength: (local) => fresh.doc.line(local + 1).length,
+      });
+      globalSel = swapped.global;
+      lastLive = swapped.live;
+      view.setState(
+        fresh.update({
+          selection: {
+            anchor: docPos(fresh.doc, swapped.live.anchor),
+            head: docPos(fresh.doc, swapped.live.head),
+          },
+        }).state,
       );
-      const cLine = fresh.doc.line(localNo);
-      const cPos =
-        mode === 'goto'
-          ? cLine.from
-          : Math.min(cLine.from + cursorCol, cLine.to);
-      view.setState(fresh.update({ selection: { anchor: cPos } }).state);
       windowEndLine = windowStartLine + view.state.doc.lines;
       traceSwap({
         at: 'placed',
         mode,
         target,
         windowStartLine,
-        cursorTarget,
-        localNo,
-        caretLine: windowStartLine + localNo,
+        caretLine: windowStartLine + swapped.live.head.line + 1,
       });
 
       requestAnimationFrame(() => {
@@ -724,6 +851,11 @@
       windowStartLine = res.start_line;
       windowStartOffset = res.start_offset;
       windowEndOffset = res.end_offset;
+      breaks = scanBreaks(res.text);
+      // The tab's line ending is read from the first window when it has none
+      // yet, before the editor accepts any input.
+      insertSep =
+        insertLineEnding ?? ondetectending(detectBreakStyle(res.text));
       totalLines = res.total_lines;
       totalBytes = res.total_bytes;
       const v = new EditorView({
@@ -732,6 +864,8 @@
       });
       view = v;
       windowEndLine = windowStartLine + v.state.doc.lines;
+      lastLive = liveSelection(v.state);
+      globalSel = toGlobalSelection(lastLive, windowStartLine);
       // Continue from the line the user was viewing: place the caret there and
       // scroll it to the top so the unlock feels like the same view kept its place.
       if (target > windowStartLine) {
