@@ -13,6 +13,7 @@ mod diag;
 #[cfg(target_os = "macos")]
 mod dock;
 mod dock_labels;
+mod edition;
 mod encoding;
 mod file_ops;
 mod flush;
@@ -2551,6 +2552,10 @@ pub fn run() {
           }
         }
       }
+      // The edition decides which features exist, so it is settled before the
+      // first window, menu or Jump List is built (and a window's first
+      // `edition_info` can never read the lite initial value).
+      edition::init(handle);
       // Restore windows: one per sticky, one per document group. Nothing in here
       // may propagate: this runs inside `setup`, whose error is unwrapped by the
       // `.expect` on `build()` below, so one window that refuses to build would
@@ -2754,6 +2759,9 @@ pub fn run() {
       open_picked_files,
       app_watch::list_running_apps,
       platform::platform_info,
+      edition::edition_info,
+      #[cfg(debug_assertions)]
+      edition::debug_set_edition,
       altgr::altgr_table,
       default_apps::default_apps_page_supported,
       default_apps::open_default_apps_page,
