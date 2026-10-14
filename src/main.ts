@@ -15,6 +15,7 @@ import LoadProblemsApp from './LoadProblemsApp.svelte';
 import PrivacyApp from './PrivacyApp.svelte';
 import { platform } from './lib/state/platform.svelte';
 import { shortcutsState } from './lib/state/shortcuts.svelte';
+import { editionState } from './lib/state/edition.svelte';
 import { matchMenuAccelerator } from './lib/util/menuAccelerator';
 
 const mode = new URLSearchParams(window.location.search).get('mode');
@@ -47,6 +48,9 @@ const app = mount(Component, {
 // The effective shortcuts, for the editors and the window-scoped handlers; they
 // follow `settings-changed` from here on.
 void shortcutsState.init();
+// The edition (full or Lite), shared by every window mode; it follows
+// `edition-changed` from here on.
+void editionState.ready();
 
 // Windows only: WebView2 keyboard input never reaches Tauri's native
 // accelerator table, so every window mode needs one bubble-phase listener

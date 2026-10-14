@@ -12,6 +12,7 @@ import {
 import type { NoteSnapshot } from './stickyNote.svelte';
 import { t } from '../i18n';
 import { settingsState } from './settings.svelte';
+import { editionState } from './edition.svelte';
 import {
   documentWindow,
   windowedRefusalReason,
@@ -30,7 +31,7 @@ import { detectByFilename } from '../editor/language';
 // import in this file by Vitest's transform, so `documentWindow.svelte.ts`'s
 // own top-level `import { invoke } from '@tauri-apps/api/core'` binds to it.
 vi.mock('@tauri-apps/api/core', () => ({ invoke: vi.fn() }));
-vi.mock('@tauri-apps/api/event', () => ({ emit: vi.fn() }));
+vi.mock('@tauri-apps/api/event', () => ({ emit: vi.fn(), listen: vi.fn() }));
 vi.mock('@tauri-apps/plugin-dialog', () => ({ save: vi.fn() }));
 
 const mockInvoke = vi.mocked(invoke);
@@ -412,6 +413,27 @@ describe('loadTab size gate on the restore fallback path (F2 regression)', () =>
       'read_file_auto',
       expect.anything(),
     );
+  });
+});
+
+describe('init waits for the edition', () => {
+  it('does not read the snapshots until the edition is settled', async () => {
+    let settle: () => void = () => {};
+    const gate = vi.spyOn(editionState, 'ready').mockReturnValue(
+      new Promise<void>((resolve) => {
+        settle = resolve;
+      }),
+    );
+    mockInvoke.mockReset();
+    mockInvoke.mockImplementation((() => Promise.resolve([])) as typeof invoke);
+    const done = documentWindow.init('g-edition', null, null);
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(mockInvoke).not.toHaveBeenCalledWith('list_notes');
+    settle();
+    await done;
+    expect(mockInvoke).toHaveBeenCalledWith('list_notes');
+    gate.mockRestore();
   });
 });
 
