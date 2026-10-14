@@ -41,6 +41,8 @@
     makeCanvasMeasurer,
   } from './lib/util/font';
   import { invoke } from '@tauri-apps/api/core';
+  import { getCurrentWindow } from '@tauri-apps/api/window';
+  import { nativeFieldHistory, nativeSelectAll } from './lib/util/menuBar';
   import { ENCODINGS, type LineEnding } from './lib/util/text';
   import { t, type I18nKey } from './lib/i18n';
   import { BUILTIN_IDS, BUILTIN_LABELS } from './lib/i18n/locale';
@@ -338,6 +340,19 @@
     const unlistenChanges = settingsState.listenChanges();
     const unlistenThemes = themeRegistry.listen();
     const unlistenLocales = localeRegistry.listen();
+    // Edit > Undo/Redo/Select All reach the focused window as menu actions (the
+    // macOS items are no longer native); the theme-name and locale fields keep
+    // their own history and selection.
+    const unlistenMenuAction = getCurrentWindow().listen<string>(
+      'menu-action',
+      (event) => {
+        if (event.payload === 'undo' || event.payload === 'redo') {
+          nativeFieldHistory(event.payload);
+        } else if (event.payload === 'select-all') {
+          nativeSelectAll();
+        }
+      },
+    );
     void platform.init();
     void invoke<boolean>('default_apps_page_supported')
       .catch(() => false)
@@ -391,6 +406,7 @@
       void unlistenChanges.then((u) => u());
       void unlistenThemes.then((u) => u());
       void unlistenLocales.then((u) => u());
+      void unlistenMenuAction.then((u) => u());
     };
   });
 

@@ -10,6 +10,7 @@ import {
   COALESCE_MS,
   decideNewGroup,
   detectBreakStyle,
+  fullyVisibleLineSpan,
   mapChangesToEdits,
   nextWindow,
   rejectDuringSwap,
@@ -522,6 +523,36 @@ describe('detectBreakStyle', () => {
   it('returns null when the sample has no line break', () => {
     expect(detectBreakStyle('')).toBeNull();
     expect(detectBreakStyle('one line only')).toBeNull();
+  });
+});
+
+describe('fullyVisibleLineSpan', () => {
+  const blocks = [-10, 10, 30, 50, 70, 90].map((top, i) => ({
+    from: i * 10,
+    to: i * 10 + 9,
+    top,
+    bottom: top + 20,
+  }));
+
+  it('spans the lines fully inside the viewport', () => {
+    expect(fullyVisibleLineSpan(blocks, 0, 100)).toEqual({ from: 10, to: 49 });
+  });
+
+  it('excludes a partially visible bottom line', () => {
+    expect(fullyVisibleLineSpan(blocks, 0, 85)).toEqual({ from: 10, to: 39 });
+  });
+
+  it('excludes a partially visible top line', () => {
+    expect(fullyVisibleLineSpan(blocks, 15, 100)).toEqual({ from: 20, to: 49 });
+  });
+
+  it('falls back to the first intersecting line', () => {
+    expect(fullyVisibleLineSpan(blocks, 12, 28)).toEqual({ from: 10, to: 19 });
+  });
+
+  it('returns null for no blocks or blocks outside the viewport', () => {
+    expect(fullyVisibleLineSpan([], 0, 100)).toBeNull();
+    expect(fullyVisibleLineSpan(blocks, 200, 300)).toBeNull();
   });
 });
 

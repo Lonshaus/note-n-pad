@@ -28,7 +28,12 @@
   import { saveDialogOptions } from './lib/util/saveDialog';
   import { READ_ONLY_DESTINATION } from './lib/util/protocol';
   import { fileName } from './lib/util/filePath';
-  import { isEditAction } from './lib/util/menuBar';
+  import {
+    isEditAction,
+    isNativeUndoField,
+    nativeFieldHistory,
+    nativeSelectAll,
+  } from './lib/util/menuBar';
   import {
     editorCopy,
     editorCut,
@@ -279,6 +284,22 @@
   // to the sticky's save-and-convert flow. New Tab, Open, Find and Find and
   // Replace never reach an enabled sticky menu item, so they are ignored here.
   function runMenuAction(action: string): void {
+    // The find field keeps its own undo history.
+    if (
+      (action === 'undo' || action === 'redo') &&
+      isNativeUndoField(document.activeElement as HTMLElement | null)
+    ) {
+      nativeFieldHistory(action);
+      return;
+    }
+    // Same for Select All: a focused field selects its own text, not the note.
+    if (
+      action === 'select-all' &&
+      isNativeUndoField(document.activeElement as HTMLElement | null)
+    ) {
+      nativeSelectAll();
+      return;
+    }
     if (isEditAction(action) && editorView !== null) {
       const view = editorView;
       switch (action) {

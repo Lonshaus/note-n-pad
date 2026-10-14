@@ -30,6 +30,8 @@
     shouldCommitCell,
   } from '../util/tableRows';
   import { t } from '../i18n';
+  import { platform } from '../state/platform.svelte';
+  import { overlayKeyAction } from '../util/overlayKeys';
 
   interface Props {
     /** The document itself, not a copy of it: `toString()` on a 100 MiB table is
@@ -480,7 +482,8 @@
     // selection guard and fires for events bubbling from a focused cell input,
     // where preventDefault also suppresses the input's native undo. A cell being
     // edited is blurred first so its pending value commits as its own step.
-    if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === 'z') {
+    const keyAction = overlayKeyAction(e, platform.os);
+    if (keyAction === 'undo' || keyAction === 'redo') {
       e.preventDefault();
       const focused = document.activeElement;
       if (
@@ -489,7 +492,7 @@
       ) {
         focused.blur();
       }
-      if (e.shiftKey) {
+      if (keyAction === 'redo') {
         onredo();
       } else {
         onundo();
@@ -526,6 +529,16 @@
   export function selectAll(): void {
     selection = { kind: 'all' };
     rootEl?.focus();
+  }
+  // Takes keyboard focus, so typing and editing commands stop reaching the
+  // source editor underneath.
+  export function focus(): void {
+    rootEl?.focus({ preventScroll: true });
+  }
+  // The clipboard text of the current row/column/table selection, or null when
+  // nothing is selected.
+  export function selectedText(): string | null {
+    return selection === null ? null : selectionText();
   }
 
   export function getSelection(): Selection | null {
