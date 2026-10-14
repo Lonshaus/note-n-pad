@@ -7,7 +7,8 @@
   import { getCurrentWindow } from '@tauri-apps/api/window';
   import { save } from '@tauri-apps/plugin-dialog';
   import EditorShell from './lib/editor/EditorShell.svelte';
-  import ConfirmModal from './lib/ConfirmModal.svelte';
+  import ConfirmModal, { isModalOpen } from './lib/ConfirmModal.svelte';
+  import { popupClosesOnEscape } from './lib/util/popupEscape';
   import {
     stickyNote,
     type PinMode,
@@ -98,7 +99,9 @@
       }
     };
     const onKey = (e: KeyboardEvent): void => {
-      if (e.key === 'Escape') {
+      // A dialog on top owns the Esc it acts on; the popup closes on the next
+      // one, or at once on an Esc the dialog ignores.
+      if (popupClosesOnEscape(e, isModalOpen())) {
         close();
       }
     };
@@ -709,7 +712,9 @@
       primaryLabel={t('common.save')}
       secondaryLabel={t('dialog.dontSave')}
       cancelLabel={t('common.cancel')}
-      onprimary={() => void saveAndConvert()}
+      onprimary={async () => {
+        await saveAndConvert();
+      }}
       onsecondary={discardAndDestroy}
       oncancel={() => (showModal = false)}
     />
@@ -721,8 +726,12 @@
       primaryLabel={t('common.save')}
       secondaryLabel={t('dialog.dontSave')}
       cancelLabel={t('common.cancel')}
-      onprimary={() => void quitGateSave()}
-      onsecondary={() => void quitGateDiscard()}
+      onprimary={async () => {
+        await quitGateSave();
+      }}
+      onsecondary={async () => {
+        await quitGateDiscard();
+      }}
       oncancel={quitGateCancel}
     />
   {/if}

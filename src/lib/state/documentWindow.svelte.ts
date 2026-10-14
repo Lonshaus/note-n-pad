@@ -1116,6 +1116,11 @@ class DocumentWindowState {
       // empty if cancelled — DocumentApp collapses it then).
       this.nextIndex = 0;
       await this.openTab(initialPath);
+      if (this.tabs.length > 0) {
+        // The window now shows a document, so it can no longer be a launch
+        // window that collapses.
+        void invoke('launch_window_loaded', { label: `doc-${group}` });
+      }
       // `switchTo(0)` returns early when the index is already active, so the
       // setter — and the restore it kicks — never fires for a fresh window's
       // first tab, which an adopted orphan can be. Kick it directly: writing
