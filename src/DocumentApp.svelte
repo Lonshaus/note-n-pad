@@ -81,6 +81,8 @@
   import { textFromString } from './lib/util/text';
   import { focusEditorIfIdle } from './lib/util/editorFocus';
   import { t } from './lib/i18n';
+  import { isOrdinaryTab } from './lib/state/heldTab';
+  import { remountTopLine } from './lib/util/largeIndex';
   import { platform } from './lib/state/platform.svelte';
   import { shortcutsState } from './lib/state/shortcuts.svelte';
   import { matchWindowShortcut } from './lib/util/windowShortcut';
@@ -147,6 +149,15 @@
       : t('doc.untitled'),
   );
   const openIds = $derived(documentWindow.tabs.map((t) => t.id));
+  // Whether the active tab renders through the ordinary editor.
+  const activeOrdinary = $derived(
+    documentWindow.ready && active !== null && isOrdinaryTab(active),
+  );
+  // The ordinary tab the editor holds: the active tab, or while a windowed or
+  // large tab is active, the last active ordinary one (editor hidden).
+  const heldTab = $derived(
+    documentWindow.ready ? documentWindow.heldTab : null,
+  );
 
   // Honest long-line status for the status bar: shown only for a normal editor
   // tab whose long-line gate is active. `workerColoring` is true when worker
@@ -491,7 +502,7 @@
     // buffer and a reload would push a redundant history step (breaking stepwise
     // undo). Only re-sync when the defensive fallback left the hidden CM stale.
     if (leavingTable) {
-      const view = editorView;
+      const view = liveView();
       // Reference compare (both ropes): equal means CM already tracks the buffer,
       // so no reload. They diverge only if the direct-write fallback ran.
       if (view === null || view.state.doc !== active.content) {
@@ -537,7 +548,7 @@
     if (changes.length === 0) {
       return;
     }
-    const view = editorView;
+    const view = liveView();
     if (view === null) {
       if (active === null) {
         return;
@@ -559,7 +570,7 @@
   // share one timeline. Selection indices may be stale after the doc changes, so
   // clear any selection first (the deselect convention used by every mutation).
   function tableUndo(): void {
-    const view = editorView;
+    const view = liveView();
     if (view === null) {
       return;
     }
@@ -568,7 +579,7 @@
   }
 
   function tableRedo(): void {
-    const view = editorView;
+    const view = liveView();
     if (view === null) {
       return;
     }
@@ -647,10 +658,14 @@
     }
     await documentWindow.openTab(selected);
   }
-
-  // The active tab's CodeMirror view, supplied by DocumentEditor so menu-driven
-  // find/replace commands run against the real editor without global state.
-  let editorView: EditorView | null = null;
+  // The ordinary editor's CodeMirror view, supplied by DocumentEditor so
+  // menu-driven find/replace commands run against the real editor without
+  // global state. The editor stays mounted (hidden) while a windowed or large
+  // tab is active, so every use goes through `liveView`.
+  let heldView: EditorView | null = null;
+  function liveView(): EditorView | null {
+    return activeOrdinary ? heldView : null;
+  }
 
   // Any dialog/modal currently up. The automatic focus handoff is suppressed
   // while one is open so a gate/confirm keeps the keyboard.
@@ -674,7 +689,7 @@
     if (documentWindow.activeTab?.windowed !== undefined) {
       windowedRef?.focus();
     } else {
-      focusEditorIfIdle(editorView, anyModalOpen);
+      focusEditorIfIdle(liveView(), anyModalOpen);
     }
   }
 
@@ -708,8 +723,9 @@
 
   function openFind(): void {
     ensureSourceView();
-    if (editorView !== null) {
-      openSearchPanel(editorView);
+    const view = liveView();
+    if (view !== null) {
+      openSearchPanel(view);
     }
   }
 
@@ -717,7 +733,7 @@
   // the replace field so Find and Replace lands the caret there.
   function openFindReplace(): void {
     ensureSourceView();
-    const view = editorView;
+    const view = liveView();
     if (view === null) {
       return;
     }
@@ -731,26 +747,30 @@
 
   function findNextMatch(): void {
     ensureSourceView();
-    if (editorView !== null) {
-      findNext(editorView);
+    const view = liveView();
+    if (view !== null) {
+      findNext(view);
     }
   }
 
   function findPrevMatch(): void {
     ensureSourceView();
-    if (editorView !== null) {
-      findPrevious(editorView);
+    const view = liveView();
+    if (view !== null) {
+      findPrevious(view);
     }
   }
 
   function closeFind(): void {
-    if (editorView !== null) {
-      closeSearchPanel(editorView);
+    const view = liveView();
+    if (view !== null) {
+      closeSearchPanel(view);
     }
   }
 
   function isSearchOpen(): boolean {
-    return editorView !== null && searchPanelOpen(editorView.state);
+    const view = liveView();
+    return view !== null && searchPanelOpen(view.state);
   }
 
   // Copy the active tab's file path to the clipboard (File > Copy File Path).
@@ -803,10 +823,11 @@
       return;
     }
     if (isEditAction(action)) {
+      const view = liveView();
       const surface = editActionSurface(action, {
         isTable: showTable,
         isWindowed: active?.windowed !== undefined,
-        hasEditorView: editorView !== null,
+        hasEditorView: view !== null,
       });
       if (surface === 'table') {
         if (action === 'undo') {
@@ -824,8 +845,7 @@
         } else {
           windowedRef?.redo();
         }
-      } else if (surface === 'editor' && editorView !== null) {
-        const view = editorView;
+      } else if (surface === 'editor' && view !== null) {
         if (action === 'undo') {
           undo(view);
         } else if (action === 'redo') {
@@ -1052,7 +1072,7 @@
       // macOS: the menu does not fire while an IME composes; save anyway and
       // leave the composition running, as TextEdit does.
       if (platform.isMacOS && isSaveKey(e)) {
-        if (editorView?.composing === true) {
+        if (liveView()?.composing === true) {
           e.preventDefault();
           void documentWindow.saveActive();
           return;
@@ -1209,7 +1229,7 @@
     window.addEventListener('keydown', onKeydown);
     // A tab switch waits for the active editor's IME composition to end.
     documentWindow.endComposition = (): Promise<void> => {
-      const view = editorView;
+      const view = liveView();
       if (view !== null) {
         return settleViewComposition(view);
       }
@@ -1252,14 +1272,17 @@
           searchPanelOpen: () => isSearchOpen(),
           closeFind: () => closeFind(),
           setSearchInSelection: (on: boolean) => {
-            if (editorView !== null) {
-              setSearchInSelection(editorView, on);
+            const view = liveView();
+            if (view !== null) {
+              setSearchInSelection(view, on);
             }
           },
-          getSearchInSelection: () =>
-            editorView !== null && getSearchInSelection(editorView),
+          getSearchInSelection: () => {
+            const view = liveView();
+            return view !== null && getSearchInSelection(view);
+          },
           setDocSelection: (from: number, to: number) => {
-            editorView?.dispatch({ selection: { anchor: from, head: to } });
+            liveView()?.dispatch({ selection: { anchor: from, head: to } });
           },
           getViewMode: () => activeViewMode,
           setViewMode: (m: ViewMode) => setViewMode(m),
@@ -1564,7 +1587,11 @@
           bind:this={windowedRef}
           sessionId={active.windowed.sessionId}
           initialTotalLines={active.windowed.totalLines}
-          initialTopLine={active.windowed.initialLine ?? 0}
+          initialTopLine={remountTopLine(
+            documentWindow.viewTopLine(active.id),
+            active.windowed.initialLine,
+          )}
+          initialCaret={documentWindow.viewCaret(active.id)}
           insertLineEnding={active.insertLineEnding}
           ondetectending={(style) => {
             const t = documentWindow.activeTab;
@@ -1592,6 +1619,16 @@
           onstatus={(info) => {
             documentWindow.setCursor(info.line, info.col);
             documentWindow.windowedTopLineChanged(info.windowStartLine);
+            const t = documentWindow.activeTab;
+            if (t?.windowed !== undefined) {
+              documentWindow.setViewCaret(t.id, info.line, info.col);
+            }
+          }}
+          ontopline={(line) => {
+            const t = documentWindow.activeTab;
+            if (t?.windowed !== undefined) {
+              documentWindow.setViewTopLine(t.id, line);
+            }
           }}
           onerror={(message) => (windowedError = message)}
         />
@@ -1600,6 +1637,19 @@
       {#key `${active.id}:${documentWindow.largeReloadSeq}`}
         <LargeFileView
           bind:this={largeRef}
+          tabId={active.id}
+          initialTopLine={remountTopLine(
+            documentWindow.viewTopLine(active.id),
+            undefined,
+          )}
+          indexRef={documentWindow.largeIndex(active.id)}
+          onindexchange={(id, ref) => documentWindow.setLargeIndex(id, ref)}
+          ontopline={(line) => {
+            const t = documentWindow.activeTab;
+            if (t?.large !== undefined) {
+              documentWindow.setViewTopLine(t.id, line);
+            }
+          }}
           path={active.path}
           size={active.large.size}
           fontSize={settingsState.editorFontSize}
@@ -1622,29 +1672,47 @@
           onindexerror={() => (indexFailed = active?.path ?? null)}
         />
       {/key}
-    {:else if documentWindow.ready && active !== null && active.windowedRestore === undefined}
-      <!-- A `windowedRestore` tab with neither `windowed` nor `large` set yet is
-           mid lazy-restore (see `beginWindowedRestore`): render nothing rather
-           than this ordinary (empty-rope) editor for the fast path's one frame,
-           or the read-only viewer for the slow path's grace period — both are
-           handled by the branches above once the tab's fields catch up. -->
-      <DocumentEditor
-        activeId={active.id}
-        content={active.content}
-        language={active.language}
-        dark={settingsState.isDark}
-        fontSize={settingsState.editorFontSize}
-        fontFamily={settingsState.editorFontFamily}
-        wordWrap={settingsState.editorWordWrap}
-        lineNumbers={settingsState.editorLineNumbers}
-        modalOpen={anyModalOpen}
-        {openIds}
-        reloadSeq={documentWindow.reloadSeq}
-        onchange={(v) => documentWindow.updateActiveContent(v)}
-        onselection={(line, col) => documentWindow.setCursor(line, col)}
-        onview={(v) => (editorView = v)}
-        onlongline={(active) => (longLineActive = active)}
-      />
+    {/if}
+    <!-- A `windowedRestore` tab with neither `windowed` nor `large` set yet is
+         mid lazy-restore (see `beginWindowedRestore`): it is not ordinary, so
+         the editor stays hidden and nothing else renders for it.
+         The ordinary editor stays mounted while a windowed or large tab is
+         active (hidden, not unmounted) so every ordinary tab keeps its caret,
+         scroll and undo history; its props follow the held tab, never the
+         active one. -->
+    {#if heldTab !== null}
+      {@const held = heldTab}
+      <div
+        class="editor-slot"
+        class:hidden={!activeOrdinary}
+        inert={!activeOrdinary}
+      >
+        <DocumentEditor
+          activeId={held.id}
+          content={held.content}
+          language={held.language}
+          dark={settingsState.isDark}
+          fontSize={settingsState.editorFontSize}
+          fontFamily={settingsState.editorFontFamily}
+          wordWrap={settingsState.editorWordWrap}
+          lineNumbers={settingsState.editorLineNumbers}
+          modalOpen={anyModalOpen}
+          hidden={!activeOrdinary}
+          {openIds}
+          reloadSeq={documentWindow.reloadSeq}
+          reloadTarget={documentWindow.reloadTargetId}
+          onchange={(v) => documentWindow.updateContentById(held.id, v)}
+          onselection={(line, col) => {
+            if (activeOrdinary) {
+              documentWindow.setCursor(line, col);
+            }
+          }}
+          onview={(v) => (heldView = v)}
+          onlongline={(on) => (longLineActive = on)}
+        />
+      </div>
+    {/if}
+    {#if activeOrdinary && active !== null}
       {#if showJson}
         <div class="table-overlay">
           <JsonView doc={active.content} dark={settingsState.isDark} />
@@ -2018,6 +2086,15 @@
     position: relative;
     flex: 1 1 auto;
     min-height: 0;
+  }
+  .editor-slot {
+    position: absolute;
+    inset: 0;
+  }
+  /* Kept in layout (not display: none) so the hidden editor keeps its scroll
+     position and measurements. */
+  .editor-slot.hidden {
+    visibility: hidden;
   }
   /* The table view overlays the (still-mounted) CodeMirror editor so its
      per-tab state survives a view toggle. */

@@ -30,11 +30,44 @@ pub struct LargeFileState {
 
 /// A byte-offset index over a file's lines. Checkpoints are `(line, byte offset
 /// of that line's start)` recorded every `interval` lines, always seeded with
-/// `(0, 0)`. `total_lines` is `None` until the background scan completes.
+/// `(0, 0)`. `total_lines` is `None` until the background scan completes, and
+/// stays `None` with `failed` set when the scan died.
 struct LineIndex {
   path: PathBuf,
   checkpoints: Vec<(u64, u64)>,
   total_lines: Option<u64>,
+  failed: bool,
+}
+/// Where an index's background scan stands, as `index_line_count` reports it.
+#[derive(Serialize, Debug, PartialEq, Eq)]
+#[serde(tag = "state", content = "lines", rename_all = "lowercase")]
+pub enum IndexStatus {
+  Running,
+  Done(u64),
+  Failed,
+}
+
+fn index_status(index: &LineIndex) -> IndexStatus {
+  if index.failed {
+    IndexStatus::Failed
+  } else {
+    match index.total_lines {
+      Some(total) => IndexStatus::Done(total),
+      None => IndexStatus::Running,
+    }
+  }
+}
+/// Look an index up by id and report its scan status.
+fn status_of(indexes: &Mutex<HashMap<String, LineIndex>>, id: &str) -> Result<IndexStatus, String> {
+  let map = indexes.lock().unwrap();
+  let index = map.get(id).ok_or_else(|| "unknown index id".to_string())?;
+  Ok(index_status(index))
+}
+/// Record that an index's scan failed, unless the index was already dropped.
+fn mark_failed(indexes: &Mutex<HashMap<String, LineIndex>>, id: &str) {
+  if let Some(entry) = indexes.lock().unwrap().get_mut(id) {
+    entry.failed = true;
+  }
 }
 
 #[derive(Serialize)]
@@ -376,6 +409,7 @@ pub fn start_line_index(
       path: path_buf.clone(),
       checkpoints: vec![(0, 0)],
       total_lines: None,
+      failed: false,
     },
   );
   let thread_id = id.clone();
@@ -384,6 +418,7 @@ pub fn start_line_index(
       Ok(f) => f,
       Err(e) => {
         log::warn!("line index open failed: {e}");
+        mark_failed(&app.state::<LargeFileState>().indexes, &thread_id);
         let _ = app.emit(
           "large-index-progress",
           IndexProgress {
@@ -420,6 +455,7 @@ pub fn start_line_index(
       }
       Err(e) => {
         log::warn!("line index scan failed: {e}");
+        mark_failed(&app.state::<LargeFileState>().indexes, &thread_id);
         let _ = app.emit(
           "large-index-progress",
           IndexProgress {
@@ -476,14 +512,11 @@ pub fn line_to_offset(state: State<LargeFileState>, id: String, line: u64) -> Re
     .map_err(|e| e.to_string())?;
   offset_of_line(BufReader::new(file), checkpoint.1, checkpoint.0, line)
 }
-
-/// The index's total line count once known, otherwise `None` while it is still
-/// being built.
+/// Where the index's scan stands: still running, done with the total line count,
+/// or failed. Errors with "unknown index id" once the index has been dropped.
 #[tauri::command]
-pub fn index_line_count(state: State<LargeFileState>, id: String) -> Result<Option<u64>, String> {
-  let map = state.indexes.lock().unwrap();
-  let index = map.get(&id).ok_or_else(|| "unknown index id".to_string())?;
-  Ok(index.total_lines)
+pub fn index_line_count(state: State<LargeFileState>, id: String) -> Result<IndexStatus, String> {
+  status_of(&state.indexes, &id)
 }
 
 /// Release a line index and its memory.
@@ -828,6 +861,62 @@ mod tests {
     // the terminal `large-index-progress` event with `error: true` instead of
     // returning silently.
     assert!(build_index(FailingReader, 1, |_, _| {}).is_err());
+  }
+
+  fn index_entry() -> LineIndex {
+    LineIndex {
+      path: PathBuf::from("x"),
+      checkpoints: vec![(0, 0)],
+      total_lines: None,
+      failed: false,
+    }
+  }
+
+  #[test]
+  fn index_status_running_while_scan_unfinished() {
+    let indexes = Mutex::new(HashMap::new());
+    indexes.lock().unwrap().insert("a".into(), index_entry());
+    assert_eq!(status_of(&indexes, "a").unwrap(), IndexStatus::Running);
+  }
+
+  #[test]
+  fn index_status_done_reports_total() {
+    let indexes = Mutex::new(HashMap::new());
+    let mut entry = index_entry();
+    entry.total_lines = Some(42);
+    indexes.lock().unwrap().insert("a".into(), entry);
+    assert_eq!(status_of(&indexes, "a").unwrap(), IndexStatus::Done(42));
+  }
+
+  #[test]
+  fn index_status_failed_after_mark_failed() {
+    let indexes = Mutex::new(HashMap::new());
+    indexes.lock().unwrap().insert("a".into(), index_entry());
+    mark_failed(&indexes, "a");
+    assert_eq!(status_of(&indexes, "a").unwrap(), IndexStatus::Failed);
+  }
+
+  #[test]
+  fn index_status_unknown_id_errors_and_mark_failed_ignores_it() {
+    let indexes = Mutex::new(HashMap::new());
+    mark_failed(&indexes, "gone");
+    assert_eq!(status_of(&indexes, "gone").unwrap_err(), "unknown index id");
+  }
+
+  #[test]
+  fn index_status_serializes_with_a_state_tag() {
+    assert_eq!(
+      serde_json::to_string(&IndexStatus::Running).unwrap(),
+      r#"{"state":"running"}"#
+    );
+    assert_eq!(
+      serde_json::to_string(&IndexStatus::Done(7)).unwrap(),
+      r#"{"state":"done","lines":7}"#
+    );
+    assert_eq!(
+      serde_json::to_string(&IndexStatus::Failed).unwrap(),
+      r#"{"state":"failed"}"#
+    );
   }
 
   #[test]
