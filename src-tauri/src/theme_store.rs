@@ -134,10 +134,12 @@ pub fn load_dir(dir: &Path) -> Result<Loaded<CustomTheme>, String> {
     skipped,
   })
 }
+/// Themes paired with the file name each came from, plus the skipped files.
+type NamedThemes = (Vec<(String, CustomTheme)>, Vec<SkippedFile>);
 /// `load_dir` with the file name each theme came from. One theme per id: the
 /// file whose stem equals the id wins, otherwise the first by file name; the
 /// other files declaring that id are reported as `DuplicateId`.
-fn load_named(dir: &Path) -> Result<(Vec<(String, CustomTheme)>, Vec<SkippedFile>), String> {
+fn load_named(dir: &Path) -> Result<NamedThemes, String> {
   let entries = match std::fs::read_dir(dir) {
     Ok(entries) => entries,
     Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok((Vec::new(), Vec::new())),
