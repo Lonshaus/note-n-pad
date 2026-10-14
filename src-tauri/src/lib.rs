@@ -1270,8 +1270,8 @@ fn build_menu(
   #[cfg(target_os = "macos")]
   let _ = window_menu.set_as_windows_menu_for_nsapp();
   // Help menu: Documentation and Report an Issue open the browser (routed to
-  // `tauri_plugin_opener` in the menu-event handler); Keyboard Shortcuts,
-  // Acknowledgements, and Privacy Policy each open our own window.
+  // `tauri_plugin_opener` in the menu-event handler); Acknowledgements and
+  // Privacy Policy each open our own window.
   let documentation = MenuItem::with_id(
     app,
     "help-documentation",
@@ -1285,13 +1285,6 @@ fn build_menu(
     tr(i18n::Key::ReportIssue),
     true,
     accel("help-report-issue"),
-  )?;
-  let keyboard_shortcuts = MenuItem::with_id(
-    app,
-    "help-keyboard-shortcuts",
-    tr(i18n::Key::KeyboardShortcuts),
-    true,
-    None::<&str>,
   )?;
   let acknowledgements = MenuItem::with_id(
     app,
@@ -1311,13 +1304,7 @@ fn build_menu(
     app,
     tr(i18n::Key::HelpMenu),
     true,
-    &[
-      &documentation,
-      &report_issue,
-      &keyboard_shortcuts,
-      &acknowledgements,
-      &privacy,
-    ],
+    &[&documentation, &report_issue, &acknowledgements, &privacy],
   )?;
   // On macOS this also gets the system-inserted menu search field; Windows and
   // Linux have no equivalent, so the menu there is just the menu.
@@ -1464,9 +1451,6 @@ fn handle_menu_id(app: &tauri::AppHandle, id: &str) {
     }
     "help-report-issue" => {
       navigation::open_externally("https://github.com/Lonshaus/note-n-pad/issues");
-    }
-    "help-keyboard-shortcuts" => {
-      let _ = windows::show_shortcuts(app);
     }
     "help-acknowledgements" => {
       let _ = windows::show_acknowledgements(app);
@@ -2560,6 +2544,7 @@ pub fn run() {
       note_store::get_snapshot_dir,
       settings::load_settings,
       settings::save_settings,
+      settings::ack_unset_defaults,
       theme_store::list_themes,
       theme_store::save_theme,
       theme_store::delete_theme,
@@ -2585,7 +2570,6 @@ pub fn run() {
       windows::show_workspace_window,
       windows::show_settings_window,
       windows::show_about_window,
-      windows::show_shortcuts_window,
       windows::show_acknowledgements_window,
       windows::show_privacy_window,
       shortcuts::get_shortcuts,

@@ -345,3 +345,33 @@ export function formatAcceleratorSymbols(
   const unknown = resolved.filter((m) => !MAC_MODIFIER_ORDER.includes(m));
   return [...unknown, ...known, key].join('');
 }
+
+const KEY_GLYPHS: Record<string, string> = {
+  ArrowLeft: '←',
+  ArrowRight: '→',
+  ArrowUp: '↑',
+  ArrowDown: '↓',
+  Escape: 'Esc',
+};
+// What the native macOS menus draw; wins over KEY_GLYPHS.
+const MAC_KEY_GLYPHS: Record<string, string> = {
+  Backspace: '⌫',
+  Delete: '⌦',
+  Shift: '⇧',
+  Enter: '↩',
+  Escape: '⎋',
+  Tab: '⇥',
+  PageUp: '⇞',
+  PageDown: '⇟',
+  Home: '↖',
+  End: '↘',
+};
+/** Like `formatAcceleratorSymbols`, but the final key is shown the way a
+ *  keycap reads: arrows as arrows, `Escape` as `Esc`, and on macOS the glyphs
+ *  the native menus draw (Enter, Escape, Tab, PageUp, PageDown, Home, End,
+ *  Backspace, Delete and a bare Shift). */
+export function formatKeyDisplay(accel: string, isMacOS: boolean): string {
+  const { mods, key } = tokenize(accel);
+  const shown = (isMacOS ? MAC_KEY_GLYPHS[key] : undefined) ?? KEY_GLYPHS[key];
+  return formatAcceleratorSymbols([...mods, shown ?? key].join('+'), isMacOS);
+}

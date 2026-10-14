@@ -6,6 +6,7 @@ import {
   eventKeyName,
   formatAccelerator,
   formatAcceleratorSymbols,
+  formatKeyDisplay,
   recordAccelerator,
   type KeyLike,
   type RecordResult,
@@ -597,5 +598,49 @@ describe('formatAcceleratorSymbols', () => {
   it('keeps a literal + key token instead of losing it to the separator split', () => {
     expect(formatAcceleratorSymbols('Cmd++', true)).toBe('⌘+');
     expect(formatAcceleratorSymbols('Ctrl++', false)).toBe('Ctrl++');
+  });
+});
+
+describe('formatKeyDisplay', () => {
+  it('shows arrows and Escape as keycaps on both platforms', () => {
+    expect(formatKeyDisplay('ArrowLeft', true)).toBe('←');
+    expect(formatKeyDisplay('Alt+ArrowLeft', true)).toBe('⌥←');
+    expect(formatKeyDisplay('Ctrl+ArrowLeft', false)).toBe('Ctrl+←');
+    expect(formatKeyDisplay('Escape', false)).toBe('Esc');
+    expect(formatKeyDisplay('Shift+Enter', true)).toBe('⇧↩');
+    expect(formatKeyDisplay('Shift+Enter', false)).toBe('Shift+Enter');
+  });
+
+  it('uses the Backspace, Delete and Shift glyphs on macOS only', () => {
+    expect(formatKeyDisplay('Alt+Backspace', true)).toBe('⌥⌫');
+    expect(formatKeyDisplay('Cmd+Delete', true)).toBe('⌘⌦');
+    expect(formatKeyDisplay('Shift', true)).toBe('⇧');
+    expect(formatKeyDisplay('Ctrl+Backspace', false)).toBe('Ctrl+Backspace');
+    expect(formatKeyDisplay('Delete', false)).toBe('Delete');
+  });
+
+  it('draws Enter, Escape, Tab and the paging keys as the macOS menus do', () => {
+    expect(formatKeyDisplay('Cmd+Enter', true)).toBe('⌘↩');
+    expect(formatKeyDisplay('Alt+Escape', true)).toBe('⌥⎋');
+    expect(formatKeyDisplay('Ctrl+Tab', true)).toBe('⌃⇥');
+    expect(formatKeyDisplay('PageUp', true)).toBe('⇞');
+    expect(formatKeyDisplay('Cmd+PageDown', true)).toBe('⌘⇟');
+    expect(formatKeyDisplay('Home', true)).toBe('↖');
+    expect(formatKeyDisplay('Shift+End', true)).toBe('⇧↘');
+  });
+
+  it('leaves Enter, Escape, Tab and the paging keys as words off macOS', () => {
+    expect(formatKeyDisplay('Ctrl+Enter', false)).toBe('Ctrl+Enter');
+    expect(formatKeyDisplay('Alt+Escape', false)).toBe('Alt+Esc');
+    expect(formatKeyDisplay('Ctrl+Tab', false)).toBe('Ctrl+Tab');
+    expect(formatKeyDisplay('PageUp', false)).toBe('PageUp');
+    expect(formatKeyDisplay('Home', false)).toBe('Home');
+    expect(formatKeyDisplay('End', false)).toBe('End');
+  });
+
+  it('leaves letters, F keys and a literal + key alone', () => {
+    expect(formatKeyDisplay('Shift+Cmd+Z', true)).toBe('⇧⌘Z');
+    expect(formatKeyDisplay('F3', false)).toBe('F3');
+    expect(formatKeyDisplay('Cmd++', true)).toBe('⌘+');
   });
 });
