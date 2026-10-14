@@ -1,6 +1,7 @@
 // Copyright © 2026 Lonshaus
 // SPDX-License-Identifier: GPL-3.0-only
 
+mod altgr;
 mod app_watch;
 #[cfg(debug_assertions)]
 mod automation;
@@ -1084,8 +1085,8 @@ fn build_menu(
     accel("find-prev"),
   )?;
   // Undo/Redo/Cut/Copy/Paste/Select All: predefined items on macOS (needed for
-  // the responder chain) and Windows (already dispatched natively via
-  // `execute_edit_command`, see windows/mod.rs). On Linux muda's predefined
+  // the responder chain) and Windows (already dispatched natively through
+  // muda's `EditCommand::run`). On Linux muda's predefined
   // versions are silent no-ops — Cut/Copy/Paste/SelectAll synthesize an X11 key
   // sequence via `libxdo`, a feature this build does not enable, and Undo/Redo
   // have no GTK implementation at all — so Linux gets custom items instead,
@@ -2753,6 +2754,7 @@ pub fn run() {
       open_picked_files,
       app_watch::list_running_apps,
       platform::platform_info,
+      altgr::altgr_table,
       default_apps::default_apps_page_supported,
       default_apps::open_default_apps_page,
       fonts::installed_font_families,
