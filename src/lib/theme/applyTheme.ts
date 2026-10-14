@@ -1,9 +1,11 @@
 // Copyright © 2026 Lonshaus
 // SPDX-License-Identifier: GPL-3.0-only
 
-import { themeCssVars } from './themes';
+import { resolveEditorTheme, themeCssVars } from './themes';
 import { themeRegistry } from './themeRegistry.svelte';
 import { chromeCssVars, interfaceIsDark, type InterfaceMode } from './chrome';
+import { isLite } from '../state/edition.svelte';
+import { settingsState } from '../state/settings.svelte';
 
 /** Stamp the selected theme's editor colors onto the document root: `data-theme`
  *  (informational) plus the `--e-*` editor surface and `--tok-*` syntax vars.
@@ -14,9 +16,16 @@ import { chromeCssVars, interfaceIsDark, type InterfaceMode } from './chrome';
  *
  *  An unresolvable id — a theme deleted elsewhere, or the registry not loaded
  *  yet — falls back to the first available theme so the editor is never left
- *  unthemed; the stored id is corrected separately (settings.svelte.ts's apply). */
+ *  unthemed; the stored id is corrected separately (settings.svelte.ts's apply).
+ *  In lite there is no theme choice: the id is ignored and the editor takes the
+ *  default theme of the interface mode (see `resolveEditorTheme`). */
 export function applyTheme(id: string): void {
-  const theme = themeRegistry.get(id) ?? themeRegistry.themes[0];
+  const theme = resolveEditorTheme(
+    themeRegistry.themes,
+    id,
+    isLite(),
+    interfaceIsDark(settingsState.interfaceMode, settingsState.prefersDark),
+  );
   if (theme === undefined) {
     return;
   }

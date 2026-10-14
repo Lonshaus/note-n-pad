@@ -220,6 +220,7 @@
     "status.longLine.reason": "Tệp này có một dòng rất dài; phân tích nó sau mỗi lần gõ sẽ làm chậm việc nhập.",
     "doc.openFailed": "Không mở được “{name}”. Tệp có thể đã bị di chuyển hoặc xoá, hoặc tên tệp chứa ký tự mà ứng dụng này không hỗ trợ.",
     "doc.restoreUnreadable": "Không đọc được: {names}. Hãy mở lại tệp để tiếp tục.",
+    "doc.keptTabs": "Chưa mở {count} tab cần phiên bản đầy đủ. Các tab này được giữ nguyên, kể cả thay đổi chưa lưu, và sẽ mở lại khi đọc được giấy phép bản đầy đủ.",
     "doc.revealFailed": "Không hiển thị được “{name}”. Tệp có thể đã bị di chuyển hoặc xoá.",
     "doc.saveFailed": "Không lưu được “{name}”: {error}",
     "doc.saveReadOnly": "“{name}” chỉ đọc nên không có gì được lưu. Hãy thay đổi quyền của tệp để lưu vào đó.",

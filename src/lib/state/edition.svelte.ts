@@ -14,6 +14,17 @@ export class EditionState {
   #ready: Promise<void> | null = null;
   // An event is newer than any read still in flight, so it must win.
   #changedByEvent = false;
+  #listeners = new Set<(lite: boolean) => void>();
+
+  /** Run `callback` with the new value each time `edition-changed` arrives.
+   *  For work a `$derived` cannot do (loading tabs a lite session kept).
+   *  Returns the unsubscribe. */
+  onChanged(callback: (lite: boolean) => void): () => void {
+    this.#listeners.add(callback);
+    return () => {
+      this.#listeners.delete(callback);
+    };
+  }
 
   /** Resolves once the value is settled and the change listener is up.
    *  Idempotent: every window and every caller shares one load. */
@@ -27,6 +38,9 @@ export class EditionState {
       await listen<boolean>('edition-changed', (event) => {
         this.#changedByEvent = true;
         this.lite = event.payload;
+        for (const callback of this.#listeners) {
+          callback(event.payload);
+        }
       });
       const lite = await invoke<boolean>('edition_info');
       if (!this.#changedByEvent) {
@@ -45,3 +59,12 @@ export class EditionState {
 }
 
 export const editionState = new EditionState();
+
+/** Whether the Lite edition's cuts apply right now. `__LITE__` is constant in a
+ *  Lite build, so gated code is folded away there; elsewhere it follows the
+ *  runtime value, which a license change can flip without a restart. Reactive
+ *  through `editionState.lite` when read inside `$derived`, `$effect` or a
+ *  template. */
+export function isLite(): boolean {
+  return __LITE__ || editionState.lite;
+}

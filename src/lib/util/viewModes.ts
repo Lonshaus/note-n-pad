@@ -35,8 +35,9 @@ export function previewCharLimit(mode: ViewMode): number {
 /** Modes offered for `path`, in the order the switcher should list them. The
  *  first entry is the mode a freshly opened tab starts in. A path with no
  *  alternative rendering gets `['source']`, which the caller reads as "no
- *  switcher at all". */
-export function viewModesFor(path: string | null): ViewMode[] {
+ *  switcher at all". The Lite edition has no JSON or XML tree view; the table
+ *  and the Markdown preview stay. */
+export function viewModesFor(path: string | null, lite: boolean): ViewMode[] {
   if (path === null) {
     return ['source'];
   }
@@ -54,9 +55,9 @@ export function viewModesFor(path: string | null): ViewMode[] {
       // previews existed, and that default is not changing.
       return ['table', 'source'];
     case 'json':
-      return ['source', 'json'];
+      return lite ? ['source'] : ['source', 'json'];
     case 'xml':
-      return ['source', 'xml'];
+      return lite ? ['source'] : ['source', 'xml'];
     case 'md':
     case 'markdown':
       return ['source', 'markdown'];
@@ -66,8 +67,11 @@ export function viewModesFor(path: string | null): ViewMode[] {
 }
 
 /** The mode a tab for `path` opens in. */
-export function defaultViewModeFor(path: string | null): ViewMode {
-  const modes = viewModesFor(path);
+export function defaultViewModeFor(
+  path: string | null,
+  lite: boolean,
+): ViewMode {
+  const modes = viewModesFor(path, lite);
   return modes[0] ?? 'source';
 }
 

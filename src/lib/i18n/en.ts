@@ -309,6 +309,8 @@ export const en = {
     'Couldn’t open “{name}”. The file may have been moved or deleted, or its name may contain characters this app doesn’t support.',
   'doc.restoreUnreadable':
     'Couldn’t read: {names}. Open the file(s) again to continue.',
+  'doc.keptTabs':
+    'Not opened: {count} tab(s) that need the full version. They are kept as they are, unsaved edits included, and open again once the full license is read.',
   'doc.revealFailed':
     'Couldn’t show “{name}”. The file may have been moved or deleted.',
   'doc.saveFailed': 'Couldn’t save “{name}”: {error}',

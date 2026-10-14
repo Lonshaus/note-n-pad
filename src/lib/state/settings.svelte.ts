@@ -6,9 +6,14 @@ import { listen, type UnlistenFn } from '@tauri-apps/api/event';
 import type { LineEnding } from '../util/text';
 import { resolveLocale, type Language, type Locale } from '../i18n/locale';
 import { localeRegistry } from '../i18n/localeRegistry.svelte';
-import { pickDefaultTheme } from '../theme/themes';
+import { pickDefaultTheme, resolveEditorTheme } from '../theme/themes';
+import { isLite } from './edition.svelte';
 import { themeRegistry } from '../theme/themeRegistry.svelte';
-import { isInterfaceMode, type InterfaceMode } from '../theme/chrome';
+import {
+  interfaceIsDark,
+  isInterfaceMode,
+  type InterfaceMode,
+} from '../theme/chrome';
 
 /** How an over-threshold file opens: ask (confirm offering view/edit), or open
  *  straight into the read-only view or in-place edit. */
@@ -130,7 +135,9 @@ export class SettingsState {
    *  default and clobber the selection everywhere. applyTheme falls back
    *  visually until the registry catches up, then resolves the real theme. */
   private apply(s: AppSettings, validate = false): void {
-    if (!validate || themeRegistry.has(s.theme)) {
+    // Lite has no theme choice and must not correct the stored one: that would
+    // overwrite a choice made in the full edition.
+    if (!validate || themeRegistry.has(s.theme) || isLite()) {
       this.themeId = s.theme;
     } else {
       const picked = pickDefaultTheme(this.prefersDark, themeRegistry.themes);
@@ -283,7 +290,14 @@ export class SettingsState {
   }
 
   get isDark(): boolean {
-    return themeRegistry.get(this.themeId)?.variant === 'dark';
+    return (
+      resolveEditorTheme(
+        themeRegistry.themes,
+        this.themeId,
+        isLite(),
+        interfaceIsDark(this.interfaceMode, this.prefersDark),
+      )?.variant === 'dark'
+    );
   }
 
   async setLanguage(language: Language): Promise<void> {
