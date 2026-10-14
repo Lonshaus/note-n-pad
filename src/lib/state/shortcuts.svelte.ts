@@ -48,13 +48,19 @@ export class ShortcutsState {
   }
   /** Load once and stay current: a change from any window, or a language
    *  switch (the names are localized in the core), arrives as
-   *  `settings-changed`. */
+   *  `settings-changed`; an edition change as `edition-changed`, since lite has
+   *  no row for the workspace key. */
   async init(): Promise<UnlistenFn> {
-    const unlisten = await listen('settings-changed', () => {
+    const reload = (): void => {
       void this.load();
-    });
+    };
+    const offSettings = await listen('settings-changed', reload);
+    const offEdition = await listen('edition-changed', reload);
     await this.load();
-    return unlisten;
+    return () => {
+      offSettings();
+      offEdition();
+    };
   }
 }
 

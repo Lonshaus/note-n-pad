@@ -1259,7 +1259,7 @@ fn build_menu(
   let mut language_items = Vec::new();
   let languages = app.state::<MenuLists>().languages.lock().unwrap().clone();
   let current = focused_doc_language(app);
-  let order = syntax_order(&languages, current.as_deref());
+  let order = syntax_entries(&languages, current.as_deref(), edition::is_lite());
   for (index, entry) in order.iter().enumerate() {
     let (id, label) = match entry {
       // Plain Text is never translated, matching program-language names.
@@ -1276,8 +1276,9 @@ fn build_menu(
     )?;
     syntax_menu.append(&item)?;
     language_items.push((entry.clone(), item));
-    // A separator follows the pinned current-syntax entry (index 0).
-    if index == 0 {
+    // A separator follows the pinned current-syntax entry (index 0), when
+    // anything follows it.
+    if index == 0 && order.len() > 1 {
       syntax_menu.append(&PredefinedMenuItem::separator(app)?)?;
     }
   }
@@ -1317,12 +1318,11 @@ fn build_menu(
     s.editor_line_numbers,
     accel("line-numbers"),
   )?;
-  let view_menu = Submenu::with_items(
-    app,
-    tr(i18n::Key::ViewMenu),
-    true,
-    &[&workspace, &line_numbers],
-  )?;
+  let view_menu = Submenu::new(app, tr(i18n::Key::ViewMenu), true)?;
+  if edition::workspace_enabled(edition::is_lite()) {
+    view_menu.append(&workspace)?;
+  }
+  view_menu.append(&line_numbers)?;
   // Window menu. Zoom is the predefined Maximize (macOS renders it as "Zoom");
   // always-on-top is per-window (document-focus only); Bring All to Front is the
   // predefined role. On macOS the submenu is registered as the app's Window menu
@@ -1632,6 +1632,10 @@ fn trigger_menu_accelerator(
   let Some(id) = keys.menu_id_for_accelerator(&accelerator) else {
     return false;
   };
+  // The workspace has no menu item in lite, so its key is not ours to take.
+  if id == "workspace" && !edition::workspace_enabled(edition::is_lite()) {
+    return false;
+  }
   if !accelerator_enabled(id, focus_kind(window.label())) {
     return false;
   }
@@ -1644,7 +1648,8 @@ fn trigger_menu_accelerator(
 /// `trigger_menu_accelerator` can never intercept them.
 #[tauri::command]
 fn get_menu_accelerators(app: tauri::AppHandle) -> Vec<String> {
-  shortcuts::resolve_current(&settings::app_settings(&app)).menu_accelerators()
+  shortcuts::resolve_current(&settings::app_settings(&app))
+    .menu_accelerators_for(edition::workspace_enabled(edition::is_lite()))
 }
 
 #[cfg(test)]
@@ -1935,9 +1940,35 @@ fn syntax_order(languages: &[String], current: Option<&str>) -> Vec<Option<Strin
   order
 }
 
+/// The entries of the Format > Syntax submenu: `syntax_order`, except that the
+/// Lite edition has no syntax highlighting and so lists Plain Text alone.
+fn syntax_entries(languages: &[String], current: Option<&str>, lite: bool) -> Vec<Option<String>> {
+  if lite {
+    vec![None]
+  } else {
+    syntax_order(languages, current)
+  }
+}
+
 #[cfg(test)]
 mod syntax_order_tests {
-  use super::syntax_order;
+  use super::{syntax_entries, syntax_order};
+
+  #[test]
+  fn lite_lists_plain_text_only_whatever_the_tab_had() {
+    for current in [None, Some("Rust"), Some("Cobol")] {
+      assert_eq!(syntax_entries(&langs(), current, true), vec![None]);
+    }
+  }
+
+  #[test]
+  fn full_lists_every_language() {
+    assert_eq!(
+      syntax_entries(&langs(), Some("Rust"), false),
+      syntax_order(&langs(), Some("Rust"))
+    );
+    assert_eq!(syntax_entries(&langs(), None, false).len(), 4);
+  }
 
   fn langs() -> Vec<String> {
     vec!["HTML".into(), "Rust".into(), "JSON".into()]
@@ -2186,17 +2217,15 @@ fn build_tray_menu(
     true,
     None::<&str>,
   )?;
-  Menu::with_items(
-    app,
-    &[
-      &new_item,
-      &show_item,
-      &workspace_item,
-      &settings_item,
-      &quit_item,
-    ],
-  )
-  .map_err(Into::into)
+  let menu = Menu::new(app)?;
+  menu.append(&new_item)?;
+  menu.append(&show_item)?;
+  if edition::workspace_enabled(edition::is_lite()) {
+    menu.append(&workspace_item)?;
+  }
+  menu.append(&settings_item)?;
+  menu.append(&quit_item)?;
+  Ok(menu)
 }
 
 fn build_tray(
@@ -2355,7 +2384,7 @@ fn apply_launch_action(app: &tauri::AppHandle, action: cmdline::Action) {
 /// double-launch with no flags at all.
 #[cfg(any(target_os = "windows", target_os = "linux"))]
 fn handle_second_launch(app: &tauri::AppHandle, argv: Vec<String>) {
-  match cmdline::parse_args(&argv) {
+  match cmdline::for_edition(cmdline::parse_args(&argv), edition::is_lite()) {
     cmdline::Action::None => activate_existing(app),
     action => apply_launch_action(app, action),
   }
@@ -2370,7 +2399,10 @@ fn handle_second_launch(app: &tauri::AppHandle, argv: Vec<String>) {
 #[cfg(any(target_os = "windows", target_os = "linux"))]
 fn handle_first_launch(app: &tauri::AppHandle) {
   let argv: Vec<String> = std::env::args().collect();
-  apply_launch_action(app, cmdline::parse_args(&argv));
+  apply_launch_action(
+    app,
+    cmdline::for_edition(cmdline::parse_args(&argv), edition::is_lite()),
+  );
 }
 /// Whether the launch hands the app files to open. Windows and Linux read them
 /// off the command line; macOS has already received them as `RunEvent::Opened`
@@ -2537,25 +2569,12 @@ pub fn run() {
       app.manage(MenuLists::default());
       app.manage(preview_img::PreviewBases::default());
       let store = app.state::<NoteStore>();
-      // Migrate any group-less document to its own solo group (keyed by its id)
-      // so future restores keep it grouped. A store that cannot be written to
-      // (read-only dir, full disk) only loses the migration, never the launch.
-      for note in &notes {
-        if note.kind == "document" && note.window_group.is_none() {
-          let mut migrated = note.clone();
-          migrated.window_group = Some(note.id.clone());
-          if let Err(e) = store.upsert(migrated) {
-            log::warn!(
-              "failed to migrate document {} to a solo group: {e}",
-              note.id
-            );
-          }
-        }
-      }
       // The edition decides which features exist, so it is settled before the
       // first window, menu or Jump List is built (and a window's first
-      // `edition_info` can never read the lite initial value).
+      // `edition_info` can never read the lite initial value), and before the
+      // snapshot migration below, which must leave a lite-kept tab alone.
       edition::init(handle);
+      note_store::migrate_group_less_documents(&store, &notes, edition::is_lite());
       // Restore windows: one per sticky, one per document group. Nothing in here
       // may propagate: this runs inside `setup`, whose error is unwrapped by the
       // `.expect` on `build()` below, so one window that refuses to build would
@@ -2635,7 +2654,7 @@ pub fn run() {
       // and document window is restored, so the workspace opens on top of them
       // rather than being buried; as the explicitly requested window it does
       // take focus, which is the expected behavior for this opt-in.
-      if startup.open_workspace_on_startup {
+      if startup.open_workspace_on_startup && edition::workspace_enabled(edition::is_lite()) {
         if launch_has_files {
           launch_windows::focus_launch_window_after_workspace();
         }

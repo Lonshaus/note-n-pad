@@ -9,7 +9,7 @@
 // any window or edition-dependent menu is built, so no consumer ever sees the
 // initial value. Gating itself lives at the feature entry points, not here.
 use std::sync::atomic::{AtomicBool, Ordering};
-use tauri::{AppHandle, Emitter};
+use tauri::{AppHandle, Emitter, Manager};
 
 /// The macOS Lite build: the answer is lite, constant.
 const LITE_FEATURE: bool = cfg!(feature = "lite");
@@ -44,6 +44,31 @@ pub fn resolve(lite_feature: bool, packaged: bool, license: LicenseRead) -> bool
 /// Whether this process is lite right now.
 pub fn is_lite() -> bool {
   LITE.load(Ordering::Relaxed)
+}
+
+/// What every refusal ends with. The frontend tells a refusal the edition caused
+/// from one about the file by it (`LITE_REFUSAL` in `util/protocol.ts`).
+pub(crate) const LITE_REFUSAL: &str = "is not available in the Lite edition";
+
+/// The refusal a removed feature gives when `lite`; `Ok` otherwise. Pure so the
+/// decision is testable without flipping the process-wide flag.
+pub(crate) fn refuse_if(lite: bool, feature: &str) -> Result<(), String> {
+  if lite {
+    Err(format!("{feature} {LITE_REFUSAL}"))
+  } else {
+    Ok(())
+  }
+}
+
+/// Entry-point guard of a command that belongs to a removed feature.
+pub(crate) fn require_full(feature: &str) -> Result<(), String> {
+  refuse_if(is_lite(), feature)
+}
+
+/// Whether the workspace window and every way into it (View menu item, tray
+/// item, Dock item, Jump List task, `--workspace`, open on startup) exist.
+pub(crate) fn workspace_enabled(lite: bool) -> bool {
+  !lite
 }
 
 /// The value of `NOTENPAD_EDITION`: `lite` or `full`, anything else is no override.
@@ -106,8 +131,22 @@ pub(crate) fn set_lite(app: &AppHandle, lite: bool) -> bool {
     return false;
   }
   let _ = app.emit("edition-changed", lite);
+  if !lite {
+    // Document windows that were not opened (or were closed) in lite because
+    // every tab they held was kept come back; the windows still open reload
+    // their kept tabs themselves on `edition-changed`. Off this thread: a
+    // window cannot be built from the event loop on Windows.
+    let reopen_app = app.clone();
+    std::thread::spawn(move || crate::windows::reopen_kept_groups(&reopen_app));
+  }
   let app_for_main = app.clone();
   if let Err(e) = app.run_on_main_thread(move || {
+    if lite {
+      // The workspace is gone in lite; an open one goes with it.
+      if let Some(window) = app_for_main.get_webview_window("workspace") {
+        let _ = window.destroy();
+      }
+    }
     let locale =
       crate::i18n::current_locale(&crate::settings::app_settings(&app_for_main).language);
     crate::rebuild_menus(&app_for_main, locale);
@@ -302,5 +341,235 @@ mod tests {
   fn the_flag_starts_lite() {
     // Nothing in the test binary calls `init` or `set_lite`.
     assert!(is_lite());
+  }
+}
+
+/// Each removed feature is cut at its entry points, which are Tauri commands and
+/// menu builders that need a running app to call. So these read the sources, as
+/// `heavy_io_command_threading_tests` does, and assert every listed entry point
+/// carries its guard; deleting one makes the matching test fail.
+#[cfg(test)]
+mod gate_tests {
+  use super::*;
+
+  fn body_of<'a>(source: &'a str, name: &str) -> &'a str {
+    let needle = format!("fn {name}(");
+    let at = source
+      .find(&needle)
+      .unwrap_or_else(|| panic!("{name} is listed here but no longer exists"));
+    let rest = &source[at..];
+    &rest[..rest.find("\n}\n").expect("end of function")]
+  }
+
+  fn assert_guarded(source: &str, names: &[&str], guard: &str) {
+    for name in names {
+      assert!(
+        body_of(source, name).contains(guard),
+        "{name} must carry `{guard}`"
+      );
+    }
+  }
+
+  #[test]
+  fn the_refusal_text_is_the_one_the_frontend_recognises() {
+    let protocol = include_str!("../../src/lib/util/protocol.ts");
+    let declared = protocol
+      .split("export const LITE_REFUSAL =")
+      .nth(1)
+      .and_then(|rest| rest.split(';').next())
+      .expect("LITE_REFUSAL in protocol.ts");
+    assert_eq!(declared.trim(), format!("'{LITE_REFUSAL}'"));
+    assert!(refuse_if(true, "anything")
+      .unwrap_err()
+      .ends_with(LITE_REFUSAL));
+  }
+
+  #[test]
+  fn refuse_if_refuses_lite_and_lets_full_through() {
+    assert!(refuse_if(true, "x").unwrap_err().contains("Lite"));
+    assert!(refuse_if(false, "x").is_ok());
+  }
+
+  #[test]
+  fn the_workspace_exists_only_in_full() {
+    assert!(!workspace_enabled(true));
+    assert!(workspace_enabled(false));
+  }
+
+  /// Every `pub fn` of `source` whose body carries the lite refusal.
+  fn guarded(source: &str) -> Vec<String> {
+    source
+      .match_indices("pub fn ")
+      .filter_map(|(at, _)| {
+        let rest = &source[at + "pub fn ".len()..];
+        let name = &rest[..rest.find('(')?];
+        let end = rest.find("\n}\n")?;
+        rest[..end]
+          .contains("crate::edition::require_full(")
+          .then(|| name.to_string())
+      })
+      .collect()
+  }
+
+  #[test]
+  fn only_the_openers_of_a_removed_feature_refuse_in_lite() {
+    // A lite session can only hold a large viewer, windowed session or range
+    // tab that was opened while full, so everything that works on one stays
+    // allowed. The guard list is exactly the commands that start a new one.
+    assert_eq!(guarded(include_str!("windowed.rs")), vec!["windowed_open"]);
+    assert_eq!(guarded(include_str!("range_edit.rs")), vec!["read_range"]);
+    assert!(guarded(include_str!("large_file.rs")).is_empty());
+  }
+
+  #[test]
+  fn commands_on_an_existing_handle_are_not_refused_in_lite() {
+    for (source, names) in [
+      (
+        include_str!("large_file.rs"),
+        &[
+          "stat_file",
+          "read_chunk",
+          "start_line_index",
+          "line_to_offset",
+          "index_line_count",
+          "stream_search",
+        ][..],
+      ),
+      (
+        include_str!("range_edit.rs"),
+        &["file_fingerprint", "splice_file", "copy_range"][..],
+      ),
+      (
+        include_str!("windowed.rs"),
+        &[
+          "windowed_reopen",
+          "windowed_index",
+          "windowed_read",
+          "windowed_apply",
+          "windowed_undo",
+          "windowed_redo",
+          "windowed_save",
+          "windowed_find",
+          "windowed_search",
+          "windowed_replace_all",
+        ][..],
+      ),
+    ] {
+      for name in names {
+        assert!(
+          !body_of(source, name).contains("require_full("),
+          "{name} works on an existing handle and must not refuse in lite"
+        );
+      }
+    }
+  }
+
+  #[test]
+  fn the_openers_carry_the_refusal() {
+    assert_guarded(
+      include_str!("windowed.rs"),
+      &["windowed_open"],
+      "crate::edition::require_full(",
+    );
+    assert_guarded(
+      include_str!("range_edit.rs"),
+      &["read_range"],
+      "crate::edition::require_full(",
+    );
+  }
+
+  #[test]
+  fn theme_commands_refuse_in_lite() {
+    assert_guarded(
+      include_str!("theme_store.rs"),
+      &[
+        "save_theme",
+        "delete_theme",
+        "import_theme",
+        "export_theme",
+        "restore_default_theme",
+      ],
+      "crate::edition::require_full(",
+    );
+    assert!(body_of(include_str!("theme_store.rs"), "list_themes").contains("for_edition("));
+  }
+
+  #[test]
+  fn locale_commands_refuse_in_lite() {
+    let source = include_str!("locale_store.rs");
+    assert_guarded(
+      source,
+      &["import_locale", "read_locale_file", "export_locale"],
+      "crate::edition::require_full(",
+    );
+    assert_guarded(source, &["delete_locale"], "delete_allowed(");
+    // Editing and restoring the default stay available.
+    for name in ["save_locale", "restore_default_locale"] {
+      assert!(!body_of(source, name).contains("edition::"), "{name}");
+    }
+  }
+
+  #[test]
+  fn deleting_a_data_file_follows_the_edition() {
+    assert_guarded(
+      include_str!("data_files.rs"),
+      &["delete_data_file"],
+      "delete_allowed(",
+    );
+  }
+
+  #[test]
+  fn the_workspace_command_refuses_in_lite() {
+    assert_guarded(
+      include_str!("windows.rs"),
+      &["show_workspace"],
+      "crate::edition::require_full(",
+    );
+  }
+
+  #[test]
+  fn every_workspace_entry_point_checks_the_edition() {
+    let lib = include_str!("lib.rs");
+    assert_guarded(
+      lib,
+      &["build_menu", "build_tray_menu"],
+      "workspace_enabled(",
+    );
+    assert_guarded(lib, &["get_menu_accelerators"], "workspace_enabled(");
+    assert_guarded(lib, &["trigger_menu_accelerator"], "workspace_enabled(");
+    assert_guarded(
+      lib,
+      &["handle_second_launch", "handle_first_launch"],
+      "for_edition(",
+    );
+    assert!(
+      lib.contains("startup.open_workspace_on_startup && edition::workspace_enabled("),
+      "the open-workspace-on-startup setting must be ignored in lite"
+    );
+    assert_guarded(
+      include_str!("dock.rs"),
+      &["build_menu"],
+      "workspace_enabled(",
+    );
+    assert_guarded(
+      include_str!("jumplist.rs"),
+      &["build_tasks"],
+      "workspace_enabled(",
+    );
+    assert_guarded(
+      include_str!("shortcuts.rs"),
+      &["get_shortcuts"],
+      "rows_for_edition(",
+    );
+    assert_guarded(
+      include_str!("shortcuts.rs"),
+      &["resolve_current"],
+      "workspace_enabled(",
+    );
+  }
+
+  #[test]
+  fn the_syntax_menu_follows_the_edition() {
+    assert_guarded(include_str!("lib.rs"), &["build_menu"], "syntax_entries(");
   }
 }

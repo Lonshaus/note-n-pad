@@ -49,11 +49,19 @@ class ThemeRegistry {
     this.skipped = loaded.skipped;
   }
 
-  /** Reload whenever any window adds/edits/deletes/imports/restores a theme. */
-  listen(): Promise<UnlistenFn> {
-    return listen('themes-changed', () => {
+  /** Reload whenever any window adds/edits/deletes/imports/restores a theme,
+   *  and when the edition changes: the core lists only the bundled defaults
+   *  in lite. */
+  async listen(): Promise<UnlistenFn> {
+    const reload = (): void => {
       void this.load();
-    });
+    };
+    const offThemes = await listen('themes-changed', reload);
+    const offEdition = await listen('edition-changed', reload);
+    return () => {
+      offThemes();
+      offEdition();
+    };
   }
 
   /** Persist a theme (create or overwrite) and reload. Use for discrete actions

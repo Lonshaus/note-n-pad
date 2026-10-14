@@ -94,7 +94,7 @@ unsafe fn build_menu(
     .get("workspace")
     .map(|w| w.is_visible().unwrap_or(false))
     .unwrap_or(false);
-  if !workspace_visible {
+  if !workspace_visible && crate::edition::workspace_enabled(crate::edition::is_lite()) {
     let ws_title = NSString::from_str(i18n::tr(locale, Key::DockOpenWorkspace));
     let ws_item = NSMenuItem::initWithTitle_action_keyEquivalent(
       NSMenuItem::alloc(mtm),

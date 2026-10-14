@@ -44,3 +44,13 @@ export interface Loaded<T> {
 /** Which data folder a `SkippedFile` came from, for `delete_data_file` and
  *  `reveal_data_file`. Matches the Rust `data_files::DataKind`. */
 export type DataKind = 'snapshots' | 'themes' | 'locales';
+
+/** What every refusal a removed feature gives in lite ends with (Rust
+ *  `edition::LITE_REFUSAL`, which a test ties to this value). It tells a
+ *  refusal the edition caused from one about the file. */
+export const LITE_REFUSAL = 'is not available in the Lite edition';
+
+/** Whether `error` (a command's rejection) is the Lite edition's refusal. */
+export function isLiteRefusal(error: unknown): boolean {
+  return String(error).includes(LITE_REFUSAL);
+}

@@ -48,11 +48,18 @@
   import { BUILTIN_IDS, BUILTIN_LABELS } from './lib/i18n/locale';
   import { localeRegistry } from './lib/i18n/localeRegistry.svelte';
   import LocaleEditor from './lib/i18n/LocaleEditor.svelte';
+  import { isLite } from './lib/state/edition.svelte';
+  import {
+    editionUi,
+    editorTabsFor,
+    shownEditorTab,
+    type EditorTab,
+  } from './lib/util/editionUi';
 
   type Section = 'sticky' | 'editor' | 'shortcuts' | 'general' | 'language';
   // The editor section has two sub-tabs: its own settings, and the theme editor
   // (a theme only colors the editor, so it belongs here, not a top-level tab).
-  type EditorTab = 'general' | 'theme';
+  // Lite has no theme editor, so no sub-tabs.
 
   // Theme colors only the editor surface, so the color editor drops the
   // interface chrome group (that is the interface mode's job now).
@@ -70,10 +77,10 @@
   ];
 
   // Sub-tabs of the editor section (reusing the General label for the first).
-  const EDITOR_TABS: { id: EditorTab; key: I18nKey }[] = [
-    { id: 'general', key: 'settings.section.general' },
-    { id: 'theme', key: 'settings.editor.tabTheme' },
-  ];
+  const EDITOR_TAB_KEYS: Record<EditorTab, I18nKey> = {
+    general: 'settings.section.general',
+    theme: 'settings.editor.tabTheme',
+  };
 
   // Interface (chrome) appearance options, shown in the General section.
   const INTERFACE_MODES: { id: InterfaceMode; key: I18nKey }[] = [
@@ -84,6 +91,11 @@
 
   let section = $state<Section>('general');
   let editorTab = $state<EditorTab>('general');
+  // What the edition has of this window; read in the template so a license
+  // change shows or hides it live.
+  const ui = $derived(editionUi(isLite()));
+  const editorTabs = $derived(editorTabsFor(isLite()));
+  const shownTab = $derived(shownEditorTab(editorTab, isLite()));
   // Shortcut recorder state: the row being recorded, the last message and the
   // row it belongs to, and whether the read-only key list is open.
   let recordingId = $state<string | null>(null);
@@ -768,22 +780,22 @@
         </div>
       </div>
     {/if}
-    {#if section === 'editor'}
+    {#if section === 'editor' && editorTabs.length > 1}
       <div class="subtabs" role="tablist">
-        {#each EDITOR_TABS as tab (tab.id)}
+        {#each editorTabs as tab (tab)}
           <button
             class="subtab"
-            class:active={editorTab === tab.id}
+            class:active={shownTab === tab}
             role="tab"
-            aria-selected={editorTab === tab.id}
-            onclick={() => (editorTab = tab.id)}
+            aria-selected={shownTab === tab}
+            onclick={() => (editorTab = tab)}
           >
-            {t(tab.key)}
+            {t(EDITOR_TAB_KEYS[tab])}
           </button>
         {/each}
       </div>
     {/if}
-    {#if section === 'editor' && editorTab === 'theme'}
+    {#if section === 'editor' && shownTab === 'theme'}
       <div class="theme-layout">
         <div class="theme-side">
           <!-- An open listbox: optgroup headers + tight option rows, like an
@@ -1053,7 +1065,7 @@
           {/each}
         {/each}
       </section>
-    {:else if section === 'editor' && editorTab === 'general'}
+    {:else if section === 'editor' && shownTab === 'general'}
       <label class="toggle">
         <input
           type="checkbox"
@@ -1073,18 +1085,20 @@
         <span>{t('settings.editor.lineNumbers')}</span>
       </label>
 
-      <div class="field">
-        <label class="toggle">
-          <input
-            type="checkbox"
-            checked={settingsState.workerHighlight}
-            onchange={(e) =>
-              settingsState.setWorkerHighlight(e.currentTarget.checked)}
-          />
-          <span>{t('settings.editor.workerHighlight')}</span>
-        </label>
-        <span class="hint">{t('settings.editor.workerHighlightHint')}</span>
-      </div>
+      {#if ui.workerHighlight}
+        <div class="field">
+          <label class="toggle">
+            <input
+              type="checkbox"
+              checked={settingsState.workerHighlight}
+              onchange={(e) =>
+                settingsState.setWorkerHighlight(e.currentTarget.checked)}
+            />
+            <span>{t('settings.editor.workerHighlight')}</span>
+          </label>
+          <span class="hint">{t('settings.editor.workerHighlightHint')}</span>
+        </div>
+      {/if}
 
       <div class="field">
         <span class="field-label">{t('settings.editor.font')}</span>
@@ -1212,33 +1226,38 @@
         <span class="hint">{t('settings.general.snapshotCloudHint')}</span>
       </div>
 
-      <div class="field">
-        <span class="field-label">{t('settings.general.largeOpenMode')}</span>
-        <select
-          class="select"
-          value={settingsState.largeOpenMode}
-          onchange={(e) =>
-            settingsState.setLargeOpenMode(
-              e.currentTarget.value as LargeOpenMode,
-            )}
-        >
-          <option value="ask">{t('settings.general.largeOpenModeAsk')}</option>
-          <option value="view">{t('settings.general.largeOpenModeView')}</option
+      {#if ui.largeFileSettings}
+        <div class="field">
+          <span class="field-label">{t('settings.general.largeOpenMode')}</span>
+          <select
+            class="select"
+            value={settingsState.largeOpenMode}
+            onchange={(e) =>
+              settingsState.setLargeOpenMode(
+                e.currentTarget.value as LargeOpenMode,
+              )}
           >
-          <option value="edit">{t('settings.general.largeOpenModeEdit')}</option
-          >
-        </select>
-      </div>
+            <option value="ask">{t('settings.general.largeOpenModeAsk')}</option
+            >
+            <option value="view"
+              >{t('settings.general.largeOpenModeView')}</option
+            >
+            <option value="edit"
+              >{t('settings.general.largeOpenModeEdit')}</option
+            >
+          </select>
+        </div>
 
-      <label class="toggle">
-        <input
-          type="checkbox"
-          checked={settingsState.askLongLineOpen}
-          onchange={(e) =>
-            settingsState.setAskLongLineOpen(e.currentTarget.checked)}
-        />
-        <span>{t('settings.general.askLongLineOpen')}</span>
-      </label>
+        <label class="toggle">
+          <input
+            type="checkbox"
+            checked={settingsState.askLongLineOpen}
+            onchange={(e) =>
+              settingsState.setAskLongLineOpen(e.currentTarget.checked)}
+          />
+          <span>{t('settings.general.askLongLineOpen')}</span>
+        </label>
+      {/if}
 
       <label class="toggle">
         <input
@@ -1287,15 +1306,17 @@
         <span>{t('settings.general.showTrayIcon')}</span>
       </label>
 
-      <label class="toggle">
-        <input
-          type="checkbox"
-          checked={settingsState.openWorkspaceOnStartup}
-          onchange={(e) =>
-            settingsState.setOpenWorkspaceOnStartup(e.currentTarget.checked)}
-        />
-        <span>{t('settings.general.openWorkspaceOnStartup')}</span>
-      </label>
+      {#if ui.openWorkspaceOnStartup}
+        <label class="toggle">
+          <input
+            type="checkbox"
+            checked={settingsState.openWorkspaceOnStartup}
+            onchange={(e) =>
+              settingsState.setOpenWorkspaceOnStartup(e.currentTarget.checked)}
+          />
+          <span>{t('settings.general.openWorkspaceOnStartup')}</span>
+        </label>
+      {/if}
     {:else if section === 'language'}
       <div class="lang-layout">
         <div class="lang-side">
@@ -1346,18 +1367,24 @@
               {/each}
             {/if}
           </div>
-          <div class="theme-actions">
-            <button class="btn" onclick={() => void importLocale()}>
-              {t('settings.language.import')}
-            </button>
-            <button
-              class="btn"
-              disabled={!canDeleteSelected}
-              onclick={() => void deleteLocale()}
-            >
-              {t('settings.language.delete')}
-            </button>
-          </div>
+          {#if ui.localeImport || ui.localeDelete}
+            <div class="theme-actions">
+              {#if ui.localeImport}
+                <button class="btn" onclick={() => void importLocale()}>
+                  {t('settings.language.import')}
+                </button>
+              {/if}
+              {#if ui.localeDelete}
+                <button
+                  class="btn"
+                  disabled={!canDeleteSelected}
+                  onclick={() => void deleteLocale()}
+                >
+                  {t('settings.language.delete')}
+                </button>
+              {/if}
+            </div>
+          {/if}
           {#if importError !== ''}
             <span class="error">{importError}</span>
           {/if}
@@ -1368,6 +1395,7 @@
             items={localeRegistry.skipped}
             kind="locales"
             actions={true}
+            deletable={ui.localeDelete}
             onchanged={() => void localeRegistry.load()}
           />
         </div>

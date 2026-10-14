@@ -892,6 +892,9 @@ fn open_new_session(
 /// Refuses a file at or above `LARGE_EDIT_MAX` with the `TOO_LARGE` error.
 #[tauri::command(async)]
 pub fn windowed_open(state: State<WindowedState>, path: String) -> Result<OpenResult, String> {
+  // Starting a new editing session is the removed feature; every other command
+  // works on a session that already exists, which only a full session opened.
+  crate::edition::require_full("large-file editing")?;
   let path = PathBuf::from(path);
   let (session_id, session, result) = open_new_session(&state.next_id, path)?;
   state.sessions.lock().unwrap().insert(session_id, session);
