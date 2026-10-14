@@ -1032,10 +1032,19 @@ class DocumentWindowState {
     }
     this.ready = true;
   }
+  /** Set by the window: ends an IME composition in the active editor and
+   *  resolves once its text is in the tab. A switch waits for it. */
+  endComposition: (() => Promise<void>) | null = null;
 
   /** Switch tabs, flushing the outgoing tab's pending upsert first. */
   async switchTo(index: number): Promise<void> {
     if (index === this.activeIndex || index < 0 || index >= this.tabs.length) {
+      return;
+    }
+    const from = this.activeIndex;
+    await this.endComposition?.();
+    // Another switch or a close may have moved on while waiting.
+    if (this.activeIndex !== from || index >= this.tabs.length) {
       return;
     }
     this.persistActive.flush();

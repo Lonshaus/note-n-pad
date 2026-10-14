@@ -443,6 +443,36 @@ describe('switchTo flush ordering (F4 regression: upsertTab must not become asyn
   });
 });
 
+describe('switchTo and an IME composition', () => {
+  afterEach(() => {
+    documentWindow.endComposition = null;
+  });
+
+  it('changes the active tab only after the composition has ended', async () => {
+    mockInvoke.mockImplementation((() =>
+      Promise.resolve(undefined)) as typeof invoke);
+    documentWindow.tabs.length = 0;
+    documentWindow.tabs.push(
+      baseTab({ id: 'a', tabIndex: 0 }),
+      baseTab({ id: 'b', tabIndex: 1, path: '' }),
+    );
+    documentWindow.activeIndex = 0;
+    let finish: () => void = () => {};
+    documentWindow.endComposition = () =>
+      new Promise<void>((resolve) => {
+        finish = resolve;
+      });
+
+    const switching = documentWindow.switchTo(1);
+    await Promise.resolve();
+    expect(documentWindow.activeIndex).toBe(0);
+
+    finish();
+    await switching;
+    expect(documentWindow.activeIndex).toBe(1);
+  });
+});
+
 describe('loadTab restores a pending windowed-restore tab', () => {
   it('rebuilds windowedRestore from the persisted checkpoint index, fingerprint, digest, and top line, without hitting stat_file or read_file_auto', async () => {
     documentWindow.tabs.length = 0;

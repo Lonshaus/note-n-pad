@@ -4,7 +4,12 @@
 // accelerator table, so a menu accelerator has to be matched here and run
 // through the `trigger_menu_accelerator` command instead. See `main.ts`.
 
-import { functionKey, eventKeyName, type KeyLike } from './accelerator';
+import {
+  functionKey,
+  eventKeyName,
+  isComposingKey,
+  type KeyLike,
+} from './accelerator';
 /** A keydown plus the flag the matcher uses to leave handled events alone. */
 interface MenuKeyLike extends KeyLike {
   defaultPrevented: boolean;
@@ -15,11 +20,13 @@ interface MenuKeyLike extends KeyLike {
  *  accelerators already fire through the platform's own mechanism, so this
  *  must never intercept a keydown there. Needs at least one modifier or an
  *  F key, and an event CodeMirror or another handler hasn't already claimed
- *  via `preventDefault`. */
+ *  via `preventDefault`. While an IME composes, `saveAccelerator` (the
+ *  effective Save key) is left alone: Notepad does not save mid-composition. */
 export function matchMenuAccelerator(
   event: MenuKeyLike,
   os: string,
   table: readonly string[],
+  saveAccelerator: string | null = null,
 ): string | null {
   if (os !== 'windows' || event.defaultPrevented) {
     return null;
@@ -45,5 +52,8 @@ export function matchMenuAccelerator(
     return null;
   }
   const candidate = [...parts, key].join('+');
+  if (candidate === saveAccelerator && isComposingKey(event)) {
+    return null;
+  }
   return table.includes(candidate) ? candidate : null;
 }
