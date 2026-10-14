@@ -880,7 +880,7 @@ fn populate_recent(
   let clear = MenuItem::with_id(
     app,
     "recent-clear",
-    i18n::tr(locale, i18n::Key::ClearMenu),
+    escape_menu_label(i18n::tr(locale, i18n::Key::ClearMenu)),
     !recent.is_empty(),
     None::<&str>,
   )?;
@@ -889,24 +889,16 @@ fn populate_recent(
 }
 
 /// Escape a menu label that may carry a literal `&` (the product name
-/// `Note&Pad`, or any translated label) for the native menu bar. `&` is the
-/// mnemonic-prefix character on Windows and GTK menus, so a bare `&` there is
-/// swallowed and the following letter is underlined instead — the item
-/// renders as "NotePad". Doubling it (`&&`) escapes it to a literal ampersand
-/// on those platforms. macOS menus have no mnemonic syntax, so the label is
-/// returned unchanged there. `build_menu` and `build_tray_menu` apply this to
-/// every `tr`-sourced label via their own `tr` closure, so no call site needs
-/// to remember it individually; the brand literal `"Note&Pad"` still calls it
-/// directly since it doesn't go through `tr`.
+/// `Note&Pad`, or any translated label) for the native menu bar. muda reads a
+/// bare `&` as the mnemonic prefix on every platform (Windows and GTK underline
+/// the next letter, macOS strips it), so the item renders as "NotePad".
+/// Doubling it (`&&`) yields a literal ampersand everywhere. `build_menu` and
+/// `build_tray_menu` apply this to every `tr`-sourced label via their own `tr`
+/// closure, so no call site needs to remember it individually; the brand
+/// literal `"Note&Pad"` still calls it directly since it doesn't go through
+/// `tr`. The Dock menu is built with AppKit directly and must not use it.
 pub(crate) fn escape_menu_label(label: &str) -> String {
-  #[cfg(target_os = "macos")]
-  {
-    label.to_string()
-  }
-  #[cfg(not(target_os = "macos"))]
-  {
-    label.replace('&', "&&")
-  }
+  label.replace('&', "&&")
 }
 
 /// Build the menu bar in `locale`, returning the built menu (not yet installed;
@@ -1158,7 +1150,7 @@ fn build_menu(
     let item = CheckMenuItem::with_id(
       app,
       format!("enc:{label}"),
-      label,
+      escape_menu_label(label),
       true,
       false,
       None::<&str>,
@@ -1177,7 +1169,14 @@ fn build_menu(
       None => ("lang:".to_string(), "Plain Text".to_string()),
       Some(name) => (format!("lang:{name}"), name.clone()),
     };
-    let item = CheckMenuItem::with_id(app, id, label, true, false, None::<&str>)?;
+    let item = CheckMenuItem::with_id(
+      app,
+      id,
+      escape_menu_label(&label),
+      true,
+      false,
+      None::<&str>,
+    )?;
     syntax_menu.append(&item)?;
     language_items.push((entry.clone(), item));
     // A separator follows the pinned current-syntax entry (index 0).
@@ -2361,9 +2360,10 @@ pub fn run() {
       if let Err(e) = theme_store::seed_on_startup(handle) {
         log::warn!("failed to seed default themes: {e}");
       }
-      // Seed the bundled data locales on first run only, same policy as themes;
-      // the three compiled locales (en/ja/zh-TW) are never files, so they are
-      // unaffected and always available even after every data locale is deleted.
+      // Seed the bundled data locales on first run only, same policy as themes,
+      // then add keys that later releases put in a seed to the existing files
+      // (a deleted locale stays deleted). The three compiled locales
+      // (en/ja/zh-TW) are never files, so they are always available.
       if let Err(e) = locale_store::seed_on_startup(handle) {
         log::warn!("failed to seed default locales: {e}");
       }
@@ -2789,21 +2789,10 @@ mod tests {
   }
 
   #[test]
-  fn escapes_menu_label_for_current_target() {
-    // Behavior is cfg-dependent: doubled on non-macOS (mnemonic escape),
-    // unchanged on macOS (no mnemonic syntax there).
-    #[cfg(target_os = "macos")]
-    {
-      assert_eq!(escape_menu_label("Note&Pad"), "Note&Pad");
-      assert_eq!(escape_menu_label("no ampersand"), "no ampersand");
-      assert_eq!(escape_menu_label(""), "");
-    }
-    #[cfg(not(target_os = "macos"))]
-    {
-      assert_eq!(escape_menu_label("Note&Pad"), "Note&&Pad");
-      assert_eq!(escape_menu_label("no ampersand"), "no ampersand");
-      assert_eq!(escape_menu_label(""), "");
-    }
+  fn escapes_menu_label_on_every_platform() {
+    assert_eq!(escape_menu_label("Note&Pad"), "Note&&Pad");
+    assert_eq!(escape_menu_label("no ampersand"), "no ampersand");
+    assert_eq!(escape_menu_label(""), "");
   }
 
   #[test]

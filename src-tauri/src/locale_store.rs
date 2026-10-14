@@ -3,7 +3,7 @@
 
 use crate::fs_ops::{is_ignored_file, write_text_atomic, Loaded, SkipReason, SkippedFile};
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use tauri::{AppHandle, Emitter, Manager};
 
@@ -280,11 +280,88 @@ fn restore_default_from(
   save_locale_to(data_dir, &locale)?;
   Ok(locale)
 }
+/// Manifest of the seed keys already offered to each data locale, so a key the
+/// user later emptied is never added back. Dot-prefixed: `load_dir` skips it.
+const SEEDED_KEYS_FILE: &str = ".seeded-keys.json";
 
-/// Seed the app-data `locales` dir from the bundled resources on first run.
+type SeededKeys = BTreeMap<String, BTreeSet<String>>;
+/// Add seed keys that an existing data file lacks and that no earlier merge
+/// offered. Existing values, label, order, extra keys, missing and unparsable
+/// files are never touched. A manifest entry only grows for a file that parsed
+/// and was either complete or written, so a failed file is retried next run.
+pub fn merge_new_seed_keys(resource_dir: &Path, data_dir: &Path) {
+  let Ok(entries) = std::fs::read_dir(resource_dir) else {
+    return;
+  };
+  let manifest_path = data_dir.join(SEEDED_KEYS_FILE);
+  let stored: SeededKeys = std::fs::read_to_string(&manifest_path)
+    .ok()
+    .and_then(|text| serde_json::from_str(&text).ok())
+    .unwrap_or_default();
+  let mut manifest = stored.clone();
+  for entry in entries.flatten() {
+    let path = entry.path();
+    if path.extension().and_then(|e| e.to_str()) != Some("json") {
+      continue;
+    }
+    let Some(id) = path.file_stem().and_then(|n| n.to_str()) else {
+      continue;
+    };
+    if !valid_id(id) {
+      continue;
+    }
+    let Some(seed) = std::fs::read_to_string(&path)
+      .ok()
+      .and_then(|text| parse_locale(&text).ok())
+    else {
+      continue;
+    };
+    let Some(mut data) = std::fs::read_to_string(locale_file(data_dir, id))
+      .ok()
+      .and_then(|text| parse_locale(&text).ok())
+    else {
+      continue;
+    };
+    let offered = stored.get(id);
+    let mut added = false;
+    for (key, value) in &seed.strings {
+      if !data.strings.contains_key(key) && !offered.is_some_and(|set| set.contains(key)) {
+        data.strings.insert(key.clone(), value.clone());
+        added = true;
+      }
+    }
+    if added {
+      if data.id != id {
+        continue;
+      }
+      if let Err(e) = save_locale_to(data_dir, &data) {
+        log::warn!("failed to merge new keys into locale {id}: {e}");
+        continue;
+      }
+    }
+    manifest
+      .entry(id.to_string())
+      .or_default()
+      .extend(seed.strings.keys().cloned());
+  }
+  if manifest != stored {
+    let result = serde_json::to_string_pretty(&manifest)
+      .map_err(|e| e.to_string())
+      .and_then(|json| write_text_atomic(&manifest_path, &json));
+    if let Err(e) = result {
+      log::warn!("failed to write {SEEDED_KEYS_FILE}: {e}");
+    }
+  }
+}
+/// Seed the app-data `locales` dir from the bundled resources on first run,
+/// then fold in seed keys added by later releases.
 /// Called once from setup, before any locale command touches the dir.
 pub fn seed_on_startup(app: &AppHandle) -> Result<(), String> {
-  seed_defaults_if_missing(&resource_locales_dir(app)?, &app_data_locales_dir(app)?)
+  let resource_dir = resource_locales_dir(app)?;
+  let data_dir = app_data_locales_dir(app)?;
+  seed_defaults_if_missing(&resource_dir, &data_dir)?;
+  merge_new_seed_keys(&resource_dir, &data_dir);
+  Ok(())
 }
 
 #[tauri::command]
@@ -597,5 +674,209 @@ mod tests {
     write_locale(&data, &edited);
     seed_defaults_if_missing(&resources, &data).unwrap();
     assert_eq!(load_dir(&data).unwrap().items, vec![edited]);
+  }
+
+  fn locale_with(id: &str, pairs: &[(&str, &str)]) -> LocaleData {
+    LocaleData {
+      id: id.into(),
+      label: format!("{id} label"),
+      order: 3,
+      strings: pairs
+        .iter()
+        .map(|(k, v)| (k.to_string(), v.to_string()))
+        .collect(),
+    }
+  }
+
+  fn read_locale(dir: &Path, id: &str) -> LocaleData {
+    parse_locale(&std::fs::read_to_string(locale_file(dir, id)).unwrap()).unwrap()
+  }
+
+  fn manifest_of(dir: &Path) -> SeededKeys {
+    serde_json::from_str(&std::fs::read_to_string(dir.join(SEEDED_KEYS_FILE)).unwrap()).unwrap()
+  }
+
+  fn keys(items: &[&str]) -> BTreeSet<String> {
+    items.iter().map(|k| k.to_string()).collect()
+  }
+
+  #[test]
+  fn merge_adds_missing_keys_and_keeps_edits() {
+    let base = tempdir().unwrap();
+    let (res, data) = (base.path().join("res"), base.path().join("data"));
+    std::fs::create_dir_all(&res).unwrap();
+    std::fs::create_dir_all(&data).unwrap();
+    write_locale(
+      &res,
+      &locale_with("de", &[("a", "A seed"), ("b", "B seed"), ("c", "C seed")]),
+    );
+    let mut old = locale_with("de", &[("a", "A edited"), ("extra", "mine")]);
+    old.label = "Deutsch (custom)".into();
+    old.order = 9;
+    write_locale(&data, &old);
+    merge_new_seed_keys(&res, &data);
+    let merged = read_locale(&data, "de");
+    assert_eq!(merged.strings["a"], "A edited");
+    assert_eq!(merged.strings["b"], "B seed");
+    assert_eq!(merged.strings["c"], "C seed");
+    assert_eq!(merged.strings["extra"], "mine");
+    assert_eq!(merged.label, "Deutsch (custom)");
+    assert_eq!(merged.order, 9);
+    assert_eq!(manifest_of(&data)["de"], keys(&["a", "b", "c"]));
+  }
+
+  #[test]
+  fn merge_does_not_rewrite_when_nothing_is_new() {
+    let base = tempdir().unwrap();
+    let (res, data) = (base.path().join("res"), base.path().join("data"));
+    std::fs::create_dir_all(&res).unwrap();
+    std::fs::create_dir_all(&data).unwrap();
+    write_locale(&res, &locale_with("de", &[("a", "A"), ("b", "B")]));
+    // Hand-formatted, not what save_locale_to would produce.
+    let hand = "{\"id\":\"de\",\"label\":\"D\",\"strings\":{\"a\":\"x\",\"b\":\"y\"}}";
+    std::fs::write(locale_file(&data, "de"), hand).unwrap();
+    merge_new_seed_keys(&res, &data);
+    assert_eq!(
+      std::fs::read_to_string(locale_file(&data, "de")).unwrap(),
+      hand
+    );
+    let manifest_before = std::fs::read(data.join(SEEDED_KEYS_FILE)).unwrap();
+    merge_new_seed_keys(&res, &data);
+    assert_eq!(
+      std::fs::read_to_string(locale_file(&data, "de")).unwrap(),
+      hand
+    );
+    assert_eq!(
+      std::fs::read(data.join(SEEDED_KEYS_FILE)).unwrap(),
+      manifest_before
+    );
+  }
+
+  #[test]
+  fn merge_does_not_readd_a_key_the_user_emptied() {
+    let base = tempdir().unwrap();
+    let (res, data) = (base.path().join("res"), base.path().join("data"));
+    std::fs::create_dir_all(&res).unwrap();
+    std::fs::create_dir_all(&data).unwrap();
+    write_locale(&res, &locale_with("de", &[("a", "A"), ("b", "B")]));
+    write_locale(&data, &locale_with("de", &[("a", "A")]));
+    merge_new_seed_keys(&res, &data);
+    assert!(read_locale(&data, "de").strings.contains_key("b"));
+    let mut emptied = read_locale(&data, "de");
+    emptied.strings.remove("b");
+    save_locale_to(&data, &emptied).unwrap();
+    merge_new_seed_keys(&res, &data);
+    assert!(!read_locale(&data, "de").strings.contains_key("b"));
+  }
+
+  #[test]
+  fn merge_leaves_missing_unparsable_and_unseeded_files_alone() {
+    let base = tempdir().unwrap();
+    let (res, data) = (base.path().join("res"), base.path().join("data"));
+    std::fs::create_dir_all(&res).unwrap();
+    std::fs::create_dir_all(&data).unwrap();
+    write_locale(&res, &locale_with("de", &[("a", "A")]));
+    write_locale(&res, &locale_with("fr", &[("a", "A")]));
+    // de: deleted. fr: unparsable. pirate: user-made, no seed.
+    std::fs::write(locale_file(&data, "fr"), "{ not json").unwrap();
+    let pirate = locale_with("pirate", &[("z", "Z")]);
+    write_locale(&data, &pirate);
+    let pirate_bytes = std::fs::read(locale_file(&data, "pirate")).unwrap();
+    merge_new_seed_keys(&res, &data);
+    assert!(!locale_file(&data, "de").exists());
+    assert_eq!(
+      std::fs::read_to_string(locale_file(&data, "fr")).unwrap(),
+      "{ not json"
+    );
+    assert_eq!(
+      std::fs::read(locale_file(&data, "pirate")).unwrap(),
+      pirate_bytes
+    );
+    assert!(!data.join(SEEDED_KEYS_FILE).exists());
+  }
+
+  #[test]
+  fn merge_treats_an_unparsable_manifest_as_absent() {
+    let base = tempdir().unwrap();
+    let (res, data) = (base.path().join("res"), base.path().join("data"));
+    std::fs::create_dir_all(&res).unwrap();
+    std::fs::create_dir_all(&data).unwrap();
+    write_locale(&res, &locale_with("de", &[("a", "A"), ("b", "B")]));
+    write_locale(&data, &locale_with("de", &[("a", "A")]));
+    std::fs::write(data.join(SEEDED_KEYS_FILE), "garbage").unwrap();
+    merge_new_seed_keys(&res, &data);
+    assert!(read_locale(&data, "de").strings.contains_key("b"));
+    assert_eq!(manifest_of(&data)["de"], keys(&["a", "b"]));
+  }
+
+  #[cfg(unix)]
+  #[test]
+  fn merge_failure_does_not_extend_the_manifest_and_is_retried() {
+    use std::os::unix::fs::PermissionsExt;
+    let base = tempdir().unwrap();
+    let (res, data) = (base.path().join("res"), base.path().join("data"));
+    std::fs::create_dir_all(&res).unwrap();
+    std::fs::create_dir_all(&data).unwrap();
+    write_locale(&res, &locale_with("de", &[("a", "A"), ("b", "B")]));
+    write_locale(&res, &locale_with("fr", &[("a", "A"), ("b", "B")]));
+    write_locale(&data, &locale_with("de", &[("a", "A")]));
+    write_locale(&data, &locale_with("fr", &[("a", "A")]));
+    let de_file = locale_file(&data, "de");
+    std::fs::set_permissions(&de_file, std::fs::Permissions::from_mode(0o444)).unwrap();
+    if std::fs::OpenOptions::new()
+      .write(true)
+      .open(&de_file)
+      .is_ok()
+    {
+      // Permission bits are not enforced (running as root): nothing to exercise.
+      return;
+    }
+    // fr: unparsable on the first run.
+    let fr_good = std::fs::read_to_string(locale_file(&data, "fr")).unwrap();
+    std::fs::write(locale_file(&data, "fr"), "{ not json").unwrap();
+    merge_new_seed_keys(&res, &data);
+    let manifest = std::fs::read_to_string(data.join(SEEDED_KEYS_FILE));
+    assert!(manifest.is_err() || !manifest.unwrap().contains("\"de\""));
+    std::fs::set_permissions(&de_file, std::fs::Permissions::from_mode(0o644)).unwrap();
+    std::fs::write(locale_file(&data, "fr"), fr_good).unwrap();
+    merge_new_seed_keys(&res, &data);
+    assert!(read_locale(&data, "de").strings.contains_key("b"));
+    assert!(read_locale(&data, "fr").strings.contains_key("b"));
+    assert_eq!(manifest_of(&data)["de"], keys(&["a", "b"]));
+    assert_eq!(manifest_of(&data)["fr"], keys(&["a", "b"]));
+  }
+
+  #[test]
+  fn merge_after_fresh_seed_records_keys_so_later_removal_sticks() {
+    let base = tempdir().unwrap();
+    let (res, data) = (base.path().join("res"), base.path().join("data"));
+    std::fs::create_dir_all(&res).unwrap();
+    write_locale(&res, &locale_with("de", &[("a", "A"), ("b", "B")]));
+    seed_defaults_if_missing(&res, &data).unwrap();
+    merge_new_seed_keys(&res, &data);
+    assert_eq!(manifest_of(&data)["de"], keys(&["a", "b"]));
+    let mut cut = read_locale(&data, "de");
+    cut.strings.remove("b");
+    save_locale_to(&data, &cut).unwrap();
+    write_locale(
+      &res,
+      &locale_with("de", &[("a", "A"), ("b", "B"), ("c", "C")]),
+    );
+    merge_new_seed_keys(&res, &data);
+    let merged = read_locale(&data, "de");
+    assert!(!merged.strings.contains_key("b"));
+    assert_eq!(merged.strings["c"], "C");
+  }
+
+  #[test]
+  fn merge_overwrites_nothing_when_edited_value_differs_from_seed() {
+    let base = tempdir().unwrap();
+    let (res, data) = (base.path().join("res"), base.path().join("data"));
+    std::fs::create_dir_all(&res).unwrap();
+    std::fs::create_dir_all(&data).unwrap();
+    write_locale(&res, &locale_with("de", &[("a", "seed"), ("b", "B")]));
+    write_locale(&data, &locale_with("de", &[("a", "edited")]));
+    merge_new_seed_keys(&res, &data);
+    assert_eq!(read_locale(&data, "de").strings["a"], "edited");
   }
 }

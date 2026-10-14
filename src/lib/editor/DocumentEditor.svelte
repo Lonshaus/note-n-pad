@@ -47,6 +47,7 @@
   import { focusEditorIfIdle } from '../util/editorFocus';
   import { readCspNonce } from '../util/cspNonce';
   import { keymapExtension } from './keymap';
+  import { cmPhraseExtension, cmPhraseSignature } from './cmPhrases';
   import { shortcutsState } from '../state/shortcuts.svelte';
   import { platform } from '../state/platform.svelte';
 
@@ -137,6 +138,8 @@
   const wrapCompartment = new Compartment();
   const gutterCompartment = new Compartment();
   const keymapCompartment = new Compartment();
+  // CodeMirror's own UI text in the active UI language.
+  const phraseCompartment = new Compartment();
   // Off-main-thread highlighting for oversized documents, reconfigured in place
   // so switching tabs or toggling the flag adds/removes it (and disposes the
   // worker) without rebuilding the state.
@@ -152,6 +155,8 @@
   // is added, or the last long line is shortened back). Per-tab: rescanned on
   // mount and on every tab switch, updated incrementally on each edit.
   let hasLongLine = $state(false);
+  // Phrases baked into every state so far; a reconfigure is skipped when equal.
+  let appliedPhrases = cmPhraseSignature();
 
   function buildState(doc: Text): EditorState {
     return EditorState.create({
@@ -161,6 +166,7 @@
         EditorView.cspNonce.of(readCspNonce()),
         coreSetup,
         keymapCompartment.of(currentKeymap()),
+        phraseCompartment.of(cmPhraseExtension()),
         gutterCompartment.of(gutterExtension(showLineNumbers)),
         wrapCompartment.of(wordWrap ? EditorView.lineWrapping : []),
         languageCompartment.of([]),
@@ -420,6 +426,26 @@
         states.set(id, saved.update({ effects }).state);
       }
       view?.dispatch({ effects });
+    });
+  });
+
+  // Swap the CodeMirror phrases when the UI language changes; saved tab states
+  // are updated too, or switching to one would bring the old language back.
+  $effect(() => {
+    const ext = cmPhraseExtension();
+    const sig = cmPhraseSignature();
+    untrack(() => {
+      if (sig === appliedPhrases) {
+        return;
+      }
+      appliedPhrases = sig;
+      const effects = phraseCompartment.reconfigure(ext);
+      for (const [id, saved] of states) {
+        states.set(id, saved.update({ effects }).state);
+      }
+      if (view !== undefined) {
+        view.dispatch({ effects });
+      }
     });
   });
 
