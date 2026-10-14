@@ -269,7 +269,7 @@ fn offset_of_line<R: Read>(
 
 /// Case-aware substring search over bytes. Case-insensitive matching folds ASCII
 /// letters only; non-ASCII bytes compare verbatim.
-fn find_sub(hay: &[u8], needle: &[u8], case_sensitive: bool) -> Option<usize> {
+pub(crate) fn find_sub(hay: &[u8], needle: &[u8], case_sensitive: bool) -> Option<usize> {
   if needle.is_empty() || needle.len() > hay.len() {
     return None;
   }
@@ -285,7 +285,7 @@ fn find_sub(hay: &[u8], needle: &[u8], case_sensitive: bool) -> Option<usize> {
 }
 
 /// Count newline bytes in a slice.
-fn count_newlines(b: &[u8]) -> u64 {
+pub(crate) fn count_newlines(b: &[u8]) -> u64 {
   b.iter().filter(|&&c| c == b'\n').count() as u64
 }
 
@@ -300,7 +300,7 @@ fn truncate_chars(s: &str, max: usize) -> String {
 /// Preview of the line containing the match at `idx` within `buf`, bounded to the
 /// surrounding newlines and truncated to `PREVIEW_CHARS`. The line may be clipped
 /// when it crosses a read boundary, which is acceptable for a preview.
-fn preview_at(buf: &[u8], idx: usize) -> String {
+pub(crate) fn preview_at(buf: &[u8], idx: usize) -> String {
   let start = buf[..idx]
     .iter()
     .rposition(|&b| b == b'\n')

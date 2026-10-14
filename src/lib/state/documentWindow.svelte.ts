@@ -29,6 +29,7 @@ import {
 } from '../util/text';
 import { replacementByteLength } from '../util/rangeEdit';
 import { detectBreakStyle } from '../util/windowedEdit';
+import { createOpGate, type OpGate } from '../util/windowedGate';
 import {
   routeOpen,
   orphanCandidates,
@@ -82,7 +83,6 @@ export function windowedRefusalReason(error: string): WindowedRefusalReason {
   }
   return 'cannot';
 }
-
 /** Whether `tab` is a read-only large view, a windowed-editing tab or one about to
  *  become one: its bytes stay as they are on disk, so its line ending and
  *  encoding are not changeable. */
@@ -428,6 +428,11 @@ class DocumentWindowState {
    *  switches, by tab id. Dropped when the tab closes, the window closes, the
    *  file is rewritten or the tab unlocks. */
   private largeIndexes = new Map<string, LargeIndexRef>();
+  /** The pending-operation gate of each windowed session, by session id: a
+   *  replace all (or its undo or redo) runs in the Rust core and can outlive
+   *  the editor that started it, since the editor is mounted only for the
+   *  active tab. Not reactive; an editor reads it when it mounts. */
+  private windowedGates = new Map<number, OpGate>();
   viewTopLine(id: string): number | undefined {
     return this.viewPos.get(id)?.top;
   }
@@ -2106,6 +2111,36 @@ class DocumentWindowState {
     await this.upsertTab(tab);
     return null;
   }
+  /** The gate of a windowed session: pending while one of its whole-file
+   *  operations runs, whichever editor started it. */
+  windowedGate(sessionId: number): OpGate {
+    let gate = this.windowedGates.get(sessionId);
+    if (gate === undefined) {
+      gate = createOpGate(null);
+      this.windowedGates.set(sessionId, gate);
+    }
+    return gate;
+  }
+  /** Run a whole-file operation (`run` starts the Rust command) for a windowed
+   *  session. The session's gate is pending until it has finished, including
+   *  this bookkeeping, so an editor mounted meanwhile reads no stale content.
+   *  The tab's totals and dirty flag follow the result even when the editor
+   *  that asked has been unmounted by then. `changed` says whether the result
+   *  changed the content. */
+  runWindowedOp<T extends { total_bytes: number; total_lines: number }>(
+    sessionId: number,
+    run: () => Promise<T>,
+    changed: (result: T) => boolean,
+  ): Promise<T> {
+    const op = run().then((result) => {
+      if (changed(result)) {
+        this.windowedApplied(sessionId, result.total_bytes, result.total_lines);
+      }
+      return result;
+    });
+    this.windowedGate(sessionId).begin(op);
+    return op;
+  }
 
   /** Called by the WindowedEditor after each successful apply: record the fresh
    *  totals and mark the session's tab dirty (the first apply flips dirty). */
@@ -2210,6 +2245,7 @@ class DocumentWindowState {
       return;
     }
     void invoke('windowed_close', { sessionId: w.sessionId });
+    this.windowedGates.delete(w.sessionId);
     let open: WindowedOpen;
     try {
       open = await invoke<WindowedOpen>('windowed_open', { path: tab.path });
@@ -2478,6 +2514,7 @@ class DocumentWindowState {
     // Release the Rust windowed session before dropping the tab.
     if (tab.windowed !== undefined) {
       void invoke('windowed_close', { sessionId: tab.windowed.sessionId });
+      this.windowedGates.delete(tab.windowed.sessionId);
     }
     if (tab === this.windowedConflict) {
       this.windowedConflict = null;

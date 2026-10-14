@@ -1,5 +1,6 @@
 // Copyright © 2026 Lonshaus
 // SPDX-License-Identifier: GPL-3.0-only
+import { MARGIN_LINES, WINDOW_LINES, nextWindow } from './windowedEdit';
 /** Pure model of a selection that outlives the sliding window: the editor keeps
  *  the selection's global ends, and only the part inside the loaded window is
  *  live in CodeMirror. Free of CodeMirror/Tauri so it unit-tests in isolation. */
@@ -102,4 +103,34 @@ export function selectionAfterChange(
       : next.anchor,
     head: samePos(prevLive.head, nextLive.head) ? global.head : next.head,
   };
+}
+/** Whether both ends of the selection lie on lines of the loaded window. */
+export function insideWindow(
+  global: LineSelection,
+  startLine: number,
+  lineCount: number,
+): boolean {
+  const end = startLine + lineCount;
+  return (
+    global.anchor.line >= startLine &&
+    global.anchor.line < end &&
+    global.head.line >= startLine &&
+    global.head.line < end
+  );
+}
+/** Whether one window can hold the selection with a margin on both sides. */
+export function fitsWindow(global: LineSelection): boolean {
+  return (
+    Math.abs(global.anchor.line - global.head.line) <=
+    WINDOW_LINES - 2 * MARGIN_LINES
+  );
+}
+/** The first line of a window holding both ends of a selection that fits one,
+ *  clamped to the file. */
+export function windowStartFor(
+  global: LineSelection,
+  totalLines: number,
+): number {
+  const first = Math.min(global.anchor.line, global.head.line);
+  return nextWindow(first, totalLines, WINDOW_LINES, MARGIN_LINES).startLine;
 }

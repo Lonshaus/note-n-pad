@@ -3,10 +3,13 @@
 
 import { describe, expect, it } from 'vitest';
 import {
+  fitsWindow,
   gotoSelection,
+  insideWindow,
   selectionAfterChange,
   selectionAfterSwap,
   toLiveSelection,
+  windowStartFor,
   type LineSelection,
   type WindowShape,
 } from './windowSelection';
@@ -154,5 +157,86 @@ describe('selectionAfterChange (document change)', () => {
 describe('gotoSelection', () => {
   it('is a caret at the start of the target line', () => {
     expect(gotoSelection(4200)).toEqual(sel(4200, 0, 4200, 0));
+  });
+});
+
+describe('insideWindow', () => {
+  it('holds a selection with both ends on window lines', () => {
+    expect(insideWindow(sel(110, 2, 120, 5), 100, 50)).toBe(true);
+  });
+
+  it('holds the first and the last line of the window', () => {
+    expect(insideWindow(sel(100, 0, 149, 3), 100, 50)).toBe(true);
+  });
+
+  it('rejects a selection entirely before the window', () => {
+    expect(insideWindow(sel(10, 0, 20, 0), 100, 50)).toBe(false);
+  });
+
+  it('rejects a selection entirely after the window', () => {
+    expect(insideWindow(sel(150, 0, 300, 0), 100, 50)).toBe(false);
+  });
+
+  it('rejects a selection straddling either window edge', () => {
+    expect(insideWindow(sel(90, 0, 110, 0), 100, 50)).toBe(false);
+    expect(insideWindow(sel(110, 0, 150, 0), 100, 50)).toBe(false);
+  });
+
+  it('is independent of the direction of the selection', () => {
+    expect(insideWindow(sel(120, 5, 110, 2), 100, 50)).toBe(true);
+    expect(insideWindow(sel(120, 5, 10, 2), 100, 50)).toBe(false);
+  });
+});
+
+describe('fitsWindow', () => {
+  it('fits a caret', () => {
+    expect(fitsWindow(sel(5, 3, 5, 3))).toBe(true);
+  });
+
+  it('fits a span of exactly the window minus both margins', () => {
+    expect(fitsWindow(sel(100, 0, 1100, 0))).toBe(true);
+    expect(fitsWindow(sel(1100, 0, 100, 0))).toBe(true);
+  });
+
+  it('does not fit a span one line over that', () => {
+    expect(fitsWindow(sel(100, 0, 1101, 0))).toBe(false);
+    expect(fitsWindow(sel(1101, 0, 100, 0))).toBe(false);
+  });
+});
+
+describe('windowStartFor', () => {
+  const total = 1_200_000;
+
+  it('puts a margin above the first selected line', () => {
+    expect(windowStartFor(sel(3600, 0, 3600, 0), total)).toBe(3100);
+    expect(windowStartFor(sel(3700, 0, 3650, 0), total)).toBe(3150);
+  });
+
+  it('clamps to the start of the file', () => {
+    expect(windowStartFor(sel(10, 0, 20, 0), total)).toBe(0);
+  });
+
+  it('clamps to the last full window at the end of the file', () => {
+    expect(windowStartFor(sel(total - 5, 0, total - 5, 0), total)).toBe(
+      total - 2000,
+    );
+  });
+
+  it('yields a window holding a widest fitting selection with margins', () => {
+    const wide = sel(5000, 0, 6000, 0);
+    const start = windowStartFor(wide, total);
+    expect(insideWindow(wide, start, 2000)).toBe(true);
+    expect(5000 - start).toBe(500);
+    expect(start + 2000 - 6000).toBe(500);
+  });
+
+  it('holds a widest fitting selection that ends at the end of the file', () => {
+    const wide = sel(total - 1001, 0, total - 1, 0);
+    const start = windowStartFor(wide, total);
+    expect(insideWindow(wide, start, 2000)).toBe(true);
+  });
+
+  it('starts a short file at its first line', () => {
+    expect(windowStartFor(sel(300, 0, 300, 0), 800)).toBe(0);
   });
 });
