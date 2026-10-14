@@ -1004,7 +1004,7 @@ fn strings(key: Key) -> [&'static str; 15] {
       "Thẻ trước",
     ],
     Key::GoToLine => [
-      "跳至行號",
+      "前往行",
       "跳至行号",
       "指定行へ移動",
       "Go to Line",
