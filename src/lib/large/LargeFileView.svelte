@@ -9,7 +9,10 @@
   import { Lru } from '../util/lru';
   import {
     computeVisibleWindow,
+    fullyVisibleSpan,
+    joinSelectedRows,
     lineToScrollTop,
+    type SelectedRow,
     scrollAxisHeight,
   } from '../util/largeView';
   import { moveResultCursor, parseGotoRange } from '../util/largeSearch';
@@ -188,6 +191,7 @@
   let avgBytes = 80;
   const pageCache = new Lru<number, string[]>(PAGE_CACHE_MAX);
 
+  let wrap = $state<HTMLDivElement | null>(null);
   let container = $state<HTMLDivElement | null>(null);
   let scrollTop = $state(0);
   let viewportHeight = $state(0);
@@ -685,6 +689,116 @@
       }
     }
   }
+  // The rendered rows' text elements, in order.
+  function rowTexts(): HTMLElement[] {
+    return wrap === null
+      ? []
+      : Array.from(wrap.querySelectorAll<HTMLElement>('.row .text'));
+  }
+  // Characters between the start of `el` and a boundary point inside it.
+  function offsetIn(el: HTMLElement, node: Node, offset: number): number {
+    const r = document.createRange();
+    r.selectNodeContents(el);
+    r.setEnd(node, offset);
+    return r.toString().length;
+  }
+  // The rendered rows fully on screen become the selection.
+  function selectVisibleRows(): void {
+    const sel = document.getSelection();
+    if (wrap === null || container === null || sel === null) {
+      return;
+    }
+    const texts = rowTexts();
+    // clientHeight leaves out a horizontal scrollbar covering the last row.
+    const viewTop = container.getBoundingClientRect().top + container.clientTop;
+    // The find panel floats over the bottom rows, full width.
+    const panelTop = wrap
+      .querySelector('.search-panel')
+      ?.getBoundingClientRect().top;
+    const span = fullyVisibleSpan(
+      texts.map((el) => {
+        const r = el.closest('.row')?.getBoundingClientRect();
+        return { top: r?.top ?? 0, bottom: r?.bottom ?? 0 };
+      }),
+      viewTop,
+      Math.min(viewTop + container.clientHeight, panelTop ?? Infinity),
+    );
+    const a = span === null ? undefined : texts[span.first];
+    const b = span === null ? undefined : texts[span.last];
+    if (a === undefined || b === undefined) {
+      return;
+    }
+    const next = document.createRange();
+    next.setStart(a, 0);
+    next.setEnd(b, b.childNodes.length);
+    sel.removeAllRanges();
+    sel.addRange(next);
+  }
+  // A native select-all (keyboard) starts before the viewer and ends at or
+  // after the last rendered row; narrow it to the rows fully on screen.
+  function onSelectionChange(): void {
+    const sel = document.getSelection();
+    if (wrap === null || container === null || sel === null) {
+      return;
+    }
+    if (sel.rangeCount === 0 || sel.isCollapsed) {
+      return;
+    }
+    const range = sel.getRangeAt(0);
+    const texts = rowTexts();
+    const lastText = texts[texts.length - 1];
+    if (lastText === undefined) {
+      return;
+    }
+    const root = document.createRange();
+    root.selectNode(wrap);
+    // Chromium ends a select-all inside the last text node, WebKit after it.
+    const endNode = lastText.lastChild ?? lastText;
+    const endOffset =
+      endNode.nodeType === Node.TEXT_NODE
+        ? (endNode.textContent ?? '').length
+        : endNode.childNodes.length;
+    if (
+      range.compareBoundaryPoints(Range.START_TO_START, root) >= 0 ||
+      range.comparePoint(endNode, endOffset) !== 0
+    ) {
+      return;
+    }
+    selectVisibleRows();
+  }
+  // Copies the selected rows' text only: a multi-row selection otherwise
+  // carries the gutter numbers in WebKit.
+  function onCopy(e: ClipboardEvent): void {
+    const sel = document.getSelection();
+    if (sel === null || sel.rangeCount === 0 || sel.isCollapsed) {
+      return;
+    }
+    const range = sel.getRangeAt(0);
+    const rows: SelectedRow[] = [];
+    for (const el of rowTexts()) {
+      if (!range.intersectsNode(el)) {
+        continue;
+      }
+      const len = el.textContent?.length ?? 0;
+      const row: SelectedRow = { text: el.textContent ?? '' };
+      if (el.contains(range.startContainer)) {
+        row.from = offsetIn(el, range.startContainer, range.startOffset);
+      }
+      if (el.contains(range.endContainer)) {
+        row.to = offsetIn(el, range.endContainer, range.endOffset);
+      }
+      // A boundary touching a non-empty row without selecting from it.
+      if (len > 0 && ((row.from ?? 0) >= len || row.to === 0)) {
+        continue;
+      }
+      rows.push(row);
+    }
+    if (rows.length === 0 || e.clipboardData === null) {
+      return;
+    }
+    e.preventDefault();
+    e.clipboardData.setData('text/plain', joinSelectedRows(rows));
+  }
   // The shortcut registry's `goto-line` key opens goto. Cmd/Ctrl+F is a native
   // menu accelerator (it never reaches this listener), so DocumentApp routes it
   // to `openSearch` instead.
@@ -705,6 +819,11 @@
   }
   export function largeGoto(line: number): void {
     void scrollToLine(Math.max(0, Math.round(line) - 1));
+  }
+  // Edit > Select All (the macOS item is custom): the rows fully on screen, the
+  // same rows the narrowing above picks.
+  export function selectAllVisible(): void {
+    selectVisibleRows();
   }
   export function largeSearchOpen(): void {
     openSearch();
@@ -860,6 +979,8 @@
     // Only mounted while a large tab is active, so this shortcut never fires in
     // the normal editor (which has no LargeFileView).
     window.addEventListener('keydown', onWindowKeydown);
+    document.addEventListener('selectionchange', onSelectionChange);
+    document.addEventListener('copy', onCopy);
     if (container !== null) {
       // Keep the visible-line math and status in step with the pane height.
       observer = new ResizeObserver(() => {
@@ -958,6 +1079,8 @@
       destroyed = true;
       observer?.disconnect();
       window.removeEventListener('keydown', onWindowKeydown);
+      document.removeEventListener('selectionchange', onSelectionChange);
+      document.removeEventListener('copy', onCopy);
     };
   });
 
@@ -980,6 +1103,7 @@
 </script>
 
 <div
+  bind:this={wrap}
   class="large-wrap"
   style="--doc-font-size: {fontSize}px; --doc-font-family: {cssFontFamily(
     fontFamily,

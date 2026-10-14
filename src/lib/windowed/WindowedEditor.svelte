@@ -10,6 +10,7 @@
     Transaction,
     type Extension,
     type Text,
+    type TransactionSpec,
   } from '@codemirror/state';
   import {
     EditorView,
@@ -39,6 +40,7 @@
     charToByte,
     decideNewGroup,
     detectBreakStyle,
+    fullyVisibleLineSpan,
     mapChangesToEdits,
     nextWindow,
     rejectDuringSwap,
@@ -236,6 +238,68 @@
       : [];
   }
 
+  // The document span of the lines fully on screen, or null when none is.
+  function visibleSpan(v: EditorView): { from: number; to: number } | null {
+    // clientHeight leaves out a horizontal scrollbar covering the last line.
+    const el = v.scrollDOM;
+    const top = el.getBoundingClientRect().top + el.clientTop;
+    return fullyVisibleLineSpan(
+      v.viewportLineBlocks.map((b) => ({
+        from: b.from,
+        to: b.to,
+        top: v.documentTop + b.top,
+        bottom: v.documentTop + b.bottom,
+      })),
+      top,
+      top + el.clientHeight,
+    );
+  }
+  // Select All covers what is on screen, not the whole loaded window.
+  function selectVisible(v: EditorView): boolean {
+    const span = visibleSpan(v);
+    if (span === null) {
+      return false;
+    }
+    v.dispatch({
+      selection: { anchor: span.from, head: span.to },
+      userEvent: 'select',
+    });
+    return true;
+  }
+  // Set by a keydown for the rest of its task: selections made while it is
+  // set come from a key command, not from the native select-all.
+  let keyActive = false;
+  // The native (menu) select-all arrives as a DOM selection covering the whole
+  // rendered viewport; replace it with the on-screen span.
+  function narrowNativeSelectAll(
+    tr: Transaction,
+  ): TransactionSpec | Transaction {
+    const v = view;
+    if (
+      v === undefined ||
+      keyActive ||
+      swapping ||
+      tr.docChanged ||
+      tr.selection === undefined ||
+      !tr.isUserEvent('select') ||
+      tr.isUserEvent('select.pointer')
+    ) {
+      return tr;
+    }
+    const main = tr.selection.main;
+    if (main.from > v.viewport.from || main.to < v.viewport.to) {
+      return tr;
+    }
+    const span = visibleSpan(v);
+    if (span === null) {
+      return tr;
+    }
+    return {
+      selection: { anchor: span.from, head: span.to },
+      userEvent: 'select',
+    };
+  }
+
   // No CodeMirror `history()`: undo/redo is owned by the Rust journal (the whole
   // document lives there, not in CM), so Mod-z / Mod-Shift-z route to runUndo. A
   // local CM history would fight it — undoing only the window's slice of edits.
@@ -244,7 +308,18 @@
     drawSelection(),
     dropCursor(),
     highlightActiveLine(),
+    EditorView.domEventHandlers({
+      keydown() {
+        keyActive = true;
+        queueMicrotask(() => {
+          keyActive = false;
+        });
+        return false;
+      },
+    }),
+    EditorState.transactionFilter.of(narrowNativeSelectAll),
     keymap.of([
+      { key: 'Mod-a', preventDefault: true, run: selectVisible },
       {
         key: 'Mod-z',
         preventDefault: true,
@@ -1027,6 +1102,13 @@
 
   export function redo(): void {
     runUndo('redo');
+  }
+  // Edit > Select All (the macOS item is custom): the on-screen span, same as
+  // Mod-a.
+  export function selectAllVisible(): void {
+    if (view !== undefined) {
+      selectVisible(view);
+    }
   }
   // Called by the host before a tab switch: ends an IME composition and
   // resolves once its text has been read into the document and applied.

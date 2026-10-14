@@ -13,6 +13,7 @@
   import { platform } from '../../state/platform.svelte';
   import { settingsState } from '../../state/settings.svelte';
   import MarkdownNode from './MarkdownNode.svelte';
+  import { markdownViewText } from './viewText';
   import {
     addRun,
     anchoredScrollTop,
@@ -420,6 +421,36 @@
       }
     }
   }
+  // Select All cannot be a DOM range here: only the blocks near the viewport
+  // exist. It is a view-level state instead, drawn on every block as it
+  // scrolls into view and read back by Copy. Keyed to the document it was made
+  // on, so a new document starts unselected without an effect writing state.
+  let selectedDoc = $state.raw<Text | null>(null);
+  const allSelected = $derived(selectedDoc === doc);
+  /** Takes keyboard focus, so typing and editing commands stop reaching the
+   *  source editor underneath. */
+  export function focus(): void {
+    scrollEl.focus({ preventScroll: true });
+  }
+  /** The element holding the rendered content. */
+  export function root(): HTMLElement {
+    return scrollEl;
+  }
+  /** Select every block, on screen or not. */
+  export function selectAll(): void {
+    focus();
+    document.getSelection()?.removeAllRanges();
+    selectedDoc = doc;
+  }
+  /** The text of every block as displayed while all of them are selected,
+   *  otherwise null. Rendered from the whole document by the view's own
+   *  renderer, not read from the DOM. */
+  export function selectedText(): string | null {
+    if (!allSelected) {
+      return null;
+    }
+    return markdownViewText(doc, index, refs, (s) => parser.parse(s));
+  }
 
   onMount(() => {
     const observer = new ResizeObserver(() => {
@@ -439,9 +470,22 @@
   });
 </script>
 
-<div class="markdown-view" class:dark bind:this={scrollEl} onscroll={onScroll}>
+<div
+  class="markdown-view"
+  class:dark
+  role="document"
+  tabindex="-1"
+  bind:this={scrollEl}
+  onscroll={onScroll}
+  onpointerdown={() => (selectedDoc = null)}
+>
   <div class="spacer" style="height: {contentHeight}px;">
-    <div class="blocks" style="top: {topSpacer}px;" bind:this={blockEl}>
+    <div
+      class="blocks"
+      class:all-selected={allSelected}
+      style="top: {topSpacer}px;"
+      bind:this={blockEl}
+    >
       <!-- Keyed on the registered folder so a destination that failed under
            the previous one is not still latched as failed under this one. -->
       {#key registeredBase}
@@ -464,6 +508,9 @@
     font-size: 0.95rem;
     line-height: 1.6;
   }
+  .markdown-view:focus {
+    outline: none;
+  }
   .spacer {
     position: relative;
   }
@@ -471,5 +518,8 @@
     position: absolute;
     left: 0;
     right: 0;
+  }
+  .blocks.all-selected > :global(*) {
+    background: color-mix(in srgb, var(--accent) 35%, transparent);
   }
 </style>
