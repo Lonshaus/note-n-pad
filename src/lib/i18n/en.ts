@@ -42,9 +42,9 @@ export const en = {
   'settings.theme.color.danger': 'Danger',
   // Files a data folder held that could not be loaded (snapshots, themes,
   // locales). The reason names the case; `skipReasonKey` maps it.
-  'skipped.heading': '{count} files could not be loaded',
+  'skipped.heading': '{count} file(s) could not be loaded',
   'skipped.snapshotHeading':
-    '{count} sticky or document snapshots could not be loaded',
+    '{count} sticky or document snapshot(s) could not be loaded',
   'skipped.windowHint':
     'These files could not be read when Note&Pad started, so nothing they hold is showing in any window.',
   'skipped.reason.notJson': 'Not a JSON file',
@@ -111,11 +111,11 @@ export const en = {
   'settings.general.snapshotReset': 'Reset to default',
   'settings.general.snapshotMoveTitle': 'Move the existing sticky notes over?',
   'settings.general.snapshotMoveBody':
-    "The current folder has {count} sticky notes and unsaved document content. If you don't move them, they won't show up in Note&Pad anymore — they'll stay in the original folder.",
+    "The current folder has {count} sticky note(s) and unsaved document content. If you don't move them, they won't show up in Note&Pad anymore — they'll stay in the original folder.",
   'settings.general.snapshotMoveConfirm': 'Move',
   'settings.general.snapshotMoveSkip': "Don't move",
   'settings.general.snapshotCollisionTitle':
-    'The chosen folder already has {count} matching snapshots',
+    'The chosen folder already has {count} matching snapshot(s)',
   'settings.general.snapshotCollisionSource':
     "Overwrite with this folder's copies",
   'settings.general.snapshotCollisionDest':
@@ -205,7 +205,7 @@ export const en = {
   'large.gutter.title': 'Click a line number to select a range (Shift extends)',
   'large.goto.placeholder': 'Line',
   'large.goto.aria': 'Go to line',
-  'large.range.info': 'Lines {start}–{end} ({count} lines, ~{size})',
+  'large.range.info': 'Lines {start}–{end} ({count} line(s), ~{size})',
   'large.range.edit': 'Edit this range',
   'large.range.saveAs': 'Save range',
   'large.range.tooBig':
@@ -217,7 +217,7 @@ export const en = {
   'large.search.label': 'Search',
   'large.search.case': 'Case',
   'large.search.searching': 'Searching… {count} found',
-  'large.search.results': '{count} results',
+  'large.search.results': '{count} result(s)',
   'large.search.truncatedSuffix': ' (truncated)',
   'large.search.failed':
     'Search failed. The file may have been moved or become unreadable.',
@@ -227,8 +227,8 @@ export const en = {
     'Couldn’t read part of this file. It may have been moved or become unreadable.',
   // Status bar
   'status.view': 'View',
-  'status.indexing': 'Indexing… {count} lines',
-  'status.lines': '{count} lines',
+  'status.indexing': 'Indexing… {count} line(s)',
+  'status.lines': '{count} line(s)',
   'status.lineEnding': 'Line ending',
   'status.encoding': 'Encoding',
   'status.language': 'Language',
@@ -308,7 +308,7 @@ export const en = {
   'doc.openFailed':
     'Couldn’t open “{name}”. The file may have been moved or deleted, or its name may contain characters this app doesn’t support.',
   'doc.restoreUnreadable':
-    'Couldn’t read {names}. Open them again to continue.',
+    'Couldn’t read: {names}. Open the file(s) again to continue.',
   'doc.revealFailed':
     'Couldn’t show “{name}”. The file may have been moved or deleted.',
   'doc.saveFailed': 'Couldn’t save “{name}”: {error}',
