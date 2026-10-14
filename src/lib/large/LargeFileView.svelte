@@ -2,7 +2,7 @@
   // Copyright © 2026 Lonshaus
   // SPDX-License-Identifier: GPL-3.0-only
 
-  import { onDestroy, onMount } from 'svelte';
+  import { onDestroy, onMount, tick } from 'svelte';
   import { invoke } from '@tauri-apps/api/core';
   import { listen, type UnlistenFn } from '@tauri-apps/api/event';
   import { cssFontFamily } from '../util/font';
@@ -21,6 +21,11 @@
     resolveByteRange,
   } from '../util/rangeEdit';
   import { formatFileSize } from '../util/format';
+  import {
+    canReuseIndex,
+    type IndexScanState,
+    type LargeIndexRef,
+  } from '../util/largeIndex';
   import { t } from '../i18n';
   import { platform } from '../state/platform.svelte';
   import { shortcutsState } from '../state/shortcuts.svelte';
@@ -42,6 +47,8 @@
   }
 
   interface Props {
+    // The tab this view shows; the kept index is reported against it.
+    tabId: string;
     path: string;
     size: number;
     fontSize: number;
@@ -61,6 +68,16 @@
     // mid-scan I/O error), so the app can surface it via its existing
     // openFailed/revealFailed-style notice.
     onindexerror: () => void;
+    // The 0-based line to open scrolled to (the line the tab was left at).
+    initialTopLine?: number;
+    // The line index this tab kept from an earlier mount, if any. It is reused
+    // when the file is unchanged, so coming back to the tab does not rescan.
+    indexRef?: LargeIndexRef | undefined;
+    // Fired with the index this view started (to keep), or null once a kept
+    // one was found stale and dropped.
+    onindexchange?: (tabId: string, ref: LargeIndexRef | null) => void;
+    // Fired with the first visible line as the view scrolls.
+    ontopline?: (line: number) => void;
   }
 
   export interface LargeStatus {
@@ -75,6 +92,7 @@
   }
 
   let {
+    tabId,
     path,
     size,
     fontSize,
@@ -84,6 +102,10 @@
     onextract,
     onsaverange,
     onindexerror,
+    initialTopLine = 0,
+    indexRef,
+    onindexchange,
+    ontopline,
   }: Props = $props();
 
   /** Boundary-aligned text slice returned by the Rust `read_chunk` command. */
@@ -91,6 +113,16 @@
     text: string;
     start: number;
     end: number;
+  }
+  /** What the Rust `index_line_count` answers. */
+  type IndexStatus =
+    | { state: 'running' }
+    | { state: 'done'; lines: number }
+    | { state: 'failed' };
+  /** The Rust `file_fingerprint` answer. */
+  interface Fingerprint {
+    size: number;
+    mtime_ms: number;
   }
 
   interface IndexProgress {
@@ -141,6 +173,11 @@
   const lineHeight = $derived(Math.round(fontSize * 1.5));
 
   let indexId: string | null = null;
+  // The kept index being checked for reuse: its progress is heard before it is adopted.
+  let candidateId: string | null = null;
+  // Set once the app tab owns the index, so a destroy leaves it alive.
+  let indexKept = false;
+  let destroyed = false;
   let unlisten: UnlistenFn | null = null;
   let unlistenHit: UnlistenFn | null = null;
   let unlistenDone: UnlistenFn | null = null;
@@ -341,6 +378,7 @@
     }
     scrollTop = container.scrollTop;
     publishStatus();
+    ontopline?.(visible.firstVisible);
     void syncLoad();
   }
 
@@ -713,9 +751,111 @@
   export function largeRangeSaveAs(targetPath: string): Promise<boolean> {
     return triggerRangeSaveAs(targetPath);
   }
+  /** The scan ended without a line count: stop the "indexing" status and tell
+   *  the app once. */
+  function failIndex(): void {
+    if (indexFailed) {
+      return;
+    }
+    indexFailed = true;
+    onindexerror();
+  }
+  /** The scan ended with `lines` lines. A finish heard while the view is open
+   *  rescales the axis from the estimate to the precise count, so the scroll is
+   *  re-anchored to keep the line at the top of the viewport where it is. */
+  function finishIndex(lines: number, reanchor: boolean): void {
+    indexedLines = lines;
+    const anchorLine = visible.firstVisible;
+    totalLines = lines;
+    if (reanchor && container !== null) {
+      const height = scrollAxisHeight(lines, lineHeight);
+      container.scrollTop = lineToScrollTop(
+        anchorLine,
+        lines,
+        lineHeight,
+        height,
+        viewportHeight,
+      );
+      scrollTop = container.scrollTop;
+    }
+  }
+
+  async function readStatus(id: string): Promise<IndexStatus | null> {
+    try {
+      return await invoke<IndexStatus>('index_line_count', { id });
+    } catch {
+      // The id is gone on the Rust side.
+      return null;
+    }
+  }
+
+  function scanState(status: IndexStatus | null): IndexScanState {
+    return status === null ? 'unknown' : status.state;
+  }
+  /** Reuse the index this tab kept when the file is unchanged, otherwise
+   *  (re)build it. The index id and the file's size and mtime from before the
+   *  scan go back to the tab, which keeps them across unmounts. */
+  async function resolveIndex(
+    id: string,
+    kept: LargeIndexRef | undefined,
+  ): Promise<void> {
+    let current: { size: number; mtimeMs: number } | null = null;
+    try {
+      const f = await invoke<Fingerprint>('file_fingerprint', { path });
+      current = { size: f.size, mtimeMs: f.mtime_ms };
+    } catch {
+      current = null;
+    }
+    if (destroyed) {
+      return;
+    }
+    if (kept !== undefined) {
+      candidateId = kept.id;
+      const status = await readStatus(kept.id);
+      candidateId = null;
+      if (canReuseIndex(kept, current, scanState(status))) {
+        indexId = kept.id;
+        indexKept = true;
+        if (status?.state === 'done') {
+          finishIndex(status.lines, false);
+        }
+        return;
+      }
+      void invoke('drop_line_index', { id: kept.id });
+      onindexchange?.(id, null);
+    }
+    try {
+      indexId = await invoke<string>('start_line_index', {
+        path,
+        intervalLines: INTERVAL_LINES,
+      });
+    } catch {
+      indexId = null;
+    }
+    if (indexId === null) {
+      return;
+    }
+    if (current !== null) {
+      indexKept = true;
+      onindexchange?.(id, { id: indexId, ...current });
+    } else if (destroyed) {
+      void invoke('drop_line_index', { id: indexId });
+    }
+    // The progress events may have gone by before the id was known.
+    const status = await readStatus(indexId);
+    if (status?.state === 'done') {
+      finishIndex(status.lines, true);
+    } else if (status?.state === 'failed') {
+      failIndex();
+    }
+  }
 
   onMount(() => {
     let disposed = false;
+    // The tab at mount time: the prop moves on when the view is reused.
+    const mountedTabId = tabId;
+    const startLine = initialTopLine;
+    const kept = indexRef;
     let observer: ResizeObserver | null = null;
     // Only mounted while a large tab is active, so this shortcut never fires in
     // the normal editor (which has no LargeFileView).
@@ -734,47 +874,28 @@
       if (container !== null) {
         viewportHeight = container.clientHeight;
       }
-      try {
-        indexId = await invoke<string>('start_line_index', {
-          path,
-          intervalLines: INTERVAL_LINES,
-        });
-      } catch {
-        indexId = null;
-      }
-      if (disposed) {
-        return;
-      }
+      // Subscribe before looking at the index, so a scan that ends while it is
+      // being resolved is still heard (and one that ended earlier is read back
+      // from its status).
       unlisten = await listen<IndexProgress>('large-index-progress', (e) => {
-        if (e.payload.id !== indexId) {
+        if (e.payload.id !== indexId && e.payload.id !== candidateId) {
           return;
         }
         indexedLines = e.payload.lines;
         if (e.payload.done && e.payload.error) {
-          // No total line count was ever produced; publishStatus reads
-          // indexFailed to stop treating this as still-indexing.
-          indexFailed = true;
-          onindexerror();
+          failIndex();
         } else if (e.payload.done) {
-          // Switching from the estimate to the precise count rescales the
-          // proportional axis; re-anchor the scroll so the line currently at the
-          // top of the viewport stays put instead of jumping.
-          const anchorLine = visible.firstVisible;
-          totalLines = e.payload.lines;
-          if (container !== null) {
-            const height = scrollAxisHeight(e.payload.lines, lineHeight);
-            container.scrollTop = lineToScrollTop(
-              anchorLine,
-              e.payload.lines,
-              lineHeight,
-              height,
-              viewportHeight,
-            );
-            scrollTop = container.scrollTop;
-          }
+          finishIndex(e.payload.lines, true);
         }
         publishStatus();
       });
+      if (disposed) {
+        return;
+      }
+      await resolveIndex(mountedTabId, kept);
+      if (disposed) {
+        return;
+      }
       unlistenHit = await listen<SearchHitPayload>('large-search-hit', (e) => {
         if (e.payload.search_id !== currentSearchId) {
           return;
@@ -822,11 +943,19 @@
         return;
       }
       lastPage = -1;
-      await syncLoad();
+      if (startLine > 0) {
+        // The axis height follows the line count, which only reaches the DOM
+        // after a tick; scrolling before it would be clamped to the old height.
+        await tick();
+        await scrollToLine(startLine);
+      } else {
+        await syncLoad();
+      }
       publishStatus();
     })();
     return () => {
       disposed = true;
+      destroyed = true;
       observer?.disconnect();
       window.removeEventListener('keydown', onWindowKeydown);
     };
@@ -842,8 +971,9 @@
     if (currentSearchId !== null) {
       void invoke('cancel_search', { searchId: currentSearchId });
     }
-    if (indexId !== null) {
-      // The Rust index is not garbage-collected; release it explicitly.
+    if (indexId !== null && !indexKept) {
+      // The Rust index is not garbage-collected; release it explicitly. One the
+      // tab keeps is released by the tab when it closes.
       void invoke('drop_line_index', { id: indexId });
     }
   });
