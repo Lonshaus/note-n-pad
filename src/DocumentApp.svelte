@@ -84,6 +84,8 @@
   import { platform } from './lib/state/platform.svelte';
   import { shortcutsState } from './lib/state/shortcuts.svelte';
   import { matchWindowShortcut } from './lib/util/windowShortcut';
+  import { settleViewComposition } from './lib/editor/composition';
+  import { isSaveKey } from './lib/editor/imeShortcuts';
   import type { EditorView } from '@codemirror/view';
   import { undo, redo, selectAll } from '@codemirror/commands';
   import {
@@ -242,6 +244,9 @@
     undo: () => void;
     redo: () => void;
     focus: () => void;
+    endComposition: () => Promise<void>;
+    isComposing: () => boolean;
+    applied: () => Promise<void>;
   } | null>(null);
   let largeStatus = $state<LargeStatus>({
     totalLines: null,
@@ -1044,6 +1049,22 @@
     // keydown-only (it is deliberately not a menu item); its keys are the
     // `window.next-tab` and `window.prev-tab` rows of the shortcut registry.
     const onKeydown = (e: KeyboardEvent): void => {
+      // macOS: the menu does not fire while an IME composes; save anyway and
+      // leave the composition running, as TextEdit does.
+      if (platform.isMacOS && isSaveKey(e)) {
+        if (editorView?.composing === true) {
+          e.preventDefault();
+          void documentWindow.saveActive();
+          return;
+        }
+        const windowed = windowedRef;
+        if (windowed !== null && windowed.isComposing()) {
+          e.preventDefault();
+          // The edits typed so far must be in the Rust buffer before it is saved.
+          void windowed.applied().then(() => documentWindow.saveActive());
+          return;
+        }
+      }
       const next = shortcutsState.accel('window.next-tab');
       const prev = shortcutsState.accel('window.prev-tab');
       if (next !== null && matchWindowShortcut(e, next, platform.os)) {
@@ -1186,6 +1207,14 @@
     });
 
     window.addEventListener('keydown', onKeydown);
+    // A tab switch waits for the active editor's IME composition to end.
+    documentWindow.endComposition = (): Promise<void> => {
+      const view = editorView;
+      if (view !== null) {
+        return settleViewComposition(view);
+      }
+      return windowedRef?.endComposition() ?? Promise.resolve();
+    };
     // DEV-only automation hook; dynamic import keeps it out of production.
     if (import.meta.env.DEV) {
       void import('./lib/dev/auto').then((m) =>
@@ -1376,6 +1405,7 @@
     }
     return () => {
       window.removeEventListener('keydown', onKeydown);
+      documentWindow.endComposition = null;
       unlistenTheme();
       void unlistenChanges.then((u) => u());
       void unlistenThemes.then((u) => u());
