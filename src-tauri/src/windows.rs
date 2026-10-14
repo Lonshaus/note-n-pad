@@ -1138,17 +1138,45 @@ pub fn show_privacy_window(app: AppHandle) -> Result<(), String> {
   show_privacy(&app)
 }
 
+/// Open (or focus) the singleton "Full Version Features" window, the table of
+/// what the full version adds. Lite only: the full version has no such window.
+pub fn show_edition(app: &AppHandle) -> Result<(), String> {
+  crate::edition::require_lite("the full version features window")?;
+  if let Some(win) = app.get_webview_window("edition") {
+    reveal(&win);
+    return Ok(());
+  }
+  let locale = crate::i18n::current_locale(&crate::settings::app_settings(app).language);
+  let url = WebviewUrl::App("index.html?mode=edition".into());
+  let window = WebviewWindowBuilder::new(app, "edition", url)
+    .title(crate::i18n::tr(locale, crate::i18n::Key::FullFeatures))
+    .visible(false)
+    .background_color(chrome_background(app))
+    .inner_size(620.0, 560.0)
+    .build()
+    .map_err(|e| e.to_string())?;
+  detach_menu_unless_document(&window);
+  show_after_grace(window);
+  Ok(())
+}
+
+#[tauri::command(async)]
+pub fn show_edition_window(app: AppHandle) -> Result<(), String> {
+  show_edition(&app)
+}
+
 /// The fixed-title singleton windows and the i18n key each one's title comes
 /// from. Doc windows (title is the file name) and stickies (no title bar) are
 /// intentionally not part of this table. Extracted from `retitle_fixed_windows`
 /// so the label-to-key mapping is unit-testable without an `AppHandle`.
-fn fixed_window_titles() -> [(&'static str, crate::i18n::Key); 5] {
+fn fixed_window_titles() -> [(&'static str, crate::i18n::Key); 6] {
   [
     ("workspace", crate::i18n::Key::Workspace),
     ("settings", crate::i18n::Key::SettingsTitle),
     ("about", crate::i18n::Key::About),
     ("acknowledgements", crate::i18n::Key::Acknowledgements),
     ("privacy", crate::i18n::Key::PrivacyPolicy),
+    ("edition", crate::i18n::Key::FullFeatures),
   ]
 }
 
@@ -1440,6 +1468,17 @@ mod tests {
   }
 
   #[test]
+  fn the_edition_window_is_retitled_with_the_language() {
+    let entry = fixed_window_titles()
+      .into_iter()
+      .find(|(label, _)| *label == "edition");
+    assert_eq!(
+      entry.map(|(_, key)| key),
+      Some(crate::i18n::Key::FullFeatures)
+    );
+  }
+
+  #[test]
   fn every_fixed_window_label_is_distinct() {
     let labels: Vec<&str> = fixed_window_titles().iter().map(|(l, _)| *l).collect();
     let mut sorted = labels.clone();
@@ -1565,6 +1604,7 @@ mod window_command_threading_tests {
     "show_about_window",
     "show_acknowledgements_window",
     "show_privacy_window",
+    "show_edition_window",
     "focus_note_window",
     "sticky_row_action",
   ];

@@ -11,7 +11,8 @@
     "about",
     "acknowledgements",
     "load-problems",
-    "privacy"
+    "privacy",
+    "edition"
   ],
   "permissions": [
     "core:default",
