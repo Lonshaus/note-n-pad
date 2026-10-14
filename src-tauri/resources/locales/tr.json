@@ -220,7 +220,7 @@
     "status.longLine.reason": "Bu dosyada çok uzun bir satır var; her tuş vuruşunda ayrıştırmak yazmayı yavaşlatır.",
     "doc.openFailed": "“{name}” açılamadı. Dosya taşınmış ya da silinmiş olabilir veya adı bu uygulamanın desteklemediği karakterler içeriyor olabilir.",
     "doc.restoreUnreadable": "Okunamayan dosya: {names}. Devam etmek için yeniden açın.",
-    "doc.keptTabs": "Açılmayan sekmeler (tam sürüm gerekli): {count}. Kaydedilmemiş değişiklikler dahil olduğu gibi saklanır; tam lisans okunduğunda yeniden açılır.",
+    "doc.keptTabs": "Açılmayan sekmeler (bu sürümde desteklenmiyor): {count}.",
     "doc.revealFailed": "“{name}” gösterilemedi. Dosya taşınmış ya da silinmiş olabilir.",
     "doc.saveFailed": "“{name}” kaydedilemedi: {error}",
     "doc.saveReadOnly": "“{name}” salt okunur olduğundan hiçbir şey kaydedilmedi. Kaydetmek için dosyanın izinlerini değiştirin.",

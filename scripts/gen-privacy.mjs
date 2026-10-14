@@ -22,6 +22,12 @@ import { fileURLToPath, pathToFileURL } from 'node:url';
 const SCRIPT_DIR = path.dirname(fileURLToPath(import.meta.url));
 const REPO_ROOT = path.join(SCRIPT_DIR, '..');
 const OUT_DIR = path.join(REPO_ROOT, 'src-tauri', 'resources', 'privacy');
+const LITE_OUT_DIR = path.join(
+  REPO_ROOT,
+  'src-tauri',
+  'resources',
+  'privacy-lite',
+);
 
 /** Root file to bundled name. The bundled names are the locale ids the Rust
  *  side resolves against; every other interface language reads `en`. */
@@ -29,6 +35,15 @@ export const DOCUMENTS = [
   ['PRIVACY.md', 'en.md'],
   ['PRIVACY.zh-TW.md', 'zh-TW.md'],
   ['PRIVACY.ja.md', 'ja.md'],
+];
+
+/** The same for the Lite app, which has a policy of its own (not the full one
+ *  with the name replaced): bundled by `tauri.lite.conf.json` as `privacy-lite/`
+ *  and read instead of `privacy/` by a build with the `lite` feature. */
+export const LITE_DOCUMENTS = [
+  ['PRIVACY-Lite.md', 'en.md'],
+  ['PRIVACY-Lite.zh-TW.md', 'zh-TW.md'],
+  ['PRIVACY-Lite.ja.md', 'ja.md'],
 ];
 
 /** The document without its language-switching line. That line is the second
@@ -50,19 +65,24 @@ export function stripLanguageSwitcher(markdown) {
   return lines.join('\n');
 }
 
-function main() {
-  fs.mkdirSync(OUT_DIR, { recursive: true });
-  for (const [source, target] of DOCUMENTS) {
+function copyAll(documents, outDir) {
+  fs.mkdirSync(outDir, { recursive: true });
+  for (const [source, target] of documents) {
     const from = path.join(REPO_ROOT, source);
     if (!fs.existsSync(from)) {
       throw new Error(`missing ${source} at the repo root`);
     }
     fs.writeFileSync(
-      path.join(OUT_DIR, target),
+      path.join(outDir, target),
       stripLanguageSwitcher(fs.readFileSync(from, 'utf8')),
     );
   }
-  console.log(`wrote ${DOCUMENTS.length} documents into ${OUT_DIR}`);
+  console.log(`wrote ${documents.length} documents into ${outDir}`);
+}
+
+function main() {
+  copyAll(DOCUMENTS, OUT_DIR);
+  copyAll(LITE_DOCUMENTS, LITE_OUT_DIR);
 }
 
 // Only generate when run as a script, so the freshness test can import the
