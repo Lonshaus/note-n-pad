@@ -19,6 +19,7 @@
   import { oneDark } from '@codemirror/theme-one-dark';
   import { readCspNonce } from '../util/cspNonce';
   import { keymapExtension } from './keymap';
+  import { cmPhraseExtension, cmPhraseSignature } from './cmPhrases';
   import { shortcutsState } from '../state/shortcuts.svelte';
   import { platform } from '../state/platform.svelte';
 
@@ -73,6 +74,10 @@
   // The rebindable commands' keys (minimal editors only; the full setup ships
   // its own keymaps).
   const keymapCompartment = new Compartment();
+  // CodeMirror's own UI text in the active UI language.
+  const phraseCompartment = new Compartment();
+  // Phrases baked into the state so far; a reconfigure is skipped when equal.
+  let appliedPhrases = cmPhraseSignature();
 
   function currentKeymap(): Extension {
     return keymapExtension('sticky', platform.os, (id) =>
@@ -98,6 +103,7 @@
           minimal
             ? [minimalSetup, keymapCompartment.of(currentKeymap())]
             : basicSetup,
+          phraseCompartment.of(cmPhraseExtension()),
           languageCompartment.of([]),
           themeCompartment.of([]),
           EditorView.updateListener.of((update) => {
@@ -144,6 +150,23 @@
         effects: keymapCompartment.reconfigure(
           keymapExtension('sticky', os, (id) => accels[id] ?? null),
         ),
+      });
+    }
+  });
+
+  // Swap the CodeMirror phrases when the UI language changes.
+  $effect(() => {
+    const ext = cmPhraseExtension();
+    const sig = cmPhraseSignature();
+    if (view !== undefined && sig !== appliedPhrases) {
+      appliedPhrases = sig;
+      // The phrase change rebuilds the view, so put the scroll position back.
+      const top = view.scrollDOM.scrollTop;
+      view.dispatch({ effects: phraseCompartment.reconfigure(ext) });
+      const restoring = view;
+      // Runs after CodeMirror's own measure pass, which moves the scroll.
+      requestAnimationFrame(() => {
+        restoring.scrollDOM.scrollTop = top;
       });
     }
   });

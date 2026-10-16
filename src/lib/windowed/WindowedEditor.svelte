@@ -23,6 +23,7 @@
   } from '@codemirror/view';
   import { varEditorTheme } from '../editor/editorTheme';
   import { keymapExtension } from '../editor/keymap';
+  import { cmPhraseExtension } from '../editor/cmPhrases';
   import { shortcutsState } from '../state/shortcuts.svelte';
   import { platform } from '../state/platform.svelte';
   import { cssFontFamily } from '../util/font';
@@ -218,6 +219,10 @@
         EditorView.cspNonce.of(readCspNonce()),
         coreSetup,
         keymapCompartment.of(currentKeymap()),
+        // Applied at creation only: a setState here can move the caret (see the
+        // `swapping` filter below) and the one phrase used is the control-char
+        // tooltip, which picks up a new language the next time a file opens.
+        cmPhraseExtension(),
         gutterCompartment.of(gutterExtension(showLineNumbers)),
         wrapCompartment.of(wordWrap ? EditorView.lineWrapping : []),
         themeCompartment.of(varEditorTheme(dark)),
