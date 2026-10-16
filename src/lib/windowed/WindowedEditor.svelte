@@ -23,6 +23,10 @@
   } from '@codemirror/view';
   import { varEditorTheme } from '../editor/editorTheme';
   import { keymapExtension } from '../editor/keymap';
+  import {
+    settleThenDrain,
+    settleViewComposition,
+  } from '../editor/composition';
   import { cmPhraseExtension } from '../editor/cmPhrases';
   import { shortcutsState } from '../state/shortcuts.svelte';
   import { platform } from '../state/platform.svelte';
@@ -844,6 +848,24 @@
 
   export function redo(): void {
     runUndo('redo');
+  }
+  // Called by the host before a tab switch: ends an IME composition and
+  // resolves once its text has been read into the document and applied.
+  export function endComposition(): Promise<void> {
+    return settleThenDrain(
+      () =>
+        view === undefined ? Promise.resolve() : settleViewComposition(view),
+      () => applyChain,
+    );
+  }
+  // Whether an IME composition is running in this editor.
+  export function isComposing(): boolean {
+    return view?.compositionStarted ?? false;
+  }
+  // Resolves once every edit typed so far has been applied; leaves any
+  // composition alone.
+  export function applied(): Promise<void> {
+    return applyChain;
   }
 
   // Called by the host when the window regains focus, so a windowed tab types
