@@ -28,6 +28,7 @@ import {
   type LineEnding,
 } from '../util/text';
 import { replacementByteLength } from '../util/rangeEdit';
+import { detectBreakStyle } from '../util/windowedEdit';
 import {
   routeOpen,
   orphanCandidates,
@@ -78,6 +79,17 @@ export function windowedRefusalReason(error: string): WindowedRefusalReason {
     return 'tooLarge';
   }
   return 'cannot';
+}
+
+/** Whether `tab` is a read-only large view, a windowed-editing tab or one about to
+ *  become one: its bytes stay as they are on disk, so its line ending and
+ *  encoding are not changeable. */
+function isLargeKind(tab: DocTab): boolean {
+  return (
+    tab.large !== undefined ||
+    tab.windowed !== undefined ||
+    tab.windowedRestore !== undefined
+  );
 }
 
 /** `windowedRefusalReason` resolved to its `doc.edit.*` translation, the
@@ -238,6 +250,11 @@ export interface DocTab {
   explicit: boolean;
   lineEnding: LineEnding;
   savedLineEnding: LineEnding;
+  /** Large and windowed tabs only: the separator typed line breaks are written
+   *  with, set together with `lineEnding` once the file's own ending has been
+   *  read. Undefined means not detected yet. Never persisted: a restored tab
+   *  detects again from its first window. */
+  insertLineEnding?: '\r\n' | '\n';
   hadBom: boolean;
   encoding: string;
   /** Transient: set when the last decode produced replacement characters. */
@@ -1518,7 +1535,9 @@ class DocumentWindowState {
    *  chosen ending. Dirty is tracked against savedLineEnding, so this marks it. */
   setLineEnding(ending: LineEnding): void {
     const tab = this.activeTab;
-    if (tab === null || tab.lineEnding === ending) {
+    // A large tab's ending is the file's own (read by detection) and saving
+    // never rewrites it, so there is nothing to choose.
+    if (tab === null || isLargeKind(tab) || tab.lineEnding === ending) {
       return;
     }
     tab.lineEnding = ending;
@@ -1596,23 +1615,23 @@ class DocumentWindowState {
   /** File > Save As: always prompt for a new path and write the active tab's
    *  buffer there, turning the tab into an ordinary saved document at that path.
    *  A range tab sheds its range identity (like the range save-as conflict path);
-   *  a windowed tab has no separate buffer here, so it falls back to its own save.
+   *  a windowed tab is written by its Rust session and retargeted to the new path.
    *  `pathOverride` skips the dialog (automation/E2E). Returns false on cancel. */
   async saveAs(pathOverride?: string): Promise<boolean> {
     const tab = this.activeTab;
     if (tab === null) {
       return false;
     }
-    // A windowed tab's buffer lives in the Rust core, not this rope; it has no
-    // save-as target, so run its normal save instead.
-    if (tab.windowed !== undefined) {
-      return (await this.saveWindowed(tab, false)) === 'ok';
-    }
     const chosen =
       pathOverride ??
       (await save(saveDialogOptions(tab.language, suggestedName(tab.path))));
     if (chosen === null) {
       return false;
+    }
+    // A windowed tab's buffer lives in the Rust core, not this rope: Rust
+    // writes the chosen path and retargets its session.
+    if (tab.windowed !== undefined) {
+      return this.windowedSaveTo(tab, chosen);
     }
     // Flush point: materialize the rope for the save-as write.
     const out = applyLineEnding(tab.content.toString(), tab.lineEnding);
@@ -1999,6 +2018,43 @@ class DocumentWindowState {
     tab.windowed.dirty = true;
     this.persistActive();
   }
+  /** Record the line ending read from a large tab's first text. `style` is null
+   *  when the sample had no line break, which falls back to the user's default.
+   *  Returns the separator typed line breaks get. */
+  private setDetectedEnding(
+    tab: DocTab,
+    style: ReturnType<typeof detectBreakStyle>,
+  ): '\r\n' | '\n' {
+    const lineEnding = style?.lineEnding ?? settingsState.defaultLineEnding;
+    tab.lineEnding = lineEnding;
+    tab.savedLineEnding = lineEnding;
+    tab.insertLineEnding = lineEnding === 'CRLF' ? '\r\n' : '\n';
+    return tab.insertLineEnding;
+  }
+  /** A windowed tab's editor read its first window: detect the file's line
+   *  ending now unless the tab already has one. */
+  windowedEndingDetected(
+    sessionId: number,
+    style: ReturnType<typeof detectBreakStyle>,
+  ): '\r\n' | '\n' {
+    const tab = this.tabs.find((t) => t.windowed?.sessionId === sessionId);
+    if (tab === undefined) {
+      return settingsState.defaultLineEnding === 'CRLF' ? '\r\n' : '\n';
+    }
+    return tab.insertLineEnding ?? this.setDetectedEnding(tab, style);
+  }
+  /** The viewer's first chunk arrived. A sample without a line break leaves the
+   *  tab undetected so the editor decides from its own first window. */
+  largeEndingDetected(
+    path: string,
+    style: ReturnType<typeof detectBreakStyle>,
+  ): void {
+    const tab = this.tabs.find((t) => t.large !== undefined && t.path === path);
+    if (tab === undefined || style === null || tab.insertLineEnding) {
+      return;
+    }
+    this.setDetectedEnding(tab, style);
+  }
 
   /** Save a windowed tab back to disk. `force` skips the fingerprint check; a
    *  conflict raises the conflict modal instead of writing. On success the
@@ -2121,7 +2177,7 @@ class DocumentWindowState {
   }
 
   /** Conflict choice: save the current buffer to a chosen path instead. The
-   *  session keeps tracking the original file; only its dirty flag clears. */
+   *  session and the tab both move to the chosen path. */
   async windowedConflictSaveAs(pathOverride?: string): Promise<boolean> {
     const tab = this.windowedConflict;
     if (tab?.windowed === undefined) {
@@ -2133,26 +2189,44 @@ class DocumentWindowState {
     if (chosen === null) {
       return false;
     }
+    return this.windowedSaveTo(tab, chosen);
+  }
+  /** Write a windowed tab's buffer to `chosen` and retarget the tab to it.
+   *  `expected` is null, so Rust checks nothing against the destination: the
+   *  user chose it in the dialog. A failure retargets nothing and is reported
+   *  with `chosen`; it never raises the conflict modal, whose Force button
+   *  writes the old path. */
+  private async windowedSaveTo(tab: DocTab, chosen: string): Promise<boolean> {
+    const w = tab.windowed;
+    if (w === undefined) {
+      return false;
+    }
     let saved: WindowedSaved;
     try {
       saved = await invoke<WindowedSaved>('windowed_save', {
-        sessionId: tab.windowed.sessionId,
+        sessionId: w.sessionId,
         expected: null,
         pathOverride: chosen,
       });
     } catch (e) {
-      // The conflict modal stays up and nothing is written. The user picked
-      // this path by hand, so every failure here is reported rather than
-      // handing back a dialog that looks like it did nothing. `chosen` is the
-      // target, not `tab.path`, which is still the old file.
+      // The user picked this path by hand, so every failure here is reported
+      // rather than handing back a dialog that looks like it did nothing.
+      // `chosen` is the target, not `tab.path`, which is still the old file.
       this.saveFailed = { path: chosen, error: String(e) };
       return false;
     }
-    tab.windowed.totalBytes = saved.total_bytes;
-    tab.windowed.totalLines = saved.total_lines;
-    tab.windowed.dirty = false;
+    // Rust has already moved the session to `chosen`; mirror that here.
+    tab.path = chosen;
+    if (!tab.explicit) {
+      tab.language = detectByFilename(chosen);
+    }
+    w.fingerprint = saved.fingerprint;
+    w.totalBytes = saved.total_bytes;
+    w.totalLines = saved.total_lines;
+    w.dirty = false;
     this.windowedConflict = null;
     await this.upsertTab(tab);
+    void invoke('add_recent_file', { path: chosen });
     return true;
   }
 
@@ -2166,7 +2240,10 @@ class DocumentWindowState {
    *  its buffer and only changes the encoding used at save time (stays dirty). */
   async setEncoding(label: string): Promise<void> {
     const tab = this.activeTab;
-    if (tab === null || tab.encoding === label) {
+    // A large tab's bytes are never re-decoded (the editor takes UTF-8 only
+    // and the viewer decodes lossily), and the re-decode below would read the
+    // whole file into memory.
+    if (tab === null || isLargeKind(tab) || tab.encoding === label) {
       return;
     }
     if (this.isDirty(tab)) {

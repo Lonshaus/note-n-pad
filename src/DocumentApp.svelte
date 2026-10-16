@@ -1565,6 +1565,14 @@
           sessionId={active.windowed.sessionId}
           initialTotalLines={active.windowed.totalLines}
           initialTopLine={active.windowed.initialLine ?? 0}
+          insertLineEnding={active.insertLineEnding}
+          ondetectending={(style) => {
+            const t = documentWindow.activeTab;
+            return documentWindow.windowedEndingDetected(
+              t?.windowed?.sessionId ?? -1,
+              style,
+            );
+          }}
           dark={settingsState.isDark}
           fontSize={settingsState.editorFontSize}
           fontFamily={settingsState.editorFontFamily}
@@ -1597,6 +1605,8 @@
           fontSize={settingsState.editorFontSize}
           fontFamily={settingsState.editorFontFamily}
           onstatus={(s) => (largeStatus = s)}
+          ondetectending={(style) =>
+            documentWindow.largeEndingDetected(active?.path ?? '', style)}
           onextract={(info) => {
             const active = documentWindow.activeTab;
             return active !== null
@@ -1687,6 +1697,7 @@
   {#if active !== null}
     <StatusBar
       lineEnding={active.lineEnding}
+      fixedFormat={active.windowed !== undefined}
       hadBom={active.hadBom}
       encoding={active.encoding}
       encodings={ENCODINGS}

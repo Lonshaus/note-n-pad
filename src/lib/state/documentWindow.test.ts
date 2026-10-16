@@ -4,6 +4,7 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { Text } from '@codemirror/state';
 import { invoke } from '@tauri-apps/api/core';
+import { save } from '@tauri-apps/plugin-dialog';
 import {
   snapshotContentPolicy,
   SNAPSHOT_CONTENT_MAX,
@@ -21,6 +22,7 @@ import {
   type DocTab,
 } from './documentWindow.svelte';
 import { READ_ONLY_DESTINATION } from '../util/protocol';
+import { detectByFilename } from '../editor/language';
 
 // Mocked so the tests below drive `documentWindow`'s real
 // `setBounds`/`switchTo` against a fake Tauri backend instead of
@@ -32,6 +34,7 @@ vi.mock('@tauri-apps/api/event', () => ({ emit: vi.fn() }));
 vi.mock('@tauri-apps/plugin-dialog', () => ({ save: vi.fn() }));
 
 const mockInvoke = vi.mocked(invoke);
+const mockSave = vi.mocked(save);
 
 // `beginWindowedRestore`'s grace-period timer uses `window.setTimeout`/
 // `clearTimeout`; this file runs under Vitest's default node environment (no
@@ -970,6 +973,129 @@ describe('windowedConflictSaveAs reports a failure that is not a refusal', () =>
     expect(documentWindow.windowedConflict).toBe(tab);
   });
 });
+/** A windowed tab on `/tmp/original.log`, pushed as the only (active) tab. */
+function pushWindowedTab(): DocTab {
+  documentWindow.tabs.length = 0;
+  documentWindow.saveFailed = null;
+  documentWindow.windowedConflict = null;
+  const tab = baseTab({
+    id: 'windowed-tab',
+    path: '/tmp/original.log',
+    windowed: {
+      sessionId: 9,
+      totalBytes: 1000,
+      totalLines: 10,
+      fingerprint: { size: 1000, mtime_ms: 1 },
+      dirty: true,
+      topLine: 0,
+    },
+  });
+  documentWindow.tabs.push(tab);
+  documentWindow.activeIndex = 0;
+  return tab;
+}
+
+const SAVED_AS = {
+  fingerprint: { size: 1234, mtime_ms: 99 },
+  total_bytes: 1234,
+  total_lines: 12,
+};
+
+describe('saveAs on a windowed tab', () => {
+  it('asks the dialog and writes the chosen path with no expected fingerprint', async () => {
+    const tab = pushWindowedTab();
+    mockSave.mockResolvedValue('/tmp/copy.txt');
+    mockInvoke.mockImplementation(((cmd: string) =>
+      Promise.resolve(
+        cmd === 'windowed_save' ? SAVED_AS : null,
+      )) as typeof invoke);
+
+    expect(await documentWindow.saveAs()).toBe(true);
+
+    expect(mockSave).toHaveBeenCalled();
+    expect(mockInvoke).toHaveBeenCalledWith('windowed_save', {
+      sessionId: 9,
+      expected: null,
+      pathOverride: '/tmp/copy.txt',
+    });
+    expect(tab.path).toBe('/tmp/copy.txt');
+    expect(tab.language).toBe(detectByFilename('/tmp/copy.txt'));
+    expect(tab.windowed?.fingerprint).toEqual(SAVED_AS.fingerprint);
+    expect(tab.windowed?.totalBytes).toBe(1234);
+    expect(tab.windowed?.totalLines).toBe(12);
+    expect(tab.windowed?.dirty).toBe(false);
+    expect(mockInvoke).toHaveBeenCalledWith('upsert_note', expect.anything());
+    expect(mockInvoke).toHaveBeenCalledWith('add_recent_file', {
+      path: '/tmp/copy.txt',
+    });
+  });
+
+  it('writes nothing when the dialog is cancelled', async () => {
+    const tab = pushWindowedTab();
+    mockSave.mockResolvedValue(null);
+    mockInvoke.mockReset();
+
+    expect(await documentWindow.saveAs()).toBe(false);
+
+    expect(mockInvoke).not.toHaveBeenCalled();
+    expect(tab.path).toBe('/tmp/original.log');
+  });
+
+  it('reports a failure with the chosen path, retargets nothing and never raises the conflict modal', async () => {
+    const tab = pushWindowedTab();
+    mockInvoke.mockImplementation(((cmd: string) =>
+      cmd === 'windowed_save'
+        ? Promise.reject('fingerprint-mismatch')
+        : Promise.resolve(null)) as typeof invoke);
+
+    expect(await documentWindow.saveAs('/tmp/copy.txt')).toBe(false);
+
+    expect(documentWindow.windowedConflictVisible()).toBe(false);
+    expect(tab.path).toBe('/tmp/original.log');
+    expect(tab.windowed?.fingerprint).toEqual({ size: 1000, mtime_ms: 1 });
+    expect(documentWindow.saveFailed).toEqual({
+      path: '/tmp/copy.txt',
+      error: 'fingerprint-mismatch',
+    });
+  });
+});
+
+describe('windowedConflictSaveAs success', () => {
+  it('retargets the tab: path, fingerprint, sizes, language and conflict state', async () => {
+    const tab = pushWindowedTab();
+    documentWindow.windowedConflict = tab;
+    mockInvoke.mockImplementation(((cmd: string) =>
+      Promise.resolve(
+        cmd === 'windowed_save' ? SAVED_AS : null,
+      )) as typeof invoke);
+
+    expect(
+      await documentWindow.windowedConflictSaveAs('/tmp/picked.json'),
+    ).toBe(true);
+
+    expect(tab.path).toBe('/tmp/picked.json');
+    expect(tab.language).toBe('JSON');
+    expect(tab.windowed?.fingerprint).toEqual(SAVED_AS.fingerprint);
+    expect(tab.windowed?.dirty).toBe(false);
+    expect(documentWindow.windowedConflictVisible()).toBe(false);
+    expect(mockInvoke).toHaveBeenCalledWith('upsert_note', expect.anything());
+  });
+
+  it('keeps an explicitly chosen language', async () => {
+    const tab = pushWindowedTab();
+    tab.explicit = true;
+    tab.language = 'markdown';
+    documentWindow.windowedConflict = tab;
+    mockInvoke.mockImplementation(((cmd: string) =>
+      Promise.resolve(
+        cmd === 'windowed_save' ? SAVED_AS : null,
+      )) as typeof invoke);
+
+    await documentWindow.windowedConflictSaveAs('/tmp/picked.json');
+
+    expect(tab.language).toBe('markdown');
+  });
+});
 
 // A failed `read_range`/`copy_range` used to be indistinguishable from a
 // successful extraction or a cancelled save (both were swallowed to the same
@@ -1551,5 +1677,121 @@ describe('init still selects the stored tab when restoring a window group', () =
 
     expect(documentWindow.tabs.length).toBe(2);
     expect(documentWindow.activeIndex).toBe(1);
+  });
+});
+// A large tab's bytes are never rewritten or re-decoded, so the line ending is
+// the file's own (detected) and the encoding stays what it was.
+describe('large and windowed tabs: line ending and encoding', () => {
+  const largeTab = (): DocTab =>
+    baseTab({ id: 'big', large: { size: 200 * 1024 * 1024 } });
+  const windowedTab = (): DocTab =>
+    baseTab({
+      id: 'win',
+      windowed: {
+        sessionId: 7,
+        totalBytes: 1,
+        totalLines: 1,
+        fingerprint: null,
+        dirty: false,
+        topLine: 0,
+      },
+    });
+  const crlf = { lineEnding: 'CRLF', insert: '\r\n' } as const;
+
+  beforeEach(() => {
+    mockInvoke.mockReset();
+    mockInvoke.mockResolvedValue(null);
+    settingsState.defaultLineEnding = 'LF';
+  });
+
+  function select(tab: DocTab): void {
+    documentWindow.tabs.length = 0;
+    documentWindow.tabs.push(tab);
+    documentWindow.activeIndex = 0;
+  }
+
+  it('a windowed tab takes the detected ending, not the setting', () => {
+    settingsState.defaultLineEnding = 'LF';
+    const tab = windowedTab();
+    select(tab);
+    expect(documentWindow.windowedEndingDetected(7, crlf)).toBe('\r\n');
+    expect(tab.lineEnding).toBe('CRLF');
+    expect(tab.savedLineEnding).toBe('CRLF');
+    expect(tab.insertLineEnding).toBe('\r\n');
+  });
+
+  it('a sample without a line break falls back to the setting', () => {
+    settingsState.defaultLineEnding = 'CRLF';
+    const tab = windowedTab();
+    select(tab);
+    expect(documentWindow.windowedEndingDetected(7, null)).toBe('\r\n');
+    expect(tab.lineEnding).toBe('CRLF');
+    settingsState.defaultLineEnding = 'LF';
+  });
+
+  it('an already detected windowed tab keeps its value', () => {
+    const tab = windowedTab();
+    tab.insertLineEnding = '\n';
+    select(tab);
+    expect(documentWindow.windowedEndingDetected(7, crlf)).toBe('\n');
+    expect(tab.lineEnding).toBe('LF');
+  });
+
+  it('a viewer tab takes the detected ending from its first chunk', () => {
+    const tab = largeTab();
+    select(tab);
+    documentWindow.largeEndingDetected('/tmp/huge.log', crlf);
+    expect(tab.lineEnding).toBe('CRLF');
+    expect(tab.insertLineEnding).toBe('\r\n');
+  });
+
+  it('a viewer chunk without a line break leaves the tab undetected', () => {
+    const tab = largeTab();
+    select(tab);
+    documentWindow.largeEndingDetected('/tmp/huge.log', null);
+    expect(tab.insertLineEnding).toBeUndefined();
+    expect(tab.lineEnding).toBe('LF');
+  });
+
+  it.each([
+    ['large', largeTab],
+    ['windowed', windowedTab],
+  ] as const)(
+    'setLineEnding and toggleLineEnding do nothing on a %s tab',
+    (_name, make) => {
+      const tab = make();
+      tab.insertLineEnding = '\n';
+      select(tab);
+      documentWindow.setLineEnding('CRLF');
+      expect(tab.lineEnding).toBe('LF');
+      documentWindow.toggleLineEnding();
+      expect(tab.lineEnding).toBe('LF');
+      expect(tab.savedLineEnding).toBe('LF');
+      expect(tab.insertLineEnding).toBe('\n');
+    },
+  );
+
+  it.each([
+    ['large', largeTab],
+    ['windowed', windowedTab],
+  ] as const)(
+    'setEncoding does not read or change a %s tab',
+    async (_name, make) => {
+      const tab = make();
+      select(tab);
+      const seq = documentWindow.reloadSeq;
+      await documentWindow.setEncoding('Windows-1252');
+      expect(mockInvoke).not.toHaveBeenCalled();
+      expect(tab.encoding).toBe('UTF-8');
+      expect(tab.content.toString()).toBe('');
+      expect(documentWindow.reloadSeq).toBe(seq);
+    },
+  );
+
+  it('a normal tab still changes its line ending', () => {
+    const tab = baseTab({ id: 'plain' });
+    select(tab);
+    documentWindow.setLineEnding('CRLF');
+    expect(tab.lineEnding).toBe('CRLF');
   });
 });
