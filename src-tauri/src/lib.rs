@@ -37,6 +37,7 @@ mod preview_img;
 mod privacy;
 mod project;
 mod range_edit;
+mod replace_layer;
 mod settings;
 mod shortcut;
 mod shortcuts;
@@ -44,6 +45,7 @@ mod theme_store;
 mod webview2_runtime;
 mod win_menu_gray;
 mod windowed;
+mod windowed_scan;
 mod windows;
 
 use flush::{FlushGate, FlushOutcome};
@@ -2520,6 +2522,8 @@ pub fn run() {
             &notes,
           );
           grants::restore_all(&app_data, keep.as_ref());
+          // Change lists of replace-alls from an earlier run are of no use.
+          replace_layer::cleanup_tmp(&app_data.join(replace_layer::TMP_DIR));
         }
         Err(e) => log::warn!("grants: no app data dir: {e}"),
       }
@@ -2735,6 +2739,10 @@ pub fn run() {
       windowed::windowed_redo,
       windowed::windowed_save,
       windowed::windowed_close,
+      windowed::windowed_find,
+      windowed::windowed_search,
+      windowed::windowed_search_cancel,
+      windowed::windowed_replace_all,
       file_ops::create_file,
       file_ops::create_folder,
       file_ops::rename_path,
