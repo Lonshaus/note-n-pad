@@ -2455,7 +2455,90 @@ pub fn tr(locale: Locale, key: Key) -> &'static str {
     Locale::Th => 13,
     Locale::Vi => 14,
   };
-  s[idx]
+  branded(s[idx])
+}
+
+/// Turkish case suffixes that follow the brand after an apostrophe, mapped to
+/// the form that follows "Lite" instead: it is read /layt/, ends in a voiceless
+/// "t" after a back vowel, so "Note&Pad’ten" becomes "Note&Pad Lite’tan". No
+/// other language writes a suffix after an apostrophe on the name (checked over
+/// every locale), so this applies to all of them.
+const LITE_SUFFIXES: [(&str, &str); 10] = [
+  ("ten", "tan"),
+  ("den", "tan"),
+  ("te", "ta"),
+  ("de", "ta"),
+  ("nin", "ın"),
+  ("in", "ın"),
+  ("le", "la"),
+  ("la", "la"),
+  ("i", "ı"),
+  ("e", "a"),
+];
+
+/// The apostrophe-and-suffix at the start of `after`, as (bytes covered,
+/// apostrophe, replacement suffix); None when `after` does not start with one
+/// of `LITE_SUFFIXES` as a whole word.
+fn lite_suffix(after: &str) -> Option<(usize, char, &'static str)> {
+  let mut chars = after.chars();
+  let apostrophe = chars.next().filter(|c| matches!(c, '’' | '\''))?;
+  let word: String = chars.take_while(|c| c.is_alphabetic()).collect();
+  let (_, mapped) = LITE_SUFFIXES.iter().find(|(from, _)| *from == word)?;
+  Some((apostrophe.len_utf8() + word.len(), apostrophe, mapped))
+}
+
+#[cfg_attr(not(any(feature = "lite", test)), allow(dead_code))]
+/// `template` with every "Note&Pad" turned into `name` ("Note&Pad Lite" in the
+/// Lite build). Applied to a template, before any argument is formatted into
+/// it, so a file name or path that happens to hold "Note&Pad" is never
+/// touched. Idempotent: a "Note&Pad" that already reads `name` is left alone.
+/// A Turkish suffix on the name follows the new last word (`LITE_SUFFIXES`).
+pub fn with_app_name(template: &str, name: &str) -> String {
+  const BASE: &str = "Note&Pad";
+  let Some(suffix) = name.strip_prefix(BASE).filter(|s| !s.is_empty()) else {
+    return template.to_string();
+  };
+  let mut out = String::with_capacity(template.len() + 8);
+  let mut rest = template;
+  while let Some(at) = rest.find(BASE) {
+    let after = &rest[at + BASE.len()..];
+    out.push_str(&rest[..at]);
+    out.push_str(BASE);
+    rest = after;
+    if after.starts_with(suffix) {
+      continue;
+    }
+    out.push_str(suffix);
+    if let Some((covered, apostrophe, mapped)) = lite_suffix(after) {
+      out.push(apostrophe);
+      out.push_str(mapped);
+      rest = &after[covered..];
+    }
+  }
+  out.push_str(rest);
+  out
+}
+
+/// The template as this build shows it. Only the Lite build changes anything;
+/// the few strings that name the app are rewritten once and kept for the life of
+/// the process, which is what lets `tr` keep returning `&'static str`.
+#[cfg(not(feature = "lite"))]
+fn branded(template: &'static str) -> &'static str {
+  template
+}
+
+#[cfg(feature = "lite")]
+fn branded(template: &'static str) -> &'static str {
+  use std::collections::HashMap;
+  use std::sync::{Mutex, OnceLock};
+  static CACHE: OnceLock<Mutex<HashMap<&'static str, &'static str>>> = OnceLock::new();
+  if !template.contains("Note&Pad") {
+    return template;
+  }
+  let mut cache = CACHE.get_or_init(Default::default).lock().unwrap();
+  cache.entry(template).or_insert_with(|| {
+    Box::leak(with_app_name(template, crate::edition::app_name()).into_boxed_str())
+  })
 }
 
 /// Resolve a stored `language` preference into a concrete locale. Mirrors the
@@ -2541,6 +2624,140 @@ pub fn current_locale(language: &str) -> Locale {
 mod tests {
   use super::*;
 
+  const NAMED: [Key; 3] = [Key::About, Key::Quit, Key::Documentation];
+  const LOCALES: [Locale; 15] = [
+    Locale::ZhTw,
+    Locale::ZhCn,
+    Locale::Ja,
+    Locale::En,
+    Locale::Ru,
+    Locale::Es,
+    Locale::PtBr,
+    Locale::De,
+    Locale::Fr,
+    Locale::Ko,
+    Locale::Pl,
+    Locale::Tr,
+    Locale::It,
+    Locale::Th,
+    Locale::Vi,
+  ];
+
+  #[test]
+  fn the_lite_name_replaces_every_occurrence_once() {
+    assert_eq!(
+      with_app_name("About Note&Pad", "Note&Pad Lite"),
+      "About Note&Pad Lite"
+    );
+    assert_eq!(
+      with_app_name("Note&Pad and Note&Pad", "Note&Pad Lite"),
+      "Note&Pad Lite and Note&Pad Lite"
+    );
+    assert_eq!(
+      with_app_name("no name here", "Note&Pad Lite"),
+      "no name here"
+    );
+  }
+
+  #[test]
+  fn replacing_twice_changes_nothing_more() {
+    let once = with_app_name("Quit Note&Pad", "Note&Pad Lite");
+    assert_eq!(with_app_name(&once, "Note&Pad Lite"), once);
+    assert_eq!(
+      with_app_name("Note&Pad Lite Help", "Note&Pad Lite"),
+      "Note&Pad Lite Help"
+    );
+  }
+
+  #[test]
+  fn a_turkish_suffix_follows_the_new_last_word() {
+    for (before, after) in [
+      ("Note&Pad’ten Çık", "Note&Pad Lite’tan Çık"),
+      ("Note&Pad'den", "Note&Pad Lite'tan"),
+      ("Note&Pad'de görünmez", "Note&Pad Lite'ta görünmez"),
+      ("Note&Pad’te", "Note&Pad Lite’ta"),
+      ("Note&Pad’i yeniden", "Note&Pad Lite’ı yeniden"),
+      ("Note&Pad’e", "Note&Pad Lite’a"),
+      ("Note&Pad’in", "Note&Pad Lite’ın"),
+      ("Note&Pad’nin", "Note&Pad Lite’ın"),
+      ("Note&Pad’le", "Note&Pad Lite’la"),
+      ("Note&Pad'la", "Note&Pad Lite'la"),
+    ] {
+      assert_eq!(with_app_name(before, "Note&Pad Lite"), after, "{before}");
+    }
+  }
+
+  #[test]
+  fn only_a_whole_known_suffix_is_remapped() {
+    // Not a suffix, or a longer word: the name changes and the rest stays.
+    for (before, after) in [
+      ("Note&Pad’s", "Note&Pad Lite’s"),
+      ("Note&Pad’dene", "Note&Pad Lite’dene"),
+      ("Note&Pad’", "Note&Pad Lite’"),
+      ("Note&Pad de", "Note&Pad Lite de"),
+    ] {
+      assert_eq!(with_app_name(before, "Note&Pad Lite"), after, "{before}");
+    }
+  }
+
+  #[test]
+  fn a_remapped_suffix_is_stable_when_replaced_again() {
+    let once = with_app_name("Quit Note&Pad’ten", "Note&Pad Lite");
+    assert_eq!(with_app_name(&once, "Note&Pad Lite"), once);
+    assert_eq!(once, "Quit Note&Pad Lite’tan");
+  }
+
+  #[test]
+  fn the_full_name_leaves_a_suffix_alone() {
+    assert_eq!(with_app_name("Note&Pad’ten", "Note&Pad"), "Note&Pad’ten");
+  }
+
+  #[cfg(feature = "lite")]
+  #[test]
+  fn the_lite_build_says_quit_in_turkish_with_the_right_suffix() {
+    assert_eq!(tr(Locale::Tr, Key::Quit), "Note&Pad Lite’tan Çık");
+    assert!(tr(Locale::Tr, Key::WebView2MissingBody).contains("Note&Pad Lite’ı yeniden"));
+  }
+
+  #[cfg(not(feature = "lite"))]
+  #[test]
+  fn the_full_build_says_quit_in_turkish_as_before() {
+    assert_eq!(tr(Locale::Tr, Key::Quit), "Note&Pad’ten Çık");
+  }
+
+  #[test]
+  fn the_full_name_leaves_the_template_alone() {
+    assert_eq!(with_app_name("Note&Pad Help", "Note&Pad"), "Note&Pad Help");
+  }
+
+  #[cfg(feature = "lite")]
+  #[test]
+  fn the_lite_build_names_itself_exactly_once_in_every_language() {
+    for locale in LOCALES {
+      for key in NAMED {
+        let text = tr(locale, key);
+        assert_eq!(
+          text.matches("Note&Pad Lite").count(),
+          1,
+          "{locale:?} {key:?}"
+        );
+        assert_eq!(text.matches("Note&Pad").count(), 1, "{locale:?} {key:?}");
+      }
+    }
+  }
+
+  #[cfg(not(feature = "lite"))]
+  #[test]
+  fn the_full_build_never_says_lite() {
+    for locale in LOCALES {
+      for key in NAMED {
+        let text = tr(locale, key);
+        assert_eq!(text.matches("Note&Pad").count(), 1, "{locale:?} {key:?}");
+        assert!(!text.contains("Lite"), "{locale:?} {key:?}: {text}");
+      }
+    }
+  }
+
   #[test]
   fn translates_representative_keys_in_every_locale() {
     assert_eq!(tr(Locale::ZhTw, Key::FileMenu), "檔案");
@@ -2592,7 +2809,10 @@ mod tests {
     assert_eq!(tr(Locale::Th, Key::Close), "ปิด");
     assert_eq!(tr(Locale::Vi, Key::CtxOpen), "Mở");
     // Turkish apostrophe (U+2019) and French apostrophe are preserved verbatim.
-    assert_eq!(tr(Locale::Tr, Key::Quit), "Note&Pad’ten Çık");
+    // Preserved verbatim in the full build; the Lite build's form is tested below.
+    if !cfg!(feature = "lite") {
+      assert_eq!(tr(Locale::Tr, Key::Quit), "Note&Pad’ten Çık");
+    }
     assert_eq!(tr(Locale::Fr, Key::CtxCloseTab), "Fermer l’onglet");
   }
 

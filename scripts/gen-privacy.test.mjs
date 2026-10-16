@@ -7,10 +7,20 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { describe, expect, it } from 'vitest';
-import { DOCUMENTS, stripLanguageSwitcher } from './gen-privacy.mjs';
+import {
+  DOCUMENTS,
+  LITE_DOCUMENTS,
+  stripLanguageSwitcher,
+} from './gen-privacy.mjs';
 
 const REPO_ROOT = path.join(import.meta.dirname, '..');
 const OUT_DIR = path.join(REPO_ROOT, 'src-tauri', 'resources', 'privacy');
+const LITE_OUT_DIR = path.join(
+  REPO_ROOT,
+  'src-tauri',
+  'resources',
+  'privacy-lite',
+);
 
 describe('bundled privacy policy', () => {
   it('matches the documents at the repo root', () => {
@@ -30,6 +40,48 @@ describe('bundled privacy policy', () => {
     for (const [, target] of DOCUMENTS) {
       const text = fs.readFileSync(path.join(OUT_DIR, target), 'utf8');
       expect(/\]\(PRIVACY[.\w-]*\.md\)/.test(text), target).toBe(false);
+    }
+  });
+});
+
+describe('bundled Lite privacy policy', () => {
+  it('matches the Lite documents at the repo root', () => {
+    for (const [source, target] of LITE_DOCUMENTS) {
+      const want = stripLanguageSwitcher(
+        fs.readFileSync(path.join(REPO_ROOT, source), 'utf8'),
+      );
+      const bundled = path.join(LITE_OUT_DIR, target);
+      expect(fs.existsSync(bundled), `${target} is missing`).toBe(true);
+      expect(fs.readFileSync(bundled, 'utf8'), `${target} is stale`).toBe(want);
+    }
+  });
+
+  it('carries no link to a document that does not ship', () => {
+    for (const [, target] of LITE_DOCUMENTS) {
+      const text = fs.readFileSync(path.join(LITE_OUT_DIR, target), 'utf8');
+      expect(/\]\(PRIVACY[.\w-]*\.md\)/.test(text), target).toBe(false);
+    }
+  });
+
+  it('is a policy of its own, in the same three languages as the full one', () => {
+    expect(LITE_DOCUMENTS.map(([, target]) => target)).toEqual(
+      DOCUMENTS.map(([, target]) => target),
+    );
+    for (const [source, target] of LITE_DOCUMENTS) {
+      expect(source).toMatch(/^PRIVACY-Lite/);
+      const text = fs.readFileSync(path.join(LITE_OUT_DIR, target), 'utf8');
+      expect(text, target).toContain('Note&Pad Lite');
+    }
+  });
+
+  it('is not the full policy under another name', () => {
+    for (const [index, [, target]] of LITE_DOCUMENTS.entries()) {
+      const lite = fs.readFileSync(path.join(LITE_OUT_DIR, target), 'utf8');
+      const full = fs.readFileSync(
+        path.join(OUT_DIR, DOCUMENTS[index][1]),
+        'utf8',
+      );
+      expect(lite).not.toBe(full);
     }
   });
 });

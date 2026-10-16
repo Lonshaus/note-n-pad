@@ -16,6 +16,21 @@ fn document_for(locale: Locale) -> &'static str {
   }
 }
 
+/// The resource folder holding the policy the app shows: the Lite app has a
+/// policy of its own, bundled by `tauri.lite.conf.json`.
+fn policy_dir(lite: bool) -> &'static str {
+  if lite {
+    "privacy-lite"
+  } else {
+    "privacy"
+  }
+}
+
+/// The policy folder of this build: fixed at compile time by the `lite` feature.
+fn build_policy_dir() -> &'static str {
+  policy_dir(cfg!(feature = "lite"))
+}
+
 /// Absolute path of one bundled policy (see `tauri.conf.json`'s
 /// `bundle.resources` mapping and `scripts/gen-privacy.mjs`).
 fn resource_file(app: &AppHandle, name: &str) -> Result<PathBuf, String> {
@@ -24,7 +39,7 @@ fn resource_file(app: &AppHandle, name: &str) -> Result<PathBuf, String> {
       .path()
       .resource_dir()
       .map_err(|e| e.to_string())?
-      .join("privacy")
+      .join(build_policy_dir())
       .join(name),
   )
 }
@@ -58,6 +73,37 @@ pub fn read_privacy_policy(app: AppHandle) -> Result<String, String> {
 #[cfg(test)]
 mod tests {
   use super::*;
+
+  #[test]
+  fn the_lite_build_reads_its_own_policy_folder_and_the_full_build_the_full_one() {
+    assert_eq!(policy_dir(true), "privacy-lite");
+    assert_eq!(policy_dir(false), "privacy");
+  }
+
+  #[cfg(feature = "lite")]
+  #[test]
+  fn a_build_with_the_lite_feature_reads_the_lite_policy() {
+    assert_eq!(build_policy_dir(), "privacy-lite");
+  }
+
+  #[cfg(not(feature = "lite"))]
+  #[test]
+  fn a_build_without_the_lite_feature_reads_the_full_policy() {
+    assert_eq!(build_policy_dir(), "privacy");
+  }
+
+  #[test]
+  fn both_policy_folders_ship_every_document_a_language_can_choose() {
+    let resources = Path::new(env!("CARGO_MANIFEST_DIR")).join("resources");
+    for folder in [policy_dir(false), policy_dir(true)] {
+      for name in ["en.md", "zh-TW.md", "ja.md"] {
+        assert!(
+          resources.join(folder).join(name).is_file(),
+          "{folder}/{name} is missing"
+        );
+      }
+    }
+  }
 
   #[test]
   fn three_languages_have_their_own_document() {

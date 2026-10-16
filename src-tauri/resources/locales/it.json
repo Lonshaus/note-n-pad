@@ -220,7 +220,7 @@
     "status.longLine.reason": "Questo file ha una riga molto lunga; analizzarla a ogni tasto rallenta la digitazione.",
     "doc.openFailed": "Impossibile aprire «{name}». Il file potrebbe essere stato spostato o eliminato, oppure il suo nome contiene caratteri che questa app non supporta.",
     "doc.restoreUnreadable": "Impossibile leggere: {names}. Riapri il file o i file per continuare.",
-    "doc.keptTabs": "Schede non aperte (serve la versione completa): {count}. Vengono conservate così come sono, comprese le modifiche non salvate, e si riaprono quando la licenza completa viene letta.",
+    "doc.keptTabs": "Schede non aperte, non supportate in questa versione: {count}.",
     "doc.revealFailed": "Impossibile mostrare «{name}». Il file potrebbe essere stato spostato o eliminato.",
     "doc.saveFailed": "Impossibile salvare «{name}»: {error}",
     "doc.saveReadOnly": "«{name}» è di sola lettura, quindi non è stato salvato nulla. Modifica i permessi del file per salvarlo.",
