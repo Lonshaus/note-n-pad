@@ -6,6 +6,7 @@
   import { invoke } from '@tauri-apps/api/core';
   import { listen, type UnlistenFn } from '@tauri-apps/api/event';
   import {
+    Annotation,
     Compartment,
     EditorState,
     Transaction,
@@ -22,10 +23,13 @@
     drawSelection,
     dropCursor,
     keymap,
+    runScopeHandlers,
+    type Command,
     type ViewUpdate,
   } from '@codemirror/view';
+  import { toggleTabFocusMode } from '@codemirror/commands';
   import { varEditorTheme } from '../editor/editorTheme';
-  import { keymapExtension } from '../editor/keymap';
+  import { buildKeymap, keymapExtension } from '../editor/keymap';
   import {
     settleThenDrain,
     settleViewComposition,
@@ -56,6 +60,8 @@
     fitsWindow,
     gotoSelection,
     insideWindow,
+    isImeKey,
+    replayKind,
     selectionAfterChange,
     selectionAfterSwap,
     toGlobalSelection,
@@ -63,6 +69,19 @@
     type LinePos,
     type LineSelection,
   } from '../util/windowSelection';
+  import {
+    chordReplaysAtEdge,
+    copiedRange,
+    coreKeyBindings,
+    decideKey,
+    linewiseAfterCopy,
+    pasteIsLinewise,
+    pasteSpec,
+    replayWanted as replayStateWanted,
+    type AltGrTable,
+    type KeyLayers,
+    type ReplayState,
+  } from '../util/replayKeys';
   import { focusEditorIfIdle } from '../util/editorFocus';
   import { readCspNonce } from '../util/cspNonce';
   import { parseGotoRange, moveResultCursor } from '../util/largeSearch';
@@ -253,14 +272,19 @@
   // Set once the editor is unmounted, so work that outlives it stops touching it.
   let gone = false;
   // Whole-file work in flight (replace all, undo, redo): while it counts, the
-  // editor is read-only and typed input is dropped.
+  // editor is read-only. A replace all pass drops typed input; an undo or redo
+  // queues it for the replay, which runs once the work is over.
   let holds = 0;
+  // How many of those holds queue typed input instead of dropping it.
+  let queuingHolds = 0;
   // Counts every edit and undo, so a find can tell the content moved under it.
   let editSeq = 0;
   // True while a programmatic window swap replaces the document, so the update
   // listener does not mistake the replacement for a user edit, and the scroll
   // handler ignores the scroll-position changes the swap causes.
   let swapping = false;
+  // Whether the view held focus when the current swap began.
+  let hadFocusAtSwap = false;
   // Set when an undo or redo changed the document while a swap was running,
   // which the update listener does not track; the swap folds it in.
   let docChangedDuringSwap = false;
@@ -316,19 +340,52 @@
       effects: readOnlyCompartment.reconfigure(readOnlyExtension(isReadOnly())),
     });
   }
+  // Whether the view held focus when the first of the current holds began.
+  let holdHadFocus = false;
   // Keep the editor read-only until the returned function is called. Typed
-  // input is dropped meanwhile.
-  function hold(): () => void {
+  // input is dropped meanwhile, or queued for the replay with `queueInput`.
+  // The editor loses focus while it is not editable; the last release gives
+  // it back, as a swap's end does.
+  function hold(queueInput = false): () => void {
+    if (holds === 0) {
+      holdHadFocus = view?.hasFocus ?? false;
+    }
     holds += 1;
+    if (queueInput) {
+      queuingHolds += 1;
+    }
     syncReadOnly();
     let released = false;
     return () => {
       if (!released) {
         released = true;
         holds -= 1;
+        if (queueInput) {
+          queuingHolds -= 1;
+        }
         syncReadOnly();
+        if (holds === 0) {
+          restoreFocusAfterHold();
+        }
+        resumeReplay();
       }
     };
+  }
+  function restoreFocusAfterHold(): void {
+    const had = holdHadFocus;
+    holdHadFocus = false;
+    if (!had || locked || view === undefined) {
+      return;
+    }
+    if (swapping) {
+      // A swap the hold's work started: its end gives focus back.
+      hadFocusAtSwap = true;
+      return;
+    }
+    const active = document.activeElement;
+    if (active === null || active === document.body) {
+      view.focus();
+    }
   }
   // The document span of the lines fully on screen, or null when none is.
   function visibleSpan(v: EditorView): { from: number; to: number } | null {
@@ -346,6 +403,8 @@
       top + el.clientHeight,
     );
   }
+  // Marks the Select All transaction, which the outside-window filter lets pass.
+  const selectVisibleMark = Annotation.define<boolean>();
   // Select All covers what is on screen, not the whole loaded window.
   function selectVisible(v: EditorView): boolean {
     const span = visibleSpan(v);
@@ -355,12 +414,15 @@
     v.dispatch({
       selection: { anchor: span.from, head: span.to },
       userEvent: 'select',
+      annotations: selectVisibleMark.of(true),
     });
     return true;
   }
   // Set by a keydown for the rest of its task: selections made while it is
   // set come from a key command, not from the native select-all.
   let keyActive = false;
+  // The keydown CodeMirror is handling, for the same span as keyActive.
+  let currentKeydown: KeyboardEvent | undefined;
   // The native (menu) select-all arrives as a DOM selection covering the whole
   // rendered viewport; replace it with the on-screen span.
   function narrowNativeSelectAll(
@@ -392,6 +454,14 @@
     };
   }
 
+  const undoCommand: Command = () => {
+    runUndo('undo');
+    return true;
+  };
+  const redoCommand: Command = () => {
+    runUndo('redo');
+    return true;
+  };
   // No CodeMirror `history()`: undo/redo is owned by the Rust journal (the whole
   // document lives there, not in CM), so Mod-z / Mod-Shift-z route to runUndo. A
   // local CM history would fight it — undoing only the window's slice of edits.
@@ -401,35 +471,25 @@
     dropCursor(),
     highlightActiveLine(),
     EditorView.domEventHandlers({
-      keydown() {
+      keydown(event) {
         keyActive = true;
+        currentKeydown = event;
         queueMicrotask(() => {
           keyActive = false;
+          currentKeydown = undefined;
         });
         return false;
       },
     }),
     EditorState.transactionFilter.of(narrowNativeSelectAll),
-    keymap.of([
-      { key: 'Escape', run: closeBox },
-      { key: 'Mod-a', preventDefault: true, run: selectVisible },
-      {
-        key: 'Mod-z',
-        preventDefault: true,
-        run: () => {
-          runUndo('undo');
-          return true;
-        },
-      },
-      {
-        key: 'Mod-Shift-z',
-        preventDefault: true,
-        run: () => {
-          runUndo('redo');
-          return true;
-        },
-      },
-    ]),
+    keymap.of(
+      coreKeyBindings({
+        closeBox,
+        selectVisible,
+        undo: undoCommand,
+        redo: redoCommand,
+      }),
+    ),
   ];
 
   function buildState(doc: string, cursorPos?: number): EditorState {
@@ -475,6 +535,9 @@
             ? []
             : tr,
         ),
+        // While the selection lies outside the window, a user edit or a key
+        // command would act on the window edge: reject it and replay the key.
+        EditorState.transactionFilter.of(rejectOutsideWindow),
         EditorView.updateListener.of((update) => {
           if (update.docChanged && !swapping && !applyingRemote) {
             handleUserEdit(update);
@@ -655,7 +718,9 @@
     if (locked || swapping) {
       return;
     }
-    const release = hold();
+    // Input typed from here to the end of the undo is queued: it replays at
+    // the caret the undo leaves, instead of landing on content about to change.
+    const release = hold(true);
     applyChain = applyChain.then(async () => {
       try {
         if (locked || view === undefined) {
@@ -778,8 +843,12 @@
   // in the update listener. Read-only closes both gaps honestly (input is briefly
   // refused instead of silently lost). endSwap is idempotent and always restores
   // the flag, so no exit path can wedge the editor in the ignore-edits state.
-  // User document changes are rejected during a swap.
+  // The content is non-editable during a swap, which can move focus to <body>.
+  // endSwap gives focus back when the editor had it and nothing else holds it.
+  // User document changes are rejected during a swap, and Tab is blocked so it
+  // cannot walk focus out of the editor.
   function beginSwap(): void {
+    hadFocusAtSwap = view?.hasFocus ?? false;
     docChangedDuringSwap = false;
     swapping = true;
     view?.dispatch({
@@ -797,8 +866,431 @@
       if (view !== undefined) {
         trackSelection(view.state, false);
       }
+      const active = document.activeElement;
+      if (hadFocusAtSwap && (active === null || active === document.body)) {
+        view?.focus();
+      }
+    }
+    if (replayPending) {
+      void drainReplay();
     }
     notifySettled();
+  }
+  // Input typed while the selection lies outside the window (and fits one) is
+  // queued, the window is swapped back to the selection, and the queue is then
+  // replayed there as ordinary user transactions.
+  type ReplayItem =
+    | { kind: 'text'; text: string; userEvent: string }
+    | { kind: 'key'; event: KeyboardEvent }
+    | {
+        kind: 'copy' | 'cut';
+        supply: (text: string | null) => void;
+        written: Promise<boolean>;
+      };
+  let replayQueue: ReplayItem[] = [];
+  // True from the first queued item until the queue has drained, so nothing
+  // overtakes it.
+  let replayPending = false;
+  let draining = false;
+  let replayTimer: ReturnType<typeof setTimeout> | undefined;
+
+  function isWindows(): boolean {
+    return platform.os === 'windows';
+  }
+
+  function selectionOutside(doc: Text): boolean {
+    return (
+      !insideWindow(globalSel, windowStartLine, doc.lines) &&
+      fitsWindow(globalSel)
+    );
+  }
+  function replayState(): ReplayState {
+    const v = view;
+    const active = document.activeElement;
+    return {
+      locked: v === undefined || locked,
+      focusElsewhere:
+        v !== undefined &&
+        active !== null &&
+        active !== document.body &&
+        !v.dom.contains(active),
+      dropHold: holds > queuingHolds,
+      queueHold: queuingHolds > 0,
+      swapping,
+      replayPending,
+      outside: v !== undefined && selectionOutside(v.state.doc),
+    };
+  }
+  // Whether input should be handled by the replay: focus is in the editor (or
+  // nowhere) and the selection is outside the window, or a replay is running,
+  // or an undo or redo is under way.
+  function replayWanted(): boolean {
+    return replayStateWanted(replayState());
+  }
+
+  function dropReplay(): void {
+    for (const item of replayQueue) {
+      if (item.kind === 'copy' || item.kind === 'cut') {
+        item.supply(null);
+      }
+    }
+    replayQueue = [];
+    replayPending = false;
+    clearTimeout(replayTimer);
+    replayTimer = undefined;
+    notifySettled();
+  }
+
+  function startReplaySwap(): void {
+    replayTimer = undefined;
+    replayPending = true;
+    if (view === undefined || locked || swapping) {
+      dropReplay();
+      return;
+    }
+    // An undo or redo is still running: resumeReplay carries on after it.
+    if (holds > 0) {
+      return;
+    }
+    // The layout may have changed since the table was last read.
+    refreshAltGr();
+    const start = windowStartFor(globalSel, totalLines);
+    void loadWindow(start + MARGIN_LINES, 'reveal');
+    // The keys that got here may have come with focus on <body>.
+    hadFocusAtSwap = true;
+  }
+  // Carry on with the queued input once nothing holds it back: swap back to
+  // the selection, or drain the queue when the window already covers it.
+  function resumeReplay(): void {
+    if (
+      !replayPending ||
+      swapping ||
+      draining ||
+      holds > 0 ||
+      replayTimer !== undefined
+    ) {
+      return;
+    }
+    if (view === undefined || locked) {
+      dropReplay();
+    } else if (selectionOutside(view.state.doc)) {
+      startReplaySwap();
+    } else {
+      void drainReplay();
+    }
+  }
+
+  function queueReplay(item: ReplayItem): void {
+    replayQueue.push(item);
+    if (!replayPending) {
+      if (holds > 0) {
+        replayPending = true;
+      } else {
+        startReplaySwap();
+      }
+    }
+  }
+  // Safety net for a key command CodeMirror ran at the window edge: reject the
+  // transaction and replay the keydown once the window is back on the selection.
+  function rejectOutsideWindow(
+    tr: Transaction,
+  ): Transaction | readonly TransactionSpec[] {
+    if (
+      swapping ||
+      locked ||
+      tr.annotation(selectVisibleMark) === true ||
+      !selectionOutside(tr.startState.doc)
+    ) {
+      return tr;
+    }
+    const edit =
+      tr.docChanged && tr.annotation(Transaction.userEvent) !== undefined;
+    const keySelect =
+      keyActive &&
+      !tr.docChanged &&
+      tr.selection !== undefined &&
+      !tr.isUserEvent('select.pointer');
+    if (!edit && !keySelect) {
+      return tr;
+    }
+    if (tr.isUserEvent('input.type') && !tr.isUserEvent('input.type.compose')) {
+      // Text no keydown announced, such as an AltGr character.
+      let text = '';
+      tr.changes.iterChanges((_fromA, _toA, _fromB, _toB, inserted) => {
+        text += inserted.toString();
+      });
+      if (text !== '') {
+        queueDeferred({ kind: 'text', text, userEvent: 'input.type' });
+      }
+      return [];
+    }
+    const e = currentKeydown;
+    if (
+      e !== undefined &&
+      !replayPending &&
+      replayKind(e, isWindows()) === 'chord'
+    ) {
+      queueDeferred({ kind: 'key', event: e });
+    }
+    return [];
+  }
+  // Never swap inside a filter: the swap starts in the next task.
+  function queueDeferred(item: ReplayItem): void {
+    replayQueue.push(item);
+    if (!replayPending) {
+      replayPending = true;
+      replayTimer = setTimeout(startReplaySwap, 0);
+    }
+  }
+  // The text a copy or cut with an empty caret took, line by line: CodeMirror
+  // pastes it back above the caret line. A copy of a selection clears it.
+  let linewiseCopy: string | null = null;
+
+  async function runReplayItem(v: EditorView, item: ReplayItem): Promise<void> {
+    if (item.kind === 'text') {
+      v.dispatch(
+        item.userEvent === 'input.paste'
+          ? pasteSpec(v.state, item.text, linewiseCopy)
+          : v.state.replaceSelection(item.text),
+        {
+          userEvent: item.userEvent,
+          scrollIntoView: true,
+        },
+      );
+    } else if (item.kind === 'key') {
+      runScopeHandlers(v, item.event, 'editor');
+    } else {
+      const copied = copiedRange(v.state);
+      linewiseCopy = linewiseAfterCopy(copied);
+      item.supply(copied.text === '' && !copied.linewise ? null : copied.text);
+      if (!(await item.written)) {
+        return;
+      }
+      // Delete only after the write succeeded, as editorCut does.
+      if (item.kind === 'cut' && view === v && !swapping) {
+        v.dispatch({
+          changes: copied.ranges,
+          userEvent: 'delete.cut',
+          scrollIntoView: true,
+        });
+      }
+    }
+  }
+  // Replay the queue in order once the swap is over. New input keeps being
+  // queued until the queue is empty. A swap or an undo that begins meanwhile
+  // pauses the drain; its end resumes it.
+  async function drainReplay(): Promise<void> {
+    if (draining) {
+      return;
+    }
+    draining = true;
+    try {
+      while (replayQueue.length > 0) {
+        const v = view;
+        if (swapping || holds > 0) {
+          return;
+        }
+        if (
+          v === undefined ||
+          locked ||
+          !insideWindow(globalSel, windowStartLine, v.state.doc.lines)
+        ) {
+          dropReplay();
+          return;
+        }
+        const item = replayQueue.shift();
+        if (item !== undefined) {
+          await runReplayItem(v, item);
+        }
+      }
+      replayPending = false;
+    } catch (e) {
+      dropReplay();
+      throw e;
+    } finally {
+      draining = false;
+      notifySettled();
+    }
+  }
+  // The layout's AltGr characters, as the core last reported them. Null until
+  // the first answer, and always off Windows.
+  let altGrTable: AltGrTable | null = null;
+  function refreshAltGr(): void {
+    if (isWindows()) {
+      invoke<AltGrTable>('altgr_table').then(
+        (table) => {
+          altGrTable = table;
+        },
+        () => {},
+      );
+    }
+  }
+  const neverReplayed = new Set<Command>([
+    toggleTabFocusMode,
+    undoCommand,
+    redoCommand,
+  ]);
+  // The editor's key bindings in the order CodeMirror ranks them: the
+  // off-screen moves, the editor's own keys, then the shared keymap.
+  function keyLayers(): KeyLayers {
+    const { offscreen, normal } = buildKeymap('windowed', platform.os, (id) =>
+      shortcutsState.accel(id),
+    );
+    return [
+      offscreen,
+      coreKeyBindings({
+        closeBox,
+        selectVisible,
+        undo: undoCommand,
+        redo: redoCommand,
+      }),
+      normal,
+    ];
+  }
+
+  function blockTabDuringSwap(e: KeyboardEvent): void {
+    if (
+      !swapping ||
+      e.key !== 'Tab' ||
+      e.ctrlKey ||
+      e.metaKey ||
+      e.altKey ||
+      view === undefined
+    ) {
+      return;
+    }
+    const active = document.activeElement;
+    if (
+      active === null ||
+      active === document.body ||
+      view.dom.contains(active)
+    ) {
+      e.preventDefault();
+    }
+  }
+  // Keydowns CodeMirror had already prevented when they bubbled out of the
+  // editor, before any window-level accelerator handler.
+  const claimedByEditor = new WeakSet<KeyboardEvent>();
+  function onViewKeydown(e: KeyboardEvent): void {
+    if (e.defaultPrevented) {
+      claimedByEditor.add(e);
+    }
+  }
+
+  function onDocKeydown(e: KeyboardEvent): void {
+    const action = decideKey({
+      event: e,
+      os: platform.os,
+      state: replayState(),
+      draining,
+      altGr: altGrTable,
+      layers: keyLayers,
+    });
+    if (action.type === 'text' || action.type === 'key') {
+      e.preventDefault();
+      e.stopPropagation();
+      queueReplay(
+        action.type === 'text'
+          ? { kind: 'text', text: action.text, userEvent: 'input.type' }
+          : { kind: 'key', event: e },
+      );
+      return;
+    }
+    if (isImeKey(e) && replayWanted()) {
+      // A composition cannot be replayed: move the view, the user composes
+      // again. The key is not prevented.
+      if (!replayPending) {
+        startReplaySwap();
+      }
+    } else if (
+      !replayPending &&
+      e.isTrusted &&
+      replayWanted() &&
+      replayKind(e, isWindows()) === 'chord'
+    ) {
+      // A chord that is a no-op at the window edge leaves no transaction:
+      // replay it unless a menu accelerator took it after CodeMirror passed
+      // on it.
+      setTimeout(() => {
+        const v = view;
+        if (
+          (claimedByEditor.has(e) || !e.defaultPrevented) &&
+          !replayPending &&
+          v !== undefined &&
+          selectionOutside(v.state.doc) &&
+          chordReplaysAtEdge(keyLayers(), e, platform.os, neverReplayed)
+        ) {
+          queueReplay({ kind: 'key', event: e });
+        }
+      }, 0);
+    }
+    blockTabDuringSwap(e);
+  }
+
+  function onDocCompositionStart(): void {
+    if (holds === 0 && replayWanted() && !replayPending) {
+      startReplaySwap();
+    }
+  }
+
+  function onDocPaste(e: ClipboardEvent): void {
+    const text = e.clipboardData?.getData('text/plain') ?? '';
+    if (text === '') {
+      return;
+    }
+    if (replayWanted()) {
+      e.preventDefault();
+      e.stopPropagation();
+      queueReplay({ kind: 'text', text, userEvent: 'input.paste' });
+      return;
+    }
+    // CodeMirror's own paste only knows the copies it made itself.
+    const v = view;
+    if (
+      v !== undefined &&
+      !v.state.readOnly &&
+      v.dom.contains(document.activeElement) &&
+      pasteIsLinewise(v.state, text, linewiseCopy)
+    ) {
+      e.preventDefault();
+      e.stopPropagation();
+      v.dispatch(pasteSpec(v.state, text, linewiseCopy), {
+        userEvent: 'input.paste',
+        scrollIntoView: true,
+      });
+    }
+  }
+  // WebKit allows a clipboard write only while the copy event is handled, so
+  // the write starts here and its text is supplied once the window is back.
+  function onDocCopyCut(e: ClipboardEvent): void {
+    if (replayWanted()) {
+      e.preventDefault();
+      e.stopPropagation();
+      let supply: (text: string | null) => void = () => {};
+      const blob = new Promise<Blob>((resolve, reject) => {
+        supply = (text) => {
+          if (text === null) {
+            reject(new Error('nothing to copy'));
+          } else {
+            resolve(new Blob([text], { type: 'text/plain' }));
+          }
+        };
+      });
+      // A write that fails never reads this promise; that is not an error.
+      void blob.catch(() => {});
+      const written = navigator.clipboard
+        .write([new ClipboardItem({ 'text/plain': blob })])
+        .then(
+          () => true,
+          () => false,
+        );
+      queueReplay({ kind: e.type === 'cut' ? 'cut' : 'copy', supply, written });
+      return;
+    }
+    const v = view;
+    if (v !== undefined && v.dom.contains(document.activeElement)) {
+      linewiseCopy = linewiseAfterCopy(copiedRange(v.state));
+    }
   }
 
   async function loadWindow(
@@ -845,8 +1337,10 @@
           endLine: w.endLine,
         });
       } catch (e) {
-        endSwap();
+        // Locked first, so the swap's end does not refocus the editor just
+        // before the error dialog shows.
         lock(t('editor.locked.read', { detail: String(e) }));
+        endSwap();
         return;
       }
       // Capture the anchor and the cursor's global position against the OLD
@@ -930,8 +1424,8 @@
       // The swap died mid-flight (possibly after setState): the buffer/offset
       // pairing is no longer trustworthy, so surface it as a lock rather than
       // limping on with silently misaligned coordinates.
-      endSwap();
       lock(t('editor.locked.swap', { detail: String(e) }));
+      endSwap();
     }
   }
 
@@ -1108,10 +1602,10 @@
               (truncated ? t('large.search.truncatedSuffix') : '')
             : '',
   );
-  // Callers waiting for no swap to run.
+  // Callers waiting for no swap to run and the replay queue to be empty.
   let settleWaiters: (() => void)[] = [];
   function isSettled(): boolean {
-    return !swapping;
+    return !swapping && !replayPending;
   }
   function notifySettled(): void {
     if (!isSettled()) {
@@ -1130,7 +1624,8 @@
       wake();
     }
   }
-  // Resolves once no window swap is running, so a window load is never skipped
+  // Resolves once no window swap is running and the replay queue is empty, so
+  // a find never retargets queued typing and a window load is never skipped
   // because a swap is in flight. False when the editor cannot take the
   // operation: it is gone, locked, or busy with whole-file work.
   async function settled(): Promise<boolean> {
@@ -1613,7 +2108,19 @@
         requestAnimationFrame(() => scrollLineToTop(target));
       }
       v.scrollDOM.addEventListener('scroll', onScroll);
+      v.dom.addEventListener('keydown', onViewKeydown);
+      document.addEventListener('keydown', onDocKeydown, true);
+      document.addEventListener(
+        'compositionstart',
+        onDocCompositionStart,
+        true,
+      );
+      document.addEventListener('paste', onDocPaste, true);
+      document.addEventListener('cut', onDocCopyCut, true);
+      document.addEventListener('copy', onDocCopyCut, true);
       window.addEventListener('keydown', onWindowKeydown);
+      window.addEventListener('focus', refreshAltGr);
+      refreshAltGr();
       reportSelection();
       // Claim keyboard focus on load so an unlocked/restored windowed tab types
       // without a click.
@@ -1632,6 +2139,7 @@
       unlistenHit?.();
       unlistenDone?.();
       window.removeEventListener('keydown', onWindowKeydown);
+      window.removeEventListener('focus', refreshAltGr);
       if (selRaf !== 0) {
         cancelAnimationFrame(selRaf);
       }
@@ -1639,6 +2147,17 @@
         cancelAnimationFrame(topRaf);
       }
       view?.scrollDOM.removeEventListener('scroll', onScroll);
+      view?.dom.removeEventListener('keydown', onViewKeydown);
+      document.removeEventListener('keydown', onDocKeydown, true);
+      document.removeEventListener(
+        'compositionstart',
+        onDocCompositionStart,
+        true,
+      );
+      document.removeEventListener('paste', onDocPaste, true);
+      document.removeEventListener('cut', onDocCopyCut, true);
+      document.removeEventListener('copy', onDocCopyCut, true);
+      dropReplay();
       if (import.meta.env.DEV) {
         void import('../dev/editorRegistry').then((m) => m.setActiveView(null));
       }

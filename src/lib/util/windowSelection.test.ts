@@ -6,11 +6,15 @@ import {
   fitsWindow,
   gotoSelection,
   insideWindow,
+  isEditingKey,
+  isImeKey,
+  replayKind,
   selectionAfterChange,
   selectionAfterSwap,
   toLiveSelection,
   windowStartFor,
   type LineSelection,
+  type ReplayKeyEvent,
   type WindowShape,
 } from './windowSelection';
 // Every line is 10 characters long.
@@ -238,5 +242,144 @@ describe('windowStartFor', () => {
 
   it('starts a short file at its first line', () => {
     expect(windowStartFor(sel(300, 0, 300, 0), 800)).toBe(0);
+  });
+});
+
+function key(init: Partial<ReplayKeyEvent> & { key: string }): ReplayKeyEvent {
+  return {
+    keyCode: 0,
+    ctrlKey: false,
+    metaKey: false,
+    altKey: false,
+    shiftKey: false,
+    isComposing: false,
+    ...init,
+  };
+}
+
+describe('replayKind', () => {
+  it('replays a letter, a Shift letter, a digit and a space as text', () => {
+    expect(replayKind(key({ key: 'a' }), false)).toBe('text');
+    expect(replayKind(key({ key: 'A', shiftKey: true }), false)).toBe('text');
+    expect(replayKind(key({ key: '7' }), true)).toBe('text');
+    expect(replayKind(key({ key: ' ' }), true)).toBe('text');
+  });
+
+  it('replays a character outside the BMP as text', () => {
+    expect(replayKind(key({ key: '\u{1F600}' }), false)).toBe('text');
+  });
+
+  it('replays an Option character on macOS as text', () => {
+    expect(replayKind(key({ key: 'å', altKey: true }), false)).toBe('text');
+  });
+
+  it('treats Alt plus a character on Windows as a chord, not text', () => {
+    expect(replayKind(key({ key: 'f', altKey: true }), true)).toBe('chord');
+  });
+
+  it('treats Ctrl+Alt plus a character as a chord on both platforms', () => {
+    const find = key({ key: 'f', ctrlKey: true, altKey: true });
+    expect(replayKind(find, true)).toBe('chord');
+    expect(replayKind(find, false)).toBe('chord');
+    const altGr = key({ key: '@', ctrlKey: true, altKey: true });
+    expect(replayKind(altGr, true)).toBe('chord');
+  });
+
+  it('replays editing and navigation keys as keys', () => {
+    for (const name of [
+      'Enter',
+      'Backspace',
+      'Delete',
+      'Tab',
+      'ArrowUp',
+      'ArrowDown',
+      'ArrowLeft',
+      'ArrowRight',
+      'Home',
+      'End',
+      'PageUp',
+      'PageDown',
+    ]) {
+      expect(replayKind(key({ key: name }), false)).toBe('key');
+      expect(replayKind(key({ key: name }), true)).toBe('key');
+    }
+  });
+
+  it('keeps the Alt and Shift variants of those keys as keys', () => {
+    expect(replayKind(key({ key: 'ArrowUp', altKey: true }), false)).toBe(
+      'key',
+    );
+    expect(replayKind(key({ key: 'ArrowUp', altKey: true }), true)).toBe('key');
+    expect(replayKind(key({ key: 'ArrowDown', shiftKey: true }), true)).toBe(
+      'key',
+    );
+    expect(replayKind(key({ key: 'Tab', shiftKey: true }), false)).toBe('key');
+    expect(
+      replayKind(key({ key: 'PageDown', shiftKey: true, altKey: true }), true),
+    ).toBe('key');
+  });
+
+  it('treats any other Ctrl or Meta combination as a chord', () => {
+    expect(replayKind(key({ key: 'c', metaKey: true }), false)).toBe('chord');
+    expect(replayKind(key({ key: 's', ctrlKey: true }), true)).toBe('chord');
+    expect(
+      replayKind(key({ key: 'K', metaKey: true, shiftKey: true }), false),
+    ).toBe('chord');
+    expect(replayKind(key({ key: 'Tab', ctrlKey: true }), true)).toBe('chord');
+    expect(replayKind(key({ key: 'F5', ctrlKey: true }), true)).toBe('chord');
+  });
+
+  it('treats an editing key with Ctrl or Meta as a chord', () => {
+    expect(replayKind(key({ key: 'Backspace', ctrlKey: true }), true)).toBe(
+      'chord',
+    );
+    expect(replayKind(key({ key: 'ArrowLeft', metaKey: true }), false)).toBe(
+      'chord',
+    );
+  });
+
+  it('tells editing keys other than Tab apart', () => {
+    expect(isEditingKey('Backspace')).toBe(true);
+    expect(isEditingKey('PageDown')).toBe(true);
+    expect(isEditingKey('Tab')).toBe(false);
+    expect(isEditingKey('s')).toBe(false);
+  });
+
+  it('ignores bare modifiers', () => {
+    for (const name of ['Shift', 'Control', 'Alt', 'Meta', 'AltGraph']) {
+      expect(
+        replayKind(
+          key({ key: name, shiftKey: true, ctrlKey: true, altKey: true }),
+          true,
+        ),
+      ).toBe('ignore');
+    }
+    expect(replayKind(key({ key: 'CapsLock' }), false)).toBe('ignore');
+  });
+
+  it('ignores Escape, function keys and dead keys without Ctrl or Meta', () => {
+    expect(replayKind(key({ key: 'Escape' }), false)).toBe('ignore');
+    expect(replayKind(key({ key: 'F5' }), true)).toBe('ignore');
+    expect(replayKind(key({ key: 'Dead' }), false)).toBe('ignore');
+  });
+
+  it('ignores IME process keys, keyCode 229 and composing keys', () => {
+    expect(replayKind(key({ key: 'Process' }), true)).toBe('ignore');
+    expect(replayKind(key({ key: 'a', keyCode: 229 }), true)).toBe('ignore');
+    expect(replayKind(key({ key: 'a', isComposing: true }), false)).toBe(
+      'ignore',
+    );
+    expect(replayKind(key({ key: 'Enter', isComposing: true }), false)).toBe(
+      'ignore',
+    );
+  });
+});
+
+describe('isImeKey', () => {
+  it('is true for Process, keyCode 229 and isComposing only', () => {
+    expect(isImeKey(key({ key: 'Process' }))).toBe(true);
+    expect(isImeKey(key({ key: 'a', keyCode: 229 }))).toBe(true);
+    expect(isImeKey(key({ key: 'a', isComposing: true }))).toBe(true);
+    expect(isImeKey(key({ key: 'a', keyCode: 65 }))).toBe(false);
   });
 });
