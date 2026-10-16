@@ -412,6 +412,58 @@ pub fn plan_document_windows(notes: &[NoteSnapshot]) -> Vec<DocWindowPlan> {
     .collect()
 }
 
+/// Whether restoring `note` needs a feature the Lite edition removes: the
+/// large-file viewer (`large`), windowed editing (`windowed_index`) or a range
+/// tab (`range_source`). In lite such a record is a kept tab: never opened,
+/// never rewritten, never dropped, and restored as usual once the edition is
+/// full again.
+pub fn needs_full_edition(note: &NoteSnapshot) -> bool {
+  note.kind == "document"
+    && (note.large.is_some() || note.windowed_index.is_some() || note.range_source.is_some())
+}
+
+/// Whether startup should rewrite a group-less document into its own solo
+/// group. Never a kept tab in lite: its record stays byte for byte as it is.
+pub fn needs_group_migration(note: &NoteSnapshot, lite: bool) -> bool {
+  note.kind == "document" && note.window_group.is_none() && !(lite && needs_full_edition(note))
+}
+
+/// Migrate every group-less document in `notes` to its own solo group (keyed by
+/// its id) so future restores keep it grouped. A store that cannot be written to
+/// (read-only dir, full disk) only loses the migration, never the launch.
+pub fn migrate_group_less_documents(store: &NoteStore, notes: &[NoteSnapshot], lite: bool) {
+  for note in notes {
+    if needs_group_migration(note, lite) {
+      let mut migrated = note.clone();
+      migrated.window_group = Some(note.id.clone());
+      if let Err(e) = store.upsert(migrated) {
+        log::warn!(
+          "failed to migrate document {} to a solo group: {e}",
+          note.id
+        );
+      }
+    }
+  }
+}
+
+/// The windows to open when the edition turns full: every group holding a tab
+/// that lite kept and whose window is not open (`is_live`), planned exactly as a
+/// startup restore would.
+pub fn groups_to_reopen(
+  notes: &[NoteSnapshot],
+  is_live: impl Fn(&str) -> bool,
+) -> Vec<DocWindowPlan> {
+  let kept: std::collections::HashSet<&str> = notes
+    .iter()
+    .filter(|n| needs_full_edition(n))
+    .map(resolved_group)
+    .collect();
+  plan_document_windows(notes)
+    .into_iter()
+    .filter(|plan| kept.contains(plan.group.as_str()) && !is_live(&plan.group))
+    .collect()
+}
+
 /// The snapshot files that could not be loaded at startup, held until a window
 /// takes focus and claims them. `NoteStore::load` runs inside `setup`, before a
 /// single window exists, so there is nowhere to report them at the moment they
@@ -1985,6 +2037,162 @@ mod tests {
     store.upsert(d.clone()).unwrap();
     let reloaded = NoteStore::load(dir.path().to_path_buf()).unwrap().list();
     assert_eq!(reloaded, vec![d]);
+  }
+
+  fn kept_large(id: &str, group: Option<&str>, tab_index: i64) -> NoteSnapshot {
+    NoteSnapshot {
+      large: Some(200 * 1024 * 1024),
+      ..doc(id, group, tab_index)
+    }
+  }
+
+  fn kept_windowed(id: &str, group: Option<&str>, tab_index: i64) -> NoteSnapshot {
+    NoteSnapshot {
+      large: Some(200 * 1024 * 1024),
+      windowed_index: Some(crate::windowed::CheckpointIndex {
+        checkpoints: vec![(0, 0)],
+        total_newlines: 1,
+      }),
+      ..doc(id, group, tab_index)
+    }
+  }
+
+  fn kept_range(id: &str, group: Option<&str>, tab_index: i64) -> NoteSnapshot {
+    NoteSnapshot {
+      file_path: Some(String::new()),
+      range_source: Some("/tmp/big.log".into()),
+      range_start: Some(0),
+      range_end: Some(10),
+      dirty: true,
+      content: "unsaved edit".into(),
+      ..doc(id, group, tab_index)
+    }
+  }
+
+  #[test]
+  fn a_tab_needing_a_removed_feature_is_a_kept_tab() {
+    assert!(needs_full_edition(&kept_large("a", None, 0)));
+    assert!(needs_full_edition(&kept_windowed("b", None, 0)));
+    assert!(needs_full_edition(&kept_range("c", None, 0)));
+    assert!(!needs_full_edition(&doc("d", None, 0)));
+    // A sticky is never one, whatever its fields say.
+    assert!(!needs_full_edition(&NoteSnapshot {
+      large: Some(1),
+      ..note("s")
+    }));
+  }
+
+  #[test]
+  fn lite_leaves_a_kept_tab_out_of_the_group_migration_and_full_does_not() {
+    for kept in [
+      kept_large("a", None, 0),
+      kept_windowed("b", None, 0),
+      kept_range("c", None, 0),
+    ] {
+      assert!(!needs_group_migration(&kept, true), "{}", kept.id);
+      assert!(needs_group_migration(&kept, false), "{}", kept.id);
+    }
+    // An ordinary group-less document migrates in both.
+    assert!(needs_group_migration(&doc("d", None, 0), true));
+    assert!(needs_group_migration(&doc("d", None, 0), false));
+    // One that already has a group, and a sticky, never do.
+    assert!(!needs_group_migration(&doc("e", Some("g"), 0), false));
+    assert!(!needs_group_migration(&note("s"), false));
+  }
+
+  /// The bytes of every `*.json` in `dir`, by name.
+  fn file_bytes(dir: &Path) -> std::collections::BTreeMap<String, Vec<u8>> {
+    std::fs::read_dir(dir)
+      .unwrap()
+      .map(|e| e.unwrap().path())
+      .filter(|p| p.extension().and_then(|e| e.to_str()) == Some("json"))
+      .map(|p| {
+        (
+          p.file_name().unwrap().to_string_lossy().into_owned(),
+          std::fs::read(&p).unwrap(),
+        )
+      })
+      .collect()
+  }
+
+  #[test]
+  fn lite_startup_never_rewrites_or_drops_a_kept_tab_record() {
+    let dir = tempdir().unwrap();
+    // Hand-written, deliberately not what this build would serialize, so any
+    // rewrite changes the bytes. Group-less: the one record the startup
+    // migration would otherwise touch.
+    let legacy = |id: &str, extra: &str| {
+      format!(
+        "{{\"id\":\"{id}\",\"content\":\"unsaved edit\",\"file_path\":\"\",\"kind\":\"document\",\"dirty\":true,{extra}}}"
+      )
+    };
+    std::fs::write(
+      dir.path().join("range.json"),
+      legacy(
+        "range",
+        "\"range_source\":\"/tmp/big.log\",\"range_start\":0,\"range_end\":10",
+      ),
+    )
+    .unwrap();
+    std::fs::write(
+      dir.path().join("large.json"),
+      legacy("large", "\"large\":209715200"),
+    )
+    .unwrap();
+    std::fs::write(
+      dir.path().join("plain.json"),
+      legacy("plain", "\"language\":null"),
+    )
+    .unwrap();
+    let before = file_bytes(dir.path());
+    let store = NoteStore::load(dir.path().to_path_buf()).unwrap();
+    let notes = store.list();
+    assert_eq!(notes.len(), 3);
+
+    migrate_group_less_documents(&store, &notes, true);
+
+    let after = file_bytes(dir.path());
+    assert_eq!(
+      after.keys().collect::<Vec<_>>(),
+      before.keys().collect::<Vec<_>>()
+    );
+    assert_eq!(after["range.json"], before["range.json"]);
+    assert_eq!(after["large.json"], before["large.json"]);
+    // The ordinary one is migrated as always, so the check above is not vacuous.
+    assert_ne!(after["plain.json"], before["plain.json"]);
+    // Still in the store, and still planned into a window each.
+    let kept: Vec<_> = store
+      .list()
+      .into_iter()
+      .filter(needs_full_edition)
+      .collect();
+    assert_eq!(kept.len(), 2);
+    assert_eq!(plan_document_windows(&store.list()).len(), 3);
+    // Full: they migrate like any other.
+    migrate_group_less_documents(&store, &notes, false);
+    let full = file_bytes(dir.path());
+    assert_ne!(full["range.json"], before["range.json"]);
+    assert_ne!(full["large.json"], before["large.json"]);
+  }
+
+  #[test]
+  fn only_groups_holding_a_kept_tab_and_without_a_window_reopen() {
+    let notes = vec![
+      doc("a1", Some("plain"), 0),
+      kept_large("b1", Some("kept-closed"), 0),
+      doc("b2", Some("kept-closed"), 1),
+      kept_range("c1", Some("kept-open"), 0),
+      kept_windowed("d1", None, 0),
+      note("sticky"),
+    ];
+    let live = |group: &str| group == "kept-open";
+    let groups: Vec<String> = groups_to_reopen(&notes, live)
+      .into_iter()
+      .map(|p| p.group)
+      .collect();
+    // A group-less kept tab is its own group, keyed by its id.
+    assert_eq!(groups, vec!["kept-closed", "d1"]);
+    assert!(groups_to_reopen(&notes, |_| true).is_empty());
   }
 
   #[test]

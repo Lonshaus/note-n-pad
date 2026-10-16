@@ -6,6 +6,8 @@
   import { t, englishText, builtinStrings, I18N_KEYS } from '.';
   import { BUILTIN_LABELS, type LocaleData } from './locale';
   import { localeRegistry } from './localeRegistry.svelte';
+  import { isLite } from '../state/edition.svelte';
+  import { editionUi } from '../util/editionUi';
   import {
     customizedLabel,
     groupKeys,
@@ -26,6 +28,9 @@
     ondirty: (dirty: boolean) => void;
   }
   let { id, isBuiltin, hasSeed, ondirty }: Props = $props();
+  // Lite edits and restores a language but cannot merge a file into it or
+  // export it.
+  const ui = $derived(editionUi(isLite()));
 
   // Editor rows, grouped by the key's namespace. The key set is fixed at build
   // time (it comes from the master dictionary), so this is computed once.
@@ -163,12 +168,16 @@
     <button class="btn" disabled={!dirty} onclick={() => void save()}>
       {t('settings.language.save')}
     </button>
-    <button class="btn" onclick={() => void updateFromJson()}>
-      {t('settings.language.updateFromJson')}
-    </button>
-    <button class="btn" onclick={() => void exportDraft()}>
-      {t('settings.language.export')}
-    </button>
+    {#if ui.localeUpdateFromJson}
+      <button class="btn" onclick={() => void updateFromJson()}>
+        {t('settings.language.updateFromJson')}
+      </button>
+    {/if}
+    {#if ui.localeExport}
+      <button class="btn" onclick={() => void exportDraft()}>
+        {t('settings.language.export')}
+      </button>
+    {/if}
     <button class="btn" disabled={!canReset} onclick={() => void reset()}>
       {t('settings.language.reset')}
     </button>

@@ -37,7 +37,12 @@
     isWorkerHighlightActive,
     isWorkerHighlightEnabled,
   } from './lib/highlight/workerHighlight.svelte';
-  import { languageNames } from './lib/editor/language';
+  import {
+    availableLanguageNames,
+    effectiveLanguage,
+  } from './lib/editor/language';
+  import { editionState, isLite } from './lib/state/edition.svelte';
+  import { editionUi } from './lib/util/editionUi';
   import { resolveLanguageId } from './lib/highlight/languages';
   import {
     parseInitialTab,
@@ -177,6 +182,7 @@
       active.windowed === undefined
       ? {
           workerColoring:
+            !isLite() &&
             settingsState.workerHighlight &&
             active.language !== null &&
             resolveLanguageId(active.language) !== null,
@@ -201,7 +207,7 @@
         path: tb.path,
         lineEnding: tb.lineEnding,
         encoding: tb.encoding,
-        language: tb.language,
+        language: effectiveLanguage(tb.language),
       }),
     );
     const active = documentWindow.activeTab?.tabIndex ?? null;
@@ -339,6 +345,15 @@
       void win.destroy();
     }
   }
+  // Lite kept some of this window's stored tabs closed (see `keptTabs`); a
+  // window that has nothing else to show has nothing left once the notice is
+  // closed. The tabs come back through `reopen_kept_groups` in the core.
+  function onKeptTabsClose(): void {
+    documentWindow.dismissKeptTabs();
+    if (documentWindow.tabs.length === 0) {
+      void win.destroy();
+    }
+  }
 
   // Unlike the failed-open report above, the tab whose encoding change failed
   // stays open with its previous content — there is nothing to collapse.
@@ -395,6 +410,7 @@
     const tab = documentWindow.activeTab;
     const l = tab?.large;
     return (
+      editionUi(isLite()).largeUnlock &&
       l !== undefined &&
       l.size < LARGE_EDIT_MAX &&
       l.unlockRefused === undefined &&
@@ -446,13 +462,21 @@
   const availableModes = $derived<ViewMode[]>(
     active === null
       ? ['source']
-      : viewModesFor(active.path).filter((m) => IMPLEMENTED_MODES.includes(m)),
+      : viewModesFor(active.path, isLite()).filter((m) =>
+          IMPLEMENTED_MODES.includes(m),
+        ),
   );
-  const activeViewMode = $derived<ViewMode>(
-    active !== null && !viewsUnavailable
-      ? (viewModes.get(active.id) ?? defaultViewModeFor(active.path))
-      : 'source',
-  );
+  // A mode the edition no longer offers (JSON or XML after a switch to lite)
+  // gives way to the file's default one.
+  const activeViewMode = $derived.by<ViewMode>(() => {
+    if (active === null || viewsUnavailable) {
+      return 'source';
+    }
+    const chosen = viewModes.get(active.id);
+    return chosen !== undefined && availableModes.includes(chosen)
+      ? chosen
+      : defaultViewModeFor(active.path, isLite());
+  });
   const showTable = $derived(isTabular && activeViewMode === 'table');
   const showJson = $derived(activeViewMode === 'json');
   const showXml = $derived(activeViewMode === 'xml');
@@ -756,6 +780,7 @@
       windowedError !== null ||
       documentWindow.openFailed !== null ||
       documentWindow.restoreUnreadable.length > 0 ||
+      documentWindow.keptTabs > 0 ||
       documentWindow.saveFailed !== null ||
       documentWindow.rangeConflict !== null ||
       documentWindow.windowedConflict !== null ||
@@ -1272,10 +1297,22 @@
     const unlistenLocales = localeRegistry.listen();
     // Push the encoding and syntax lists (the frontend is their single source of
     // truth) so the Format submenus build from them. Idempotent in the core: only
-    // the first push that changes the stored lists rebuilds the menu.
-    void invoke('set_menu_lists', {
-      encodings: [...ENCODINGS],
-      languages: languageNames,
+    // the first push that changes the stored lists rebuilds the menu. The syntax
+    // list is empty in lite, so it is pushed once the edition is settled and
+    // again whenever it changes.
+    const pushMenuLists = (): void => {
+      void invoke('set_menu_lists', {
+        encodings: [...ENCODINGS],
+        languages: availableLanguageNames(),
+      });
+    };
+    void editionState.ready().then(pushMenuLists);
+    const offEdition = editionState.onChanged((lite) => {
+      pushMenuLists();
+      // The edition turned full: tabs this window kept in lite come back.
+      if (!lite) {
+        void documentWindow.restoreKeptTabs();
+      }
     });
     // Reveal the window only after the theme is loaded and applied, so a
     // dark-theme window never flashes its default white background. File
@@ -1673,6 +1710,7 @@
     return () => {
       window.removeEventListener('keydown', onKeydown);
       documentWindow.endComposition = null;
+      offEdition();
       unlistenTheme();
       void unlistenChanges.then((u) => u());
       void unlistenThemes.then((u) => u());
@@ -1749,7 +1787,7 @@
         {#if documentWindow.isDirty(tab)}
           <span class="tab-dirty" title={t('doc.tab.unsaved')}>•</span>
         {/if}
-        {#if lock !== null}
+        {#if lock !== null && editionUi(isLite()).largeUnlock}
           <button
             class="tab-lock"
             class:disabled={lock.disabled}
@@ -1937,7 +1975,7 @@
         <DocumentEditor
           activeId={held.id}
           content={held.content}
-          language={held.language}
+          language={effectiveLanguage(held.language)}
           dark={settingsState.isDark}
           fontSize={settingsState.editorFontSize}
           fontFamily={settingsState.editorFontFamily}
@@ -2027,8 +2065,8 @@
       encoding={active.encoding}
       encodings={ENCODINGS}
       lossy={active.lossy}
-      language={active.language}
-      languages={languageNames}
+      language={effectiveLanguage(active.language)}
+      languages={availableLanguageNames()}
       line={documentWindow.line}
       col={documentWindow.col}
       {modeOptions}
@@ -2075,6 +2113,16 @@
       })}
       cancelLabel={t('common.close')}
       oncancel={onRestoreUnreadableClose}
+    />
+  {/if}
+
+  {#if documentWindow.keptTabs > 0}
+    <!-- Report only: nothing was lost, the tabs are simply not opened by this
+         edition. Their stored copies, unsaved edits included, are untouched. -->
+    <ConfirmModal
+      message={t('doc.keptTabs', { count: documentWindow.keptTabs })}
+      cancelLabel={t('common.close')}
+      oncancel={onKeptTabsClose}
     />
   {/if}
 

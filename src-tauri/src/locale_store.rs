@@ -515,8 +515,23 @@ pub fn restore_default_locale(app: AppHandle, id: String) -> Result<LocaleData, 
   Ok(locale)
 }
 
+/// The locales compiled into the app. Deleting the data file of one of them only
+/// drops its override, which is how "restore" works for it, so lite allows
+/// that and nothing else.
+const COMPILED_LOCALES: [&str; 3] = ["zh-TW", "ja", "en"];
+
+/// What lite leaves of `delete_locale`: dropping a compiled locale's override.
+/// Deleting any other locale is a removed feature.
+fn delete_allowed(lite: bool, id: &str) -> Result<(), String> {
+  if COMPILED_LOCALES.contains(&id) {
+    return Ok(());
+  }
+  crate::edition::refuse_if(lite, "deleting a language")
+}
+
 #[tauri::command]
 pub fn delete_locale(app: AppHandle, id: String) -> Result<(), String> {
+  delete_allowed(crate::edition::is_lite(), &id)?;
   delete_locale_file(&locales_dir(&app)?, &id)?;
   let _ = app.emit("locales-changed", ());
   Ok(())
@@ -524,6 +539,7 @@ pub fn delete_locale(app: AppHandle, id: String) -> Result<(), String> {
 
 #[tauri::command]
 pub fn import_locale(app: AppHandle, path: String) -> Result<LocaleData, String> {
+  crate::edition::require_full("importing a language")?;
   let text = std::fs::read_to_string(&path).map_err(|e| e.to_string())?;
   let locale = parse_locale(&text)?;
   validate(&locale)?;
@@ -539,6 +555,7 @@ pub fn import_locale(app: AppHandle, path: String) -> Result<LocaleData, String>
 /// locale currently open in the editor instead of adding a new language.
 #[tauri::command]
 pub fn read_locale_file(path: String) -> Result<LocaleData, String> {
+  crate::edition::require_full("importing a language")?;
   let text = std::fs::read_to_string(&path).map_err(|e| e.to_string())?;
   let locale = parse_locale(&text)?;
   validate(&locale)?;
@@ -547,6 +564,7 @@ pub fn read_locale_file(path: String) -> Result<LocaleData, String> {
 
 #[tauri::command]
 pub fn export_locale(locale: LocaleData, path: String) -> Result<(), String> {
+  crate::edition::require_full("exporting a language")?;
   validate(&locale)?;
   let json = serde_json::to_string_pretty(&locale).map_err(|e| e.to_string())?;
   std::fs::write(&path, json).map_err(|e| e.to_string())
@@ -620,6 +638,17 @@ mod tests {
     let dir = tempdir().unwrap();
     write_locale(dir.path(), &locale("de"));
     assert_eq!(load_dir(dir.path()).unwrap().items, vec![locale("de")]);
+  }
+
+  #[test]
+  fn lite_deletes_a_compiled_locales_override_and_nothing_else() {
+    for id in ["en", "ja", "zh-TW"] {
+      assert!(delete_allowed(true, id).is_ok(), "{id}");
+    }
+    for id in ["de", "zh-CN", "mine"] {
+      assert!(delete_allowed(true, id).is_err(), "{id}");
+      assert!(delete_allowed(false, id).is_ok(), "{id}");
+    }
   }
 
   #[test]

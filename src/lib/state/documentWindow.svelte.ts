@@ -13,6 +13,7 @@ import {
 } from '../editor/language';
 import { beautifyJson, softWrapLongLines } from '../util/longLine';
 import {
+  KeptRestore,
   UnreadableRestore,
   activePositionAfterRestore,
   restoreOutcome,
@@ -38,7 +39,8 @@ import {
 } from '../util/openRouting';
 import type { CheckpointIndex, NoteSnapshot } from './stickyNote.svelte';
 import { settingsState } from './settings.svelte';
-import { editionState } from './edition.svelte';
+import { editionState, isLite } from './edition.svelte';
+import { keptTabsToLoad, partitionRestorable } from '../util/keptTabs';
 import { isOrdinaryTab, pickHeldTab, touchMru } from './heldTab';
 import type { LargeIndexRef } from '../util/largeIndex';
 import {
@@ -47,7 +49,7 @@ import {
   restoredRangeContent,
 } from '../util/snapshotPolicy';
 import { t } from '../i18n';
-import { READ_ONLY_DESTINATION } from '../util/protocol';
+import { READ_ONLY_DESTINATION, isLiteRefusal } from '../util/protocol';
 
 /** Rust `splice_file` rejects an out-of-band-edited source with this exact error
  *  string; the write-back keys its conflict flow off it (protocol value). */
@@ -232,6 +234,12 @@ export const LARGE_FILE_THRESHOLD = 100 * 1024 * 1024;
  *  this big whole would blow the WebView's memory, so above it the confirm only
  *  offers the read-only view. */
 export const LARGE_EDIT_MAX = 512 * 1024 * 1024;
+
+/** Whether a file of `size` bytes opens in the read-only large-file viewer. The
+ *  Lite edition has no viewer: every size opens in the ordinary editor. */
+export function opensInLargeViewer(size: number, lite: boolean): boolean {
+  return !lite && size > LARGE_FILE_THRESHOLD;
+}
 
 /** One open document tab. The buffer (`content`) is always LF-normalized. It is a
  *  CodeMirror `Text` (rope), not a string, so a keystroke costs O(edit) instead of
@@ -520,12 +528,22 @@ class DocumentWindowState {
   /** Paths of restored clean tabs that exist but could not be read. They are
    *  not opened (a blank tab would pass for the file); reported once. */
   restoreUnreadable = $state<string[]>([]);
+  /** How many of this window's stored tabs a lite session left closed: the ones
+   *  that need the large-file viewer, windowed editing or range editing. Their
+   *  records are not touched, and they open once the edition is full. Shown once
+   *  as a notice; zero otherwise. */
+  keptTabs = $state(0);
   /** True when the most recent snapshot write did not reach disk. `upsertTab`
    *  never lets a write's rejection propagate (see its own comment), so this
    *  is the only surviving signal that a save failed; cleared by the next
    *  write that succeeds. No UI reads this yet (see the follow-up issue) —
    *  it exists so a failure is not swallowed into nothing. */
   snapshotFailed = $state(false);
+
+  /** Dismiss the kept-tabs notice. */
+  dismissKeptTabs(): void {
+    this.keptTabs = 0;
+  }
 
   /** Dismiss the unreadable-restore report. */
   dismissRestoreUnreadable(): void {
@@ -845,6 +863,14 @@ class DocumentWindowState {
         diskSlice = null;
         rangeReadError = String(e);
       }
+      // The edition turned lite while this restore ran and the core refused the
+      // read: that says nothing about the file, and the record needs full.
+      if (
+        rangeReadError !== null &&
+        (isLite() || isLiteRefusal(rangeReadError))
+      ) {
+        throw new KeptRestore();
+      }
       if (restoreOutcome(snap.dirty, rangeReadError) === 'unreadable') {
         throw new UnreadableRestore(source);
       }
@@ -947,14 +973,15 @@ class DocumentWindowState {
     // any reason) must still degrade to the read-only viewer rather than
     // decoding a huge file whole into the WebView — the same ceiling `openTab`
     // enforces before a fresh open ever reaches a full decode.
-    if (path !== '') {
+    // Lite has no viewer to degrade to, so it neither stats nor gates.
+    if (path !== '' && !isLite()) {
       let size: number | null = null;
       try {
         size = (await invoke<FileStat>('stat_file', { path })).size;
       } catch {
         size = null;
       }
-      if (size !== null && size > LARGE_FILE_THRESHOLD) {
+      if (size !== null && opensInLargeViewer(size, false)) {
         return {
           id: snap?.id ?? crypto.randomUUID(),
           path,
@@ -1085,11 +1112,22 @@ class DocumentWindowState {
     if (entries.length > 0) {
       // Restore: adopt the project the group's tabs were saved with.
       this.project = entries[0]!.project;
-      const dropped = new Set<number>();
-      for (const entry of entries) {
+      // A lite session does not open a tab that needs a removed feature. It has
+      // no tab object for it, so nothing below can write, rewrite or delete its
+      // record (every snapshot write and delete goes through a tab in `tabs`);
+      // it is counted and noticed instead.
+      const { restorable, kept } = partitionRestorable(entries, isLite());
+      this.keptTabs = kept.length;
+      const dropped = new Set<number>(kept.map((n) => n.tab_index));
+      for (const entry of restorable) {
         try {
           this.tabs.push(await this.loadTab(entry.file_path ?? '', entry));
         } catch (e) {
+          if (e instanceof KeptRestore) {
+            this.keptTabs += 1;
+            dropped.add(entry.tab_index);
+            continue;
+          }
           if (!(e instanceof UnreadableRestore)) {
             throw e;
           }
@@ -1138,6 +1176,67 @@ class DocumentWindowState {
       this.ensureWindowedRestore(this.activeTab);
     }
     this.ready = true;
+    // The edition turned full while the tabs above were loading.
+    if (this.keptTabs > 0 && !isLite()) {
+      await this.restoreKeptTabs();
+    }
+  }
+
+  /** The edition turned full: open the tabs of this window that lite kept, from
+   *  their stored records exactly as a startup restore would, so a range tab
+   *  comes back with its unsaved edits. Tabs keep their stored order. */
+  restoreKeptTabs(): Promise<void> {
+    // One at a time: two flips in quick succession would otherwise both read
+    // the store before either had opened a tab, and open every one twice.
+    const run = this.keptRestore.then(() => this.restoreKeptTabsNow());
+    this.keptRestore = run.catch(() => {});
+    return run;
+  }
+
+  private keptRestore: Promise<void> = Promise.resolve();
+
+  private async restoreKeptTabsNow(): Promise<void> {
+    if (!this.ready || isLite()) {
+      return;
+    }
+    let all: NoteSnapshot[];
+    try {
+      all = await invoke<NoteSnapshot[]>('list_notes');
+    } catch {
+      return;
+    }
+    const kept = keptTabsToLoad(
+      all,
+      this.group,
+      new Set(this.tabs.map((tab) => tab.id)),
+    );
+    const activeId = this.activeTab?.id ?? null;
+    let stillKept = 0;
+    for (const entry of kept) {
+      try {
+        this.tabs.push(await this.loadTab(entry.file_path ?? '', entry));
+      } catch (e) {
+        if (e instanceof KeptRestore) {
+          // Lite again before this one could be read: it stays kept.
+          stillKept += 1;
+          continue;
+        }
+        if (!(e instanceof UnreadableRestore)) {
+          throw e;
+        }
+        await invoke('delete_note', { id: entry.id }).catch(() => {});
+        this.restoreUnreadable.push(e.path);
+      }
+    }
+    this.keptTabs = stillKept;
+    if (kept.length === 0) {
+      return;
+    }
+    this.tabs.sort((a, b) => a.tabIndex - b.tabIndex);
+    const at = this.tabs.findIndex((tab) => tab.id === activeId);
+    // Written even when unchanged: the setter is what starts the lazy reopen of
+    // a restored windowed tab that is now the active one.
+    this.activeIndex = at === -1 ? 0 : at;
   }
   /** Set by the window: ends an IME composition in the active editor and
    *  resolves once its text is in the tab. A switch waits for it. */
@@ -1353,12 +1452,15 @@ class DocumentWindowState {
       return;
     }
     let size = 0;
-    try {
-      size = (await invoke<FileStat>('stat_file', { path })).size;
-    } catch {
-      size = 0;
+    // Lite has no large-file viewer, so it does not even ask for the size.
+    if (!isLite()) {
+      try {
+        size = (await invoke<FileStat>('stat_file', { path })).size;
+      } catch {
+        size = 0;
+      }
     }
-    if (size > LARGE_FILE_THRESHOLD) {
+    if (opensInLargeViewer(size, isLite())) {
       this.pendingLargeOpen = { path, size };
       // 'ask' raises the confirm; 'view'/'edit' skip it and open straight in the
       // chosen mode (edit falls back to the read-only view for a non-UTF-8 or
@@ -1446,7 +1548,9 @@ class DocumentWindowState {
       return { kind: 'fresh' };
     }
     const groups = [
-      ...new Set(orphanCandidates(all, path, this.group).map(documentGroup)),
+      ...new Set(
+        orphanCandidates(all, path, this.group, isLite()).map(documentGroup),
+      ),
     ];
     // Common case: no other group holds this path, so skip the liveness probe.
     if (groups.length === 0) {
@@ -1458,7 +1562,7 @@ class DocumentWindowState {
     } catch {
       live = [];
     }
-    return routeOpen(all, path, this.group, new Set(live));
+    return routeOpen(all, path, this.group, new Set(live), isLite());
   }
 
   /** Re-home an orphaned stored tab (its window group is gone) into this window:
@@ -1472,6 +1576,10 @@ class DocumentWindowState {
     try {
       tab = await this.loadTab(path, note);
     } catch (e) {
+      if (e instanceof KeptRestore) {
+        this.keptTabs += 1;
+        return;
+      }
       if (!(e instanceof UnreadableRestore)) {
         throw e;
       }
@@ -1518,6 +1626,11 @@ class DocumentWindowState {
       return;
     }
     this.pendingLargeOpen = null;
+    // The edition turned lite while the question was up: no viewer to open in.
+    if (isLite()) {
+      void this.openNormal(pending.path);
+      return;
+    }
     const tab: DocTab = {
       id: crypto.randomUUID(),
       path: pending.path,
@@ -1571,14 +1684,22 @@ class DocumentWindowState {
     if (tab?.large === undefined) {
       return null;
     }
+    // Lite has no editing session to start. Nothing is asked of the core, and
+    // nothing is recorded on the tab: its lock must be as it was when the
+    // edition is full again.
+    if (isLite()) {
+      return null;
+    }
     let open: WindowedOpen;
     try {
       open = await invoke<WindowedOpen>('windowed_open', { path: tab.path });
     } catch (e) {
       // Record the refusal on the tab so its lock stays disabled with the reason
       // (the tab may not be active, so the state must live on the tab, not the view).
+      // Not one the edition caused (it turned lite while the open was in
+      // flight): that is not a property of the file and would outlive the edition.
       const reason = windowedRefusalMessage(String(e));
-      if (tab.large !== undefined) {
+      if (tab.large !== undefined && !isLite() && !isLiteRefusal(e)) {
         tab.large.unlockRefused = reason;
       }
       return reason;
@@ -2248,14 +2369,30 @@ class DocumentWindowState {
     if (w === undefined) {
       return;
     }
+    // The fresh session is opened before the old one is let go: when the open
+    // is refused (lite) or fails, the tab keeps the session it has.
+    let open: WindowedOpen | null = null;
+    if (!isLite()) {
+      try {
+        open = await invoke<WindowedOpen>('windowed_open', { path: tab.path });
+      } catch {
+        if (!isLite()) {
+          return;
+        }
+      }
+    }
+    // Lite cannot start a session, but the tab already has one and the file's
+    // baseline index is all a reopen needs: the quit and close gates' Discard
+    // has to be able to clear the edits there too.
+    if (open === null) {
+      try {
+        open = await this.reopenAtBaseline(tab.path, w.sessionId);
+      } catch {
+        return;
+      }
+    }
     void invoke('windowed_close', { sessionId: w.sessionId });
     this.windowedGates.delete(w.sessionId);
-    let open: WindowedOpen;
-    try {
-      open = await invoke<WindowedOpen>('windowed_open', { path: tab.path });
-    } catch {
-      return;
-    }
     tab.windowed = {
       sessionId: open.session_id,
       totalBytes: open.total_bytes,
@@ -2266,6 +2403,30 @@ class DocumentWindowState {
     };
     this.windowedConflict = null;
     await this.upsertTab(tab);
+  }
+
+  /** A fresh session on `path` at its on-disk baseline, made from the index of
+   *  the live session `sessionId` through `windowed_reopen` instead of
+   *  `windowed_open`. */
+  private async reopenAtBaseline(
+    path: string,
+    sessionId: number,
+  ): Promise<WindowedOpen> {
+    const base = await invoke<WindowedIndexSnapshot>('windowed_index', {
+      sessionId,
+    });
+    const r = await invoke<WindowedReopened>('windowed_reopen', {
+      path,
+      index: base.index,
+      fingerprint: base.fingerprint,
+      digest: base.digest,
+    });
+    return {
+      session_id: r.session_id,
+      total_bytes: r.total_bytes,
+      total_lines: r.total_lines,
+      fingerprint: r.fingerprint,
+    };
   }
 
   /** DEV/E2E: save the active windowed tab (fingerprint-checked). */

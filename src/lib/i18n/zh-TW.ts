@@ -289,6 +289,8 @@ export const zhTW = {
   'doc.openFailed':
     '無法開啟「{name}」。這個檔案可能已被移動或刪除，或是檔案名稱含有這個應用程式不支援的字元。',
   'doc.restoreUnreadable': '無法讀取 {names}。請重新開啟檔案。',
+  'doc.keptTabs':
+    '未開啟：有 {count} 個分頁需要完整版。這些分頁連同未儲存的編輯都原封不動保留，待讀取到完整版授權後會再次開啟。',
   'doc.revealFailed': '無法顯示「{name}」。這個檔案可能已被移動或刪除。',
   'doc.saveFailed': '無法儲存「{name}」：{error}',
   'doc.saveReadOnly':

@@ -4,6 +4,7 @@
 import type { Extension, Text } from '@codemirror/state';
 import { LanguageDescription } from '@codemirror/language';
 import { languages } from '@codemirror/language-data';
+import { isLite } from '../state/edition.svelte';
 
 /**
  * Above this content size highlighting is forced off. Compares
@@ -72,6 +73,23 @@ export const languageNames: string[] = [
   ...Object.values(TABULAR_LABELS),
 ].sort((a, b) => a.localeCompare(b));
 
+/** The names the language pickers list: all of them, or none in lite, where
+ *  there is no syntax highlighting and Plain Text is the only choice (the
+ *  pickers always add Plain Text themselves). */
+export function availableLanguageNames(lite: boolean = isLite()): string[] {
+  return lite ? [] : languageNames;
+}
+
+/** The language a tab is shown and colored with. Lite has none: a tab keeps the
+ *  language it was saved with (so the full edition finds it again) but is shown
+ *  as plain text. */
+export function effectiveLanguage(
+  name: string | null,
+  lite: boolean = isLite(),
+): string | null {
+  return lite ? null : name;
+}
+
 /** Lowercased file extension, or null for no-extension names and dotfiles. */
 export function fileExtension(path: string): string | null {
   const base = path.split(/[/\\]/).pop() ?? '';
@@ -82,7 +100,10 @@ export function fileExtension(path: string): string | null {
   return base.slice(dot + 1).toLowerCase();
 }
 
-/** Match a path to a language name via CM's registry, or null. */
+/** Match a path to a language name via CM's registry, or null. Not edition-
+ *  dependent: a tab stores its real language even in lite (where it is only
+ *  shown as plain text, see `effectiveLanguage`), so it is right when the
+ *  edition is full. */
 export function detectByFilename(path: string): string | null {
   const match = LanguageDescription.matchFilename(languages, path);
   if (match !== null) {
@@ -207,8 +228,15 @@ export function detectByContent(content: string): string | null {
   return null;
 }
 
-/** Resolve a language name to a loadable CM extension, or null. */
-export async function loadLanguage(name: string): Promise<Extension | null> {
+/** Resolve a language name to a loadable CM extension, or null. Always null in
+ *  lite, so nothing is ever highlighted whatever a tab was saved with. */
+export async function loadLanguage(
+  name: string,
+  lite: boolean = isLite(),
+): Promise<Extension | null> {
+  if (lite) {
+    return null;
+  }
   const desc = languages.find((l) => l.name === name);
   if (desc === undefined) {
     return null;

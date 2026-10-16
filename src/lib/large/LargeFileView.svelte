@@ -31,6 +31,8 @@
   import { t } from '../i18n';
   import FindPanels, { type FindResult } from './FindPanels.svelte';
   import { platform } from '../state/platform.svelte';
+  import { isLite } from '../state/edition.svelte';
+  import { editionUi } from '../util/editionUi';
   import { shortcutsState } from '../state/shortcuts.svelte';
   import { matchWindowShortcut } from '../util/windowShortcut';
 
@@ -460,7 +462,7 @@
   /** Extract the selection into an editable tab, refusing (with a hint) when the
    *  span exceeds RANGE_EDIT_MAX. */
   async function triggerRangeEdit(): Promise<void> {
-    if (sel === null) {
+    if (sel === null || !editionUi(isLite()).rangeEdit) {
       return;
     }
     const { start, end } = sel;
@@ -1141,9 +1143,11 @@
           size: formatFileSize(selEstBytes),
         })}</span
       >
-      <button class="cm-button" onclick={() => void triggerRangeEdit()}
-        >{t('large.range.edit')}</button
-      >
+      {#if editionUi(isLite()).rangeEdit}
+        <button class="cm-button" onclick={() => void triggerRangeEdit()}
+          >{t('large.range.edit')}</button
+        >
+      {/if}
       <button class="cm-button" onclick={() => void triggerRangeSaveAs()}
         >{t('large.range.saveAs')}</button
       >

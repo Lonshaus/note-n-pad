@@ -60,18 +60,21 @@ void editionState.ready();
 // alone. `get_menu_accelerators` (not `get_shortcuts`) is used deliberately:
 // it lists only the native menu items, so the frontend-only shortcuts (tab
 // switching, go to line) are never intercepted here. The list is fetched
-// again whenever the settings change, since the user can move a menu key.
+// again whenever the settings change, since the user can move a menu key, and
+// whenever the edition changes, since Lite has no workspace menu item.
 void (async (): Promise<void> => {
   await platform.init();
   if (!platform.isWindows) {
     return;
   }
   let table = await invoke<string[]>('get_menu_accelerators');
-  void listen('settings-changed', () => {
-    void invoke<string[]>('get_menu_accelerators').then((next) => {
-      table = next;
+  for (const event of ['settings-changed', 'edition-changed']) {
+    void listen(event, () => {
+      void invoke<string[]>('get_menu_accelerators').then((next) => {
+        table = next;
+      });
     });
-  });
+  }
   window.addEventListener('keydown', (event) => {
     const accelerator = matchMenuAccelerator(
       event,

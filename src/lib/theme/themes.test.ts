@@ -2,7 +2,12 @@
 // SPDX-License-Identifier: GPL-3.0-only
 
 import { describe, expect, it } from 'vitest';
-import { pickDefaultTheme, themeCssVars, type Theme } from './themes';
+import {
+  pickDefaultTheme,
+  resolveEditorTheme,
+  themeCssVars,
+  type Theme,
+} from './themes';
 
 function theme(id: string, variant: 'light' | 'dark'): Theme {
   return {
@@ -58,5 +63,42 @@ describe('themeCssVars', () => {
     expect(vars['tok-keyword']).toBe('#b48ead');
     // Chrome vars are the interface mode's job now, not the theme's.
     expect(vars.bg).toBeUndefined();
+  });
+});
+
+describe('resolveEditorTheme', () => {
+  const themes = [
+    theme('paper', 'light'),
+    theme('ink', 'dark'),
+    theme('mine', 'dark'),
+  ];
+
+  it('uses the chosen theme in full', () => {
+    expect(resolveEditorTheme(themes, 'mine', false, false)?.id).toBe('mine');
+  });
+
+  it('falls back to the first theme in full when the choice is gone', () => {
+    expect(resolveEditorTheme(themes, 'deleted', false, true)?.id).toBe(
+      'paper',
+    );
+  });
+
+  it('uses the default of the interface appearance in lite, whatever is chosen', () => {
+    expect(resolveEditorTheme(themes, 'mine', true, true)?.id).toBe('ink');
+    expect(resolveEditorTheme(themes, 'mine', true, false)?.id).toBe('paper');
+  });
+
+  it('follows the appearance when it flips', () => {
+    expect(resolveEditorTheme(themes, 'ink', true, false)?.variant).toBe(
+      'light',
+    );
+    expect(resolveEditorTheme(themes, 'paper', true, true)?.variant).toBe(
+      'dark',
+    );
+  });
+
+  it('is undefined with no theme at all', () => {
+    expect(resolveEditorTheme([], 'x', true, true)).toBeUndefined();
+    expect(resolveEditorTheme([], 'x', false, true)).toBeUndefined();
   });
 });

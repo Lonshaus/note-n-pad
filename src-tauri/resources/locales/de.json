@@ -220,6 +220,7 @@
     "status.longLine.reason": "Diese Datei hat eine sehr lange Zeile; sie bei jedem Tastendruck zu parsen verlangsamt die Eingabe.",
     "doc.openFailed": "„{name}“ konnte nicht geöffnet werden. Die Datei wurde möglicherweise verschoben oder gelöscht, oder ihr Dateiname enthält Zeichen, die diese App nicht unterstützt.",
     "doc.restoreUnreadable": "Nicht lesbar: {names}. Öffne die Datei(en) erneut, um fortzufahren.",
+    "doc.keptTabs": "Nicht geöffnet: {count} Tab(s), die die Vollversion benötigen. Sie bleiben unverändert erhalten, ungespeicherte Änderungen eingeschlossen, und öffnen sich wieder, sobald die Vollversionslizenz gelesen wird.",
     "doc.revealFailed": "„{name}“ konnte nicht angezeigt werden. Die Datei wurde möglicherweise verschoben oder gelöscht.",
     "doc.saveFailed": "„{name}“ konnte nicht gespeichert werden: {error}",
     "doc.saveReadOnly": "„{name}“ ist schreibgeschützt, daher wurde nichts gespeichert. Ändern Sie die Dateiberechtigungen, um sie zu speichern.",

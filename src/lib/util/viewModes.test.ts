@@ -10,62 +10,71 @@ import {
 
 describe('viewModesFor', () => {
   it('offers the table view for delimiter-separated files, table first', () => {
-    expect(viewModesFor('/tmp/a.csv')).toEqual(['table', 'source']);
-    expect(viewModesFor('/tmp/a.tsv')).toEqual(['table', 'source']);
+    expect(viewModesFor('/tmp/a.csv', false)).toEqual(['table', 'source']);
+    expect(viewModesFor('/tmp/a.tsv', false)).toEqual(['table', 'source']);
   });
 
   it('offers a preview for the three previewable formats, source first', () => {
-    expect(viewModesFor('/tmp/a.json')).toEqual(['source', 'json']);
-    expect(viewModesFor('/tmp/a.xml')).toEqual(['source', 'xml']);
-    expect(viewModesFor('/tmp/a.md')).toEqual(['source', 'markdown']);
-    expect(viewModesFor('/tmp/a.markdown')).toEqual(['source', 'markdown']);
+    expect(viewModesFor('/tmp/a.json', false)).toEqual(['source', 'json']);
+    expect(viewModesFor('/tmp/a.xml', false)).toEqual(['source', 'xml']);
+    expect(viewModesFor('/tmp/a.md', false)).toEqual(['source', 'markdown']);
+    expect(viewModesFor('/tmp/a.markdown', false)).toEqual([
+      'source',
+      'markdown',
+    ]);
   });
 
   it('ignores extension case', () => {
-    expect(viewModesFor('/tmp/NOTES.JSON')).toEqual(['source', 'json']);
-    expect(viewModesFor('/tmp/DATA.CsV')).toEqual(['table', 'source']);
-    expect(viewModesFor('/tmp/README.MD')).toEqual(['source', 'markdown']);
+    expect(viewModesFor('/tmp/NOTES.JSON', false)).toEqual(['source', 'json']);
+    expect(viewModesFor('/tmp/DATA.CsV', false)).toEqual(['table', 'source']);
+    expect(viewModesFor('/tmp/README.MD', false)).toEqual([
+      'source',
+      'markdown',
+    ]);
   });
 
   it('offers nothing but source for anything else', () => {
-    expect(viewModesFor('/tmp/a.txt')).toEqual(['source']);
-    expect(viewModesFor('/tmp/a.jsonl')).toEqual(['source']);
-    expect(viewModesFor('/tmp/a.mdx')).toEqual(['source']);
+    expect(viewModesFor('/tmp/a.txt', false)).toEqual(['source']);
+    expect(viewModesFor('/tmp/a.jsonl', false)).toEqual(['source']);
+    expect(viewModesFor('/tmp/a.mdx', false)).toEqual(['source']);
   });
 
   it('handles paths with no extension and no path at all', () => {
-    expect(viewModesFor('/tmp/Makefile')).toEqual(['source']);
-    expect(viewModesFor('')).toEqual(['source']);
-    expect(viewModesFor(null)).toEqual(['source']);
+    expect(viewModesFor('/tmp/Makefile', false)).toEqual(['source']);
+    expect(viewModesFor('', false)).toEqual(['source']);
+    expect(viewModesFor(null, false)).toEqual(['source']);
   });
 
   it('does not treat a dotfile name as an extension', () => {
     // '.json' here is the whole file name, not a suffix — but it is also a
     // perfectly good JSON file, so it stays previewable. What must not happen
     // is a crash or an empty list.
-    expect(viewModesFor('/tmp/.json')).toEqual(['source', 'json']);
-    expect(viewModesFor('/tmp/.gitignore')).toEqual(['source']);
+    expect(viewModesFor('/tmp/.json', false)).toEqual(['source', 'json']);
+    expect(viewModesFor('/tmp/.gitignore', false)).toEqual(['source']);
   });
 
   it('reads the extension after the last dot', () => {
-    expect(viewModesFor('/tmp/archive.tar.json')).toEqual(['source', 'json']);
-    expect(viewModesFor('/tmp/json.txt')).toEqual(['source']);
+    expect(viewModesFor('/tmp/archive.tar.json', false)).toEqual([
+      'source',
+      'json',
+    ]);
+    expect(viewModesFor('/tmp/json.txt', false)).toEqual(['source']);
   });
 });
 
 describe('defaultViewModeFor', () => {
   it('opens tabular files in the table view', () => {
-    expect(defaultViewModeFor('/tmp/a.csv')).toBe('table');
+    expect(defaultViewModeFor('/tmp/a.csv', false)).toBe('table');
   });
 
   it('opens previewable files in the editor, not the preview', () => {
-    expect(defaultViewModeFor('/tmp/a.json')).toBe('source');
-    expect(defaultViewModeFor('/tmp/a.md')).toBe('source');
+    expect(defaultViewModeFor('/tmp/a.json', false)).toBe('source');
+    expect(defaultViewModeFor('/tmp/a.md', false)).toBe('source');
   });
 
   it('falls back to source for everything else', () => {
-    expect(defaultViewModeFor('/tmp/a.txt')).toBe('source');
-    expect(defaultViewModeFor(null)).toBe('source');
+    expect(defaultViewModeFor('/tmp/a.txt', false)).toBe('source');
+    expect(defaultViewModeFor(null, false)).toBe('source');
   });
 });
 
@@ -152,5 +161,26 @@ describe('previewCharLimit', () => {
   it('has no ceiling for the views that are not previews', () => {
     expect(previewCharLimit('source')).toBe(Number.POSITIVE_INFINITY);
     expect(previewCharLimit('table')).toBe(Number.POSITIVE_INFINITY);
+  });
+});
+
+describe('view modes in lite', () => {
+  it('drop the JSON and XML tree views, whatever the extension case', () => {
+    for (const path of ['/a.json', '/a.JSON', '/a.xml', '/a.Xml']) {
+      expect(viewModesFor(path, false)).toHaveLength(2);
+      expect(viewModesFor(path, true)).toEqual(['source']);
+    }
+  });
+
+  it('keep the table and the Markdown preview', () => {
+    expect(viewModesFor('/a.csv', true)).toEqual(['table', 'source']);
+    expect(viewModesFor('/a.tsv', true)).toEqual(['table', 'source']);
+    expect(viewModesFor('/a.md', true)).toEqual(['source', 'markdown']);
+    expect(viewModesFor('/a.markdown', true)).toEqual(['source', 'markdown']);
+  });
+
+  it('open a table file in the table and the rest in the source', () => {
+    expect(defaultViewModeFor('/a.csv', true)).toBe('table');
+    expect(defaultViewModeFor('/a.json', true)).toBe('source');
   });
 });

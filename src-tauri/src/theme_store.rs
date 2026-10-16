@@ -444,9 +444,20 @@ pub fn seed_on_startup(app: &AppHandle) -> Result<(), String> {
   Ok(())
 }
 
+/// What the Lite edition shows of the theme list: only the bundled defaults.
+/// The editor needs one of them to be colored; themes the user made or imported
+/// stay on disk, untouched, for when the edition is full again.
+fn for_edition(mut loaded: Loaded<ThemeListItem>, lite: bool) -> Loaded<ThemeListItem> {
+  if lite {
+    loaded.items.retain(|item| item.is_default);
+  }
+  loaded
+}
+
 #[tauri::command]
 pub fn list_themes(app: AppHandle) -> Result<Loaded<ThemeListItem>, String> {
-  list_with_defaults(&themes_dir(&app)?, &resource_themes_dir(&app)?)
+  let loaded = list_with_defaults(&themes_dir(&app)?, &resource_themes_dir(&app)?)?;
+  Ok(for_edition(loaded, crate::edition::is_lite()))
 }
 
 /// Last-applied sequence per theme id. Guards `save_theme` (now `(async)`,
@@ -464,6 +475,7 @@ fn theme_seqs() -> &'static Mutex<HashMap<String, u64>> {
 /// order) guards against a stale drag tick landing after a newer one.
 #[tauri::command(async)]
 pub fn save_theme(app: AppHandle, theme: CustomTheme, seq: u64) -> Result<(), String> {
+  crate::edition::require_full("themes")?;
   let mut seqs = theme_seqs().lock().unwrap();
   if let Some(&last) = seqs.get(&theme.id) {
     if seq < last {
@@ -479,6 +491,7 @@ pub fn save_theme(app: AppHandle, theme: CustomTheme, seq: u64) -> Result<(), St
 
 #[tauri::command]
 pub fn delete_theme(app: AppHandle, id: String) -> Result<(), String> {
+  crate::edition::require_full("themes")?;
   delete_theme_file(&themes_dir(&app)?, &id)?;
   let _ = app.emit("themes-changed", ());
   Ok(())
@@ -486,6 +499,7 @@ pub fn delete_theme(app: AppHandle, id: String) -> Result<(), String> {
 
 #[tauri::command]
 pub fn import_theme(path: String) -> Result<CustomTheme, String> {
+  crate::edition::require_full("themes")?;
   let text = std::fs::read_to_string(&path).map_err(|e| e.to_string())?;
   let theme = parse_theme(&text)?;
   validate(&theme)?;
@@ -494,6 +508,7 @@ pub fn import_theme(path: String) -> Result<CustomTheme, String> {
 
 #[tauri::command]
 pub fn export_theme(theme: CustomTheme, path: String) -> Result<(), String> {
+  crate::edition::require_full("themes")?;
   validate(&theme)?;
   let json = serde_json::to_string_pretty(&theme).map_err(|e| e.to_string())?;
   std::fs::write(&path, json).map_err(|e| e.to_string())
@@ -501,6 +516,7 @@ pub fn export_theme(theme: CustomTheme, path: String) -> Result<(), String> {
 
 #[tauri::command]
 pub fn restore_default_theme(app: AppHandle, id: String) -> Result<CustomTheme, String> {
+  crate::edition::require_full("themes")?;
   let theme = restore_default_from(&resource_themes_dir(&app)?, &themes_dir(&app)?, &id)?;
   let _ = app.emit("themes-changed", ());
   Ok(theme)
@@ -761,6 +777,30 @@ mod tests {
     assert!(listed[1].is_default);
     assert!(!listed[0].is_default);
     assert!(!listed[2].is_default);
+  }
+
+  #[test]
+  fn lite_lists_the_bundled_defaults_only_and_full_lists_everything() {
+    let data = tempdir().unwrap();
+    let resources = tempdir().unwrap();
+    for id in ["default-a", "mine"] {
+      save_theme_to(data.path(), &theme(id)).unwrap();
+    }
+    std::fs::write(resources.path().join("default-a.json"), "{}").unwrap();
+    let ids = |lite| -> Vec<String> {
+      for_edition(
+        list_with_defaults(data.path(), resources.path()).unwrap(),
+        lite,
+      )
+      .items
+      .into_iter()
+      .map(|i| i.theme.id)
+      .collect()
+    };
+    assert_eq!(ids(true), vec!["default-a"]);
+    assert_eq!(ids(false).len(), 2);
+    // Nothing on disk changed.
+    assert!(data.path().join("mine.json").exists());
   }
 
   #[test]

@@ -221,7 +221,7 @@
              matching the Format > Syntax menu. -->
         {#each langOrder as name, index (name ?? '')}
           <option value={name ?? ''}>{name ?? 'Plain Text'}</option>
-          {#if index === 0}
+          {#if index === 0 && langOrder.length > 1}
             <hr />
           {/if}
         {/each}
