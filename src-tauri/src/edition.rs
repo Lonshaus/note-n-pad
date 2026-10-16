@@ -14,6 +14,17 @@ use tauri::{AppHandle, Emitter, Manager};
 /// The macOS Lite build: the answer is lite, constant.
 const LITE_FEATURE: bool = cfg!(feature = "lite");
 
+/// The name the app calls itself. Compile-time, like the bundle name: only the
+/// macOS Lite build is named "Note&Pad Lite"; the Windows trial is the full
+/// package and never changes its name.
+pub const fn app_name() -> &'static str {
+  if LITE_FEATURE {
+    "Note&Pad Lite"
+  } else {
+    "Note&Pad"
+  }
+}
+
 /// Lite until `init` says otherwise.
 static LITE: AtomicBool = AtomicBool::new(true);
 
@@ -335,6 +346,18 @@ mod tests {
     assert_eq!(parse_delay_ms(Some("-1")), None);
     assert_eq!(parse_delay_ms(Some("2s")), None);
     assert_eq!(parse_delay_ms(None), None);
+  }
+
+  #[cfg(feature = "lite")]
+  #[test]
+  fn the_lite_build_is_named_lite() {
+    assert_eq!(app_name(), "Note&Pad Lite");
+  }
+
+  #[cfg(not(feature = "lite"))]
+  #[test]
+  fn the_full_build_keeps_its_name() {
+    assert_eq!(app_name(), "Note&Pad");
   }
 
   #[test]
