@@ -190,7 +190,7 @@ export const zhTW = {
   // Large-file view
   'large.gutter.title': '點選行號選取範圍（Shift 擴選）',
   'large.goto.placeholder': '行號',
-  'large.goto.aria': '跳至行號',
+  'large.goto.aria': '前往行',
   'large.range.info': '第 {start}–{end} 行（{count} 行，約 {size}）',
   'large.range.edit': '編輯此範圍',
   'large.range.saveAs': '另存範圍',
@@ -206,7 +206,7 @@ export const zhTW = {
   'large.search.truncatedSuffix': '（已截斷）',
   'large.search.failed': '搜尋失敗。檔案可能已被移動，或無法讀取。',
   'large.index.failed':
-    '無法完成「{name}」的索引建立。這個檔案目前無法顯示行數，也無法跳至指定行。',
+    '無法完成「{name}」的索引建立。這個檔案目前無法顯示行數，也無法前往指定行。',
   'large.read.failed':
     '無法讀取這個檔案的一部分。檔案可能已被移動，或變得無法讀取。',
   // Status bar
@@ -312,4 +312,33 @@ export const zhTW = {
   // Settings — general, Windows only
   'settings.general.defaultApps': '預設開啟的檔案類型',
   'settings.general.defaultAppsOpen': '開啟 Windows 設定',
+  // CodeMirror UI text (search panel, go-to-line, folding, announcements)
+  'cm.find': '尋找',
+  'cm.replaceField': '取代',
+  'cm.next': '下一個',
+  'cm.previous': '上一個',
+  'cm.all': '全選',
+  'cm.matchCase': '大小寫須相符',
+  'cm.regexp': '使用規則運算式',
+  'cm.byWord': '全字拼寫須相符',
+  'cm.inSelection': '在選取範圍中尋找',
+  'cm.replace': '取代',
+  'cm.replaceAll': '全部取代',
+  'cm.close': '關閉',
+  'cm.gotoLine': '前往行',
+  'cm.go': '前往',
+  'cm.foldedCode': '已摺疊的程式碼',
+  'cm.unfold': '展開',
+  'cm.foldLine': '摺疊此行',
+  'cm.unfoldLine': '展開此行',
+  'cm.foldedLines': '已摺疊行',
+  'cm.unfoldedLines': '已展開行',
+  'cm.controlChar': '控制字元',
+  'cm.currentMatch': '目前相符項目',
+  'cm.onLine': '位於行',
+  'cm.replacedOne': '已取代第 $ 行的相符項目',
+  'cm.replacedMany': '已取代 $ 個相符項目',
+  'cm.completions': '建議',
+  'cm.selectionDeleted': '已刪除選取內容',
+  'cm.to': '至',
 } as const;
