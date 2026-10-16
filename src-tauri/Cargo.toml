@@ -10,6 +10,10 @@ rust-version = "1.77.2"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
+[features]
+# The macOS Lite build (`--features lite`): `edition::is_lite()` is constant true.
+lite = []
+
 [lib]
 name = "note_n_pad_lib"
 crate-type = ["staticlib", "cdylib", "rlib"]
@@ -84,6 +88,8 @@ windows = { version = "0.61", features = [
   "Win32_UI_Shell_Common",
   "Win32_UI_Shell_PropertiesSystem",
   "Win32_UI_WindowsAndMessaging",
+  "Foundation",
+  "Services_Store",
 ] }
 
 # Single-instance guard is only needed off macOS: macOS already routes a second
