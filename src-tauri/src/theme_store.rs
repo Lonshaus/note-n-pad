@@ -3,7 +3,7 @@
 
 use crate::fs_ops::{is_ignored_file, write_text_atomic, Loaded, SkipReason, SkippedFile};
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
 use tauri::{AppHandle, Emitter, Manager};
@@ -128,23 +128,29 @@ fn parse_theme(text: &str) -> Result<CustomTheme, String> {
 /// app: copied into the folder by hand, or synced in. Its colors reach
 /// `setProperty` untouched, so the check belongs on the way in.
 pub fn load_dir(dir: &Path) -> Result<Loaded<CustomTheme>, String> {
+  let (named, skipped) = load_named(dir)?;
+  Ok(Loaded {
+    items: named.into_iter().map(|(_, theme)| theme).collect(),
+    skipped,
+  })
+}
+/// Themes paired with the file name each came from, plus the skipped files.
+type NamedThemes = (Vec<(String, CustomTheme)>, Vec<SkippedFile>);
+/// `load_dir` with the file name each theme came from. One theme per id: the
+/// file whose stem equals the id wins, otherwise the first by file name; the
+/// other files declaring that id are reported as `DuplicateId`.
+fn load_named(dir: &Path) -> Result<NamedThemes, String> {
   let entries = match std::fs::read_dir(dir) {
     Ok(entries) => entries,
-    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-      return Ok(Loaded {
-        items: Vec::new(),
-        skipped: Vec::new(),
-      })
-    }
+    Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok((Vec::new(), Vec::new())),
     Err(e) => return Err(e.to_string()),
   };
-  let mut themes = Vec::new();
+  // read_dir order is unspecified; byte order keeps the winner stable.
+  let mut paths: Vec<PathBuf> = entries.flatten().map(|e| e.path()).collect();
+  paths.sort();
+  let mut themes: Vec<(String, CustomTheme)> = Vec::new();
   let mut skipped = Vec::new();
-  for entry in entries {
-    let Ok(entry) = entry else {
-      continue;
-    };
-    let path = entry.path();
+  for path in paths {
     // A subdirectory is not a theme that failed to load, so it is passed over
     // rather than reported.
     if path.is_dir() {
@@ -196,27 +202,71 @@ pub fn load_dir(dir: &Path) -> Result<Loaded<CustomTheme>, String> {
       });
       continue;
     }
-    themes.push(theme);
+    let Some(held) = themes.iter().position(|(_, t)| t.id == theme.id) else {
+      themes.push((name, theme));
+      continue;
+    };
+    let stem_is_id = |file: &str| file.strip_suffix(".json") == Some(theme.id.as_str());
+    let challenger_wins = stem_is_id(&name) && !stem_is_id(&themes[held].0);
+    let displaced = if challenger_wins {
+      std::mem::replace(&mut themes[held], (name, theme)).0
+    } else {
+      name
+    };
+    log::warn!("skipping duplicate theme id in {displaced}");
+    skipped.push(SkippedFile {
+      name: displaced,
+      reason: SkipReason::DuplicateId,
+    });
   }
-  Ok(Loaded {
-    items: themes,
-    skipped,
-  })
+  Ok((themes, skipped))
 }
-
-/// Validate then atomically write one theme to `<dir>/{id}.json`.
+/// The file `load_dir` keeps for theme `id`, or `None` when no file declares it.
+fn file_for_id(dir: &Path, id: &str) -> Option<PathBuf> {
+  // A valid `{id}.json` declaring `id` always wins, so the common case skips the scan.
+  let own = theme_file(dir, id);
+  let own_declares_id = std::fs::read_to_string(&own)
+    .ok()
+    .and_then(|text| parse_theme(&text).ok())
+    .is_some_and(|t| t.id == id && validate(&t).is_ok());
+  if own_declares_id {
+    return Some(own);
+  }
+  let (named, _) = load_named(dir).ok()?;
+  named
+    .into_iter()
+    .find(|(_, t)| t.id == id)
+    .map(|(name, _)| dir.join(name))
+}
+/// `{id}.json` when that name is free, else the first free `{id}-N.json`
+/// (N = 2, 3, ...). Never names an existing file.
+fn free_theme_file(dir: &Path, id: &str) -> PathBuf {
+  let own = theme_file(dir, id);
+  if !own.exists() {
+    return own;
+  }
+  (2..)
+    .map(|n| dir.join(format!("{id}-{n}.json")))
+    .find(|path| !path.exists())
+    .expect("an unbounded range always yields a free name")
+}
+/// Validate then atomically write one theme into the file that declares its
+/// id, or into a new free file when none does.
 fn save_theme_to(dir: &Path, theme: &CustomTheme) -> Result<(), String> {
   validate(theme)?;
   let json = serde_json::to_string_pretty(theme).map_err(|e| e.to_string())?;
-  write_text_atomic(&theme_file(dir, &theme.id), &json)
+  let path = file_for_id(dir, &theme.id).unwrap_or_else(|| free_theme_file(dir, &theme.id));
+  write_text_atomic(&path, &json)
 }
-
-/// Remove `<dir>/{id}.json`. A missing file is not an error.
+/// Remove the file that declares `id`. A missing file is not an error.
 fn delete_theme_file(dir: &Path, id: &str) -> Result<(), String> {
   if !valid_id(id) {
     return Err(format!("invalid theme id: {id}"));
   }
-  match std::fs::remove_file(theme_file(dir, id)) {
+  let Some(path) = file_for_id(dir, id) else {
+    return Ok(());
+  };
+  match std::fs::remove_file(path) {
     Ok(()) => Ok(()),
     Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
     Err(e) => Err(e.to_string()),
@@ -311,9 +361,8 @@ pub fn list_with_defaults(
     skipped: loaded.skipped,
   })
 }
-
-/// Overwrite `<data_dir>/{id}.json` with the bundled default seed for `id`,
-/// undoing any edits or the deletion of that one default theme.
+/// Overwrite the file declaring `id` (or write a new one) with the bundled
+/// default seed for `id`, undoing any edits or the deletion of that one default theme.
 fn restore_default_from(
   resource_dir: &Path,
   data_dir: &Path,
@@ -333,11 +382,66 @@ fn restore_default_from(
 fn resource_themes_file(resource_dir: &Path, id: &str) -> PathBuf {
   resource_dir.join(format!("{id}.json"))
 }
-
-/// Seed the app-data `themes` dir from the bundled resources on first run.
+/// Manifest of the bundled theme ids already offered to this install.
+/// Dot-prefixed: `load_dir` skips it.
+const SEEDED_THEMES_FILE: &str = ".seeded-themes.json";
+/// The themes shipped since 1.0.0. Without a manifest they count as offered
+/// (a missing one was deleted by the user), so only later additions are copied.
+const BASELINE_THEME_IDS: [&str; 10] = [
+  "bamboo", "dawn", "dusk", "ember", "forest", "ink", "paper", "plain", "sky", "voyage",
+];
+/// Copy bundled themes that were never offered to this install. A theme the
+/// user deleted is not recreated and an existing file is never modified. An id
+/// some file already declares is not copied; a taken `{id}.json` name moves
+/// the copy to the first free `{id}-N.json`.
+pub fn seed_new_defaults(resource_dir: &Path, data_dir: &Path) {
+  let Ok(entries) = std::fs::read_dir(resource_dir) else {
+    return;
+  };
+  let manifest_path = data_dir.join(SEEDED_THEMES_FILE);
+  let stored: Option<BTreeSet<String>> = std::fs::read_to_string(&manifest_path)
+    .ok()
+    .and_then(|text| serde_json::from_str(&text).ok());
+  let mut offered = stored
+    .clone()
+    .unwrap_or_else(|| BASELINE_THEME_IDS.iter().map(|id| id.to_string()).collect());
+  for entry in entries.flatten() {
+    let path = entry.path();
+    if path.extension().and_then(|e| e.to_str()) != Some("json") {
+      continue;
+    }
+    let Some(id) = path.file_stem().and_then(|n| n.to_str()) else {
+      continue;
+    };
+    if !valid_id(id) || offered.contains(id) {
+      continue;
+    }
+    if file_for_id(data_dir, id).is_none() {
+      if let Err(e) = std::fs::copy(&path, free_theme_file(data_dir, id)) {
+        log::warn!("failed to seed theme {id}: {e}");
+        continue;
+      }
+    }
+    offered.insert(id.to_string());
+  }
+  if stored.as_ref() != Some(&offered) {
+    let result = serde_json::to_string_pretty(&offered)
+      .map_err(|e| e.to_string())
+      .and_then(|json| write_text_atomic(&manifest_path, &json));
+    if let Err(e) = result {
+      log::warn!("failed to write {SEEDED_THEMES_FILE}: {e}");
+    }
+  }
+}
+/// Seed the app-data `themes` dir from the bundled resources on first run,
+/// then copy themes that later releases added to the bundle.
 /// Called once from setup, before any theme command touches the dir.
 pub fn seed_on_startup(app: &AppHandle) -> Result<(), String> {
-  seed_defaults_if_missing(&resource_themes_dir(app)?, &app_data_themes_dir(app)?)
+  let resource_dir = resource_themes_dir(app)?;
+  let data_dir = app_data_themes_dir(app)?;
+  seed_defaults_if_missing(&resource_dir, &data_dir)?;
+  seed_new_defaults(&resource_dir, &data_dir);
+  Ok(())
 }
 
 #[tauri::command]
@@ -716,5 +820,335 @@ mod tests {
     save_theme_to(&data, &edited).unwrap();
     seed_defaults_if_missing(&resources, &data).unwrap();
     assert_eq!(load_dir(&data).unwrap().items, vec![edited]);
+  }
+
+  fn ten_ids() -> [&'static str; 10] {
+    [
+      "bamboo", "dawn", "dusk", "ember", "forest", "ink", "paper", "plain", "sky", "voyage",
+    ]
+  }
+
+  fn write_seeds(dir: &Path, ids: &[&str]) {
+    std::fs::create_dir_all(dir).unwrap();
+    for id in ids {
+      std::fs::write(
+        dir.join(format!("{id}.json")),
+        serde_json::to_string_pretty(&theme(id)).unwrap(),
+      )
+      .unwrap();
+    }
+  }
+
+  fn recorded(data: &Path) -> BTreeSet<String> {
+    serde_json::from_str(&std::fs::read_to_string(data.join(SEEDED_THEMES_FILE)).unwrap()).unwrap()
+  }
+
+  fn file_ids(data: &Path) -> BTreeSet<String> {
+    load_dir(data)
+      .unwrap()
+      .items
+      .into_iter()
+      .map(|t| t.id)
+      .collect()
+  }
+
+  fn set(ids: &[&str]) -> BTreeSet<String> {
+    ids.iter().map(|id| id.to_string()).collect()
+  }
+
+  #[test]
+  fn new_defaults_fresh_install_records_all_and_copies_nothing_extra() {
+    let base = tempdir().unwrap();
+    let (res, data) = (base.path().join("res"), base.path().join("data"));
+    write_seeds(&res, &ten_ids());
+    seed_defaults_if_missing(&res, &data).unwrap();
+    seed_new_defaults(&res, &data);
+    assert_eq!(recorded(&data), set(&ten_ids()));
+    assert_eq!(file_ids(&data), set(&ten_ids()));
+  }
+
+  #[test]
+  fn new_defaults_upgrade_without_manifest_does_not_recreate_a_deleted_default() {
+    let base = tempdir().unwrap();
+    let (res, data) = (base.path().join("res"), base.path().join("data"));
+    write_seeds(&res, &ten_ids());
+    seed_defaults_if_missing(&res, &data).unwrap();
+    delete_theme_file(&data, "dusk").unwrap();
+    seed_new_defaults(&res, &data);
+    assert!(!data.join("dusk.json").exists());
+    assert_eq!(recorded(&data), set(&ten_ids()));
+  }
+
+  #[test]
+  fn new_defaults_copies_a_new_seed_once() {
+    let base = tempdir().unwrap();
+    let (res, data) = (base.path().join("res"), base.path().join("data"));
+    write_seeds(&res, &ten_ids());
+    seed_defaults_if_missing(&res, &data).unwrap();
+    seed_new_defaults(&res, &data);
+    write_seeds(&res, &["fresh"]);
+    seed_new_defaults(&res, &data);
+    assert!(data.join("fresh.json").exists());
+    assert!(recorded(&data).contains("fresh"));
+    delete_theme_file(&data, "fresh").unwrap();
+    seed_new_defaults(&res, &data);
+    assert!(!data.join("fresh.json").exists());
+  }
+
+  #[test]
+  fn new_defaults_never_overwrites_a_same_id_user_theme() {
+    let base = tempdir().unwrap();
+    let (res, data) = (base.path().join("res"), base.path().join("data"));
+    write_seeds(&res, &ten_ids());
+    seed_defaults_if_missing(&res, &data).unwrap();
+    seed_new_defaults(&res, &data);
+    write_seeds(&res, &["fresh"]);
+    std::fs::write(data.join("fresh.json"), "user's own").unwrap();
+    seed_new_defaults(&res, &data);
+    assert_eq!(
+      std::fs::read_to_string(data.join("fresh.json")).unwrap(),
+      "user's own"
+    );
+    assert!(recorded(&data).contains("fresh"));
+  }
+
+  #[cfg(unix)]
+  #[test]
+  fn new_defaults_failed_copy_is_not_recorded_and_retried() {
+    use std::os::unix::fs::PermissionsExt;
+    let base = tempdir().unwrap();
+    let (res, data) = (base.path().join("res"), base.path().join("data"));
+    write_seeds(&res, &ten_ids());
+    seed_defaults_if_missing(&res, &data).unwrap();
+    seed_new_defaults(&res, &data);
+    write_seeds(&res, &["fresh"]);
+    std::fs::set_permissions(&data, std::fs::Permissions::from_mode(0o555)).unwrap();
+    if std::fs::write(data.join("probe"), "x").is_ok() {
+      // Permission bits are not enforced (running as root): nothing to exercise.
+      std::fs::set_permissions(&data, std::fs::Permissions::from_mode(0o755)).unwrap();
+      return;
+    }
+    seed_new_defaults(&res, &data);
+    assert!(!recorded(&data).contains("fresh"));
+    std::fs::set_permissions(&data, std::fs::Permissions::from_mode(0o755)).unwrap();
+    seed_new_defaults(&res, &data);
+    assert!(data.join("fresh.json").exists());
+    assert!(recorded(&data).contains("fresh"));
+  }
+
+  #[test]
+  fn new_defaults_unparsable_manifest_falls_back_to_the_baseline() {
+    let base = tempdir().unwrap();
+    let (res, data) = (base.path().join("res"), base.path().join("data"));
+    write_seeds(&res, &ten_ids());
+    seed_defaults_if_missing(&res, &data).unwrap();
+    delete_theme_file(&data, "sky").unwrap();
+    std::fs::write(data.join(SEEDED_THEMES_FILE), "garbage").unwrap();
+    seed_new_defaults(&res, &data);
+    assert!(!data.join("sky.json").exists());
+    assert_eq!(recorded(&data), set(&ten_ids()));
+  }
+
+  #[test]
+  fn new_defaults_skipped_versions_get_later_themes_but_not_deleted_defaults() {
+    let base = tempdir().unwrap();
+    let (res, data) = (base.path().join("res"), base.path().join("data"));
+    let mut ids = ten_ids().to_vec();
+    ids.push("fresh");
+    write_seeds(&res, &ids);
+    write_seeds(&data, &ten_ids());
+    delete_theme_file(&data, "ember").unwrap();
+    seed_new_defaults(&res, &data);
+    assert!(data.join("fresh.json").exists());
+    assert!(!data.join("ember.json").exists());
+    assert_eq!(recorded(&data).len(), 11);
+  }
+
+  #[test]
+  fn new_defaults_missing_resource_dir_writes_no_manifest() {
+    let base = tempdir().unwrap();
+    let (res, data) = (base.path().join("res"), base.path().join("data"));
+    write_seeds(&data, &ten_ids());
+    seed_new_defaults(&res, &data);
+    assert!(!data.join(SEEDED_THEMES_FILE).exists());
+    write_seeds(&res, &ten_ids());
+    delete_theme_file(&data, "plain").unwrap();
+    seed_new_defaults(&res, &data);
+    assert!(!data.join("plain.json").exists());
+  }
+
+  fn write_theme_as(dir: &Path, file: &str, id: &str) {
+    std::fs::create_dir_all(dir).unwrap();
+    std::fs::write(
+      dir.join(file),
+      serde_json::to_string_pretty(&theme(id)).unwrap(),
+    )
+    .unwrap();
+  }
+
+  fn skipped_duplicates(dir: &Path) -> Vec<String> {
+    let mut names: Vec<String> = load_dir(dir)
+      .unwrap()
+      .skipped
+      .into_iter()
+      .filter(|s| s.reason == SkipReason::DuplicateId)
+      .map(|s| s.name)
+      .collect();
+    names.sort();
+    names
+  }
+
+  #[test]
+  fn new_defaults_skip_an_id_another_file_declares() {
+    let base = tempdir().unwrap();
+    let (res, data) = (base.path().join("res"), base.path().join("data"));
+    write_seeds(&res, &ten_ids());
+    seed_defaults_if_missing(&res, &data).unwrap();
+    seed_new_defaults(&res, &data);
+    write_theme_as(&data, "mine.json", "newtheme");
+    write_seeds(&res, &["newtheme"]);
+    seed_new_defaults(&res, &data);
+    assert!(!data.join("newtheme.json").exists());
+    assert!(!data.join("newtheme-2.json").exists());
+    assert!(recorded(&data).contains("newtheme"));
+    let ids: Vec<String> = load_dir(&data)
+      .unwrap()
+      .items
+      .into_iter()
+      .map(|t| t.id)
+      .filter(|id| id == "newtheme")
+      .collect();
+    assert_eq!(ids, vec!["newtheme".to_string()]);
+  }
+
+  #[test]
+  fn load_dir_keeps_one_theme_per_id() {
+    let dir = tempdir().unwrap();
+    write_theme_as(dir.path(), "b.json", "x");
+    write_theme_as(dir.path(), "a.json", "x");
+    let loaded = load_dir(dir.path()).unwrap();
+    assert_eq!(loaded.items.len(), 1);
+    assert_eq!(
+      file_for_id(dir.path(), "x"),
+      Some(dir.path().join("a.json"))
+    );
+    assert_eq!(skipped_duplicates(dir.path()), vec!["b.json".to_string()]);
+    write_theme_as(dir.path(), "x.json", "x");
+    let loaded = load_dir(dir.path()).unwrap();
+    assert_eq!(loaded.items.len(), 1);
+    assert_eq!(
+      file_for_id(dir.path(), "x"),
+      Some(dir.path().join("x.json"))
+    );
+    assert_eq!(
+      skipped_duplicates(dir.path()),
+      vec!["a.json".to_string(), "b.json".to_string()]
+    );
+  }
+
+  #[test]
+  fn file_for_id_ignores_an_invalid_file_named_after_the_id() {
+    let dir = tempdir().unwrap();
+    let mut bad = theme("x");
+    bad.editor_bg = "red".into();
+    std::fs::write(
+      dir.path().join("x.json"),
+      serde_json::to_string(&bad).unwrap(),
+    )
+    .unwrap();
+    write_theme_as(dir.path(), "a.json", "x");
+    assert_eq!(
+      file_for_id(dir.path(), "x"),
+      Some(dir.path().join("a.json"))
+    );
+    assert_eq!(file_for_id(dir.path(), "nope"), None);
+  }
+
+  #[test]
+  fn new_defaults_use_an_alternate_name_when_the_file_name_holds_another_id() {
+    let base = tempdir().unwrap();
+    let (res, data) = (base.path().join("res"), base.path().join("data"));
+    write_seeds(&res, &ten_ids());
+    seed_defaults_if_missing(&res, &data).unwrap();
+    seed_new_defaults(&res, &data);
+    write_theme_as(&data, "newtheme.json", "other");
+    write_seeds(&res, &["newtheme"]);
+    seed_new_defaults(&res, &data);
+    assert!(data.join("newtheme-2.json").exists());
+    assert!(recorded(&data).contains("newtheme"));
+    assert_eq!(
+      file_for_id(&data, "other"),
+      Some(data.join("newtheme.json"))
+    );
+    assert_eq!(
+      file_for_id(&data, "newtheme"),
+      Some(data.join("newtheme-2.json"))
+    );
+    let before = file_ids(&data);
+    seed_new_defaults(&res, &data);
+    assert!(!data.join("newtheme-3.json").exists());
+    assert_eq!(file_ids(&data), before);
+  }
+
+  #[test]
+  fn save_delete_and_restore_follow_the_file_that_declares_the_id() {
+    let base = tempdir().unwrap();
+    let (res, data) = (base.path().join("res"), base.path().join("data"));
+    write_theme_as(&data, "newtheme.json", "other");
+    write_theme_as(&data, "newtheme-2.json", "newtheme");
+    write_seeds(&res, &["newtheme"]);
+    let other_bytes = std::fs::read(data.join("newtheme.json")).unwrap();
+    let mut edited = theme("newtheme");
+    edited.name = "edited".into();
+    save_theme_to(&data, &edited).unwrap();
+    assert_eq!(
+      std::fs::read(data.join("newtheme.json")).unwrap(),
+      other_bytes
+    );
+    assert!(!data.join("newtheme-3.json").exists());
+    assert_eq!(
+      parse_theme(&std::fs::read_to_string(data.join("newtheme-2.json")).unwrap())
+        .unwrap()
+        .name,
+      "edited"
+    );
+    let restored = restore_default_from(&res, &data, "newtheme").unwrap();
+    assert_eq!(restored, theme("newtheme"));
+    assert_eq!(
+      parse_theme(&std::fs::read_to_string(data.join("newtheme-2.json")).unwrap())
+        .unwrap()
+        .name,
+      theme("newtheme").name
+    );
+    assert_eq!(
+      std::fs::read(data.join("newtheme.json")).unwrap(),
+      other_bytes
+    );
+    delete_theme_file(&data, "newtheme").unwrap();
+    assert!(!data.join("newtheme-2.json").exists());
+    assert_eq!(
+      std::fs::read(data.join("newtheme.json")).unwrap(),
+      other_bytes
+    );
+  }
+
+  #[test]
+  fn save_and_delete_use_a_hand_placed_file_whose_name_differs_from_the_id() {
+    let dir = tempdir().unwrap();
+    write_theme_as(dir.path(), "mine.json", "newtheme");
+    let mut edited = theme("newtheme");
+    edited.name = "edited".into();
+    save_theme_to(dir.path(), &edited).unwrap();
+    assert!(!dir.path().join("newtheme.json").exists());
+    assert_eq!(load_dir(dir.path()).unwrap().items, vec![edited]);
+    delete_theme_file(dir.path(), "newtheme").unwrap();
+    assert!(!dir.path().join("mine.json").exists());
+  }
+
+  #[test]
+  fn save_of_a_new_id_creates_its_own_file() {
+    let dir = tempdir().unwrap();
+    save_theme_to(dir.path(), &theme("fresh")).unwrap();
+    assert!(dir.path().join("fresh.json").exists());
   }
 }
