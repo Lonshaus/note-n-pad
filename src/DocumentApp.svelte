@@ -182,6 +182,7 @@
       active.windowed === undefined
       ? {
           workerColoring:
+            !__LITE__ &&
             !isLite() &&
             settingsState.workerHighlight &&
             active.language !== null &&
@@ -1863,7 +1864,7 @@
   </div>
 
   <main class="body">
-    {#if documentWindow.ready && active !== null && active.windowed !== undefined}
+    {#if !__LITE__ && documentWindow.ready && active !== null && active.windowed !== undefined}
       {#key active.windowed.sessionId}
         <WindowedEditor
           bind:this={windowedRef}
@@ -1918,7 +1919,7 @@
             documentWindow.runWindowedOp(id, run, changed)}
         />
       {/key}
-    {:else if documentWindow.ready && active !== null && active.large !== undefined}
+    {:else if !__LITE__ && documentWindow.ready && active !== null && active.large !== undefined}
       {#key `${active.id}:${documentWindow.largeReloadSeq}`}
         <LargeFileView
           bind:this={largeRef}
@@ -1999,7 +2000,7 @@
       </div>
     {/if}
     {#if activeOrdinary && active !== null}
-      {#if showJson}
+      {#if !__LITE__ && showJson}
         <div class="table-overlay">
           <JsonView
             bind:this={jsonRef}
@@ -2008,7 +2009,7 @@
           />
         </div>
       {/if}
-      {#if showXml}
+      {#if !__LITE__ && showXml}
         <div class="table-overlay">
           <XmlView
             bind:this={xmlRef}

@@ -8,9 +8,22 @@ import { svelte } from '@sveltejs/vite-plugin-svelte';
 export default defineConfig({
   plugins: [svelte()],
   // The Lite build command sets NOTENPAD_LITE=1 (alongside `--features lite` on
-  // the Rust side); gated UI is then constant-folded and tree-shaken.
+  // the Rust side). `__LITE__` becomes a literal, so a branch guarded by it
+  // directly is dropped together with the imports only it used. A call to
+  // `isLite()` is not folded: the bundler does not inline across modules.
   define: {
     __LITE__: JSON.stringify(process.env['NOTENPAD_LITE'] === '1'),
+  },
+  build: {
+    // A @lezer package only defines parsers, so an import nothing uses can go.
+    // Without this the Lite build keeps the XML grammar of the tree view it drops.
+    rolldownOptions: {
+      treeshake: {
+        moduleSideEffects: [
+          { test: /[\\/]node_modules[\\/]@lezer[\\/]/, sideEffects: false },
+        ],
+      },
+    },
   },
   optimizeDeps: {
     // Parsers reach the dev server only through the dynamic import() in

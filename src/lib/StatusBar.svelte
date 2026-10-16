@@ -7,6 +7,7 @@
   import { formatFileSize } from './util/format';
   import { syntaxOrder } from './util/syntaxOrder';
   import { t } from './i18n';
+  import { isLite } from './state/edition.svelte';
 
   /** One entry of the view-mode switcher. `disabledReason` is the tooltip
    *  explaining why a mode cannot be picked right now — null when it can. */
@@ -210,22 +211,25 @@
       {#if hadBom}
         <span class="item bom">+BOM</span>
       {/if}
-      <select
-        class="item lang"
-        value={language ?? ''}
-        title={t('status.language')}
-        onchange={onLangChange}
-      >
-        <!-- Language names stay untranslated; Plain Text follows the same
-             rule. The current language is pinned first, then a separator,
-             matching the Format > Syntax menu. -->
-        {#each langOrder as name, index (name ?? '')}
-          <option value={name ?? ''}>{name ?? 'Plain Text'}</option>
-          {#if index === 0 && langOrder.length > 1}
-            <hr />
-          {/if}
-        {/each}
-      </select>
+      <!-- Lite has no syntax to pick (also the Windows trial), so no dropdown. -->
+      {#if !isLite()}
+        <select
+          class="item lang"
+          value={language ?? ''}
+          title={t('status.language')}
+          onchange={onLangChange}
+        >
+          <!-- Language names stay untranslated; Plain Text follows the same
+               rule. The current language is pinned first, then a separator,
+               matching the Format > Syntax menu. -->
+          {#each langOrder as name, index (name ?? '')}
+            <option value={name ?? ''}>{name ?? 'Plain Text'}</option>
+            {#if index === 0 && langOrder.length > 1}
+              <hr />
+            {/if}
+          {/each}
+        </select>
+      {/if}
       {#if longLine !== null}
         <span class="item longline" title={t('status.longLine.reason')}>
           {longLine.workerColoring

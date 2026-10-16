@@ -53,6 +53,9 @@ class LocaleRegistry {
    *  reserved built-in ids, and emits `locales-changed`), then reload so the
    *  new locale is immediately selectable. */
   async importFile(path: string): Promise<LocaleData> {
+    if (__LITE__) {
+      throw new Error('Locale import is not available');
+    }
     const locale = await invoke<LocaleData>('import_locale', { path });
     await this.load();
     return locale;
@@ -62,10 +65,16 @@ class LocaleRegistry {
    *  "update from JSON", which merges someone else's corrected translations
    *  into the locale open in the editor. */
   async readFile(path: string): Promise<LocaleData> {
+    if (__LITE__) {
+      throw new Error('Locale import is not available');
+    }
     return await invoke<LocaleData>('read_locale_file', { path });
   }
 
   async exportFile(locale: LocaleData, path: string): Promise<void> {
+    if (__LITE__) {
+      return;
+    }
     await invoke('export_locale', { locale, path });
   }
 
