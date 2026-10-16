@@ -7,6 +7,11 @@ import { svelte } from '@sveltejs/vite-plugin-svelte';
 // https://vite.dev/config/
 export default defineConfig({
   plugins: [svelte()],
+  // The Lite build command sets NOTENPAD_LITE=1 (alongside `--features lite` on
+  // the Rust side); gated UI is then constant-folded and tree-shaken.
+  define: {
+    __LITE__: JSON.stringify(process.env['NOTENPAD_LITE'] === '1'),
+  },
   optimizeDeps: {
     // Parsers reach the dev server only through the dynamic import() in
     // src/lib/highlight/languages.ts, so vite discovers them the first time a

@@ -1,0 +1,306 @@
+// Copyright © 2026 Lonshaus
+// SPDX-License-Identifier: GPL-3.0-only
+// Which edition is running: full, or Lite (the macOS Lite build, and the
+// packaged MSIX build while its license is a trial). Everything that cuts a
+// feature asks `is_lite()`; the frontend mirrors the answer in `editionState`,
+// kept in sync by `edition_info` and the `edition-changed` event.
+//
+// The flag starts as lite (fail-safe) and `init` settles it in `setup` before
+// any window or edition-dependent menu is built, so no consumer ever sees the
+// initial value. Gating itself lives at the feature entry points, not here.
+use std::sync::atomic::{AtomicBool, Ordering};
+use tauri::{AppHandle, Emitter};
+
+/// The macOS Lite build: the answer is lite, constant.
+const LITE_FEATURE: bool = cfg!(feature = "lite");
+
+/// Lite until `init` says otherwise.
+static LITE: AtomicBool = AtomicBool::new(true);
+
+/// What the package license read returned. `Full` is
+/// `IsActive && !IsTrial`; anything the read could not confirm is not `Full`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+pub enum LicenseRead {
+  Full,
+  Trial,
+  Failed,
+  TimedOut,
+}
+
+/// The one decision: is this process lite? `packaged` is "runs from an MSIX
+/// package"; an unpackaged process (any unpackaged Windows build, macOS full,
+/// Linux) is never lite on its own.
+pub fn resolve(lite_feature: bool, packaged: bool, license: LicenseRead) -> bool {
+  if lite_feature {
+    return true;
+  }
+  if !packaged {
+    return false;
+  }
+  license != LicenseRead::Full
+}
+
+/// Whether this process is lite right now.
+pub fn is_lite() -> bool {
+  LITE.load(Ordering::Relaxed)
+}
+
+/// The value of `NOTENPAD_EDITION`: `lite` or `full`, anything else is no override.
+#[cfg_attr(not(debug_assertions), allow(dead_code))]
+fn parse_override(value: Option<&str>) -> Option<bool> {
+  match value {
+    Some("lite") => Some(true),
+    Some("full") => Some(false),
+    _ => None,
+  }
+}
+
+/// The value of `NOTENPAD_EDITION_DELAY_MS`: a whole number of milliseconds.
+#[cfg_attr(not(debug_assertions), allow(dead_code))]
+fn parse_delay_ms(value: Option<&str>) -> Option<u64> {
+  value.and_then(|v| v.trim().parse().ok())
+}
+
+/// Debug builds: sleep for `NOTENPAD_EDITION_DELAY_MS`, standing in for a slow
+/// license read so the startup ordering can be tested on any platform.
+#[cfg(debug_assertions)]
+fn debug_delay() {
+  let value = std::env::var("NOTENPAD_EDITION_DELAY_MS").ok();
+  if let Some(ms) = parse_delay_ms(value.as_deref()) {
+    std::thread::sleep(std::time::Duration::from_millis(ms));
+  }
+}
+
+/// Settle the flag. Called once from `setup`, before the first window or
+/// edition-dependent menu exists; it may block for the license read (3 s at
+/// most).
+pub fn init(app: &AppHandle) {
+  #[cfg(debug_assertions)]
+  {
+    debug_delay();
+    let value = std::env::var("NOTENPAD_EDITION").ok();
+    if let (false, Some(lite)) = (LITE_FEATURE, parse_override(value.as_deref())) {
+      LITE.store(lite, Ordering::Relaxed);
+      return;
+    }
+  }
+  let (packaged, license) = if LITE_FEATURE {
+    (false, LicenseRead::Failed)
+  } else {
+    read_license(app)
+  };
+  LITE.store(resolve(LITE_FEATURE, packaged, license), Ordering::Relaxed);
+}
+
+/// Store a new value and tell everyone: the flag, every window (`edition-changed`
+/// with the new `lite` as payload), and the native menus (app menu, tray, Jump
+/// List). Returns whether the value changed; an unchanged value does nothing.
+/// The license-changed handler and the debug command both come through here.
+#[cfg_attr(
+  all(not(debug_assertions), not(target_os = "windows")),
+  allow(dead_code)
+)]
+pub(crate) fn set_lite(app: &AppHandle, lite: bool) -> bool {
+  if LITE.swap(lite, Ordering::Relaxed) == lite {
+    return false;
+  }
+  let _ = app.emit("edition-changed", lite);
+  let app_for_main = app.clone();
+  if let Err(e) = app.run_on_main_thread(move || {
+    let locale =
+      crate::i18n::current_locale(&crate::settings::app_settings(&app_for_main).language);
+    crate::rebuild_menus(&app_for_main, locale);
+    log::info!(
+      "edition-changed: {}; menus rebuilt",
+      if lite { "lite" } else { "full" }
+    );
+  }) {
+    log::warn!("edition-changed: could not reach the main thread: {e}");
+  }
+  true
+}
+
+#[tauri::command]
+pub fn edition_info() -> bool {
+  is_lite()
+}
+
+/// Debug builds only: flip the edition at runtime through the same path a
+/// license change takes, so the unlock can be tested before publishing.
+#[cfg(debug_assertions)]
+#[tauri::command]
+pub fn debug_set_edition(app: AppHandle, lite: bool) -> Result<(), String> {
+  if LITE_FEATURE && !lite {
+    return Err("the Lite build is always lite".to_string());
+  }
+  set_lite(&app, lite);
+  Ok(())
+}
+
+#[cfg(not(target_os = "windows"))]
+fn read_license(_app: &AppHandle) -> (bool, LicenseRead) {
+  (false, LicenseRead::Failed)
+}
+
+/// How long `setup` waits for the first license read before calling it
+/// unreadable (and so lite).
+#[cfg(target_os = "windows")]
+const READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
+
+/// Packaged processes read the package license on a worker thread, which keeps
+/// running to watch for changes. Unpackaged ones have no license to read.
+#[cfg(target_os = "windows")]
+fn read_license(app: &AppHandle) -> (bool, LicenseRead) {
+  if !crate::jumplist::has_package_identity() {
+    return (false, LicenseRead::Failed);
+  }
+  let (tx, rx) = std::sync::mpsc::channel();
+  let worker_app = app.clone();
+  std::thread::spawn(move || store::watch(worker_app, tx));
+  let license = match rx.recv_timeout(READ_TIMEOUT) {
+    Ok(license) => license,
+    Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+      // The read can still land after the wait; keep listening so it is applied.
+      let late_app = app.clone();
+      std::thread::spawn(move || {
+        if let Ok(late) = rx.recv() {
+          set_lite(&late_app, resolve(LITE_FEATURE, true, late));
+        }
+      });
+      LicenseRead::TimedOut
+    }
+    Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => LicenseRead::Failed,
+  };
+  (true, license)
+}
+
+#[cfg(target_os = "windows")]
+mod store {
+  use super::{resolve, set_lite, LicenseRead, LITE_FEATURE};
+  use std::sync::mpsc::{channel, Sender};
+  use tauri::AppHandle;
+  use windows::core::IInspectable;
+  use windows::Foundation::TypedEventHandler;
+  use windows::Services::Store::StoreContext;
+
+  /// One read of the app license. Not active, or any API error, is not full.
+  fn read(context: &StoreContext) -> LicenseRead {
+    let license = match context.GetAppLicenseAsync().and_then(|op| op.get()) {
+      Ok(license) => license,
+      Err(e) => {
+        log::warn!("edition: could not read the package license: {e}");
+        return LicenseRead::Failed;
+      }
+    };
+    match (license.IsActive(), license.IsTrial()) {
+      (Ok(true), Ok(false)) => LicenseRead::Full,
+      (Ok(true), Ok(true)) => LicenseRead::Trial,
+      _ => LicenseRead::Failed,
+    }
+  }
+
+  /// The worker thread: subscribe to license changes, read once and hand the
+  /// result to `setup` through `first`, then re-read on every change for the
+  /// life of the process (the StoreContext must stay alive for the
+  /// subscription). A first read that outlived `setup`'s wait goes through the
+  /// change path instead, so a slow Store still ends up right.
+  pub(super) fn watch(app: AppHandle, first: Sender<LicenseRead>) {
+    let context = match StoreContext::GetDefault() {
+      Ok(context) => context,
+      Err(e) => {
+        log::warn!("edition: no Store context: {e}");
+        let _ = first.send(LicenseRead::Failed);
+        return;
+      }
+    };
+    let (changed_tx, changed_rx) = channel::<()>();
+    let handler = TypedEventHandler::<StoreContext, IInspectable>::new(move |_, _| {
+      let _ = changed_tx.send(());
+      Ok(())
+    });
+    if let Err(e) = context.OfflineLicensesChanged(&handler) {
+      log::warn!("edition: could not subscribe to license changes: {e}");
+    }
+    if let Err(late) = first.send(read(&context)) {
+      set_lite(&app, resolve(LITE_FEATURE, true, late.0));
+    }
+    while changed_rx.recv().is_ok() {
+      set_lite(&app, resolve(LITE_FEATURE, true, read(&context)));
+    }
+  }
+}
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+
+  #[test]
+  fn lite_feature_is_always_lite() {
+    for license in [
+      LicenseRead::Full,
+      LicenseRead::Trial,
+      LicenseRead::Failed,
+      LicenseRead::TimedOut,
+    ] {
+      assert!(resolve(true, false, license));
+      assert!(resolve(true, true, license));
+    }
+  }
+
+  #[test]
+  fn packaged_unreadable_license_is_lite() {
+    assert!(resolve(false, true, LicenseRead::Failed));
+  }
+
+  #[test]
+  fn packaged_timed_out_read_is_lite() {
+    assert!(resolve(false, true, LicenseRead::TimedOut));
+  }
+
+  #[test]
+  fn packaged_full_license_is_full() {
+    assert!(!resolve(false, true, LicenseRead::Full));
+  }
+
+  #[test]
+  fn packaged_trial_is_lite() {
+    assert!(resolve(false, true, LicenseRead::Trial));
+  }
+
+  #[test]
+  fn unpackaged_is_full_whatever_the_license() {
+    for license in [
+      LicenseRead::Full,
+      LicenseRead::Trial,
+      LicenseRead::Failed,
+      LicenseRead::TimedOut,
+    ] {
+      assert!(!resolve(false, false, license));
+    }
+  }
+
+  #[test]
+  fn override_parses_lite_and_full_only() {
+    assert_eq!(parse_override(Some("lite")), Some(true));
+    assert_eq!(parse_override(Some("full")), Some(false));
+    assert_eq!(parse_override(Some("Lite")), None);
+    assert_eq!(parse_override(Some("")), None);
+    assert_eq!(parse_override(None), None);
+  }
+
+  #[test]
+  fn delay_parses_whole_milliseconds_only() {
+    assert_eq!(parse_delay_ms(Some("2000")), Some(2000));
+    assert_eq!(parse_delay_ms(Some(" 15 ")), Some(15));
+    assert_eq!(parse_delay_ms(Some("-1")), None);
+    assert_eq!(parse_delay_ms(Some("2s")), None);
+    assert_eq!(parse_delay_ms(None), None);
+  }
+
+  #[test]
+  fn the_flag_starts_lite() {
+    // Nothing in the test binary calls `init` or `set_lite`.
+    assert!(is_lite());
+  }
+}

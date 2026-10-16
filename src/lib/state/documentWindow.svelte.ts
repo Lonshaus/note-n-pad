@@ -38,6 +38,7 @@ import {
 } from '../util/openRouting';
 import type { CheckpointIndex, NoteSnapshot } from './stickyNote.svelte';
 import { settingsState } from './settings.svelte';
+import { editionState } from './edition.svelte';
 import { isOrdinaryTab, pickHeldTab, touchMru } from './heldTab';
 import type { LargeIndexRef } from '../util/largeIndex';
 import {
@@ -1072,6 +1073,9 @@ class DocumentWindowState {
     // A fresh window takes its project from the URL; a restored window adopts it
     // from the group's stored notes (set below), ignoring the URL value.
     this.project = project;
+    // The edition decides how a snapshot may be restored, so it is settled
+    // before the first tab is loaded.
+    await editionState.ready();
     const all = await invoke<NoteSnapshot[]>('list_notes');
     const entries = all
       .filter(
