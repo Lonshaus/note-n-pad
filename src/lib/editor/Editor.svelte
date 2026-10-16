@@ -19,6 +19,8 @@
   import { oneDark } from '@codemirror/theme-one-dark';
   import { readCspNonce } from '../util/cspNonce';
   import { keymapExtension } from './keymap';
+  import { compositionCancel } from './composition';
+  import { isUndoKey } from './imeShortcuts';
   import { cmPhraseExtension, cmPhraseSignature } from './cmPhrases';
   import { shortcutsState } from '../state/shortcuts.svelte';
   import { platform } from '../state/platform.svelte';
@@ -103,6 +105,12 @@
           minimal
             ? [minimalSetup, keymapCompartment.of(currentKeymap())]
             : basicSetup,
+          // Undo while composing cancels the composition, as TextEdit does.
+          platform.isMacOS
+            ? compositionCancel(isUndoKey, (v) =>
+                onchange(v.state.doc.toString()),
+              )
+            : [],
           phraseCompartment.of(cmPhraseExtension()),
           languageCompartment.of([]),
           themeCompartment.of([]),
@@ -153,7 +161,6 @@
       });
     }
   });
-
   // Swap the CodeMirror phrases when the UI language changes.
   $effect(() => {
     const ext = cmPhraseExtension();

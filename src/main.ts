@@ -69,7 +69,12 @@ void (async (): Promise<void> => {
     });
   });
   window.addEventListener('keydown', (event) => {
-    const accelerator = matchMenuAccelerator(event, platform.os, table);
+    const accelerator = matchMenuAccelerator(
+      event,
+      platform.os,
+      table,
+      shortcutsState.accel('menu.save'),
+    );
     if (accelerator === null) {
       return;
     }

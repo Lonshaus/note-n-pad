@@ -28,6 +28,7 @@ type Mods = Partial<{
   metaKey: boolean;
   defaultPrevented: boolean;
   code: string;
+  isComposing: boolean;
 }>;
 
 function key(
@@ -250,5 +251,48 @@ describe('matchMenuAccelerator off Windows', () => {
     expect(
       matchMenuAccelerator(key('s', { ctrlKey: true }), '', TABLE),
     ).toBeNull();
+  });
+});
+
+describe('matchMenuAccelerator while an IME composes', () => {
+  // WebView2 names a composing keydown `Process` and keeps the physical code.
+  const composingSave = key('Process', {
+    ctrlKey: true,
+    code: 'KeyS',
+    isComposing: true,
+  });
+
+  it('leaves the Save key alone', () => {
+    expect(
+      matchMenuAccelerator(composingSave, 'windows', TABLE, 'Ctrl+S'),
+    ).toBeNull();
+  });
+
+  it('still matches the other menu keys', () => {
+    expect(
+      matchMenuAccelerator(
+        key('Process', { ctrlKey: true, code: 'KeyO', isComposing: true }),
+        'windows',
+        TABLE,
+        'Ctrl+S',
+      ),
+    ).toBe('Ctrl+O');
+  });
+
+  it('still saves once the composition is over', () => {
+    expect(
+      matchMenuAccelerator(
+        key('s', { ctrlKey: true }),
+        'windows',
+        TABLE,
+        'Ctrl+S',
+      ),
+    ).toBe('Ctrl+S');
+  });
+
+  it('follows a rebound Save key', () => {
+    expect(
+      matchMenuAccelerator(composingSave, 'windows', TABLE, 'Ctrl+Alt+S'),
+    ).toBe('Ctrl+S');
   });
 });

@@ -47,6 +47,8 @@
   import { focusEditorIfIdle } from '../util/editorFocus';
   import { readCspNonce } from '../util/cspNonce';
   import { keymapExtension } from './keymap';
+  import { compositionCancel } from './composition';
+  import { isUndoKey } from './imeShortcuts';
   import { cmPhraseExtension, cmPhraseSignature } from './cmPhrases';
   import { shortcutsState } from '../state/shortcuts.svelte';
   import { platform } from '../state/platform.svelte';
@@ -166,6 +168,8 @@
         EditorView.cspNonce.of(readCspNonce()),
         coreSetup,
         keymapCompartment.of(currentKeymap()),
+        // Undo while composing cancels the composition, as TextEdit does.
+        platform.isMacOS ? compositionCancel(isUndoKey, afterCancel) : [],
         phraseCompartment.of(cmPhraseExtension()),
         gutterCompartment.of(gutterExtension(showLineNumbers)),
         wrapCompartment.of(wordWrap ? EditorView.lineWrapping : []),
@@ -184,6 +188,13 @@
         }),
       ],
     });
+  }
+  // Bring everything that mirrors the document back in line after a cancelled
+  // composition replaced the state (setState runs no update listeners).
+  function afterCancel(v: EditorView): void {
+    onchange(v.state.doc);
+    rescanLongLine(v.state.doc);
+    reportSelection();
   }
 
   // Report the caret's Ln/Col, coalesced to one update per frame so a burst of
@@ -428,7 +439,6 @@
       view?.dispatch({ effects });
     });
   });
-
   // Swap the CodeMirror phrases when the UI language changes; saved tab states
   // are updated too, or switching to one would bring the old language back.
   $effect(() => {

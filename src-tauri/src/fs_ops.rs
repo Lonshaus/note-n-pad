@@ -2,9 +2,11 @@
 // SPDX-License-Identifier: GPL-3.0-only
 
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 use std::time::Duration;
 
 /// Read a file as UTF-8 text.
@@ -221,6 +223,33 @@ fn write_bytes_atomic_with(
 /// fsyncing before it returns. It is called once, after the staging location is
 /// settled, so a staging that is refused costs nothing.
 pub fn replace_with<F>(
+  dest: &Path,
+  label: &str,
+  exclusive: bool,
+  new_mode: Option<u32>,
+  fill: F,
+) -> Result<(), String>
+where
+  F: FnOnce(&mut fs::File) -> Result<(), String>,
+{
+  // Two writes to one destination share a staged name; run them one at a time.
+  let lock = destination_lock(dest);
+  let _guard = lock.lock().unwrap_or_else(PoisonError::into_inner);
+  replace_locked(dest, label, exclusive, new_mode, fill)
+}
+/// The lock serializing writers of `dest`. Entries nobody holds or waits on are
+/// dropped on the next call, so the map does not grow with every path saved.
+fn destination_lock(dest: &Path) -> Arc<Mutex<()>> {
+  static LOCKS: OnceLock<Mutex<HashMap<PathBuf, Arc<Mutex<()>>>>> = OnceLock::new();
+  let mut locks = LOCKS
+    .get_or_init(Default::default)
+    .lock()
+    .unwrap_or_else(PoisonError::into_inner);
+  locks.retain(|_, lock| Arc::strong_count(lock) > 1);
+  Arc::clone(locks.entry(dest.to_path_buf()).or_default())
+}
+
+fn replace_locked<F>(
   dest: &Path,
   label: &str,
   exclusive: bool,
@@ -1491,6 +1520,38 @@ mod tests {
   use super::*;
   use std::cell::Cell;
   use tempfile::tempdir;
+
+  #[test]
+  fn concurrent_writes_to_one_destination_both_succeed() {
+    let dir = tempdir().unwrap();
+    let dest = dir.path().join("note.txt");
+    fs::write(&dest, "old").unwrap();
+    let handles: Vec<_> = ["first", "second"]
+      .into_iter()
+      .map(|text| {
+        let dest = dest.clone();
+        std::thread::spawn(move || {
+          // Hold the staged file open long enough for the other writer to run.
+          replace_with(&dest, "", false, None, |file| {
+            file.write_all(text.as_bytes()).map_err(|e| e.to_string())?;
+            std::thread::sleep(Duration::from_millis(150));
+            Ok(())
+          })
+        })
+      })
+      .collect();
+    for handle in handles {
+      assert_eq!(handle.join().unwrap(), Ok(()));
+    }
+    let content = fs::read_to_string(&dest).unwrap();
+    assert!(content == "first" || content == "second");
+    let leftovers: Vec<_> = fs::read_dir(dir.path())
+      .unwrap()
+      .filter_map(Result::ok)
+      .filter(|e| e.file_name().to_string_lossy().ends_with(".tmp"))
+      .collect();
+    assert!(leftovers.is_empty());
+  }
 
   // Portable tests for the retry policy itself: the CI machine is macOS, so
   // these exercise `retry` directly with a fake operation rather than a real
