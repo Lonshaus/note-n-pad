@@ -889,6 +889,21 @@ pub fn open_document_group(
   create_document_window(&app, &plan, tab)
 }
 
+/// The edition just turned full: open a window for every group that lite kept
+/// tabs of and whose window is not open, so those tabs return as at a startup
+/// restore. Windows still open reload their own kept tabs.
+pub fn reopen_kept_groups(app: &AppHandle) {
+  let notes = app.state::<NoteStore>().list();
+  let plans = crate::note_store::groups_to_reopen(&notes, |group| {
+    app.get_webview_window(&format!("doc-{group}")).is_some()
+  });
+  for plan in plans {
+    if let Err(e) = create_document_window(app, &plan, None) {
+      log::warn!("failed to reopen document window {}: {e}", plan.group);
+    }
+  }
+}
+
 #[tauri::command]
 pub fn set_window_opacity(window: tauri::WebviewWindow, value: f64) -> Result<(), String> {
   apply_opacity(&window, value)
@@ -937,6 +952,7 @@ pub(crate) fn reveal(win: &tauri::WebviewWindow) {
 /// Open (or focus, if already open) the singleton workspace window at its
 /// remembered bounds.
 pub fn show_workspace(app: &AppHandle) -> Result<(), String> {
+  crate::edition::require_full("the workspace")?;
   if let Some(win) = app.get_webview_window("workspace") {
     reveal(&win);
     return Ok(());

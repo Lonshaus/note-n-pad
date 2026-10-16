@@ -6,6 +6,7 @@ import { invoke } from '@tauri-apps/api/core';
 import { settingsState } from '../state/settings.svelte';
 import { themeRegistry } from '../theme/themeRegistry.svelte';
 import { localeRegistry } from '../i18n/localeRegistry.svelte';
+import { editionState } from '../state/edition.svelte';
 
 /** Reveal the current window once its theme is resolved and applied to the
  *  document root, so a dark-theme window never flashes its default white
@@ -22,6 +23,9 @@ export async function revealWhenThemed(): Promise<void> {
   // settings derivations (resolvedLocale, theme) read both registries.
   await themeRegistry.load();
   await localeRegistry.load();
+  // The first settings load corrects an unresolvable stored theme, which lite
+  // must not do, so the edition is settled first.
+  await editionState.ready();
   await settingsState.init();
   await tick();
   repaintNativeSelects();

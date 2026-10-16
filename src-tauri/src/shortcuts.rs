@@ -1419,6 +1419,8 @@ pub fn rule_violation(row: &Row, accel: &Accel, platform: Platform) -> Option<Ru
   }
   None
 }
+/// The registry id of the workspace key.
+const WORKSPACE_ID: &str = "menu.workspace";
 /// The keys in effect, resolved from stored settings.
 #[derive(Debug)]
 pub struct Resolved {
@@ -1432,14 +1434,30 @@ pub struct Resolved {
   pub repaired: Vec<String>,
   /// Rows whose default key is held by a stored override and so stay unset.
   pub unset_defaults: Vec<String>,
+  /// Whether the workspace exists. Without it (lite) its row is hidden, so its
+  /// key is no conflict for another row.
+  workspace: bool,
 }
 /// Resolve stored settings into effective keys in one deterministic pass:
 /// reserved and fixed keys first, then the global key, then overrides in
 /// registry order, then defaults for everything left. The first claimant wins.
+#[cfg(test)]
 pub fn resolve(
   new_note_shortcut: &str,
   overrides: &BTreeMap<String, String>,
   platform: Platform,
+) -> Resolved {
+  resolve_in(new_note_shortcut, overrides, platform, true)
+}
+/// `resolve`, for an edition with (`workspace`) or without the workspace. In
+/// lite its row is hidden, so its key is claimed by nobody and cannot collide
+/// with, block or invalidate another row; its stored override is carried along
+/// exactly as stored, for when the edition is full again.
+pub fn resolve_in(
+  new_note_shortcut: &str,
+  overrides: &BTreeMap<String, String>,
+  platform: Platform,
+  workspace: bool,
 ) -> Resolved {
   let mut occupied: HashMap<Accel, &'static str> = HashMap::new();
   let mut accels: Vec<Option<Accel>> = vec![None; ROWS.len()];
@@ -1491,6 +1509,11 @@ pub fn resolve(
     let Some(stored) = overrides.get(row.id) else {
       continue;
     };
+    if !workspace && row.id == WORKSPACE_ID {
+      kept.insert(row.id.to_string(), stored.clone());
+      settled[i] = true;
+      continue;
+    }
     if stored.is_empty() {
       kept.insert(row.id.to_string(), String::new());
       settled[i] = true;
@@ -1521,6 +1544,9 @@ pub fn resolve(
     if !row.customizable || row.id == GLOBAL_STICKY_ID || settled[i] {
       continue;
     }
+    if !workspace && row.id == WORKSPACE_ID {
+      continue;
+    }
     if let Some(accel) = default_accel(row, platform) {
       if occupied.contains_key(&accel) {
         unset_defaults.push(row.id.to_string());
@@ -1537,6 +1563,7 @@ pub fn resolve(
     platform,
     repaired,
     unset_defaults,
+    workspace,
   }
 }
 
@@ -1558,11 +1585,18 @@ impl Resolved {
     })
   }
   /// Canonical accelerators of every native menu item that can be triggered.
+  #[cfg(test)]
   pub fn menu_accelerators(&self) -> Vec<String> {
+    self.menu_accelerators_for(true)
+  }
+  /// The same, without the workspace's when `workspace` is false: with no menu
+  /// item it must not swallow its key.
+  pub fn menu_accelerators_for(&self, workspace: bool) -> Vec<String> {
     ROWS
       .iter()
       .enumerate()
       .filter(|(_, row)| row.menu_id.is_some())
+      .filter(|(_, row)| workspace || row.menu_id != Some("workspace"))
       .filter_map(|(i, _)| self.accels[i].as_ref())
       .map(|a| a.canonical(self.platform))
       .collect()
@@ -1570,7 +1604,10 @@ impl Resolved {
   /// The id of whatever already holds `accel`, ignoring row `except`.
   pub fn conflict(&self, accel: &Accel, except: &str) -> Option<&'static str> {
     for (i, row) in ROWS.iter().enumerate() {
-      if row.id != except && self.accels[i].as_ref() == Some(accel) {
+      if row.id != except
+        && (self.workspace || row.id != WORKSPACE_ID)
+        && self.accels[i].as_ref() == Some(accel)
+      {
         return Some(row.id);
       }
     }
@@ -1623,8 +1660,13 @@ fn customizable_row(id: &str) -> Result<&'static Row, SetError> {
   }
 }
 
-fn finish(next: NextState, platform: Platform) -> Result<NextState, SetError> {
-  let check = resolve(&next.new_note_shortcut, &next.overrides, platform);
+fn finish(next: NextState, platform: Platform, workspace: bool) -> Result<NextState, SetError> {
+  let check = resolve_in(
+    &next.new_note_shortcut,
+    &next.overrides,
+    platform,
+    workspace,
+  );
   if check.repaired.is_empty() {
     Ok(next)
   } else {
@@ -1679,7 +1721,7 @@ pub fn plan_set(
   } else {
     next.overrides.insert(id.to_string(), text);
   }
-  finish(next, platform)
+  finish(next, platform, resolved.workspace)
 }
 /// Plan returning row `id` to its default key.
 pub fn plan_reset(
@@ -1698,7 +1740,7 @@ pub fn plan_reset(
   } else {
     next.overrides.remove(id);
   }
-  finish(next, platform)
+  finish(next, platform, resolved.workspace)
 }
 /// Canonical default key of row `id` for `platform`; empty when it has none.
 pub fn default_canonical(id: &str, platform: Platform) -> String {
@@ -1722,10 +1764,11 @@ pub fn plan_reset_all(platform: Platform) -> NextState {
 }
 /// The shortcut settings as `settings.rs` stores them, resolved for this OS.
 pub fn resolve_current(settings: &crate::settings::AppSettings) -> Resolved {
-  resolve(
+  resolve_in(
     &settings.new_note_shortcut,
     &settings.shortcut_overrides,
     Platform::current(),
+    crate::edition::workspace_enabled(crate::edition::is_lite()),
   )
 }
 
@@ -1850,11 +1893,23 @@ pub fn shortcut_rows(
   out
 }
 
+/// The rows the Settings list shows. The Lite edition has no workspace, so no
+/// row for its key either; the stored override stays.
+pub fn rows_for_edition(rows: Vec<ShortcutRow>, lite: bool) -> Vec<ShortcutRow> {
+  rows
+    .into_iter()
+    .filter(|row| crate::edition::workspace_enabled(lite) || row.id != "menu.workspace")
+    .collect()
+}
+
 #[tauri::command]
 pub fn get_shortcuts(app: AppHandle) -> Vec<ShortcutRow> {
   let settings = crate::settings::app_settings(&app);
   let locale = i18n::current_locale(&settings.language);
-  shortcut_rows(&resolve_current(&settings), locale, Platform::current())
+  rows_for_edition(
+    shortcut_rows(&resolve_current(&settings), locale, Platform::current()),
+    crate::edition::is_lite(),
+  )
 }
 /// The stable code the frontend maps to "another app may be using it".
 fn global_register_error(detail: impl std::fmt::Display) -> String {
@@ -2116,6 +2171,115 @@ mod tests {
       &none(),
       platform,
     )
+  }
+
+  #[test]
+  fn lite_has_no_workspace_shortcut_row_and_full_does() {
+    let rows = |lite| {
+      rows_for_edition(
+        shortcut_rows(&defaults(OTHER), i18n::Locale::En, OTHER),
+        lite,
+      )
+    };
+    assert!(!rows(true).iter().any(|row| row.id == "menu.workspace"));
+    assert!(rows(false).iter().any(|row| row.id == "menu.workspace"));
+    // Nothing else goes with it.
+    assert_eq!(rows(true).len() + 1, rows(false).len());
+  }
+
+  fn with_workspace_override(workspace: bool) -> Resolved {
+    resolve_in(
+      &default_canonical(GLOBAL_STICKY_ID, OTHER),
+      &map(&[("menu.workspace", "Ctrl+Alt+K")]),
+      OTHER,
+      workspace,
+    )
+  }
+
+  #[test]
+  fn lite_ignores_the_hidden_workspace_row_when_looking_for_a_conflict() {
+    let key = normalize("Ctrl+Alt+K", OTHER).unwrap();
+    assert_eq!(
+      with_workspace_override(true).conflict(&key, "menu.find"),
+      Some("menu.workspace")
+    );
+    let lite = with_workspace_override(false);
+    assert_eq!(lite.conflict(&key, "menu.find"), None);
+    // Another row's key is still a conflict.
+    let other = normalize("Ctrl+N", OTHER).unwrap();
+    assert_eq!(lite.conflict(&other, "menu.find"), Some("menu.new"));
+  }
+
+  #[test]
+  fn lite_lets_another_row_take_the_hidden_workspace_key_and_keeps_its_override() {
+    let lite = with_workspace_override(false);
+    for id in ["menu.find-replace", "menu.line-numbers", "menu.word-wrap"] {
+      let next = plan_set(&lite, id, Some("Ctrl+Alt+K"), OTHER)
+        .unwrap_or_else(|e| panic!("{id}: {}", e.code()));
+      assert_eq!(next.overrides[id], "Ctrl+Alt+K");
+      // The workspace override rides along exactly as stored.
+      assert_eq!(next.overrides["menu.workspace"], "Ctrl+Alt+K");
+    }
+    // The workspace default key is free too.
+    let default = default_canonical("menu.workspace", OTHER);
+    assert!(plan_set(&lite, "menu.line-numbers", Some(&default), OTHER).is_ok());
+  }
+
+  #[test]
+  fn a_reset_in_lite_keeps_the_workspace_override_too() {
+    let lite = with_workspace_override(false);
+    let next = plan_reset(&lite, "menu.find-replace", OTHER).unwrap();
+    assert_eq!(next.overrides["menu.workspace"], "Ctrl+Alt+K");
+  }
+
+  #[test]
+  fn full_still_reports_the_workspace_key_as_taken() {
+    let full = with_workspace_override(true);
+    for id in ["menu.find-replace", "menu.line-numbers", "menu.word-wrap"] {
+      assert!(
+        matches!(
+          plan_set(&full, id, Some("Ctrl+Alt+K"), OTHER),
+          Err(SetError::Conflict(other)) if other == "menu.workspace"
+        ),
+        "{id}"
+      );
+    }
+  }
+
+  #[test]
+  fn lite_resolution_neither_claims_nor_repairs_the_workspace_row() {
+    // A stored override that would collide, and one that is not even a key.
+    for stored in ["Ctrl+N", "nonsense"] {
+      let lite = resolve_in(
+        &default_canonical(GLOBAL_STICKY_ID, OTHER),
+        &map(&[("menu.workspace", stored)]),
+        OTHER,
+        false,
+      );
+      assert!(lite.repaired.is_empty(), "{stored}");
+      assert_eq!(lite.overrides["menu.workspace"], stored);
+      assert!(lite.accel("menu.workspace").is_none());
+    }
+    // Nor does its default key, when nothing is stored for it.
+    let bare = resolve_in(
+      &default_canonical(GLOBAL_STICKY_ID, OTHER),
+      &none(),
+      OTHER,
+      false,
+    );
+    assert!(bare.accel("menu.workspace").is_none());
+  }
+
+  #[test]
+  fn lite_does_not_claim_the_workspace_key_for_the_menu() {
+    let keys = defaults(OTHER);
+    let workspace = keys.accel("menu.workspace").unwrap().canonical(OTHER);
+    assert!(keys.menu_accelerators_for(true).contains(&workspace));
+    assert!(!keys.menu_accelerators_for(false).contains(&workspace));
+    assert_eq!(
+      keys.menu_accelerators_for(false).len() + 1,
+      keys.menu_accelerators_for(true).len()
+    );
   }
 
   fn canon(text: &str, platform: Platform) -> String {

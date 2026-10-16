@@ -7,7 +7,7 @@
 import { describe, expect, it, vi, beforeEach } from 'vitest';
 import { invoke } from '@tauri-apps/api/core';
 import { listen } from '@tauri-apps/api/event';
-import { EditionState } from './edition.svelte';
+import { EditionState, editionState, isLite } from './edition.svelte';
 
 vi.mock('@tauri-apps/api/core', () => ({ invoke: vi.fn() }));
 vi.mock('@tauri-apps/api/event', () => ({ listen: vi.fn() }));
@@ -83,5 +83,33 @@ describe('EditionState', () => {
     await state.ready();
     expect(state.lite).toBe(true);
     quiet.mockRestore();
+  });
+
+  it('calls every subscriber with the new value, until it unsubscribes', async () => {
+    mockInvoke.mockResolvedValue(true);
+    const state = new EditionState();
+    await state.ready();
+    const seen: boolean[] = [];
+    const off = state.onChanged((lite) => seen.push(lite));
+    emit({ payload: false });
+    emit({ payload: true });
+    off();
+    emit({ payload: false });
+    expect(seen).toEqual([false, true]);
+    expect(state.lite).toBe(false);
+  });
+});
+
+describe('isLite', () => {
+  it('follows the runtime value outside a Lite build', () => {
+    const before = editionState.lite;
+    try {
+      editionState.lite = true;
+      expect(isLite()).toBe(true);
+      editionState.lite = false;
+      expect(isLite()).toBe(false);
+    } finally {
+      editionState.lite = before;
+    }
   });
 });
