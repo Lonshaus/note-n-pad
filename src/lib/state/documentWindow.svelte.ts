@@ -37,6 +37,8 @@ import {
 } from '../util/openRouting';
 import type { CheckpointIndex, NoteSnapshot } from './stickyNote.svelte';
 import { settingsState } from './settings.svelte';
+import { isOrdinaryTab, pickHeldTab, touchMru } from './heldTab';
+import type { LargeIndexRef } from '../util/largeIndex';
 import {
   snapshotContentPolicy,
   debounceContentPolicy,
@@ -398,8 +400,80 @@ class DocumentWindowState {
   }
 
   set activeIndex(index: number) {
+    this.noteOrdinary(this.activeTab);
     this.#activeIndexState = index;
+    this.noteOrdinary(this.activeTab);
     this.ensureWindowedRestore(this.activeTab);
+  }
+  /** Ids of ordinary tabs, most recently active first: the editor keeps the
+   *  latest one mounted while a windowed or large-file tab is shown. */
+  ordinaryMru = $state<string[]>([]);
+  private noteOrdinary(tab: DocTab | null): void {
+    if (tab !== null && isOrdinaryTab(tab)) {
+      this.ordinaryMru = touchMru(this.ordinaryMru, tab.id);
+    }
+  }
+  /** The ordinary tab the editor holds (see `pickHeldTab`). */
+  get heldTab(): DocTab | null {
+    return pickHeldTab(this.tabs, this.activeIndex, this.ordinaryMru);
+  }
+  /** Where each windowed tab was last looking, by tab id: the viewport's top
+   *  line and the caret (global, 1-based line and column). In memory only and
+   *  not reactive: it is read when an editor remounts, never rendered. */
+  private viewPos = new Map<
+    string,
+    { top?: number; caretLine?: number; caretCol?: number }
+  >();
+  /** The line index each large-file viewer tab keeps alive across tab
+   *  switches, by tab id. Dropped when the tab closes, the window closes, the
+   *  file is rewritten or the tab unlocks. */
+  private largeIndexes = new Map<string, LargeIndexRef>();
+  viewTopLine(id: string): number | undefined {
+    return this.viewPos.get(id)?.top;
+  }
+  setViewTopLine(id: string, line: number): void {
+    this.viewPos.set(id, { ...this.viewPos.get(id), top: line });
+  }
+  viewCaret(id: string): { line: number; col: number } | undefined {
+    const pos = this.viewPos.get(id);
+    return pos?.caretLine === undefined || pos.caretCol === undefined
+      ? undefined
+      : { line: pos.caretLine, col: pos.caretCol };
+  }
+  setViewCaret(id: string, line: number, col: number): void {
+    this.viewPos.set(id, {
+      ...this.viewPos.get(id),
+      caretLine: line,
+      caretCol: col,
+    });
+  }
+  largeIndex(id: string): LargeIndexRef | undefined {
+    return this.largeIndexes.get(id);
+  }
+  /** Record (or, with null, forget) a viewer tab's kept line index. An index
+   *  reported for a tab that is gone or no longer a viewer is released. */
+  setLargeIndex(id: string, ref: LargeIndexRef | null): void {
+    if (ref === null) {
+      this.largeIndexes.delete(id);
+      return;
+    }
+    const tab = this.tabs.find((t) => t.id === id);
+    if (tab?.large === undefined) {
+      void invoke('drop_line_index', { id: ref.id });
+      return;
+    }
+    this.largeIndexes.set(id, ref);
+  }
+  private dropLargeIndex(id: string): void {
+    const ref = this.largeIndexes.get(id);
+    if (ref !== undefined) {
+      this.largeIndexes.delete(id);
+      void invoke('drop_line_index', { id: ref.id });
+    }
+  }
+  private releaseTabView(id: string): void {
+    this.viewPos.delete(id);
+    this.dropLargeIndex(id);
   }
   /** Cursor position of the active tab, mirrored into the status bar. */
   line = $state(1);
@@ -409,6 +483,8 @@ class DocumentWindowState {
   /** Bumped to force the editor to reload the active tab's buffer from state,
    *  e.g. after re-decoding under a new encoding (content changed externally). */
   reloadSeq = $state(0);
+  /** The id of the tab the last `reloadSeq` bump was meant for. */
+  reloadTargetId = '';
   /** Bumped after a splice rewrites a source file whose large-file viewer tab is
    *  in this window, so the keyed view remounts and rebuilds its line index. */
   largeReloadSeq = $state(0);
@@ -1147,6 +1223,7 @@ class DocumentWindowState {
     }
     delete tab.large;
     delete tab.windowedRestore;
+    this.releaseTabView(tab.id);
     tab.windowed = {
       sessionId: reopened.session_id,
       totalBytes: reopened.total_bytes,
@@ -1413,6 +1490,7 @@ class DocumentWindowState {
     tab.content = textFromString(note.content);
     tab.lineEnding = note.line_ending;
     await invoke('delete_note', { id: note.id });
+    this.reloadTargetId = tab.id;
     this.reloadSeq += 1;
     await this.upsertTab(tab);
   }
@@ -1492,6 +1570,7 @@ class DocumentWindowState {
       return reason;
     }
     delete tab.large;
+    this.releaseTabView(tab.id);
     const seedLine = Math.max(0, Math.round(topLine));
     tab.windowed = {
       sessionId: open.session_id,
@@ -1519,6 +1598,20 @@ class DocumentWindowState {
     // Zero-copy: store the editor's own rope reference, not a string snapshot.
     tab.content = content;
     this.persistActive();
+  }
+  /** Store the editor's document for the tab with `id`, whichever tab is
+   *  active: a hidden editor must never write into the active tab. */
+  updateContentById(id: string, content: Text): void {
+    const tab = this.tabs.find((t) => t.id === id);
+    if (tab === undefined) {
+      return;
+    }
+    tab.content = content;
+    if (tab === this.activeTab) {
+      this.persistActive();
+    } else {
+      void this.upsertTab(tab);
+    }
   }
 
   setActiveLanguage(name: string | null): void {
@@ -1793,7 +1886,14 @@ class DocumentWindowState {
    *  by remounting its keyed view. Called on the local window and by the
    *  cross-window `range-spliced` listener after a source is rewritten. */
   refreshLargeTabs(path: string): void {
-    if (this.tabs.some((t) => t.large !== undefined && t.path === path)) {
+    const stale = this.tabs.filter(
+      (t) => t.large !== undefined && t.path === path,
+    );
+    if (stale.length > 0) {
+      // The rewritten file's kept index describes bytes that are gone.
+      for (const tab of stale) {
+        this.dropLargeIndex(tab.id);
+      }
       this.largeReloadSeq += 1;
     }
   }
@@ -2272,6 +2372,7 @@ class DocumentWindowState {
     tab.encoding = decoded.encoding;
     tab.lossy = decoded.lossy;
     // The editor doc for this tab is already mounted, so push the new buffer in.
+    this.reloadTargetId = tab.id;
     this.reloadSeq += 1;
     this.persistActive();
   }
@@ -2354,6 +2455,7 @@ class DocumentWindowState {
     tab.content = tab.savedContent;
     tab.lineEnding = tab.savedLineEnding;
     if (index === this.activeIndex) {
+      this.reloadTargetId = tab.id;
       this.reloadSeq += 1;
     }
     void this.upsertTab(tab);
@@ -2376,6 +2478,7 @@ class DocumentWindowState {
       this.windowedConflict = null;
     }
     await invoke('delete_note', { id: tab.id });
+    this.releaseTabView(tab.id);
     this.tabs.splice(index, 1);
     // Always write `activeIndex`, even when the computed value equals the
     // current one: closing the active tab can leave the numeric index
@@ -2413,6 +2516,9 @@ class DocumentWindowState {
    *  `CloseRequested` landed (see `should_forget_tabs` in `lib.rs`). */
   async dropClosedTabs(label: string): Promise<void> {
     this.persistActive.cancel();
+    for (const id of [...this.largeIndexes.keys()]) {
+      this.dropLargeIndex(id);
+    }
     const clean = this.tabs.filter((t) => !this.isDirty(t));
     for (const tab of clean) {
       // Release the Rust windowed session too; the record is going away.
@@ -2441,6 +2547,7 @@ class DocumentWindowState {
    *  leaving the table view so the CM document reflects table-side edits made
    *  while its (hidden) view was out of sync. */
   forceEditorReload(): void {
+    this.reloadTargetId = this.activeTab?.id ?? '';
     this.reloadSeq += 1;
   }
 }

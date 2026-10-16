@@ -572,6 +572,54 @@ describe('ensureWindowedRestore kicks off the reopen for the active restored tab
   });
 });
 
+describe('a slow-path windowed restore lets go of the kept viewer index', () => {
+  it('drops the kept line index when the reopen completes', async () => {
+    documentWindow.tabs.length = 0;
+    let finishReopen: (v: object) => void = () => {};
+    mockInvoke.mockReset();
+    mockInvoke.mockImplementation(((cmd: string) => {
+      switch (cmd) {
+        case 'list_notes':
+          return Promise.resolve([
+            baseNote({
+              id: 'pending-slow',
+              large: 150 * 1024 * 1024,
+              windowed_index: { checkpoints: [[0, 0]], total_newlines: 10 },
+              windowed_fp_size: 150 * 1024 * 1024,
+              windowed_fp_mtime: 1_700_000_000_000,
+              windowed_digest: '999',
+              windowed_top_line: 3,
+            }),
+          ]);
+        case 'windowed_reopen':
+          return new Promise((resolve) => {
+            finishReopen = resolve as (v: object) => void;
+          });
+        default:
+          return Promise.resolve(null);
+      }
+    }) as typeof invoke);
+    await documentWindow.init('g1', null, null);
+    const tab = documentWindow.tabs[0]!;
+    // The grace timer fired: the viewer is up and keeps an index.
+    tab.large = { size: 150 * 1024 * 1024 };
+    documentWindow.setLargeIndex(tab.id, { id: 'kept', size: 1, mtimeMs: 2 });
+    expect(documentWindow.largeIndex(tab.id)).toBeDefined();
+    finishReopen({
+      session_id: 7,
+      total_bytes: 10,
+      total_lines: 5000,
+      fingerprint: null,
+      rescanned: true,
+    });
+    await vi.waitFor(() => {
+      expect(tab.windowed).toBeDefined();
+    });
+    expect(documentWindow.largeIndex(tab.id)).toBeUndefined();
+    expect(mockInvoke).toHaveBeenCalledWith('drop_line_index', { id: 'kept' });
+  });
+});
+
 describe('loadTab size gate is a strict ">"', () => {
   it('does not degrade a file exactly at LARGE_FILE_THRESHOLD to the read-only view', async () => {
     documentWindow.tabs.length = 0;
@@ -1793,5 +1841,120 @@ describe('large and windowed tabs: line ending and encoding', () => {
     select(tab);
     documentWindow.setLineEnding('CRLF');
     expect(tab.lineEnding).toBe('CRLF');
+  });
+});
+
+describe('the ordinary editor holds a tab while a large or windowed tab is active', () => {
+  function setup(): void {
+    documentWindow.tabs.length = 0;
+    documentWindow.ordinaryMru = [];
+    mockInvoke.mockReset();
+    mockInvoke.mockResolvedValue(undefined);
+    documentWindow.tabs.push(
+      baseTab({ id: 'a', tabIndex: 0, path: '/tmp/a.txt' }),
+      baseTab({ id: 'L', tabIndex: 1, path: '/tmp/l.log', large: { size: 1 } }),
+      baseTab({ id: 'b', tabIndex: 2, path: '/tmp/b.txt' }),
+    );
+    documentWindow.activeIndex = 0;
+  }
+
+  it('holds the last active ordinary tab behind a large tab', () => {
+    setup();
+    documentWindow.activeIndex = 2;
+    documentWindow.activeIndex = 1;
+    expect(documentWindow.heldTab?.id).toBe('b');
+    documentWindow.activeIndex = 0;
+    documentWindow.activeIndex = 1;
+    expect(documentWindow.heldTab?.id).toBe('a');
+  });
+
+  it('re-points the held tab when it closes, and ends with none', async () => {
+    setup();
+    documentWindow.activeIndex = 2;
+    documentWindow.activeIndex = 0;
+    await documentWindow.deleteTab(0);
+    // tab L is now active; b is the surviving ordinary tab
+    expect(documentWindow.activeTab?.id).toBe('L');
+    expect(documentWindow.heldTab?.id).toBe('b');
+    // closing the last ordinary tab leaves nothing to hold
+    await documentWindow.deleteTab(1);
+    expect(documentWindow.heldTab).toBeNull();
+  });
+
+  it('writes an editor document to the tab it names, not the active one', () => {
+    setup();
+    documentWindow.activeIndex = 1;
+    documentWindow.updateContentById('a', Text.of(['held text']));
+    expect(documentWindow.tabs[0]?.content.toString()).toBe('held text');
+    expect(documentWindow.tabs[1]?.content.toString()).toBe('');
+  });
+
+  it('records which tab a reload was meant for', () => {
+    setup();
+    documentWindow.activeIndex = 1;
+    documentWindow.forceEditorReload();
+    expect(documentWindow.reloadTargetId).toBe('L');
+  });
+});
+
+describe('a large-file viewer tab keeps its line index', () => {
+  function setup(): void {
+    documentWindow.tabs.length = 0;
+    mockInvoke.mockReset();
+    mockInvoke.mockResolvedValue(undefined);
+    documentWindow.tabs.push(
+      baseTab({ id: 'L', tabIndex: 0, path: '/tmp/l.log', large: { size: 1 } }),
+      baseTab({ id: 'a', tabIndex: 1, path: '/tmp/a.txt' }),
+    );
+    documentWindow.activeIndex = 0;
+  }
+  const ref = { id: 'idx', size: 1, mtimeMs: 2 };
+
+  it('stores the index and releases it when the tab closes', async () => {
+    setup();
+    documentWindow.setLargeIndex('L', ref);
+    expect(documentWindow.largeIndex('L')).toEqual(ref);
+    documentWindow.setViewTopLine('L', 709);
+    await documentWindow.deleteTab(0);
+    expect(mockInvoke).toHaveBeenCalledWith('drop_line_index', { id: 'idx' });
+    expect(documentWindow.largeIndex('L')).toBeUndefined();
+    expect(documentWindow.viewTopLine('L')).toBeUndefined();
+  });
+
+  it('releases an index reported for a tab that is gone or not a viewer', () => {
+    setup();
+    documentWindow.setLargeIndex('gone', ref);
+    documentWindow.setLargeIndex('a', { ...ref, id: 'idx2' });
+    expect(mockInvoke).toHaveBeenCalledWith('drop_line_index', { id: 'idx' });
+    expect(mockInvoke).toHaveBeenCalledWith('drop_line_index', { id: 'idx2' });
+    expect(documentWindow.largeIndex('gone')).toBeUndefined();
+    expect(documentWindow.largeIndex('a')).toBeUndefined();
+  });
+
+  it('drops the index when the file is rewritten but keeps the position', () => {
+    setup();
+    documentWindow.setLargeIndex('L', ref);
+    documentWindow.setViewTopLine('L', 5);
+    documentWindow.refreshLargeTabs('/tmp/l.log');
+    expect(mockInvoke).toHaveBeenCalledWith('drop_line_index', { id: 'idx' });
+    expect(documentWindow.largeIndex('L')).toBeUndefined();
+    expect(documentWindow.viewTopLine('L')).toBe(5);
+  });
+
+  it('drops every kept index when the window closes', async () => {
+    setup();
+    documentWindow.setLargeIndex('L', ref);
+    await documentWindow.dropClosedTabs('main');
+    expect(mockInvoke).toHaveBeenCalledWith('drop_line_index', { id: 'idx' });
+  });
+});
+
+describe('where a windowed tab was looking is remembered per tab', () => {
+  it('keeps the top line and the caret apart', () => {
+    documentWindow.setViewTopLine('w', 165);
+    documentWindow.setViewCaret('w', 170, 5);
+    expect(documentWindow.viewTopLine('w')).toBe(165);
+    expect(documentWindow.viewCaret('w')).toEqual({ line: 170, col: 5 });
+    expect(documentWindow.viewCaret('other')).toBeUndefined();
   });
 });

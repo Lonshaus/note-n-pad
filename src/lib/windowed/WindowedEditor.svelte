@@ -94,6 +94,9 @@
     // 0-based line the first window should cover, so an in-place unlock continues
     // from the line the user was viewing in the read-only view.
     initialTopLine?: number;
+    // Global 1-based line and column to put the caret at when that line is in
+    // the first window; otherwise the caret stays on the top line.
+    initialCaret?: { line: number; col: number } | undefined;
     // Separator typed line breaks are written with, once detected for the tab.
     // Undefined until then: the first window's text decides (see onMount).
     insertLineEnding?: '\r\n' | '\n' | undefined;
@@ -125,12 +128,16 @@
     }) => void;
     // An apply/read failed: the editor has locked to avoid state divergence.
     onerror: (message: string) => void;
+    // The global 0-based line at the top of the viewport, once per frame while
+    // scrolling, so a remount can open at the same place.
+    ontopline?: (line: number) => void;
   }
 
   let {
     sessionId,
     initialTotalLines,
     initialTopLine = 0,
+    initialCaret,
     insertLineEnding,
     dark,
     fontSize,
@@ -142,6 +149,7 @@
     onapplied,
     onstatus,
     onerror,
+    ontopline,
   }: Props = $props();
 
   let container: HTMLDivElement;
@@ -188,6 +196,7 @@
   // Guards against re-entrant swaps while one is in flight.
   let swapInFlight = false;
   let selRaf = 0;
+  let topRaf = 0;
   // True while an undo/redo result is being mirrored into the CM document, so the
   // update listener does not re-send those (already-in-core) changes back to Rust.
   let applyingRemote = false;
@@ -822,11 +831,30 @@
   function onScroll(): void {
     if (!swapping) {
       void maybeSwap();
+      reportTopLine();
     }
+  }
+  // Report the viewport's top line, coalesced to one call per frame.
+  function reportTopLine(): void {
+    if (ontopline === undefined || topRaf !== 0) {
+      return;
+    }
+    topRaf = requestAnimationFrame(() => {
+      topRaf = 0;
+      if (view !== undefined && !swapping) {
+        // The inverse of scrollLineToTop. scrollTop is rounded, so probe a
+        // couple of pixels in or a line's own top would read as the line above.
+        const block = view.lineBlockAtHeight(view.scrollDOM.scrollTop + 2);
+        ontopline?.(
+          windowStartLine + view.state.doc.lineAt(block.from).number - 1,
+        );
+      }
+    });
   }
 
   onMount(() => {
     let disposed = false;
+    const caret = initialCaret;
     void (async (): Promise<void> => {
       totalLines = initialTotalLines;
       const target = Math.min(
@@ -868,14 +896,28 @@
       globalSel = toGlobalSelection(lastLive, windowStartLine);
       // Continue from the line the user was viewing: place the caret there and
       // scroll it to the top so the unlock feels like the same view kept its place.
-      if (target > windowStartLine) {
+      if (target > windowStartLine || caret !== undefined) {
         const localNo = clamp(
           target - windowStartLine + 1,
           1,
           v.state.doc.lines,
         );
         const cLine = v.state.doc.line(localNo);
-        v.dispatch({ selection: { anchor: cLine.from } });
+        let anchor = cLine.from;
+        // A remount puts the caret back where it was when that line is in the
+        // window; the scroll below still decides what is on screen.
+        if (
+          caret !== undefined &&
+          caret.line > windowStartLine &&
+          caret.line <= windowEndLine
+        ) {
+          const caretLine = v.state.doc.line(caret.line - windowStartLine);
+          anchor = Math.min(
+            caretLine.from + Math.max(0, caret.col - 1),
+            caretLine.to,
+          );
+        }
+        v.dispatch({ selection: { anchor } });
         requestAnimationFrame(() => scrollLineToTop(target));
       }
       v.scrollDOM.addEventListener('scroll', onScroll);
@@ -891,6 +933,9 @@
       disposed = true;
       if (selRaf !== 0) {
         cancelAnimationFrame(selRaf);
+      }
+      if (topRaf !== 0) {
+        cancelAnimationFrame(topRaf);
       }
       view?.scrollDOM.removeEventListener('scroll', onScroll);
       if (import.meta.env.DEV) {
