@@ -11,6 +11,7 @@ export const ja = {
   'settings.section.sticky': '付箋',
   'settings.section.editor': 'エディター',
   'settings.section.language': '言語',
+  'settings.section.shortcuts': 'ショートカット',
   // Settings — appearance
   'settings.theme.light': 'ライト',
   'settings.theme.dark': 'ダーク',
@@ -60,13 +61,34 @@ export const ja = {
   'skipped.delete': '削除',
   'skipped.deleteConfirm': 'ファイル「{name}」を削除しますか？',
   // Settings — sticky
-  'settings.sticky.newNoteShortcut': '付箋作成のショートカット',
   'settings.sticky.recording': 'キーの組み合わせを入力',
   'settings.sticky.recordCancelHint': 'Esc でキャンセル',
   'settings.sticky.recordHint': 'クリックして新しいキーの組み合わせを入力',
   'settings.sticky.shortcutError': 'このショートカットは設定できません',
   'settings.sticky.defaultSize': '付箋の既定サイズ',
   'settings.sticky.resetSize': 'リセット',
+  'settings.shortcuts.system': 'システム',
+  'settings.shortcuts.otherGroup': 'その他の固定キー',
+  'settings.shortcuts.notSet': '未設定',
+  'settings.shortcuts.clear': 'クリア',
+  'settings.shortcuts.reset': '既定に戻す',
+  'settings.shortcuts.resetAll': 'すべて既定に戻す',
+  'settings.shortcuts.err.conflict': '「{name}」で使用されています',
+  'settings.shortcuts.err.needsModifierMac':
+    '⌘・⌃・⌥ のいずれかと組み合わせてください（F キーを除く）',
+  'settings.shortcuts.err.needsModifierWin':
+    'Ctrl・Alt・Win のいずれかと組み合わせてください（F キーを除く）',
+  'settings.shortcuts.err.macOption':
+    'エディタでは ⌥ と文字キーで特殊文字を入力するため、⌘ か ⌃ を加えてください',
+  'settings.shortcuts.err.unreachable':
+    'この組み合わせはエディタでは使えません',
+  'settings.shortcuts.err.punctuation': '記号キーは使用できません',
+  'settings.shortcuts.err.unsupportedKey': 'このキーには対応していません',
+  'settings.shortcuts.err.noLayoutChar':
+    '現在の入力ソースにはこのキーの英字がないため、⌥ の組み合わせを記録できません',
+  'settings.shortcuts.err.fixed': 'システムのショートカットは変更できません',
+  'settings.shortcuts.err.globalRegister':
+    'グローバルショートカットとして登録できません。ほかのアプリで使用されている可能性があります',
   // Settings — editor
   'settings.editor.wordWrap': '自動折り返し',
   'settings.editor.lineNumbers': '行番号を表示',

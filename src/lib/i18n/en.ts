@@ -11,6 +11,7 @@ export const en = {
   'settings.section.sticky': 'Sticky Notes',
   'settings.section.editor': 'Editor',
   'settings.section.language': 'Language',
+  'settings.section.shortcuts': 'Shortcuts',
   // Settings — appearance
   'settings.theme.light': 'Light',
   'settings.theme.dark': 'Dark',
@@ -60,13 +61,33 @@ export const en = {
   'skipped.delete': 'Delete',
   'skipped.deleteConfirm': 'Delete the file "{name}"?',
   // Settings — sticky
-  'settings.sticky.newNoteShortcut': 'New note shortcut',
   'settings.sticky.recording': 'Press a key combination…',
   'settings.sticky.recordCancelHint': 'Press Esc to cancel',
   'settings.sticky.recordHint': 'Click, then press a new key combination',
   'settings.sticky.shortcutError': 'Couldn’t set this shortcut',
   'settings.sticky.defaultSize': 'Default note size',
   'settings.sticky.resetSize': 'Reset',
+  'settings.shortcuts.system': 'System',
+  'settings.shortcuts.otherGroup': 'Other fixed keys',
+  'settings.shortcuts.notSet': 'Not set',
+  'settings.shortcuts.clear': 'Clear',
+  'settings.shortcuts.reset': 'Reset',
+  'settings.shortcuts.resetAll': 'Reset All',
+  'settings.shortcuts.err.conflict': 'Already used by "{name}"',
+  'settings.shortcuts.err.needsModifierMac': 'Needs ⌘, ⌃ or ⌥ (except F keys)',
+  'settings.shortcuts.err.needsModifierWin':
+    'Needs Ctrl, Alt or Win (except F keys)',
+  'settings.shortcuts.err.macOption':
+    'In the editor, ⌥ with a letter types a character. Add ⌘ or ⌃.',
+  'settings.shortcuts.err.unreachable':
+    'This combination doesn’t work in the editor',
+  'settings.shortcuts.err.punctuation': 'Punctuation keys can’t be used',
+  'settings.shortcuts.err.unsupportedKey': 'This key isn’t supported',
+  'settings.shortcuts.err.noLayoutChar':
+    'The current input source has no letter for this key, so ⌥ combinations can’t be recorded',
+  'settings.shortcuts.err.fixed': 'System shortcuts can’t be changed',
+  'settings.shortcuts.err.globalRegister':
+    'Couldn’t register this global shortcut. Another app may be using it.',
   // Settings — editor
   'settings.editor.wordWrap': 'Word wrap',
   'settings.editor.lineNumbers': 'Line numbers',
