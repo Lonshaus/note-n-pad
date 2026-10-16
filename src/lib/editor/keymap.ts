@@ -66,6 +66,7 @@ import {
   splitAccelerator,
   type KeyLike,
 } from '../util/accelerator';
+import { offscreenArrowKeys } from './offscreenArrow';
 /** Which editor a keymap is for: the document editor, the sticky note editor,
  *  or the editor of a windowed (very large) file. */
 export type KeymapProfile = 'document' | 'sticky' | 'windowed';
@@ -226,12 +227,25 @@ function strip(
   }
   return { kept, origin };
 }
+/** The macOS Emacs keys for the same two moves: Ctrl-p and Ctrl-n, with their
+ *  Shift variants, run the commands bound to ArrowUp and ArrowDown. */
+const offscreenEmacsKeys: readonly KeyBinding[] = offscreenArrowKeys.map(
+  (binding) => ({
+    mac: binding.key === 'ArrowUp' ? 'Ctrl-p' : 'Ctrl-n',
+    ...(binding.run !== undefined ? { run: binding.run } : {}),
+    ...(binding.shift !== undefined ? { shift: binding.shift } : {}),
+  }),
+);
 
 export interface KeymapBindings {
   /** Bindings at normal precedence. */
   normal: KeyBinding[];
   /** The completion list's bindings, which must outrank everything else. */
   completion: KeyBinding[];
+  /** Up and Down (and, on macOS, Ctrl-p and Ctrl-n) for a caret outside the
+   *  rendered lines; they come right after the completion list's keys and
+   *  before everything else. */
+  offscreen: KeyBinding[];
 }
 
 const SOURCES: Record<KeymapProfile, readonly (readonly KeyBinding[])[]> = {
@@ -278,14 +292,68 @@ export function buildKeymap(
     }
   }
   normal.push({ key: 'Tab', run: tabKey, shift: shiftTabKey });
-  return { normal, completion: high };
+  return {
+    normal,
+    completion: high,
+    offscreen: [
+      ...offscreenArrowKeys,
+      ...(os === 'macos' ? offscreenEmacsKeys : []),
+    ],
+  };
+}
+/** CodeMirror's modifier spellings, as the canonical modifier they mean. */
+function bindingModifier(part: string, os: string): string | null {
+  switch (part.toLowerCase()) {
+    case 'ctrl':
+    case 'control':
+    case 'c':
+      return 'Ctrl';
+    case 'alt':
+    case 'a':
+      return 'Alt';
+    case 'shift':
+    case 's':
+      return 'Shift';
+    case 'meta':
+    case 'cmd':
+    case 'm':
+      return 'Meta';
+    case 'mod':
+      return os === 'macos' ? 'Meta' : 'Ctrl';
+    default:
+      return null;
+  }
+}
+/** A key name with its modifiers in one fixed order, so spellings that differ
+ *  only in modifier order or alias compare equal. Null for an unknown modifier. */
+function canonicalKeyName(
+  mods: readonly string[],
+  key: string,
+  os: string,
+): string | null {
+  const found = new Set<string>();
+  for (const part of mods) {
+    const mod = bindingModifier(part, os);
+    if (mod === null) {
+      return null;
+    }
+    found.add(mod);
+  }
+  return [
+    ...['Ctrl', 'Alt', 'Shift', 'Meta'].filter((m) => found.has(m)),
+    key,
+  ].join('-');
 }
 /** The command bound to a keydown whose layout turned a named key into a
  *  character (Option+Esc under Zhuyin), found by the key's physical code.
- *  Null for every other event, which CodeMirror matches itself. */
+ *  A binding is read the way CodeMirror reads it: its field for `os` first,
+ *  `Mod` as Meta on macOS and Ctrl elsewhere, and its `shift` variant when
+ *  Shift is held and only the unshifted name matches. Null for every other
+ *  event, which CodeMirror matches itself. */
 export function resolveCodeNamedKey(
   bindings: readonly KeyBinding[],
   e: KeyLike,
+  os: string,
 ): Command | null {
   if (namedKey(e.key) !== null || isComposingKey(e)) {
     return null;
@@ -294,21 +362,35 @@ export function resolveCodeNamedKey(
   if (named === null) {
     return null;
   }
-  const parts: string[] = [];
+  const held: string[] = [];
   if (e.ctrlKey) {
-    parts.push('Ctrl');
+    held.push('Ctrl');
   }
   if (e.altKey) {
-    parts.push('Alt');
-  }
-  if (e.shiftKey) {
-    parts.push('Shift');
+    held.push('Alt');
   }
   if (e.metaKey) {
-    parts.push('Meta');
+    held.push('Meta');
   }
-  const name = [...parts, named].join('-');
-  return bindings.find((b) => b.key === name)?.run ?? null;
+  const plain = canonicalKeyName(held, named, os);
+  const shifted = canonicalKeyName([...held, 'Shift'], named, os);
+  const wanted = e.shiftKey ? shifted : plain;
+  for (const b of bindings) {
+    const raw =
+      (os === 'macos' ? b.mac : os === 'windows' ? b.win : b.linux) ?? b.key;
+    if (raw === undefined) {
+      continue;
+    }
+    const parts = raw.split(/-(?!$)/);
+    const name = canonicalKeyName(parts.slice(0, -1), parts.at(-1) ?? '', os);
+    if (name === wanted && b.run !== undefined) {
+      return b.run;
+    }
+    if (e.shiftKey && name === plain && b.shift !== undefined) {
+      return b.shift;
+    }
+  }
+  return null;
 }
 /** The CodeMirror extension for `profile`; swap it into a `Compartment` when
  *  the effective shortcuts change. */
@@ -317,14 +399,15 @@ export function keymapExtension(
   os: string,
   accel: (id: string) => string | null,
 ): Extension {
-  const { normal, completion } = buildKeymap(profile, os, accel);
+  const { normal, completion, offscreen } = buildKeymap(profile, os, accel);
   const all = [...completion, ...normal];
   return [
     completion.length > 0 ? Prec.highest(keymap.of(completion)) : [],
+    Prec.highest(keymap.of(offscreen)),
     Prec.highest(
       EditorView.domEventHandlers({
         keydown(e, view) {
-          const run = resolveCodeNamedKey(all, e);
+          const run = resolveCodeNamedKey(all, e, os);
           if (run === null || !run(view)) {
             return false;
           }
