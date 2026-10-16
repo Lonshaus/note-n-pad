@@ -134,3 +134,75 @@ export function windowStartFor(
   const first = Math.min(global.anchor.line, global.head.line);
   return nextWindow(first, totalLines, WINDOW_LINES, MARGIN_LINES).startLine;
 }
+/** The fields of a KeyboardEvent that decide how a key is replayed. */
+export interface ReplayKeyEvent {
+  key: string;
+  keyCode: number;
+  ctrlKey: boolean;
+  metaKey: boolean;
+  altKey: boolean;
+  shiftKey: boolean;
+  isComposing: boolean;
+}
+
+const MODIFIER_KEYS = new Set([
+  'Alt',
+  'AltGraph',
+  'CapsLock',
+  'Control',
+  'Fn',
+  'FnLock',
+  'Hyper',
+  'Meta',
+  'NumLock',
+  'OS',
+  'ScrollLock',
+  'Shift',
+  'Super',
+  'Symbol',
+  'SymbolLock',
+]);
+
+const EDIT_KEYS = new Set([
+  'Enter',
+  'Backspace',
+  'Delete',
+  'Tab',
+  'ArrowUp',
+  'ArrowDown',
+  'ArrowLeft',
+  'ArrowRight',
+  'Home',
+  'End',
+  'PageUp',
+  'PageDown',
+]);
+/** Whether the key belongs to an input method (a composition is running or
+ *  about to start). */
+export function isImeKey(e: ReplayKeyEvent): boolean {
+  return e.isComposing || e.key === 'Process' || e.keyCode === 229;
+}
+/** How a keydown is replayed once the window is back on the selection: 'text'
+ *  inserts the character, 'key' runs the editor's key binding, 'chord' is a
+ *  Ctrl/Meta shortcut that keeps its native action (an AltGr character typed
+ *  with Ctrl+Alt arrives later as input), 'ignore' is dropped. */
+export function replayKind(
+  e: ReplayKeyEvent,
+  isWindows: boolean,
+): 'text' | 'key' | 'chord' | 'ignore' {
+  if (isImeKey(e) || MODIFIER_KEYS.has(e.key)) {
+    return 'ignore';
+  }
+  if (e.ctrlKey || e.metaKey) {
+    return 'chord';
+  }
+  if ([...e.key].length === 1) {
+    // Alt+character types only on macOS; elsewhere it is a menu mnemonic.
+    return isWindows && e.altKey ? 'chord' : 'text';
+  }
+  return EDIT_KEYS.has(e.key) ? 'key' : 'ignore';
+}
+/** Whether the key is an editing or navigation key other than Tab. */
+export function isEditingKey(key: string): boolean {
+  return EDIT_KEYS.has(key) && key !== 'Tab';
+}
