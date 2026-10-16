@@ -4,6 +4,8 @@
 import { describe, expect, it } from 'vitest';
 import {
   computeVisibleWindow,
+  fullyVisibleSpan,
+  joinSelectedRows,
   lineToScrollTop,
   SAFE_SCROLL_HEIGHT,
   scrollAxisHeight,
@@ -115,5 +117,71 @@ describe('lineToScrollTop', () => {
     const w = computeVisibleWindow(tail, 20, viewport, total, axis, 0);
     expect(w.firstVisible).toBe(maxFirst);
     expect(w.endLine).toBe(total);
+  });
+});
+
+describe('fullyVisibleSpan', () => {
+  const rows = [-10, 10, 30, 50, 70, 90].map((top) => ({
+    top,
+    bottom: top + 20,
+  }));
+
+  it('spans the rows fully inside the viewport', () => {
+    expect(fullyVisibleSpan(rows, 0, 100)).toEqual({ first: 1, last: 4 });
+  });
+
+  it('excludes a partially visible bottom row', () => {
+    expect(fullyVisibleSpan(rows, 0, 85)).toEqual({ first: 1, last: 3 });
+  });
+
+  it('excludes a partially visible top row', () => {
+    expect(fullyVisibleSpan(rows, 15, 100)).toEqual({ first: 2, last: 4 });
+  });
+
+  it('tolerates one pixel of rounding', () => {
+    expect(fullyVisibleSpan(rows, 10.5, 89.5)).toEqual({ first: 1, last: 4 });
+  });
+
+  it('falls back to the first intersecting row', () => {
+    expect(fullyVisibleSpan(rows, 12, 28)).toEqual({ first: 1, last: 1 });
+  });
+
+  it('returns null for no rows or rows outside the viewport', () => {
+    expect(fullyVisibleSpan([], 0, 100)).toBeNull();
+    expect(fullyVisibleSpan(rows, 200, 300)).toBeNull();
+  });
+});
+
+describe('joinSelectedRows', () => {
+  it('cuts a single partially selected row', () => {
+    expect(joinSelectedRows([{ text: 'abcdef', from: 1, to: 4 }])).toBe('bcd');
+  });
+
+  it('cuts the first and last rows and keeps the middle ones whole', () => {
+    expect(
+      joinSelectedRows([
+        { text: 'first', from: 2 },
+        { text: 'middle' },
+        { text: 'last', to: 2 },
+      ]),
+    ).toBe('rst\nmiddle\nla');
+  });
+
+  it('returns an empty string for no rows', () => {
+    expect(joinSelectedRows([])).toBe('');
+  });
+
+  it('drops the carriage return each CRLF row ends with', () => {
+    expect(
+      joinSelectedRows([
+        { text: 'one\r', from: 1 },
+        { text: 'two\r' },
+        { text: 'three\r', to: 3 },
+      ]),
+    ).toBe('ne\ntwo\nthr');
+  });
+
+  it('keeps the whole row text when the selection reaches past its CR', () => {
+    expect(joinSelectedRows([{ text: 'abc\r', from: 1, to: 4 }])).toBe('bc');
   });
 });

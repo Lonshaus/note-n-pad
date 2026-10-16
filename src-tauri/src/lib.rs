@@ -588,6 +588,57 @@ fn emit_to_focused<T: serde::Serialize + Clone>(app: &tauri::AppHandle, event: &
     let _ = app.emit_to(label, event, payload);
   }
 }
+/// Where an Edit-menu command goes.
+#[cfg(any(target_os = "macos", test))]
+#[derive(Debug, PartialEq, Eq)]
+enum EditMenuRoute {
+  /// The focused webview window's frontend, via `menu-action`.
+  Frontend,
+  /// The key window's first responder, for a native panel.
+  FirstResponder,
+}
+/// The macOS Undo, Redo and Select All items are custom, so with no webview
+/// window focused (an open/save panel or another native sheet is the key window)
+/// they would reach nobody. Those three go to the first responder instead, which
+/// is what the predefined items did; everything else always goes to the
+/// frontend.
+#[cfg(any(target_os = "macos", test))]
+fn edit_menu_route(id: &str, any_webview_focused: bool) -> EditMenuRoute {
+  if !any_webview_focused && matches!(id, "undo" | "redo" | "select-all") {
+    EditMenuRoute::FirstResponder
+  } else {
+    EditMenuRoute::Frontend
+  }
+}
+/// Whether one of the app's webview windows is the key window.
+#[cfg(target_os = "macos")]
+fn any_webview_focused(app: &tauri::AppHandle) -> bool {
+  app
+    .webview_windows()
+    .values()
+    .any(|w| w.is_focused().unwrap_or(false))
+}
+/// Send `undo:`, `redo:` or `selectAll:` down the responder chain of the key
+/// window, like the predefined items do. Menu events arrive on the main thread;
+/// off it, nothing is sent.
+#[cfg(target_os = "macos")]
+fn send_to_first_responder(id: &str) {
+  use objc2::runtime::AnyObject;
+  use objc2::{msg_send, sel, MainThreadMarker};
+  let Some(mtm) = MainThreadMarker::new() else {
+    return;
+  };
+  let action = match id {
+    "redo" => sel!(redo:),
+    "select-all" => sel!(selectAll:),
+    _ => sel!(undo:),
+  };
+  let ns_app = objc2_app_kit::NSApplication::sharedApplication(mtm);
+  let none: *const AnyObject = std::ptr::null();
+  // Safety: `sendAction:to:from:` takes a selector and two nullable objects; a
+  // nil target means "the first responder that handles it".
+  let _: bool = unsafe { msg_send![&*ns_app, sendAction: action, to: none, from: none] };
+}
 
 /// Keep the menu's mode-dependent items in sync with the focused window. On
 /// focus-gain the last-focused window wins; on focus-loss or destruction of the
@@ -1084,7 +1135,48 @@ fn build_menu(
       Some("CmdOrCtrl+A"),
     )?),
   );
-  #[cfg(not(target_os = "linux"))]
+  // macOS keeps the predefined Cut/Copy/Paste, but Undo, Redo and Select All are
+  // custom items like Linux's: the predefined ones only message the focused
+  // responder, which does nothing for a JSON/XML/Markdown view or a table drawn
+  // over the editor and selects the whole page in a large-file view, so the
+  // frontend picks the target (`menu-action`).
+  #[cfg(target_os = "macos")]
+  let (undo_item, redo_item, cut_item, copy_item, paste_item, select_all_item): EditMenuItems = (
+    Box::new(MenuItem::with_id(
+      app,
+      "undo",
+      tr(i18n::Key::Undo),
+      true,
+      Some("CmdOrCtrl+Z"),
+    )?),
+    Box::new(MenuItem::with_id(
+      app,
+      "redo",
+      tr(i18n::Key::Redo),
+      true,
+      Some("CmdOrCtrl+Shift+Z"),
+    )?),
+    Box::new(PredefinedMenuItem::cut(
+      app,
+      Some(tr(i18n::Key::Cut).as_str()),
+    )?),
+    Box::new(PredefinedMenuItem::copy(
+      app,
+      Some(tr(i18n::Key::Copy).as_str()),
+    )?),
+    Box::new(PredefinedMenuItem::paste(
+      app,
+      Some(tr(i18n::Key::Paste).as_str()),
+    )?),
+    Box::new(MenuItem::with_id(
+      app,
+      "select-all",
+      tr(i18n::Key::SelectAll),
+      true,
+      Some("CmdOrCtrl+A"),
+    )?),
+  );
+  #[cfg(not(any(target_os = "linux", target_os = "macos")))]
   let (undo_item, redo_item, cut_item, copy_item, paste_item, select_all_item): EditMenuItems = (
     Box::new(PredefinedMenuItem::undo(
       app,
@@ -1428,6 +1520,11 @@ fn handle_menu_id(app: &tauri::AppHandle, id: &str) {
     "new-tab" | "open" | "save" | "save-as" | "show-in-finder" | "copy-path" | "find"
     | "find-replace" | "find-next" | "find-prev" | "undo" | "redo" | "cut" | "copy" | "paste"
     | "select-all" => {
+      #[cfg(target_os = "macos")]
+      if edit_menu_route(id, any_webview_focused(app)) == EditMenuRoute::FirstResponder {
+        send_to_first_responder(id);
+        return;
+      }
       emit_to_focused(app, "menu-action", id.to_string());
     }
     "line-ending-lf" => emit_to_focused(app, "menu-action", "set-line-ending:LF".to_string()),
@@ -2998,6 +3095,33 @@ mod tests {
   fn should_forget_tabs_quit_in_flight_keeps_tabs_regardless_of_batch_record() {
     let close_at = Instant::now();
     assert!(!should_forget_tabs(close_at, None, true));
+  }
+}
+
+#[cfg(test)]
+mod edit_menu_route_tests {
+  use super::{edit_menu_route, EditMenuRoute};
+
+  #[test]
+  fn undo_redo_and_select_all_go_to_the_first_responder_when_no_webview_is_key() {
+    for id in ["undo", "redo", "select-all"] {
+      assert_eq!(edit_menu_route(id, false), EditMenuRoute::FirstResponder);
+    }
+  }
+
+  #[test]
+  fn undo_redo_and_select_all_go_to_the_frontend_when_a_webview_is_key() {
+    for id in ["undo", "redo", "select-all"] {
+      assert_eq!(edit_menu_route(id, true), EditMenuRoute::Frontend);
+    }
+  }
+
+  #[test]
+  fn other_commands_always_go_to_the_frontend() {
+    for id in ["cut", "copy", "paste", "find", "save"] {
+      assert_eq!(edit_menu_route(id, false), EditMenuRoute::Frontend);
+      assert_eq!(edit_menu_route(id, true), EditMenuRoute::Frontend);
+    }
   }
 }
 

@@ -13,6 +13,7 @@
   import { localeRegistry } from './lib/i18n/localeRegistry.svelte';
   import { platform } from './lib/state/platform.svelte';
   import { t } from './lib/i18n';
+  import { nativeSelectAll } from './lib/util/menuBar';
   import { startupSkips } from './lib/state/startupSkips.svelte';
   import { revealKey, skipReasonKey } from './lib/util/skipped';
 
@@ -66,6 +67,13 @@
     const unlistenChanges = settingsState.listenChanges();
     const unlistenThemes = themeRegistry.listen();
     const unlistenLocales = localeRegistry.listen();
+    // Edit > Select All reaches the focused window as a menu action (the macOS
+    // item is no longer native); this page's text is selectable.
+    const unlistenMenuAction = win.listen<string>('menu-action', (event) => {
+      if (event.payload === 'select-all') {
+        nativeSelectAll();
+      }
+    });
     void revealWhenThemed();
     // The core held the list from startup; this window is what it was held for.
     void startupSkips.claim();
@@ -74,6 +82,7 @@
       void unlistenChanges.then((u) => u());
       void unlistenThemes.then((u) => u());
       void unlistenLocales.then((u) => u());
+      void unlistenMenuAction.then((u) => u());
     };
   });
 </script>

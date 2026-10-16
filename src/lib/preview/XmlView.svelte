@@ -22,6 +22,7 @@
     rowLayout,
   } from '../util/tableRows';
   import XmlRow from './XmlRow.svelte';
+  import { xmlViewText } from './xmlText';
   import { t } from '../i18n';
 
   interface Props {
@@ -153,6 +154,35 @@
   function onScroll(): void {
     scrollTop = scrollEl.scrollTop;
   }
+  // Select All cannot be a DOM range here: only the rows near the viewport
+  // exist. It is a view-level state instead, drawn on every row as it scrolls
+  // into view and read back by Copy. Keyed to the document it was made on, so
+  // a new document starts unselected without an effect writing state.
+  let selectedDoc = $state.raw<Text | null>(null);
+  const allSelected = $derived(selectedDoc === doc);
+  /** Takes keyboard focus, so typing and editing commands stop reaching the
+   *  source editor underneath. */
+  export function focus(): void {
+    scrollEl.focus({ preventScroll: true });
+  }
+  /** The element holding the rendered content. */
+  export function root(): HTMLElement {
+    return scrollEl;
+  }
+  /** Select every row, on screen or not. */
+  export function selectAll(): void {
+    focus();
+    document.getSelection()?.removeAllRanges();
+    selectedDoc = doc;
+  }
+  /** The text of every row as displayed while all of them are selected,
+   *  otherwise null. Built from the row model, not from the DOM. */
+  export function selectedText(): string | null {
+    if (!allSelected || parsed === null) {
+      return null;
+    }
+    return xmlViewText(visibleRows(roots, toggled, 0, rowCount), toggled);
+  }
 
   function toggle(path: string): void {
     if (toggled.has(path)) {
@@ -211,11 +241,20 @@
   });
 </script>
 
-<div class="xml-view" class:dark bind:this={scrollEl} onscroll={onScroll}>
+<div
+  class="xml-view"
+  class:dark
+  role="document"
+  tabindex="-1"
+  bind:this={scrollEl}
+  onscroll={onScroll}
+  onpointerdown={() => (selectedDoc = null)}
+>
   {#if parsed !== null}
     <div class="spacer" style="height: {contentHeight}px;">
       <div
         class="blocks"
+        class:all-selected={allSelected}
         style="top: {layout.topSpacer}px;"
         bind:this={blockEl}
       >
@@ -257,6 +296,9 @@
     font-family: var(--editor-font, monospace);
     font-size: 0.85rem;
   }
+  .xml-view:focus {
+    outline: none;
+  }
   .spacer {
     position: relative;
   }
@@ -264,6 +306,9 @@
     position: absolute;
     left: 0;
     right: 0;
+  }
+  .blocks.all-selected :global(.row) {
+    background: color-mix(in srgb, var(--accent) 35%, transparent);
   }
   .error {
     margin: 0;
