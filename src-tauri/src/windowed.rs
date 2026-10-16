@@ -11,11 +11,12 @@
 //! piece table and `large_file`.
 
 use crate::large_file::{count_newlines, preview_at};
+use crate::note_store::CheckpointIndex;
 use crate::piece_table::{OriginalIndex, OriginalSource, PieceTable};
 use crate::range_edit::{Fingerprint, FINGERPRINT_MISMATCH};
 use crate::replace_layer::{self, Builder, ChangeList, Dir, Src, Table};
 use crate::windowed_scan::{scan_backward, scan_forward, Event, Flow, ScanStop};
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 use std::collections::HashMap;
 use std::fs::{self, File};
 use std::io::{Read, Seek, SeekFrom};
@@ -237,20 +238,6 @@ impl Session {
       busy: false,
     }
   }
-}
-
-/// Serializable form of the sparse line-checkpoint index `OriginalIndex` holds:
-/// the `(offset, newlines_before_offset)` checkpoint pairs plus the original's
-/// total newline count. Compact by construction — a 512-entry array of two
-/// `u64`s each is the whole cost, no per-entry object wrapper — since this
-/// crosses the IPC boundary and gets written into a JSON snapshot. See
-/// `OriginalIndex` for the checkpoint contract this must satisfy: ascending
-/// offsets seeded with `(0, 0)`, each carrying the newline count strictly
-/// before it.
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-pub struct CheckpointIndex {
-  pub checkpoints: Vec<(u64, u64)>,
-  pub total_newlines: u64,
 }
 
 /// A session's checkpoint index plus the fingerprint and sampled digest it was

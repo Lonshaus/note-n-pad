@@ -168,12 +168,12 @@
     <button class="btn" disabled={!dirty} onclick={() => void save()}>
       {t('settings.language.save')}
     </button>
-    {#if ui.localeUpdateFromJson}
+    {#if !__LITE__ && ui.localeUpdateFromJson}
       <button class="btn" onclick={() => void updateFromJson()}>
         {t('settings.language.updateFromJson')}
       </button>
     {/if}
-    {#if ui.localeExport}
+    {#if !__LITE__ && ui.localeExport}
       <button class="btn" onclick={() => void exportDraft()}>
         {t('settings.language.export')}
       </button>

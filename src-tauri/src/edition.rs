@@ -86,6 +86,7 @@ pub(crate) fn require_lite(what: &str) -> Result<(), String> {
 }
 
 /// Entry-point guard of a command that belongs to a removed feature.
+#[cfg(not(feature = "lite"))]
 pub(crate) fn require_full(feature: &str) -> Result<(), String> {
   refuse_if(is_lite(), feature)
 }
@@ -627,6 +628,68 @@ mod gate_tests {
       &["resolve_current"],
       "workspace_enabled(",
     );
+  }
+  /// The commands of a cut feature are compiled out of the Lite binary, and the
+  /// ones Lite keeps from the same modules stay in it.
+  #[test]
+  fn the_lite_binary_registers_only_the_commands_it_keeps() {
+    let lib = include_str!("lib.rs");
+    let start = lib.find("generate_handler![").unwrap();
+    let handlers = &lib[start..start + lib[start..].find("])").unwrap()];
+    let lines: Vec<&str> = handlers.lines().map(str::trim).collect();
+    let cut_modules = ["large_file::", "range_edit::", "windowed::", "project::"];
+    let cut_commands = [
+      "theme_store::save_theme",
+      "theme_store::delete_theme",
+      "theme_store::import_theme",
+      "theme_store::export_theme",
+      "theme_store::restore_default_theme",
+      "locale_store::import_locale",
+      "locale_store::read_locale_file",
+      "locale_store::export_locale",
+      "windows::show_workspace_window",
+      "windows::sticky_row_action",
+      "windows::close_doc_tab",
+      "ctx_menu::popup_row_menu",
+      "file_ops::create_file",
+      "file_ops::create_folder",
+      "file_ops::rename_path",
+      "file_ops::trash_path",
+      "open_picked_files",
+      "altgr::altgr_table",
+    ];
+    let kept_commands = [
+      "theme_store::list_themes",
+      "locale_store::list_locales",
+      "locale_store::save_locale",
+      "locale_store::delete_locale",
+      "locale_store::restore_default_locale",
+      "file_ops::reveal_in_finder",
+      "windows::focus_doc_tab",
+      "windows::live_doc_groups",
+      "windows::open_document_group",
+    ];
+    let attribute = "#[cfg(not(feature = \"lite\"))]";
+    for (i, line) in lines.iter().enumerate() {
+      let name = line.trim_end_matches(',');
+      let cut = cut_modules.iter().any(|m| name.starts_with(m)) || cut_commands.contains(&name);
+      if cut {
+        assert_eq!(
+          lines[i - 1],
+          attribute,
+          "{name} must not be in the Lite build"
+        );
+      }
+      if kept_commands.contains(&name) {
+        assert_ne!(lines[i - 1], attribute, "{name} is kept in the Lite build");
+      }
+    }
+    for name in cut_commands.iter().chain(&kept_commands) {
+      assert!(
+        lines.iter().any(|l| l.trim_end_matches(',') == *name),
+        "{name}"
+      );
+    }
   }
 
   #[test]

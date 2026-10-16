@@ -174,6 +174,7 @@ pub enum Key {
   // lint honest there without silencing it for the rest of the enum.
   // Action item that opens the workspace; shown only while the workspace window
   // is not visible (a visible one is already in the system window list).
+  #[cfg(not(feature = "lite"))]
   #[cfg_attr(not(any(target_os = "macos", target_os = "windows")), allow(dead_code))]
   DockOpenWorkspace,
   // Fallback label for a blank sticky listed in the Dock menu.
@@ -198,14 +199,22 @@ pub enum Key {
   TrayShowAll,
   TrayQuit,
   // Context menus (Close is reused from File)
+  #[cfg(not(feature = "lite"))]
   CtxOpen,
+  #[cfg(not(feature = "lite"))]
   CtxOpenSelected,
+  #[cfg(not(feature = "lite"))]
   CtxNewFile,
+  #[cfg(not(feature = "lite"))]
   CtxNewFolder,
   CtxShowInFinder,
+  #[cfg(not(feature = "lite"))]
   CtxRename,
+  #[cfg(not(feature = "lite"))]
   CtxDelete,
+  #[cfg(not(feature = "lite"))]
   CtxSaveAsDoc,
+  #[cfg(not(feature = "lite"))]
   CtxCloseTab,
   // Fatal startup message shown in a native message box on Windows when the
   // WebView2 Runtime is absent (see `webview2_runtime`). No webview can exist at
@@ -2059,6 +2068,7 @@ fn strings(key: Key) -> [&'static str; 15] {
       "สลับตัวอักษร",
       "Hoán đổi chữ cái",
     ],
+    #[cfg(not(feature = "lite"))]
     Key::DockOpenWorkspace => [
       "開啟工作區",
       "打开工作区",
@@ -2212,6 +2222,7 @@ fn strings(key: Key) -> [&'static str; 15] {
       "ออก",
       "Thoát",
     ],
+    #[cfg(not(feature = "lite"))]
     Key::CtxOpen => [
       "開啟",
       "打开",
@@ -2229,6 +2240,7 @@ fn strings(key: Key) -> [&'static str; 15] {
       "เปิด",
       "Mở",
     ],
+    #[cfg(not(feature = "lite"))]
     Key::CtxOpenSelected => [
       "開啟選取的檔案",
       "打开选中的文件",
@@ -2246,6 +2258,7 @@ fn strings(key: Key) -> [&'static str; 15] {
       "เปิดไฟล์ที่เลือก",
       "Mở các tệp đã chọn",
     ],
+    #[cfg(not(feature = "lite"))]
     Key::CtxNewFile => [
       "新增檔案",
       "新建文件",
@@ -2263,6 +2276,7 @@ fn strings(key: Key) -> [&'static str; 15] {
       "ไฟล์ใหม่",
       "Tệp mới",
     ],
+    #[cfg(not(feature = "lite"))]
     Key::CtxNewFolder => [
       "新增資料夾",
       "新建文件夹",
@@ -2281,6 +2295,7 @@ fn strings(key: Key) -> [&'static str; 15] {
       "Thư mục mới",
     ],
     Key::CtxShowInFinder => show_in_file_browser_strings(),
+    #[cfg(not(feature = "lite"))]
     Key::CtxRename => [
       "重新命名",
       "重命名",
@@ -2298,6 +2313,7 @@ fn strings(key: Key) -> [&'static str; 15] {
       "เปลี่ยนชื่อ",
       "Đổi tên",
     ],
+    #[cfg(not(feature = "lite"))]
     Key::CtxDelete => [
       "刪除",
       "删除",
@@ -2315,6 +2331,7 @@ fn strings(key: Key) -> [&'static str; 15] {
       "ลบ",
       "Xóa",
     ],
+    #[cfg(not(feature = "lite"))]
     Key::CtxSaveAsDoc => [
       "另存為文件",
       "另存为文档",
@@ -2332,6 +2349,7 @@ fn strings(key: Key) -> [&'static str; 15] {
       "บันทึกเป็นเอกสาร",
       "Lưu thành tài liệu",
     ],
+    #[cfg(not(feature = "lite"))]
     Key::CtxCloseTab => [
       "關閉分頁",
       "关闭标签页",
@@ -2798,12 +2816,15 @@ mod tests {
     );
     #[cfg(not(any(target_os = "macos", target_os = "windows")))]
     assert_eq!(tr(Locale::En, Key::CtxShowInFinder), "Show in File Manager");
-    assert_eq!(tr(Locale::ZhTw, Key::CtxOpen), "開啟");
-    assert_eq!(
-      tr(Locale::Ja, Key::CtxOpenSelected),
-      "選択したファイルを開く"
-    );
-    assert_eq!(tr(Locale::En, Key::CtxOpenSelected), "Open Selected Files");
+    #[cfg(not(feature = "lite"))]
+    {
+      assert_eq!(tr(Locale::ZhTw, Key::CtxOpen), "開啟");
+      assert_eq!(
+        tr(Locale::Ja, Key::CtxOpenSelected),
+        "選択したファイルを開く"
+      );
+      assert_eq!(tr(Locale::En, Key::CtxOpenSelected), "Open Selected Files");
+    }
     // Predefined menu-item labels passed into Tauri's PredefinedMenuItem.
     assert_eq!(tr(Locale::ZhTw, Key::Undo), "復原");
     assert_eq!(tr(Locale::Ja, Key::Paste), "ペースト");
@@ -2821,17 +2842,20 @@ mod tests {
     assert_eq!(tr(Locale::Ru, Key::Save), "Сохранить");
     assert_eq!(tr(Locale::Es, Key::EditMenu), "Edición");
     assert_eq!(tr(Locale::PtBr, Key::EditMenu), "Editar");
+    #[cfg(not(feature = "lite"))]
     assert_eq!(tr(Locale::De, Key::CtxNewFolder), "Neuer Ordner");
     assert_eq!(tr(Locale::Ko, Key::TrayQuit), "종료");
     assert_eq!(tr(Locale::Pl, Key::SelectAll), "Zaznacz wszystko");
     assert_eq!(tr(Locale::It, Key::WindowMenu), "Finestra");
     assert_eq!(tr(Locale::Th, Key::Close), "ปิด");
+    #[cfg(not(feature = "lite"))]
     assert_eq!(tr(Locale::Vi, Key::CtxOpen), "Mở");
     // Turkish apostrophe (U+2019) and French apostrophe are preserved verbatim.
     // Preserved verbatim in the full build; the Lite build's form is tested below.
     if !cfg!(feature = "lite") {
       assert_eq!(tr(Locale::Tr, Key::Quit), "Note&Pad’ten Çık");
     }
+    #[cfg(not(feature = "lite"))]
     assert_eq!(tr(Locale::Fr, Key::CtxCloseTab), "Fermer l’onglet");
   }
 
