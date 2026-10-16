@@ -615,25 +615,16 @@ pub fn create_sticky_window(app: &AppHandle, note: &NoteSnapshot) -> Result<(), 
 
 const DOC_DEFAULT_WIDTH: f64 = 800.0;
 const DOC_DEFAULT_HEIGHT: f64 = 600.0;
-
-/// Build a normal-chrome document window labeled `doc-{group}`, carrying the
-/// window group (and, for a fresh open, an initial file path and project root)
-/// in the URL so the frontend can load every tab in the group and restore it.
-fn build_document_window(
-  app: &AppHandle,
+/// The URL a document window loads, carrying the window group (and, for a fresh
+/// open, an initial file path and project root) so the frontend can load every
+/// tab in the group and restore it.
+fn document_window_query(
   group: &str,
   initial_path: Option<&str>,
   project: Option<&str>,
   tab: Option<i64>,
-  bounds: WindowBounds,
-) -> Result<(), String> {
-  let WindowBounds {
-    x,
-    y,
-    width,
-    height,
-  } = bounds;
-  let label = format!("doc-{group}");
+  blank: bool,
+) -> String {
   let mut query = format!("index.html?mode=document&group={}", percent_encode(group));
   if let Some(path) = initial_path {
     query.push_str(&format!("&path={}", percent_encode(path)));
@@ -648,6 +639,30 @@ fn build_document_window(
   if let Some(tab) = tab {
     query.push_str(&format!("&tab={tab}"));
   }
+  // A new window with nothing stored asks the frontend for one blank tab.
+  if blank {
+    query.push_str("&blank=1");
+  }
+  query
+}
+/// Build a normal-chrome document window labeled `doc-{group}`.
+fn build_document_window(
+  app: &AppHandle,
+  group: &str,
+  initial_path: Option<&str>,
+  project: Option<&str>,
+  tab: Option<i64>,
+  blank: bool,
+  bounds: WindowBounds,
+) -> Result<(), String> {
+  let WindowBounds {
+    x,
+    y,
+    width,
+    height,
+  } = bounds;
+  let label = format!("doc-{group}");
+  let query = document_window_query(group, initial_path, project, tab, blank);
   let url = WebviewUrl::App(query.into());
   // Set a real title at birth so macOS never shows its own empty-title
   // placeholder (e.g. "無題" on Japanese systems) before the frontend loads and
@@ -684,6 +699,26 @@ pub fn open_document(app: &AppHandle, path: &str, project: Option<&str>) -> Resu
     Some(path),
     project,
     None,
+    false,
+    WindowBounds {
+      x: None,
+      y: None,
+      width: DOC_DEFAULT_WIDTH,
+      height: DOC_DEFAULT_HEIGHT,
+    },
+  )
+}
+/// Open a fresh document window holding one blank tab, minting a new window
+/// group. The tab is created by the frontend, which stores it on first edit.
+pub fn new_blank_document(app: &AppHandle) -> Result<(), String> {
+  let group = uuid::Uuid::new_v4().to_string();
+  build_document_window(
+    app,
+    &group,
+    None,
+    None,
+    None,
+    true,
     WindowBounds {
       x: None,
       y: None,
@@ -708,6 +743,7 @@ pub fn create_document_window(
     None,
     None,
     tab,
+    false,
     WindowBounds {
       x: plan.x,
       y: plan.y,
@@ -990,34 +1026,8 @@ pub fn show_about_window(app: AppHandle) -> Result<(), String> {
   show_about(&app)
 }
 
-/// Open (or focus) the singleton Keyboard Shortcuts window: system chrome,
-/// resizable so a long shortcut list can be scrolled or the window grown.
-pub fn show_shortcuts(app: &AppHandle) -> Result<(), String> {
-  if let Some(win) = app.get_webview_window("shortcuts") {
-    reveal(&win);
-    return Ok(());
-  }
-  let locale = crate::i18n::current_locale(&crate::settings::app_settings(app).language);
-  let url = WebviewUrl::App("index.html?mode=shortcuts".into());
-  let window = WebviewWindowBuilder::new(app, "shortcuts", url)
-    .title(crate::i18n::tr(locale, crate::i18n::Key::KeyboardShortcuts))
-    .visible(false)
-    .background_color(chrome_background(app))
-    .inner_size(420.0, 560.0)
-    .build()
-    .map_err(|e| e.to_string())?;
-  detach_menu_unless_document(&window);
-  show_after_grace(window);
-  Ok(())
-}
-
-#[tauri::command(async)]
-pub fn show_shortcuts_window(app: AppHandle) -> Result<(), String> {
-  show_shortcuts(&app)
-}
-
 /// Open (or focus) the singleton Acknowledgements window: system chrome,
-/// resizable and wider than the shortcuts window since licence text runs long.
+/// resizable and wide since licence text runs long.
 pub fn show_acknowledgements(app: &AppHandle) -> Result<(), String> {
   if let Some(win) = app.get_webview_window("acknowledgements") {
     reveal(&win);
@@ -1073,12 +1083,11 @@ pub fn show_privacy_window(app: AppHandle) -> Result<(), String> {
 /// from. Doc windows (title is the file name) and stickies (no title bar) are
 /// intentionally not part of this table. Extracted from `retitle_fixed_windows`
 /// so the label-to-key mapping is unit-testable without an `AppHandle`.
-fn fixed_window_titles() -> [(&'static str, crate::i18n::Key); 6] {
+fn fixed_window_titles() -> [(&'static str, crate::i18n::Key); 5] {
   [
     ("workspace", crate::i18n::Key::Workspace),
     ("settings", crate::i18n::Key::SettingsTitle),
     ("about", crate::i18n::Key::About),
-    ("shortcuts", crate::i18n::Key::KeyboardShortcuts),
     ("acknowledgements", crate::i18n::Key::Acknowledgements),
     ("privacy", crate::i18n::Key::PrivacyPolicy),
   ]
@@ -1494,7 +1503,6 @@ mod window_command_threading_tests {
     "show_workspace_window",
     "show_settings_window",
     "show_about_window",
-    "show_shortcuts_window",
     "show_acknowledgements_window",
     "show_privacy_window",
     "focus_note_window",
@@ -1550,5 +1558,22 @@ mod window_command_threading_tests {
     let attribute = SOURCE[..at].trim_end();
     assert!(attribute.ends_with("#[tauri::command]"));
     assert!(!attribute.ends_with("#[tauri::command(async)]"));
+  }
+}
+
+#[cfg(test)]
+mod document_window_query_tests {
+  use super::document_window_query;
+
+  #[test]
+  fn a_blank_window_asks_for_one_blank_tab() {
+    let query = document_window_query("g1", None, None, None, true);
+    assert_eq!(query, "index.html?mode=document&group=g1&blank=1");
+  }
+
+  #[test]
+  fn restored_and_file_windows_never_ask_for_a_blank_tab() {
+    assert!(!document_window_query("g1", None, None, Some(2), false).contains("blank"));
+    assert!(!document_window_query("g1", Some("/a b.txt"), None, None, false).contains("blank"));
   }
 }

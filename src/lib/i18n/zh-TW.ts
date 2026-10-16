@@ -9,6 +9,7 @@ export const zhTW = {
   'settings.section.sticky': '便利貼',
   'settings.section.editor': '編輯器',
   'settings.section.language': '語系',
+  'settings.section.shortcuts': '快速鍵',
   // Settings — appearance
   'settings.theme.light': '淺色',
   'settings.theme.dark': '深色',
@@ -56,13 +57,32 @@ export const zhTW = {
   'skipped.delete': '刪除',
   'skipped.deleteConfirm': '確定要刪除檔案「{name}」嗎？',
   // Settings — sticky
-  'settings.sticky.newNoteShortcut': '新增便利貼快速鍵',
   'settings.sticky.recording': '請按下組合鍵…',
   'settings.sticky.recordCancelHint': '按 Esc 取消',
   'settings.sticky.recordHint': '點擊後按下新的組合鍵',
   'settings.sticky.shortcutError': '無法設定此快速鍵',
   'settings.sticky.defaultSize': '預設便利貼尺寸',
   'settings.sticky.resetSize': '重設',
+  'settings.shortcuts.system': '系統',
+  'settings.shortcuts.otherGroup': '其他固定按鍵',
+  'settings.shortcuts.notSet': '未設定',
+  'settings.shortcuts.clear': '清除',
+  'settings.shortcuts.reset': '恢復預設',
+  'settings.shortcuts.resetAll': '全部恢復預設',
+  'settings.shortcuts.err.conflict': '已被「{name}」使用',
+  'settings.shortcuts.err.needsModifierMac': '需要搭配 ⌘、⌃ 或 ⌥（F 鍵除外）',
+  'settings.shortcuts.err.needsModifierWin':
+    '需要搭配 Ctrl、Alt 或 Win（F 鍵除外）',
+  'settings.shortcuts.err.macOption':
+    '在編輯器裡 ⌥ 加字母會輸入特殊字元，請再加上 ⌘ 或 ⌃',
+  'settings.shortcuts.err.unreachable': '這個組合在編輯器裡無法觸發',
+  'settings.shortcuts.err.punctuation': '不能使用標點符號鍵',
+  'settings.shortcuts.err.unsupportedKey': '不支援這個按鍵',
+  'settings.shortcuts.err.noLayoutChar':
+    '目前的輸入法沒有對應的英文字母，無法錄製 ⌥ 組合',
+  'settings.shortcuts.err.fixed': '系統固定的快速鍵無法變更',
+  'settings.shortcuts.err.globalRegister':
+    '無法設為全域快速鍵，可能已被其他 app 使用',
   // Settings — editor
   'settings.editor.wordWrap': '自動換行',
   'settings.editor.lineNumbers': '顯示行號',

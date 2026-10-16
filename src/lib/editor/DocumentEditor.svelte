@@ -19,7 +19,6 @@
     rectangularSelection,
     crosshairCursor,
     highlightActiveLine,
-    keymap,
     type ViewUpdate,
   } from '@codemirror/view';
   import {
@@ -28,18 +27,11 @@
     syntaxHighlighting,
     defaultHighlightStyle,
     bracketMatching,
-    foldKeymap,
   } from '@codemirror/language';
-  import { history, defaultKeymap, historyKeymap } from '@codemirror/commands';
-  import { highlightSelectionMatches, searchKeymap } from '@codemirror/search';
+  import { history } from '@codemirror/commands';
+  import { highlightSelectionMatches } from '@codemirror/search';
   import { searchWithInSelection } from './searchPanel';
-  import {
-    closeBrackets,
-    autocompletion,
-    closeBracketsKeymap,
-    completionKeymap,
-  } from '@codemirror/autocomplete';
-  import { lintKeymap } from '@codemirror/lint';
+  import { closeBrackets, autocompletion } from '@codemirror/autocomplete';
   import {
     loadLanguage,
     docHasLongLine,
@@ -54,6 +46,9 @@
   import { isWorkerHighlightEnabled } from '../highlight/workerHighlight.svelte';
   import { focusEditorIfIdle } from '../util/editorFocus';
   import { readCspNonce } from '../util/cspNonce';
+  import { keymapExtension } from './keymap';
+  import { shortcutsState } from '../state/shortcuts.svelte';
+  import { platform } from '../state/platform.svelte';
 
   interface Props {
     activeId: string;
@@ -110,7 +105,9 @@
     syntaxHighlighting(defaultHighlightStyle, { fallback: true }),
     bracketMatching(),
     closeBrackets(),
-    autocompletion(),
+    // The completion list's keys come from the keymap compartment below, so
+    // the trigger key can be rebound.
+    autocompletion({ defaultKeymap: false }),
     rectangularSelection(),
     crosshairCursor(),
     highlightActiveLine(),
@@ -118,16 +115,13 @@
     // Custom search panel with an "in selection" option; replaces the default
     // panel that openSearchPanel would otherwise self-install.
     searchWithInSelection,
-    keymap.of([
-      ...closeBracketsKeymap,
-      ...defaultKeymap,
-      ...searchKeymap,
-      ...historyKeymap,
-      ...foldKeymap,
-      ...completionKeymap,
-      ...lintKeymap,
-    ]),
   ];
+  // The key bindings, rebuilt whenever the effective shortcuts change.
+  function currentKeymap(): Extension {
+    return keymapExtension('document', platform.os, (id) =>
+      shortcutsState.accel(id),
+    );
+  }
 
   // The whole gutter column (line numbers + fold + active-line gutter) toggles
   // together, so turning line numbers off removes the gutter entirely.
@@ -142,6 +136,7 @@
   const themeCompartment = new Compartment();
   const wrapCompartment = new Compartment();
   const gutterCompartment = new Compartment();
+  const keymapCompartment = new Compartment();
   // Off-main-thread highlighting for oversized documents, reconfigured in place
   // so switching tabs or toggling the flag adds/removes it (and disposes the
   // worker) without rebuilding the state.
@@ -165,6 +160,7 @@
         // Required in every view, see the note in Editor.svelte.
         EditorView.cspNonce.of(readCspNonce()),
         coreSetup,
+        keymapCompartment.of(currentKeymap()),
         gutterCompartment.of(gutterExtension(showLineNumbers)),
         wrapCompartment.of(wordWrap ? EditorView.lineWrapping : []),
         languageCompartment.of([]),
@@ -409,6 +405,22 @@
         effects: gutterCompartment.reconfigure(gutterExtension(on)),
       });
     }
+  });
+  // Rebind the customizable commands when the effective shortcuts change. The
+  // view takes the new bindings through its compartment; the states saved for
+  // the other tabs are updated too, or they would bring the old keys back when
+  // their tab is switched to.
+  $effect(() => {
+    const accels = shortcutsState.accelerators;
+    const os = platform.os;
+    untrack(() => {
+      const ext = keymapExtension('document', os, (id) => accels[id] ?? null);
+      const effects = keymapCompartment.reconfigure(ext);
+      for (const [id, saved] of states) {
+        states.set(id, saved.update({ effects }).state);
+      }
+      view?.dispatch({ effects });
+    });
   });
 
   // Forget saved states for tabs that have been closed.

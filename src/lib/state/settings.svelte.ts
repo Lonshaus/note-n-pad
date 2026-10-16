@@ -61,6 +61,7 @@ interface AppSettings {
 interface LoadedSettings {
   settings: AppSettings;
   repaired_fields: string[];
+  unset_defaults_to_notify?: string[];
   snapshot_dir_unavailable: boolean;
 }
 
@@ -204,6 +205,20 @@ export class SettingsState {
    *  used at startup and the default folder is in use instead. Set from
    *  `LoadedSettings.snapshot_dir_unavailable`, alongside `settingsRepaired`. */
   snapshotDirUnavailable = $state(false);
+  /** Rows whose default key is taken and not yet acknowledged, from the last
+   *  load. The Settings window acknowledges them once it has shown the notice. */
+  unsetDefaultsToNotify: string[] = [];
+  /** Tell the Rust core the unset-default notice was shown, so it is not
+   *  repeated on the next launch. A failure only means it is shown again. */
+  async ackUnsetDefaults(): Promise<void> {
+    try {
+      await invoke<void>('ack_unset_defaults', {
+        ids: this.unsetDefaultsToNotify,
+      });
+    } catch {
+      // Reported again on the next load.
+    }
+  }
 
   /** Persist a partial settings patch. On failure the optimistic in-memory
    *  value is re-read from disk, so the control snaps back to what is actually
@@ -219,6 +234,7 @@ export class SettingsState {
         this.apply(loaded.settings);
         this.settingsRepaired = loaded.repaired_fields.length > 0;
         this.snapshotDirUnavailable = loaded.snapshot_dir_unavailable ?? false;
+        this.unsetDefaultsToNotify = loaded.unset_defaults_to_notify ?? [];
       } catch {
         // The stored settings cannot be read back either; the flag is all the
         // signal there is.
@@ -232,6 +248,7 @@ export class SettingsState {
       this.apply(loaded.settings, true);
       this.settingsRepaired = loaded.repaired_fields.length > 0;
       this.snapshotDirUnavailable = loaded.snapshot_dir_unavailable ?? false;
+      this.unsetDefaultsToNotify = loaded.unset_defaults_to_notify ?? [];
     } finally {
       this.#markReady();
     }
@@ -387,15 +404,6 @@ export class SettingsState {
     this.snapshotDir = dir;
     await this.refreshResolvedSnapshotDir();
   }
-
-  /** Re-register the global new-note shortcut. Throws (propagated to the caller)
-   *  when the accelerator is invalid or cannot be registered, leaving the old
-   *  one in place; the local field is updated only on success. */
-  async setNewNoteShortcut(accelerator: string): Promise<void> {
-    await invoke<void>('set_new_note_shortcut', { shortcut: accelerator });
-    this.newNoteShortcut = accelerator;
-  }
-
   /** Reset the default sticky size to the built-in 280×230. */
   async resetStickySize(): Promise<void> {
     this.defaultStickyWidth = 280;

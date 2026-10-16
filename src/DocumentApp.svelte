@@ -81,6 +81,9 @@
   import { textFromString } from './lib/util/text';
   import { focusEditorIfIdle } from './lib/util/editorFocus';
   import { t } from './lib/i18n';
+  import { platform } from './lib/state/platform.svelte';
+  import { shortcutsState } from './lib/state/shortcuts.svelte';
+  import { matchWindowShortcut } from './lib/util/windowShortcut';
   import type { EditorView } from '@codemirror/view';
   import { undo, redo, selectAll } from '@codemirror/commands';
   import {
@@ -103,6 +106,8 @@
   // Stored `tab_index` to activate on restore (workspace click on a group whose
   // window was closed). Absent means the group's first tab.
   const initialTab = parseInitialTab(params.get('tab'));
+  // A window made by New Window starts with one blank tab.
+  const startBlank = params.get('blank') === '1';
 
   let showModal = $state(false);
   // The oversized gate is up: a dirty tab too large to snapshot must be saved or
@@ -1009,6 +1014,11 @@
     void revealWhenThemed();
     void (async (): Promise<void> => {
       await documentWindow.init(group, initialPath, initialProject, initialTab);
+      if (startBlank && documentWindow.tabs.length === 0) {
+        // The new tab's line ending and encoding come from the settings.
+        await settingsState.ready;
+        await documentWindow.newTab();
+      }
       // A fresh window opened for a single file whose open routed elsewhere (it
       // was already showing in another live window) has no tab and no pending
       // prompt; close the empty shell rather than leave it hanging. A pending
@@ -1030,14 +1040,18 @@
     })();
 
     // New Tab / Open / Save / Find and New Sticky are all menu accelerators now,
-    // so each fires exactly once through the menu path. Only Ctrl+Tab tab-cycling
-    // stays keydown-only (it is deliberately not a menu item). Both directions are
-    // listed in the Keyboard Shortcuts window via `NON_MENU_SHORTCUTS` in
-    // src-tauri/src/lib.rs — changing this binding means updating that table too.
+    // so each fires exactly once through the menu path. Only tab cycling stays
+    // keydown-only (it is deliberately not a menu item); its keys are the
+    // `window.next-tab` and `window.prev-tab` rows of the shortcut registry.
     const onKeydown = (e: KeyboardEvent): void => {
-      if (e.ctrlKey && e.key === 'Tab') {
+      const next = shortcutsState.accel('window.next-tab');
+      const prev = shortcutsState.accel('window.prev-tab');
+      if (next !== null && matchWindowShortcut(e, next, platform.os)) {
         e.preventDefault();
-        documentWindow.cycle(e.shiftKey ? -1 : 1);
+        documentWindow.cycle(1);
+      } else if (prev !== null && matchWindowShortcut(e, prev, platform.os)) {
+        e.preventDefault();
+        documentWindow.cycle(-1);
       }
     };
 

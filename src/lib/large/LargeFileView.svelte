@@ -21,6 +21,9 @@
   } from '../util/rangeEdit';
   import { formatFileSize } from '../util/format';
   import { t } from '../i18n';
+  import { platform } from '../state/platform.svelte';
+  import { shortcutsState } from '../state/shortcuts.svelte';
+  import { matchWindowShortcut } from '../util/windowShortcut';
 
   /** Byte span + line labels of a range selection, handed to the app to extract. */
   export interface RangeExtract {
@@ -639,13 +642,12 @@
       }
     }
   }
-
-  // Cmd/Ctrl+L opens goto. Cmd/Ctrl+F is a native menu accelerator (it never
-  // reaches this listener), so DocumentApp routes it to `openSearch` instead.
-  // Listed in the Keyboard Shortcuts window via `NON_MENU_SHORTCUTS` in
-  // src-tauri/src/lib.rs — changing this binding means updating that table too.
+  // The shortcut registry's `goto-line` key opens goto. Cmd/Ctrl+F is a native
+  // menu accelerator (it never reaches this listener), so DocumentApp routes it
+  // to `openSearch` instead.
   function onWindowKeydown(e: KeyboardEvent): void {
-    if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === 'l') {
+    const accel = shortcutsState.accel('goto-line');
+    if (accel !== null && matchWindowShortcut(e, accel, platform.os)) {
       e.preventDefault();
       openGoto();
     }
