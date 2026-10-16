@@ -33,6 +33,8 @@ mod linux_clipboard;
 mod linux_desktop_actions;
 mod locale_store;
 mod mac_bookmark;
+#[cfg(target_os = "macos")]
+mod mac_single_instance;
 mod navigation;
 mod note_store;
 mod path_guard;
@@ -243,6 +245,10 @@ pub(crate) fn flush_then_exit(app: &tauri::AppHandle) {
     log::debug!("quit handshake already in flight; ignoring re-entrant trigger");
     return;
   }
+  // A second start that sees this marker waits for the lock instead of
+  // handing over to an instance that is about to exit.
+  #[cfg(target_os = "macos")]
+  mac_single_instance::mark_quitting();
   // Every sticky and document window flushes its state and acks; the quit is
   // always silent now, and restore brings unsaved documents back afterward.
   let labels: HashSet<String> = app
@@ -273,6 +279,10 @@ pub(crate) fn flush_then_exit(app: &tauri::AppHandle) {
         // quit once the user has saved or discarded the offending tabs.
         // Release the guard so that retried quit can arm a fresh handshake.
         app.state::<FlushGate>().disarm();
+        // Removed before the guard is released, so a retried quit's marker
+        // is never the one removed.
+        #[cfg(target_os = "macos")]
+        mac_single_instance::clear_quitting();
         QUIT_IN_FLIGHT.store(false, Ordering::SeqCst);
         // `flush-request` only means a quit handshake started, not that it
         // will complete: every window that heard it must hear this too, so
@@ -2497,14 +2507,20 @@ pub fn run() {
   // `log`; it replaces the debug-only `tauri-plugin-log` registration that
   // used to leave every release build with no logging at all.
   diag::init();
+  // A second start of the same app exits here, before it reads settings or
+  // snapshots.
+  #[cfg(target_os = "macos")]
+  mac_single_instance::ensure();
   // Must run before any window (and so any taskbar association) exists.
   #[cfg(target_os = "windows")]
   jumplist::set_app_id();
   #[allow(unused_mut)]
   let mut builder = tauri::Builder::default();
   // The single-instance plugin must be registered first so it can intercept a
-  // second launch before any window is created. macOS is excluded: it handles
-  // reactivation through the Reopen event below, so its behavior is unchanged.
+  // second launch before any window is created. macOS uses
+  // `mac_single_instance::ensure` above instead: Launch Services reuses a
+  // running instance for ordinary opens, but `open -n` or running the
+  // executable directly starts a second process.
   #[cfg(any(target_os = "windows", target_os = "linux"))]
   {
     builder = builder.plugin(tauri_plugin_single_instance::init(|app, argv, _cwd| {
