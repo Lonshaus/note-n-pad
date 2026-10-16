@@ -353,6 +353,129 @@ pub fn merge_new_seed_keys(resource_dir: &Path, data_dir: &Path) {
     }
   }
 }
+/// (locale id, key, old shipped value) for every string reworded to read
+/// correctly for any count. A data-folder value that still equals the old
+/// shipped value is replaced; anything the user edited is never touched.
+const REWORDED: &[(&str, &str, &str)] = &[
+  ("en", "skipped.heading", "{count} files could not be loaded"),
+  ("en", "skipped.snapshotHeading", "{count} sticky or document snapshots could not be loaded"),
+  ("en", "settings.general.snapshotMoveBody", "The current folder has {count} sticky notes and unsaved document content. If you don't move them, they won't show up in Note&Pad anymore — they'll stay in the original folder."),
+  ("en", "settings.general.snapshotCollisionTitle", "The chosen folder already has {count} matching snapshots"),
+  ("en", "large.range.info", "Lines {start}–{end} ({count} lines, ~{size})"),
+  ("en", "large.search.results", "{count} results"),
+  ("en", "status.indexing", "Indexing… {count} lines"),
+  ("en", "status.lines", "{count} lines"),
+  ("en", "doc.restoreUnreadable", "Couldn’t read {names}. Open them again to continue."),
+  ("de", "skipped.heading", "{count} Dateien konnten nicht geladen werden"),
+  ("de", "skipped.snapshotHeading", "{count} Notiz- oder Dokument-Sicherungen konnten nicht geladen werden"),
+  ("de", "settings.general.snapshotCollisionTitle", "Der ausgewählte Ordner enthält bereits {count} gleiche Schnappschüsse"),
+  ("de", "large.range.info", "Zeilen {start}–{end} ({count} Zeilen, ca. {size})"),
+  ("de", "large.search.results", "{count} Ergebnisse"),
+  ("de", "status.indexing", "Indizierung… {count} Zeilen"),
+  ("de", "status.lines", "{count} Zeilen"),
+  ("de", "doc.restoreUnreadable", "{names} konnte nicht gelesen werden. Öffne die Dateien erneut, um fortzufahren."),
+  ("fr", "skipped.heading", "{count} fichiers n’ont pas pu être chargés"),
+  ("fr", "skipped.snapshotHeading", "{count} instantanés de notes ou de documents n’ont pas pu être chargés"),
+  ("fr", "settings.general.snapshotMoveBody", "Le dossier actuel contient {count} pense-bêtes et du contenu de document non enregistré. Si vous ne les déplacez pas, ils n'apparaîtront plus dans Note&Pad et resteront uniquement dans le dossier d'origine."),
+  ("fr", "settings.general.snapshotCollisionTitle", "Le dossier choisi contient déjà {count} instantanés identiques"),
+  ("fr", "large.range.info", "Lignes {start}–{end} ({count} lignes, ~{size})"),
+  ("fr", "large.search.results", "{count} résultats"),
+  ("fr", "status.indexing", "Indexation… {count} lignes"),
+  ("fr", "status.lines", "{count} lignes"),
+  ("fr", "doc.restoreUnreadable", "Impossible de lire {names}. Rouvrez les fichiers pour continuer."),
+  ("es", "skipped.heading", "No se pudieron cargar {count} archivos"),
+  ("es", "skipped.snapshotHeading", "No se pudieron cargar {count} instantáneas de notas o documentos"),
+  ("es", "settings.general.snapshotMoveBody", "La carpeta actual tiene {count} notas adhesivas y contenido de documentos sin guardar. Si no las mueve, dejarán de aparecer en Note&Pad y solo permanecerán en la carpeta original."),
+  ("es", "settings.general.snapshotCollisionTitle", "La carpeta seleccionada ya tiene {count} instantáneas iguales"),
+  ("es", "large.range.info", "Líneas {start}–{end} ({count} líneas, ~{size})"),
+  ("es", "large.search.searching", "Buscando… {count} encontrados"),
+  ("es", "large.search.results", "{count} resultados"),
+  ("es", "status.indexing", "Indexando… {count} líneas"),
+  ("es", "status.lines", "{count} líneas"),
+  ("es", "doc.restoreUnreadable", "No se pudo leer {names}. Ábrelos de nuevo para continuar."),
+  ("it", "skipped.snapshotHeading", "Non è stato possibile caricare {count} istantanee di note o documenti"),
+  ("it", "settings.general.snapshotCollisionTitle", "La cartella scelta contiene già {count} snapshot identici"),
+  ("it", "large.range.info", "Righe {start}–{end} ({count} righe, ~{size})"),
+  ("it", "large.search.searching", "Ricerca in corso… {count} trovati"),
+  ("it", "large.search.results", "{count} risultati"),
+  ("it", "status.indexing", "Indicizzazione… {count} righe"),
+  ("it", "status.lines", "{count} righe"),
+  ("it", "doc.restoreUnreadable", "Impossibile leggere {names}. Riaprili per continuare."),
+  ("pt-BR", "skipped.heading", "Não foi possível carregar {count} arquivos"),
+  ("pt-BR", "skipped.snapshotHeading", "Não foi possível carregar {count} instantâneos de notas ou documentos"),
+  ("pt-BR", "settings.general.snapshotMoveBody", "A pasta atual tem {count} notas adesivas e conteúdo de documentos não salvo. Se você não movê-las, elas deixarão de aparecer no Note&Pad e permanecerão apenas na pasta original."),
+  ("pt-BR", "settings.general.snapshotCollisionTitle", "A pasta escolhida já tem {count} instantâneos iguais"),
+  ("pt-BR", "large.range.info", "Linhas {start}–{end} ({count} linhas, ~{size})"),
+  ("pt-BR", "large.search.searching", "Pesquisando… {count} encontrados"),
+  ("pt-BR", "large.search.results", "{count} resultados"),
+  ("pt-BR", "status.indexing", "Indexando… {count} linhas"),
+  ("pt-BR", "status.lines", "{count} linhas"),
+  ("pt-BR", "doc.restoreUnreadable", "Não foi possível ler {names}. Abra os arquivos novamente para continuar."),
+  ("ru", "settings.general.snapshotMoveBody", "В текущей папке находится {count} стикеров и несохранённое содержимое документов. Если их не переместить, они больше не будут отображаться в Note&Pad и останутся только в исходной папке."),
+  ("ru", "settings.general.snapshotCollisionTitle", "В выбранной папке уже есть {count} таких же снимков"),
+  ("ru", "large.range.info", "Строки {start}–{end} ({count} строк, ~{size})"),
+  ("ru", "status.indexing", "Индексирование… {count} строк"),
+  ("ru", "doc.restoreUnreadable", "Не удалось прочитать: {names}. Откройте файлы снова, чтобы продолжить."),
+  ("pl", "settings.general.snapshotMoveBody", "Bieżący folder zawiera {count} karteczek i niezapisaną zawartość dokumentów. Jeśli ich nie przeniesiesz, nie będą już widoczne w Note&Pad i pozostaną tylko w pierwotnym folderze."),
+  ("pl", "settings.general.snapshotCollisionTitle", "Wybrany folder zawiera już {count} takich samych migawek"),
+  ("pl", "large.range.info", "Wiersze {start}–{end} ({count} wierszy, ~{size})"),
+  ("pl", "status.indexing", "Indeksowanie… {count} wierszy"),
+  ("pl", "status.lines", "{count} wierszy"),
+  ("pl", "doc.restoreUnreadable", "Nie można odczytać: {names}. Otwórz pliki ponownie, aby kontynuować."),
+  ("tr", "doc.restoreUnreadable", "{names} okunamadı. Devam etmek için dosyaları yeniden açın."),
+  ("vi", "doc.restoreUnreadable", "Không đọc được {names}. Hãy mở lại các tệp để tiếp tục."),
+];
+/// Replace unedited old shipped values with the new ones. A locale with a
+/// bundled seed gets the seed value. A compiled locale (no seed) has the key
+/// removed from its data file so lookup falls through to the compiled string.
+pub fn update_reworded_values(resource_dir: &Path, data_dir: &Path) {
+  update_reworded_with(REWORDED, resource_dir, data_dir);
+}
+
+fn update_reworded_with(table: &[(&str, &str, &str)], resource_dir: &Path, data_dir: &Path) {
+  let ids: BTreeSet<&str> = table.iter().map(|(id, _, _)| *id).collect();
+  for id in ids {
+    if !valid_id(id) {
+      continue;
+    }
+    let Some(mut data) = std::fs::read_to_string(locale_file(data_dir, id))
+      .ok()
+      .and_then(|text| parse_locale(&text).ok())
+    else {
+      continue;
+    };
+    if data.id != id {
+      continue;
+    }
+    let seed = std::fs::read_to_string(locale_file(resource_dir, id))
+      .ok()
+      .and_then(|text| parse_locale(&text).ok());
+    let mut changed = false;
+    for (_, key, old) in table.iter().filter(|(i, _, _)| *i == id) {
+      if data.strings.get(*key).map(String::as_str) != Some(*old) {
+        continue;
+      }
+      match &seed {
+        Some(seed) => match seed.strings.get(*key) {
+          Some(new) if new != old => {
+            data.strings.insert((*key).to_string(), new.clone());
+            changed = true;
+          }
+          _ => {}
+        },
+        None => {
+          data.strings.remove(*key);
+          changed = true;
+        }
+      }
+    }
+    if changed {
+      if let Err(e) = save_locale_to(data_dir, &data) {
+        log::warn!("failed to update reworded strings in locale {id}: {e}");
+      }
+    }
+  }
+}
 /// Seed the app-data `locales` dir from the bundled resources on first run,
 /// then fold in seed keys added by later releases.
 /// Called once from setup, before any locale command touches the dir.
@@ -361,6 +484,7 @@ pub fn seed_on_startup(app: &AppHandle) -> Result<(), String> {
   let data_dir = app_data_locales_dir(app)?;
   seed_defaults_if_missing(&resource_dir, &data_dir)?;
   merge_new_seed_keys(&resource_dir, &data_dir);
+  update_reworded_values(&resource_dir, &data_dir);
   Ok(())
 }
 
@@ -878,5 +1002,71 @@ mod tests {
     write_locale(&data, &locale_with("de", &[("a", "edited")]));
     merge_new_seed_keys(&res, &data);
     assert_eq!(read_locale(&data, "de").strings["a"], "edited");
+  }
+
+  #[test]
+  fn reworded_replaces_old_shipped_values_and_keeps_edits() {
+    let base = tempdir().unwrap();
+    let (res, data) = (base.path().join("res"), base.path().join("data"));
+    std::fs::create_dir_all(&res).unwrap();
+    std::fs::create_dir_all(&data).unwrap();
+    let table = [
+      ("de", "a", "old a"),
+      ("de", "b", "old b"),
+      ("de", "c", "old c"),
+    ];
+    write_locale(
+      &res,
+      &locale_with("de", &[("a", "new a"), ("b", "new b"), ("c", "new c")]),
+    );
+    write_locale(
+      &data,
+      &locale_with(
+        "de",
+        &[("a", "old a"), ("b", "my b"), ("c", "old c"), ("x", "mine")],
+      ),
+    );
+    update_reworded_with(&table, &res, &data);
+    let got = read_locale(&data, "de");
+    assert_eq!(got.strings["a"], "new a");
+    assert_eq!(got.strings["b"], "my b");
+    assert_eq!(got.strings["c"], "new c");
+    assert_eq!(got.strings["x"], "mine");
+    let before = std::fs::read_to_string(locale_file(&data, "de")).unwrap();
+    update_reworded_with(&table, &res, &data);
+    assert_eq!(
+      std::fs::read_to_string(locale_file(&data, "de")).unwrap(),
+      before
+    );
+  }
+
+  #[test]
+  fn reworded_removes_old_values_from_a_compiled_locale_file() {
+    let base = tempdir().unwrap();
+    let (res, data) = (base.path().join("res"), base.path().join("data"));
+    std::fs::create_dir_all(&res).unwrap();
+    std::fs::create_dir_all(&data).unwrap();
+    let table = [("en", "a", "old a"), ("en", "b", "old b")];
+    write_locale(
+      &data,
+      &locale_with("en", &[("a", "old a"), ("b", "my b"), ("c", "mine")]),
+    );
+    update_reworded_with(&table, &res, &data);
+    let got = read_locale(&data, "en");
+    assert!(!got.strings.contains_key("a"));
+    assert_eq!(got.strings["b"], "my b");
+    assert_eq!(got.strings["c"], "mine");
+  }
+
+  #[test]
+  fn reworded_table_matches_the_bundled_seeds() {
+    let res = Path::new(env!("CARGO_MANIFEST_DIR")).join("resources/locales");
+    for (id, key, old) in REWORDED {
+      if let Ok(text) = std::fs::read_to_string(locale_file(&res, id)) {
+        let seed = parse_locale(&text).unwrap();
+        let new = &seed.strings[*key];
+        assert_ne!(new, old, "{id} {key} still holds the old value");
+      }
+    }
   }
 }
