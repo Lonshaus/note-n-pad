@@ -2,7 +2,7 @@
   // Copyright © 2026 Lonshaus
   // SPDX-License-Identifier: GPL-3.0-only
 
-  import { onMount } from 'svelte';
+  import { onMount, tick, untrack } from 'svelte';
   import { SvelteMap } from 'svelte/reactivity';
   import { invoke } from '@tauri-apps/api/core';
   import { getCurrentWindow } from '@tauri-apps/api/window';
@@ -50,7 +50,11 @@
     tabReportEntry,
     isEditAction,
     editActionSurface,
+    isNativeUndoField,
+    nativeFieldHistory,
+    nativeSelectAll,
   } from './lib/util/menuBar';
+  import { overlayKeyAction } from './lib/util/overlayKeys';
   import {
     editorCopy,
     editorCut,
@@ -241,6 +245,7 @@
     largeGetRange: () => { startLine: number; endLine: number } | null;
     largeRangeEdit: () => void;
     largeRangeSaveAs: (path: string) => Promise<boolean>;
+    selectAllVisible: () => void;
   } | null>(null);
   // The mounted windowed editor (only while a windowed tab is active), exposing
   // its window/goto surface to the DEV automation hooks.
@@ -254,6 +259,7 @@
     windowedTrace: () => unknown[];
     undo: () => void;
     redo: () => void;
+    selectAllVisible: () => void;
     focus: () => void;
     endComposition: () => Promise<void>;
     isComposing: () => boolean;
@@ -434,6 +440,11 @@
   const showJson = $derived(activeViewMode === 'json');
   const showXml = $derived(activeViewMode === 'xml');
   const showMarkdown = $derived(activeViewMode === 'markdown');
+  // A view other than the source editor is drawn over the active tab's editor.
+  // The editor stays mounted behind it but must not be typed into.
+  const overlayShown = $derived(
+    activeOrdinary && (showTable || showJson || showXml || showMarkdown),
+  );
   // The folder the Markdown preview may load images from: the document's own,
   // and a range tab's real file is its source, not its (empty) `path`. Null
   // for an unsaved tab, which gets no images at all.
@@ -508,6 +519,17 @@
       if (view === null || view.state.doc !== active.content) {
         documentWindow.forceEditorReload();
       }
+    }
+  }
+  // The status-bar switcher: a mode picked there also moves the keyboard. An
+  // overlay takes focus in the effect below; leaving one for the source hands
+  // it back to the editor once that is editable again. Direct focus, not
+  // `focusEditorIfIdle`, which would leave it on the switcher's <select>.
+  function switchViewMode(mode: ViewMode): void {
+    const leavingOverlay = overlayShown && mode === 'source';
+    setViewMode(mode);
+    if (leavingOverlay) {
+      void tick().then(() => liveView()?.focus());
     }
   }
 
@@ -586,23 +608,53 @@
     tableRef?.deselect();
     redo(view);
   }
+  // The JSON, XML and Markdown views change nothing themselves: undo/redo run
+  // the source editor's history and the view redraws from the new text.
+  function previewUndo(): void {
+    const view = liveView();
+    if (view !== null) {
+      undo(view);
+    }
+  }
 
-  // Window-level fallback so undo/redo work in table view even when focus sits
-  // outside the table (e.g. right after opening, before any cell is clicked).
-  // The table's own handler runs first and preventDefaults, so skip those. A
-  // windowed tab owns its own Cmd+Z (routed to the Rust journal by the editor's
-  // keymap), so this table fallback must never steal it.
+  function previewRedo(): void {
+    const view = liveView();
+    if (view !== null) {
+      redo(view);
+    }
+  }
+  // Window-level fallback so undo/redo and Select All work in any non-source
+  // view even when focus sits outside it (e.g. right after opening, or on the
+  // mode switcher). The table's own handler runs first and preventDefaults, so
+  // skip those. A windowed tab owns its own Cmd+Z (routed to the Rust journal
+  // by the editor's keymap), so this fallback must never steal it. Select All
+  // leaves a focused text field (a cell being edited) to select its own text.
   function onWindowKeydown(e: KeyboardEvent): void {
-    if (!showTable || e.defaultPrevented || active?.windowed !== undefined) {
+    if (!overlayShown || e.defaultPrevented || active?.windowed !== undefined) {
       return;
     }
-    if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === 'z') {
-      e.preventDefault();
-      if (e.shiftKey) {
+    const action = overlayKeyAction(e, platform.os);
+    if (action === null) {
+      return;
+    }
+    if (action === 'select-all') {
+      if (!isNativeUndoField(document.activeElement)) {
+        e.preventDefault();
+        overlaySelectAll();
+      }
+      return;
+    }
+    e.preventDefault();
+    if (showTable) {
+      if (action === 'redo') {
         tableRedo();
       } else {
         tableUndo();
       }
+    } else if (action === 'redo') {
+      previewRedo();
+    } else {
+      previewUndo();
     }
   }
 
@@ -688,6 +740,8 @@
   function focusActiveEditor(): void {
     if (documentWindow.activeTab?.windowed !== undefined) {
       windowedRef?.focus();
+    } else if (overlayShown) {
+      focusEditorIfIdle({ focus: focusOverlay }, anyModalOpen);
     } else {
       focusEditorIfIdle(liveView(), anyModalOpen);
     }
@@ -708,7 +762,123 @@
     deselect: () => void;
     setHeaderRow: (on: boolean) => void;
     getHeaderRow: () => boolean;
+    focus: () => void;
+    selectedText: () => string | null;
   } | null>(null);
+  // The mounted JSON, XML or Markdown view (only while that view is shown).
+  // JSON renders its whole tree, so its Select All is a DOM range; the XML and
+  // Markdown views draw only what is near the viewport, so theirs is view state
+  // and `selectedText` is the whole content built from their own model.
+  let jsonRef = $state<{
+    focus: () => void;
+    selectAll: () => void;
+  } | null>(null);
+  let xmlRef = $state<{
+    focus: () => void;
+    selectAll: () => void;
+    selectedText: () => string | null;
+  } | null>(null);
+  let markdownRef = $state<{
+    focus: () => void;
+    selectAll: () => void;
+    selectedText: () => string | null;
+  } | null>(null);
+  // The shown view's handle, whichever kind it is.
+  const overlayRef = $derived(
+    showTable
+      ? tableRef
+      : showJson
+        ? jsonRef
+        : showXml
+          ? xmlRef
+          : showMarkdown
+            ? markdownRef
+            : null,
+  );
+
+  function focusOverlay(): void {
+    overlayRef?.focus();
+  }
+  // Every way into a view moves the keyboard onto it, so nothing typed or
+  // deleted lands in the editor underneath: a mode switch, a tab switch, a
+  // window opening or being restored, and returning from a windowed tab all
+  // mount or re-key the view or change the active tab. The window regaining
+  // focus is `focusActiveEditor`. Directly rather than through
+  // `focusEditorIfIdle`, which leaves the mode switcher's <select> alone.
+  $effect(() => {
+    const target = overlayRef;
+    void active?.id;
+    if (target === null) {
+      return;
+    }
+    untrack(() => {
+      if (!anyModalOpen) {
+        target.focus();
+      }
+    });
+  });
+  // Select All in the shown view. The table selects every cell; JSON selects
+  // its rendered content; XML and Markdown select every row or block.
+  function overlaySelectAll(): void {
+    if (isNativeUndoField(document.activeElement)) {
+      document.execCommand('selectAll');
+    } else {
+      // The table's cells are <input>s and XML/Markdown draw only what is on
+      // screen, so a DOM range cannot hold their selection: drop any DOM range
+      // and select through the model.
+      if (showTable || showXml || showMarkdown) {
+        document.getSelection()?.removeAllRanges();
+      }
+      overlayRef?.selectAll();
+    }
+  }
+  // The text a copy must write because the shown view holds a selection that
+  // has no DOM range: a table selection (its cells are <input>s) or the XML /
+  // Markdown whole-content selection. Null means "nothing of that kind": the
+  // browser's own copy applies, as it does for a cell being edited.
+  function overlayCopyText(): string | null {
+    if (isNativeUndoField(document.activeElement)) {
+      return null;
+    }
+    if (showTable) {
+      return tableRef?.selectedText() ?? null;
+    }
+    if (showXml) {
+      return xmlRef?.selectedText() ?? null;
+    }
+    if (showMarkdown) {
+      return markdownRef?.selectedText() ?? null;
+    }
+    return null;
+  }
+  // With no DOM selection a clipboard event's target is <body>, so these live
+  // on the document. `beforecopy` is what makes WebKit enable the Copy menu
+  // item when nothing is selected in the DOM.
+  function onBeforeCopy(e: Event): void {
+    if (overlayCopyText() !== null) {
+      e.preventDefault();
+    }
+  }
+
+  function onOverlayCopy(e: ClipboardEvent): void {
+    const text = overlayCopyText();
+    if (text !== null && e.clipboardData !== null) {
+      e.preventDefault();
+      e.clipboardData.setData('text/plain', text);
+    }
+  }
+
+  $effect(() => {
+    if (!overlayShown) {
+      return;
+    }
+    document.addEventListener('beforecopy', onBeforeCopy);
+    document.addEventListener('copy', onOverlayCopy);
+    return () => {
+      document.removeEventListener('beforecopy', onBeforeCopy);
+      document.removeEventListener('copy', onOverlayCopy);
+    };
+  });
 
   // Find/replace acts on the CM view, which any other view is drawn on top of.
   // Switching the active tab back to source first is the least-surprising
@@ -828,23 +998,56 @@
         isTable: showTable,
         isWindowed: active?.windowed !== undefined,
         hasEditorView: view !== null,
+        isOverlay: showJson || showXml || showMarkdown,
+        isViewer: active?.large !== undefined && active.windowed === undefined,
+        fieldFocused: isNativeUndoField(document.activeElement),
+        modalOpen: anyModalOpen,
       });
-      if (surface === 'table') {
+      if (surface === 'field') {
+        if (action === 'select-all') {
+          nativeSelectAll();
+        } else {
+          nativeFieldHistory(action === 'redo' ? 'redo' : 'undo');
+        }
+      } else if (surface === 'table') {
         if (action === 'undo') {
           tableUndo();
         } else if (action === 'redo') {
           tableRedo();
         } else if (action === 'select-all') {
-          tableRef?.selectAll();
+          overlaySelectAll();
         } else if (action === 'copy') {
-          tableRef?.copySelection();
+          if (isNativeUndoField(document.activeElement)) {
+            document.execCommand('copy');
+          } else {
+            tableRef?.copySelection();
+          }
+        }
+      } else if (surface === 'overlay') {
+        if (action === 'undo') {
+          previewUndo();
+        } else if (action === 'redo') {
+          previewRedo();
+        } else if (action === 'select-all') {
+          overlaySelectAll();
+        } else if (action === 'copy') {
+          const text = overlayCopyText();
+          if (text !== null) {
+            void navigator.clipboard.writeText(text);
+          } else {
+            document.execCommand('copy');
+          }
         }
       } else if (surface === 'windowed') {
-        if (action === 'undo') {
+        if (action === 'select-all') {
+          windowedRef?.selectAllVisible();
+        } else if (action === 'undo') {
           windowedRef?.undo();
         } else {
           windowedRef?.redo();
         }
+      } else if (surface === 'viewer') {
+        largeRef?.selectAllVisible();
       } else if (surface === 'editor' && view !== null) {
         if (action === 'undo') {
           undo(view);
@@ -1698,6 +1901,7 @@
           lineNumbers={settingsState.editorLineNumbers}
           modalOpen={anyModalOpen}
           hidden={!activeOrdinary}
+          overlay={overlayShown}
           {openIds}
           reloadSeq={documentWindow.reloadSeq}
           reloadTarget={documentWindow.reloadTargetId}
@@ -1715,12 +1919,20 @@
     {#if activeOrdinary && active !== null}
       {#if showJson}
         <div class="table-overlay">
-          <JsonView doc={active.content} dark={settingsState.isDark} />
+          <JsonView
+            bind:this={jsonRef}
+            doc={active.content}
+            dark={settingsState.isDark}
+          />
         </div>
       {/if}
       {#if showXml}
         <div class="table-overlay">
-          <XmlView doc={active.content} dark={settingsState.isDark} />
+          <XmlView
+            bind:this={xmlRef}
+            doc={active.content}
+            dark={settingsState.isDark}
+          />
         </div>
       {/if}
       {#if showMarkdown}
@@ -1730,6 +1942,7 @@
                wherever the previous one was left. -->
           {#key active.id}
             <MarkdownView
+              bind:this={markdownRef}
               doc={active.content}
               dark={settingsState.isDark}
               baseDir={previewBaseDir}
@@ -1781,7 +1994,7 @@
       onlineending={(ending) => documentWindow.setLineEnding(ending)}
       onencoding={(label) => documentWindow.setEncoding(label)}
       onlanguage={(name) => documentWindow.setActiveLanguage(name)}
-      onviewmode={(mode) => setViewMode(mode)}
+      onviewmode={(mode) => switchViewMode(mode)}
     />
   {/if}
 

@@ -72,6 +72,11 @@
     // stays mounted to keep every tab's state, but takes no focus and reports
     // nothing to the status bar.
     hidden?: boolean;
+    // True while a table, JSON, XML or Markdown view is drawn over this editor.
+    // Separate from `hidden` so the per-tab state rules stay as they are: the
+    // editor is still mounted and still holds the tab's state, but nothing can
+    // be typed, deleted or pasted into it, and it never takes focus.
+    overlay?: boolean;
     // True while any dialog/modal is up in the host window; suppresses the
     // automatic focus handoff so a gate/confirm keeps the keyboard.
     modalOpen?: boolean;
@@ -97,6 +102,7 @@
     reloadSeq,
     reloadTarget,
     hidden = false,
+    overlay = false,
     modalOpen = false,
     onchange,
     onselection,
@@ -156,9 +162,9 @@
   // so switching tabs or toggling the flag adds/removes it (and disposes the
   // worker) without rebuilding the state.
   const workerCompartment = new Compartment();
-  // Not editable while hidden: WebKit's `inert` blocks typed text but not
-  // native editing commands (Delete, menu Select All) on a still-focused
-  // editor.
+  // Not editable while hidden or covered by a view: WebKit's `inert` blocks
+  // typed text but not native editing commands (Delete, menu Select All) on a
+  // still-focused editor.
   const editableCompartment = new Compartment();
   // Per-tab EditorState (doc + selection + history), keyed by tab id. Swapping
   // via view.setState keeps each tab's undo history and cursor isolated.
@@ -197,7 +203,7 @@
         languageCompartment.of([]),
         workerCompartment.of([]),
         themeCompartment.of(varEditorTheme(dark)),
-        editableCompartment.of(EditorView.editable.of(!hidden)),
+        editableCompartment.of(EditorView.editable.of(!hidden && !overlay)),
         EditorView.updateListener.of((update) => {
           if (update.docChanged) {
             // Zero-copy: hand the rope reference to state, no whole-buffer string.
@@ -353,7 +359,7 @@
     onview?.(view);
     // Claim keyboard focus on load (initial mount, restore, or first open) so a
     // window opened programmatically does not silently drop the first keystrokes.
-    if (!hidden) {
+    if (!hidden && !overlay) {
       focusEditorIfIdle(view, modalOpen);
     }
     if (import.meta.env.DEV) {
@@ -392,7 +398,9 @@
       view.dispatch({
         effects: [
           themeCompartment.reconfigure(varEditorTheme(dark)),
-          editableCompartment.reconfigure(EditorView.editable.of(!hidden)),
+          editableCompartment.reconfigure(
+            EditorView.editable.of(!hidden && !overlay),
+          ),
         ],
       });
       const snap = scrolls.get(id);
@@ -405,7 +413,7 @@
       reportSelection();
       // Re-claim focus after a tab switch (read untracked, so this never re-runs
       // on a modal toggle) so typing works without clicking the switched-to tab.
-      if (!hidden) {
+      if (!hidden && !overlay) {
         focusEditorIfIdle(view, modalOpen);
       }
     });
@@ -415,6 +423,7 @@
   let wasHidden = false;
   $effect(() => {
     const isHidden = hidden;
+    const covered = overlay;
     untrack(() => {
       const returning = wasHidden && !isHidden;
       wasHidden = isHidden;
@@ -423,10 +432,10 @@
       }
       view.dispatch({
         effects: editableCompartment.reconfigure(
-          EditorView.editable.of(!isHidden),
+          EditorView.editable.of(!isHidden && !covered),
         ),
       });
-      if (isHidden && view.hasFocus) {
+      if ((isHidden || covered) && view.hasFocus) {
         view.contentDOM.blur();
       }
       if (import.meta.env.DEV) {
@@ -442,7 +451,9 @@
       }
       if (returning) {
         reportSelection();
-        focusEditorIfIdle(view, modalOpen);
+        if (!covered) {
+          focusEditorIfIdle(view, modalOpen);
+        }
       }
     });
   });

@@ -272,6 +272,25 @@ export function nextWindow(
   const endLine = Math.min(totalLines, startLine + windowLines);
   return { startLine, endLine };
 }
+/** The document span from the first to the last line block lying fully inside
+ *  the viewport (1 px tolerance). With no fully visible block, the first block
+ *  that intersects the viewport; null when none does. */
+export function fullyVisibleLineSpan(
+  blocks: readonly { from: number; to: number; top: number; bottom: number }[],
+  viewTop: number,
+  viewBottom: number,
+): { from: number; to: number } | null {
+  const inside = blocks.filter(
+    (b) => b.top >= viewTop - 1 && b.bottom <= viewBottom + 1,
+  );
+  const first = inside[0];
+  const last = inside[inside.length - 1];
+  if (first !== undefined && last !== undefined) {
+    return { from: first.from, to: last.to };
+  }
+  const hit = blocks.find((b) => b.bottom > viewTop && b.top < viewBottom);
+  return hit === undefined ? null : { from: hit.from, to: hit.to };
+}
 /** Whether a transaction must be dropped during a window swap: a user-originated
  *  (userEvent-annotated) document change. Our own dispatches carry no userEvent. */
 export function rejectDuringSwap(
