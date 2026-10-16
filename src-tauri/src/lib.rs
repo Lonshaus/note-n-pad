@@ -2354,9 +2354,10 @@ pub fn run() {
       }
       // Before any window exists, so restored windows paint the right title bar.
       apply_app_theme(handle, &settings::app_settings(handle).interface_mode);
-      // Seed the 10 bundled default themes into app data on first run only;
-      // a themes dir that already exists (even emptied by the user) is left
-      // untouched so deleted defaults never come back.
+      // Seed the bundled default themes into app data on first run, then copy
+      // themes that later releases added to the bundle. A themes dir that
+      // already exists is otherwise left untouched, so deleted defaults never
+      // come back.
       if let Err(e) = theme_store::seed_on_startup(handle) {
         log::warn!("failed to seed default themes: {e}");
       }

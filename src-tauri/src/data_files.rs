@@ -48,8 +48,9 @@ fn resolve(
 }
 
 /// Delete one file that failed to load. It is addressed by name because the
-/// per-store delete commands all build `{id}.json` from an id, which cannot
-/// name a conflict copy or a file whose id is the reason it was skipped.
+/// per-store delete commands work from an id (`{id}.json`, or for themes the
+/// file declaring that id), which cannot name a conflict copy or a file whose
+/// id is the reason it was skipped.
 #[tauri::command]
 pub fn delete_data_file(
   app: AppHandle,
