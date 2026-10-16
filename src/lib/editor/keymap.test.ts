@@ -7,7 +7,7 @@ import {
   EditorState,
   type Transaction,
 } from '@codemirror/state';
-import type { EditorView, KeyBinding } from '@codemirror/view';
+import { keymap, type EditorView, type KeyBinding } from '@codemirror/view';
 import { indentLess, indentMore } from '@codemirror/commands';
 import {
   cursorLineStart,
@@ -29,9 +29,11 @@ import {
   startCompletion,
 } from '@codemirror/autocomplete';
 import type { KeyLike } from '../util/accelerator';
+import { offscreenArrowKeys } from './offscreenArrow';
 import {
   REBINDABLE,
   buildKeymap,
+  keymapExtension,
   resolveCodeNamedKey,
   shiftTabKey,
   tabKey,
@@ -396,6 +398,95 @@ describe('buildKeymap', () => {
   });
 });
 
+describe('Up and Down for a caret outside the rendered lines', () => {
+  it('binds both keys with their Shift variants in every editor', () => {
+    for (const profile of PROFILES) {
+      for (const os of ['macos', 'windows'] as const) {
+        const { offscreen } = buildKeymap(profile, os, accelFor(os));
+        const arrows = offscreen.filter((b) => b.key !== undefined);
+        expect(arrows.map((b) => b.key)).toEqual(['ArrowUp', 'ArrowDown']);
+        for (const b of offscreen) {
+          expect(b.run, `${profile} ${os}`).toBeTypeOf('function');
+          expect(b.shift, `${profile} ${os}`).toBeTypeOf('function');
+          expect(b.run).not.toBe(b.shift);
+        }
+        expect(arrows).toEqual([...offscreenArrowKeys]);
+      }
+    }
+  });
+
+  it('binds macOS Ctrl-p and Ctrl-n to the same commands, on macOS only', () => {
+    for (const profile of PROFILES) {
+      const mac = buildKeymap(profile, 'macos', accelFor('macos')).offscreen;
+      expect(
+        mac.filter((b) => b.key === undefined).map((b) => b.mac),
+        profile,
+      ).toEqual(['Ctrl-p', 'Ctrl-n']);
+      const [up, down] = offscreenArrowKeys;
+      expect(mac[2]?.run, profile).toBe(up?.run);
+      expect(mac[2]?.shift, profile).toBe(up?.shift);
+      expect(mac[3]?.run, profile).toBe(down?.run);
+      expect(mac[3]?.shift, profile).toBe(down?.shift);
+      const win = buildKeymap(
+        profile,
+        'windows',
+        accelFor('windows'),
+      ).offscreen;
+      expect(
+        win.some((b) => b.mac !== undefined),
+        profile,
+      ).toBe(false);
+    }
+  });
+
+  it('keeps them out of the rebindable and the stock bindings', () => {
+    for (const profile of PROFILES) {
+      const { normal, completion, offscreen } = buildKeymap(
+        profile,
+        'macos',
+        accelFor('macos'),
+      );
+      for (const b of offscreen) {
+        expect(normal.includes(b), profile).toBe(false);
+        expect(completion.includes(b), profile).toBe(false);
+      }
+      // The stock Up and Down stay, for a caret inside the rendered lines.
+      for (const key of ['ArrowUp', 'ArrowDown']) {
+        expect(
+          normal.some((b) => b.key === key),
+          `${profile} ${key}`,
+        ).toBe(true);
+      }
+    }
+  });
+
+  it('ranks them above the other bindings and below the completion list', () => {
+    for (const profile of PROFILES) {
+      const extension = keymapExtension(
+        profile,
+        'windows',
+        accelFor('windows'),
+      );
+      // A keymap of ordinary precedence listed before the editor's own.
+      const other: KeyBinding[] = [{ key: 'ArrowDown', run: () => false }];
+      const maps = EditorState.create({
+        extensions: [keymap.of(other), extension],
+      }).facet(keymap);
+      const mine = maps.findIndex((map) =>
+        map.some((b) => b.run === offscreenArrowKeys[1]?.run),
+      );
+      const withDown = maps.flatMap((map, i) =>
+        map.some((b) => b.key === 'ArrowDown') ? [i] : [],
+      );
+      // Only the completion list's keymap, the document editor's, comes first.
+      expect(withDown.indexOf(mine), profile).toBe(
+        profile === 'document' ? 1 : 0,
+      );
+      expect(maps.indexOf(other), profile).toBeGreaterThan(mine);
+    }
+  });
+});
+
 describe('Tab key', () => {
   const tabOf = (bindings: KeyBinding[]): KeyBinding[] =>
     bindings.filter((b) => b.key === 'Tab');
@@ -499,32 +590,36 @@ describe('resolveCodeNamedKey', () => {
     metaKey: mods.metaKey ?? false,
   });
   const bindings = everyBinding('document', 'macos');
+  const resolve = (
+    list: readonly KeyBinding[],
+    event: KeyLike,
+    os = 'macos',
+  ): ReturnType<typeof resolveCodeNamedKey> =>
+    resolveCodeNamedKey(list, event, os);
 
   it('finds the binding of a named key the layout turned into a character', () => {
     // Zhuyin: Option+Esc arrives as U+200D with code Escape.
-    expect(
-      resolveCodeNamedKey(bindings, key('\u200D', 'Escape', { altKey: true })),
-    ).toBe(startCompletion);
+    expect(resolve(bindings, key('\u200D', 'Escape', { altKey: true }))).toBe(
+      startCompletion,
+    );
   });
 
   it('leaves ordinary events to CodeMirror', () => {
     expect(
-      resolveCodeNamedKey(bindings, key('Escape', 'Escape', { altKey: true })),
+      resolve(bindings, key('Escape', 'Escape', { altKey: true })),
     ).toBeNull();
+    expect(resolve(bindings, key('a', 'KeyA', { altKey: true }))).toBeNull();
     expect(
-      resolveCodeNamedKey(bindings, key('a', 'KeyA', { altKey: true })),
-    ).toBeNull();
-    expect(
-      resolveCodeNamedKey(bindings, key('\u200D', 'KeyA', { altKey: true })),
+      resolve(bindings, key('\u200D', 'KeyA', { altKey: true })),
     ).toBeNull();
   });
 
   it('ignores a key typed during an IME composition', () => {
     expect(
-      resolveCodeNamedKey(bindings, key('Process', 'Escape', { altKey: true })),
+      resolve(bindings, key('Process', 'Escape', { altKey: true })),
     ).toBeNull();
     expect(
-      resolveCodeNamedKey(bindings, {
+      resolve(bindings, {
         ...key('\u200D', 'Escape', { altKey: true }),
         isComposing: true,
       }),
@@ -533,7 +628,52 @@ describe('resolveCodeNamedKey', () => {
 
   it('returns nothing when no binding holds that key', () => {
     expect(
-      resolveCodeNamedKey(bindings, key('\u200D', 'Escape', { ctrlKey: true })),
+      resolve(bindings, key('\u200D', 'Escape', { ctrlKey: true })),
+    ).toBeNull();
+  });
+
+  it('reads Mod as Meta on macOS and Ctrl elsewhere', () => {
+    const run = (): boolean => true;
+    const list: KeyBinding[] = [{ key: 'Mod-Escape', run }];
+    const meta = key('\u200D', 'Escape', { metaKey: true });
+    const ctrl = key('\u200D', 'Escape', { ctrlKey: true });
+    expect(resolve(list, meta, 'macos')).toBe(run);
+    expect(resolve(list, ctrl, 'macos')).toBeNull();
+    expect(resolve(list, ctrl, 'windows')).toBe(run);
+    expect(resolve(list, meta, 'windows')).toBeNull();
+  });
+
+  it('prefers the field of the platform over key', () => {
+    const run = (): boolean => true;
+    const list: KeyBinding[] = [{ key: 'Ctrl-Escape', mac: 'Alt-Escape', run }];
+    const alt = key('\u200D', 'Escape', { altKey: true });
+    const ctrl = key('\u200D', 'Escape', { ctrlKey: true });
+    expect(resolve(list, alt, 'macos')).toBe(run);
+    expect(resolve(list, ctrl, 'macos')).toBeNull();
+    expect(resolve(list, ctrl, 'windows')).toBe(run);
+    expect(resolve(list, alt, 'windows')).toBeNull();
+    const win: KeyBinding[] = [{ win: 'Alt-Escape', run }];
+    expect(resolve(win, alt, 'windows')).toBe(run);
+    expect(resolve(win, alt, 'macos')).toBeNull();
+  });
+
+  it('runs the shift variant when only the unshifted name matches', () => {
+    const run = (): boolean => true;
+    const shift = (): boolean => true;
+    const list: KeyBinding[] = [{ key: 'Alt-Escape', run, shift }];
+    expect(
+      resolve(list, key('\u200D', 'Escape', { altKey: true, shiftKey: true })),
+    ).toBe(shift);
+    expect(resolve(list, key('\u200D', 'Escape', { altKey: true }))).toBe(run);
+    const explicit: KeyBinding[] = [{ key: 'Shift-Alt-Escape', run }];
+    expect(
+      resolve(
+        explicit,
+        key('\u200D', 'Escape', { altKey: true, shiftKey: true }),
+      ),
+    ).toBe(run);
+    expect(
+      resolve(explicit, key('\u200D', 'Escape', { altKey: true })),
     ).toBeNull();
   });
 });
