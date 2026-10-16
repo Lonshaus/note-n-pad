@@ -16,7 +16,6 @@
     scrollAxisHeight,
   } from '../util/largeView';
   import { moveResultCursor, parseGotoRange } from '../util/largeSearch';
-  import { matchSegments } from '../util/matchSegments';
   import { detectBreakStyle } from '../util/windowedEdit';
   import {
     RANGE_EDIT_MAX,
@@ -30,6 +29,7 @@
     type LargeIndexRef,
   } from '../util/largeIndex';
   import { t } from '../i18n';
+  import FindPanels, { type FindResult } from './FindPanels.svelte';
   import { platform } from '../state/platform.svelte';
   import { shortcutsState } from '../state/shortcuts.svelte';
   import { matchWindowShortcut } from '../util/windowShortcut';
@@ -153,10 +153,7 @@
   }
 
   /** One result row: `line` is 1-based (as displayed and returned to DEV hooks). */
-  interface SearchResult {
-    line: number;
-    preview: string;
-  }
+  type SearchResult = FindResult;
 
   // Bytes read per backend request; also the LRU key grid is line-page based.
   const READ_LEN = 1024 * 1024;
@@ -206,13 +203,12 @@
   // Goto/search overlays are mutually exclusive: only one is ever open.
   let panel = $state<'none' | 'goto' | 'search'>('none');
   let gotoValue = $state('');
-  let gotoInput = $state<HTMLInputElement | null>(null);
+  let panels = $state<ReturnType<typeof FindPanels> | null>(null);
   let searchQuery = $state('');
   let searchCase = $state(false);
   // The query and case the shown results were searched with, for highlighting.
   let resultQuery = $state('');
   let resultCase = $state(false);
-  let queryInput = $state<HTMLInputElement | null>(null);
   let results = $state<SearchResult[]>([]);
   let cursor = $state(-1);
   let searching = $state(false);
@@ -625,7 +621,7 @@
     resetSearch();
     panel = 'goto';
     gotoValue = '';
-    requestAnimationFrame(() => gotoInput?.focus());
+    requestAnimationFrame(() => panels?.focusGoto());
   }
 
   function closeGoto(): void {
@@ -650,7 +646,7 @@
 
   function openSearch(): void {
     panel = 'search';
-    requestAnimationFrame(() => queryInput?.focus());
+    requestAnimationFrame(() => panels?.focusQuery());
   }
 
   function closeSearch(): void {
@@ -682,7 +678,7 @@
       stepResult(-1);
     } else if (e.key === 'Enter') {
       e.preventDefault();
-      if (document.activeElement === queryInput) {
+      if (panels?.isQueryFocused() === true) {
         searchOrNext();
       } else {
         stepResult(1);
@@ -1135,21 +1131,6 @@
     </div>
   </div>
 
-  {#if panel === 'goto'}
-    <div class="goto-panel cm-panel">
-      <input
-        bind:this={gotoInput}
-        class="cm-textfield"
-        type="text"
-        inputmode="numeric"
-        placeholder={t('large.goto.placeholder')}
-        aria-label={t('large.goto.aria')}
-        bind:value={gotoValue}
-        onkeydown={onGotoKeydown}
-      />
-    </div>
-  {/if}
-
   {#if sel !== null}
     <div class="range-bar cm-panel">
       <span class="range-info"
@@ -1175,57 +1156,23 @@
     </div>
   {/if}
 
-  {#if panel === 'search'}
-    <div class="cm-panel cm-search search-panel">
-      <div class="cm-search-row">
-        <input
-          bind:this={queryInput}
-          class="cm-textfield"
-          type="text"
-          placeholder={t('large.search.label')}
-          aria-label={t('large.search.label')}
-          bind:value={searchQuery}
-          onkeydown={onSearchKeydown}
-        />
-        <button class="cm-button" onclick={searchOrNext}
-          >{t('large.search.label')}</button
-        >
-        <label>
-          <input type="checkbox" bind:checked={searchCase} />
-          {t('large.search.case')}
-        </label>
-      </div>
-      {#if searchStatus !== ''}
-        <div class="search-status">{searchStatus}</div>
-      {/if}
-      {#if results.length > 0}
-        <div class="search-results">
-          {#each results as r, i (i)}
-            <button
-              type="button"
-              class="search-result"
-              class:active={i === cursor}
-              onclick={() => jumpToResult(i)}
-              onkeydown={onSearchKeydown}
-            >
-              <span class="rline">{r.line}</span>
-              <span class="rprev"
-                >{#each matchSegments(r.preview, resultQuery, resultCase) as seg, j (j)}{#if seg.hit}<mark
-                      class="rhit">{seg.text}</mark
-                    >{:else}{seg.text}{/if}{/each}</span
-              >
-            </button>
-          {/each}
-        </div>
-      {/if}
-      <button
-        name="close"
-        title={t('common.close')}
-        aria-label={t('common.close')}
-        onclick={closeSearch}>×</button
-      >
-    </div>
-  {/if}
+  <FindPanels
+    bind:this={panels}
+    {panel}
+    bind:gotoValue
+    ongotokeydown={onGotoKeydown}
+    bind:query={searchQuery}
+    bind:caseSensitive={searchCase}
+    status={searchStatus}
+    {results}
+    {cursor}
+    {resultQuery}
+    {resultCase}
+    onsearch={searchOrNext}
+    onjump={jumpToResult}
+    onclose={closeSearch}
+    onsearchkeydown={onSearchKeydown}
+  />
 </div>
 
 <style>
@@ -1292,34 +1239,6 @@
     flex: 1 1 auto;
     padding: 0 0.6rem;
   }
-  /* Floating goto box, top-right, reusing the flat control look of the search
-     panel (which app.css styles globally via .cm-panel.cm-search). */
-  .goto-panel {
-    position: absolute;
-    top: 8px;
-    right: 8px;
-    z-index: 5;
-    padding: 8px 10px;
-    background: var(--bg);
-    color: var(--fg);
-    border: 1px solid var(--topbar-border);
-    border-radius: 6px;
-    box-shadow: 0 4px 16px rgba(0, 0, 0, 0.25);
-  }
-  .goto-panel .cm-textfield {
-    width: 8rem;
-    background: var(--bg);
-    color: var(--fg);
-    border: 1px solid var(--topbar-border);
-    border-radius: 5px;
-    padding: 5px 9px;
-    font-size: 0.85rem;
-  }
-  .goto-panel .cm-textfield:focus {
-    outline: none;
-    border-color: var(--accent);
-    box-shadow: 0 0 0 2px var(--accent);
-  }
   /* Floating range toolbar, top-left (mirroring the top-right goto box), shown
      while a line range is selected. */
   .range-bar {
@@ -1347,71 +1266,5 @@
     flex-basis: 100%;
     font-size: 0.78rem;
     color: var(--danger);
-  }
-  /* The search shell picks up .cm-panel.cm-search from app.css; only its docking
-     position and the read-only results list are component-local. */
-  .search-panel {
-    position: absolute;
-    bottom: 0;
-    left: 0;
-    right: 0;
-    z-index: 5;
-  }
-  .search-panel [name='close'] {
-    border: none;
-    background: none;
-    cursor: default;
-  }
-  .search-status {
-    font-size: 0.78rem;
-    opacity: 0.7;
-  }
-  .search-results {
-    display: flex;
-    flex-direction: column;
-    max-height: 40vh;
-    overflow-y: auto;
-    border: 1px solid var(--topbar-border);
-    border-radius: 5px;
-  }
-  .search-result {
-    /* overflow: hidden drops a flex item's minimum height to 0, so a long
-       result list would shrink every row to a sliver instead of scrolling. */
-    flex: 0 0 auto;
-    display: flex;
-    gap: 0.6rem;
-    align-items: baseline;
-    padding: 3px 8px;
-    border: none;
-    background: none;
-    color: var(--fg);
-    font-family: var(--doc-font-family);
-    font-size: 0.8rem;
-    text-align: left;
-    white-space: pre;
-    overflow: hidden;
-    cursor: default;
-  }
-  .search-result:hover {
-    background: rgba(127, 127, 127, 0.15);
-  }
-  .search-result.active {
-    background: color-mix(in srgb, var(--accent) 25%, transparent);
-  }
-  .rhit {
-    background: color-mix(in srgb, var(--accent) 40%, transparent);
-    color: inherit;
-    border-radius: 2px;
-  }
-  .rline {
-    flex: 0 0 auto;
-    min-width: 4rem;
-    text-align: right;
-    opacity: 0.6;
-  }
-  .rprev {
-    flex: 1 1 auto;
-    overflow: hidden;
-    text-overflow: ellipsis;
   }
 </style>

@@ -265,6 +265,12 @@
     endComposition: () => Promise<void>;
     isComposing: () => boolean;
     applied: () => Promise<void>;
+    openFind: () => void;
+    openFindReplace: () => void;
+    findNext: () => void;
+    findPrevious: () => void;
+    panelOpen: () => boolean;
+    closeFindPanel: () => void;
   } | null>(null);
   let largeStatus = $state<LargeStatus>({
     totalLines: null,
@@ -916,6 +922,10 @@
   }
 
   function openFind(): void {
+    if (active?.windowed !== undefined) {
+      windowedRef?.openFind();
+      return;
+    }
     ensureSourceView();
     const view = liveView();
     if (view !== null) {
@@ -926,6 +936,10 @@
   // Same panel as Find (CM's default panel always carries the replace row); focus
   // the replace field so Find and Replace lands the caret there.
   function openFindReplace(): void {
+    if (active?.windowed !== undefined) {
+      windowedRef?.openFindReplace();
+      return;
+    }
     ensureSourceView();
     const view = liveView();
     if (view === null) {
@@ -940,6 +954,10 @@
   }
 
   function findNextMatch(): void {
+    if (active?.windowed !== undefined) {
+      windowedRef?.findNext();
+      return;
+    }
     ensureSourceView();
     const view = liveView();
     if (view !== null) {
@@ -948,6 +966,10 @@
   }
 
   function findPrevMatch(): void {
+    if (active?.windowed !== undefined) {
+      windowedRef?.findPrevious();
+      return;
+    }
     ensureSourceView();
     const view = liveView();
     if (view !== null) {
@@ -956,6 +978,10 @@
   }
 
   function closeFind(): void {
+    if (active?.windowed !== undefined) {
+      windowedRef?.closeFindPanel();
+      return;
+    }
     const view = liveView();
     if (view !== null) {
       closeSearchPanel(view);
@@ -963,6 +989,9 @@
   }
 
   function isSearchOpen(): boolean {
+    if (active?.windowed !== undefined) {
+      return windowedRef?.panelOpen() ?? false;
+    }
     const view = liveView();
     return view !== null && searchPanelOpen(view.state);
   }
@@ -1846,6 +1875,9 @@
             }
           }}
           onerror={(message) => (windowedError = message)}
+          gate={documentWindow.windowedGate(active.windowed.sessionId)}
+          runop={(id, run, changed) =>
+            documentWindow.runWindowedOp(id, run, changed)}
         />
       {/key}
     {:else if documentWindow.ready && active !== null && active.large !== undefined}
