@@ -14,6 +14,7 @@
   } from '../util/largeView';
   import { moveResultCursor, parseGotoRange } from '../util/largeSearch';
   import { matchSegments } from '../util/matchSegments';
+  import { detectBreakStyle } from '../util/windowedEdit';
   import {
     RANGE_EDIT_MAX,
     rangeWithinLimit,
@@ -46,6 +47,9 @@
     fontSize: number;
     fontFamily: string;
     onstatus: (s: LargeStatus) => void;
+    // The first chunk's line-ending style (null: no line break in it), so the
+    // tab shows the file's own ending instead of the user's default.
+    ondetectending: (style: ReturnType<typeof detectBreakStyle>) => void;
     // Resolves null when the range opened as an edit tab, or a message to show in
     // the range toolbar when it was refused (e.g. a lossy, non-UTF-8 slice).
     // Rejects on a genuine read failure.
@@ -76,6 +80,7 @@
     fontSize,
     fontFamily,
     onstatus,
+    ondetectending,
     onextract,
     onsaverange,
     onindexerror,
@@ -807,6 +812,9 @@
         );
         estTotalLines = Math.max(1, Math.round(size / avgBytes));
         pageCache.set(0, lines.slice(0, LOAD_PAGE));
+        if (!disposed) {
+          ondetectending(detectBreakStyle(first.text));
+        }
       } catch {
         // Leave the defaults; a failed read just yields an empty view.
       }
