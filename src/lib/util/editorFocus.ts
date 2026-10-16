@@ -5,6 +5,8 @@
 // WebView silently drops keystrokes until the user clicks the editor. These
 // helpers reclaim focus for the editor, but only when nobody else is holding it.
 
+import { focusTopmostModal } from '../ConfirmModal.svelte';
+
 // Elements we must never steal keyboard focus from: text inputs, textareas,
 // selects, search fields, and any contenteditable (which includes a CodeMirror
 // editor that already holds focus). A null or BODY activeElement means nobody
@@ -37,11 +39,15 @@ export function shouldFocusEditor(
 
 // Focus the given editor (a CodeMirror view or any focusable container) only
 // when nobody else holds keyboard focus. Safe to call at load, on window focus,
-// and after a tab switch.
+// and after a tab switch. A mounted dialog keeps the keyboard whatever the
+// host's `modalOpen` says.
 export function focusEditorIfIdle(
   focusable: { focus: () => void } | null | undefined,
   modalOpen: boolean,
 ): void {
+  if (focusTopmostModal()) {
+    return;
+  }
   if (
     focusable != null &&
     shouldFocusEditor(document.activeElement, modalOpen)
