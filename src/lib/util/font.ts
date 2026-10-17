@@ -71,6 +71,50 @@ export function filterInstalledFonts(
     installedLower.has(family.toLowerCase()),
   );
 }
+/** Font names of the picker's dropdown rows after the built-in default: the
+ *  detected built-in faces, then the families the user added, in stored order,
+ *  then the current font when it is none of those (a stored face this host did
+ *  not detect), so the select can show it. A name appears once, since the name
+ *  is the option's identity. */
+export function dropdownFontFamilies(
+  installed: readonly string[],
+  extras: readonly string[],
+  current: string,
+): string[] {
+  return [
+    ...new Set([...installed, ...extras, ...(current === '' ? [] : [current])]),
+  ];
+}
+/** Families the "choose another font" list offers: the host's families minus
+ *  those already shown in the dropdown (compared case-insensitively), each name
+ *  once, in the host's order. */
+export function pickableFontFamilies(
+  host: readonly string[],
+  listed: readonly string[],
+): string[] {
+  const seen = new Set(listed.map((f) => f.toLowerCase()));
+  const picked: string[] = [];
+  for (const family of host) {
+    const key = family.toLowerCase();
+    if (!seen.has(key)) {
+      seen.add(key);
+      picked.push(family);
+    }
+  }
+  return picked;
+}
+/** The added-fonts list with `family` appended, unless it is empty or already
+ *  there. */
+export function withAddedFont(
+  extras: readonly string[],
+  family: string,
+): string[] {
+  const name = family.trim();
+  if (name === '' || extras.includes(name)) {
+    return [...extras];
+  }
+  return [...extras, name];
+}
 
 /** Build a width measurer backed by a single 2D canvas context, rendering the
  *  sample at 72px (a large size scales up per-glyph differences, so two distinct

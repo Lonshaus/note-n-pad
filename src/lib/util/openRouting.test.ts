@@ -36,6 +36,8 @@ function doc(over: Partial<NoteSnapshot>): NoteSnapshot {
     range_fp_size: null,
     range_fp_mtime: null,
     range_start_line: null,
+    range_end_line: null,
+    range_trailing_break: null,
     windowed_index: null,
     windowed_fp_size: null,
     windowed_fp_mtime: null,

@@ -1434,9 +1434,12 @@ pub struct Resolved {
   pub repaired: Vec<String>,
   /// Rows whose default key is held by a stored override and so stay unset.
   pub unset_defaults: Vec<String>,
-  /// Whether the workspace exists. Without it (lite) its row is hidden, so its
-  /// key is no conflict for another row.
+  /// Whether the workspace exists. Without it (lite) its row is hidden and it
+  /// claims no key, so nothing it would show is repaired or blocked.
   workspace: bool,
+  /// Without the workspace, the key it would hold: its stored override, or its
+  /// default key when nothing is stored; none when the override is cleared.
+  hidden_workspace: Option<Accel>,
 }
 /// Resolve stored settings into effective keys in one deterministic pass:
 /// reserved and fixed keys first, then the global key, then overrides in
@@ -1452,7 +1455,9 @@ pub fn resolve(
 /// `resolve`, for an edition with (`workspace`) or without the workspace. In
 /// lite its row is hidden, so its key is claimed by nobody and cannot collide
 /// with, block or invalidate another row; its stored override is carried along
-/// exactly as stored, for when the edition is full again.
+/// exactly as stored, for when the edition is full again. A change that assigns
+/// another row the key it would hold clears that override (`yield_hidden_key`),
+/// so the workspace gives way instead of the change being lost then.
 pub fn resolve_in(
   new_note_shortcut: &str,
   overrides: &BTreeMap<String, String>,
@@ -1501,6 +1506,8 @@ pub fn resolve_in(
     }
   }
   let mut kept: BTreeMap<String, String> = BTreeMap::new();
+  let mut hidden_workspace = None;
+  let mut hidden_stored = false;
   let mut settled = vec![false; ROWS.len()];
   for (i, row) in ROWS.iter().enumerate() {
     if !row.customizable || row.id == GLOBAL_STICKY_ID {
@@ -1511,6 +1518,8 @@ pub fn resolve_in(
     };
     if !workspace && row.id == WORKSPACE_ID {
       kept.insert(row.id.to_string(), stored.clone());
+      hidden_workspace = normalize(stored, platform).ok();
+      hidden_stored = true;
       settled[i] = true;
       continue;
     }
@@ -1556,6 +1565,9 @@ pub fn resolve_in(
       }
     }
   }
+  if !workspace && !hidden_stored {
+    hidden_workspace = row_index(WORKSPACE_ID).and_then(|i| default_accel(&ROWS[i], platform));
+  }
   Resolved {
     new_note_shortcut: global_text,
     overrides: kept,
@@ -1564,6 +1576,7 @@ pub fn resolve_in(
     repaired,
     unset_defaults,
     workspace,
+    hidden_workspace,
   }
 }
 
@@ -1659,6 +1672,18 @@ fn customizable_row(id: &str) -> Result<&'static Row, SetError> {
     Err(SetError::Fixed)
   }
 }
+/// Without the workspace, make it give way to a change that assigns another
+/// row (or the global key) the key it would hold: its override becomes an
+/// explicit empty one, which stays valid and unclaimed when the edition is full
+/// again. `assigned` is the key this change gives, never what a row shows
+/// already, so a change to any other key leaves the workspace alone.
+fn yield_hidden_key(next: &mut NextState, current: &Resolved, assigned: Option<&Accel>) {
+  if assigned.is_some() && current.hidden_workspace.as_ref() == assigned {
+    next
+      .overrides
+      .insert(WORKSPACE_ID.to_string(), String::new());
+  }
+}
 
 fn finish(next: NextState, platform: Platform, workspace: bool) -> Result<NextState, SetError> {
   let check = resolve_in(
@@ -1708,18 +1733,24 @@ pub fn plan_set(
 ) -> Result<NextState, SetError> {
   let row = customizable_row(id)?;
   let mut next = state_of(resolved);
+  let mut assigned = None;
   let text = match accel {
     None => String::new(),
     Some(raw) => {
       let parsed = normalize(raw, platform).map_err(SetError::Invalid)?;
       validate_for(resolved, row, &parsed, platform)?;
-      parsed.canonical(platform)
+      let text = parsed.canonical(platform);
+      assigned = Some(parsed);
+      text
     }
   };
   if id == GLOBAL_STICKY_ID {
     next.new_note_shortcut = text;
   } else {
     next.overrides.insert(id.to_string(), text);
+  }
+  if id != WORKSPACE_ID {
+    yield_hidden_key(&mut next, resolved, assigned.as_ref());
   }
   finish(next, platform, resolved.workspace)
 }
@@ -1736,9 +1767,15 @@ pub fn plan_reset(
     validate_for(resolved, row, accel, platform)?;
   }
   if id == GLOBAL_STICKY_ID {
-    next.new_note_shortcut = default.map(|a| a.canonical(platform)).unwrap_or_default();
+    next.new_note_shortcut = default
+      .as_ref()
+      .map(|a| a.canonical(platform))
+      .unwrap_or_default();
   } else {
     next.overrides.remove(id);
+  }
+  if id != WORKSPACE_ID {
+    yield_hidden_key(&mut next, resolved, default.as_ref());
   }
   finish(next, platform, resolved.workspace)
 }
@@ -1749,18 +1786,33 @@ pub fn default_canonical(id: &str, platform: Platform) -> String {
     .map(|a| a.canonical(platform))
     .unwrap_or_default()
 }
-/// The state with nothing customized.
-pub fn plan_reset_all(platform: Platform) -> NextState {
+/// The state with nothing customized. Without the workspace its stored
+/// override stays, as `resolve_in` carries it, unless a default key returning
+/// now is the key it holds.
+pub fn plan_reset_all(resolved: &Resolved, platform: Platform) -> NextState {
   let global = ROWS
     .iter()
     .find(|row| row.id == GLOBAL_STICKY_ID)
     .and_then(|row| default_accel(row, platform))
     .map(|a| a.canonical(platform))
     .unwrap_or_default();
-  NextState {
-    new_note_shortcut: global,
-    overrides: BTreeMap::new(),
+  let mut overrides = BTreeMap::new();
+  if !resolved.workspace {
+    if let Some(stored) = resolved.overrides.get(WORKSPACE_ID) {
+      overrides.insert(WORKSPACE_ID.to_string(), stored.clone());
+    }
   }
+  let mut next = NextState {
+    new_note_shortcut: global,
+    overrides,
+  };
+  for row in ROWS
+    .iter()
+    .filter(|row| row.customizable && row.id != WORKSPACE_ID)
+  {
+    yield_hidden_key(&mut next, resolved, default_accel(row, platform).as_ref());
+  }
+  next
 }
 /// The shortcut settings as `settings.rs` stores them, resolved for this OS.
 pub fn resolve_current(settings: &crate::settings::AppSettings) -> Resolved {
@@ -1998,7 +2050,9 @@ pub fn reset_shortcut(app: AppHandle, id: String) -> Result<(), String> {
 
 #[tauri::command]
 pub fn reset_all_shortcuts(app: AppHandle) -> Result<(), String> {
-  change(&app, |_, platform| Ok(plan_reset_all(platform)))
+  change(&app, |resolved, platform| {
+    Ok(plan_reset_all(resolved, platform))
+  })
 }
 /// Register the global new-sticky key at startup.
 pub fn register_startup_global(app: &AppHandle) {
@@ -2196,8 +2250,21 @@ mod tests {
     )
   }
 
+  fn lite_with(pairs: &[(&str, &str)]) -> Resolved {
+    resolve_in(
+      &default_canonical(GLOBAL_STICKY_ID, OTHER),
+      &map(pairs),
+      OTHER,
+      false,
+    )
+  }
+  /// The state in full again, as startup would resolve it.
+  fn back_in_full(next: &NextState) -> Resolved {
+    resolve_in(&next.new_note_shortcut, &next.overrides, OTHER, true)
+  }
+
   #[test]
-  fn lite_ignores_the_hidden_workspace_row_when_looking_for_a_conflict() {
+  fn lite_does_not_report_the_hidden_workspace_key_as_a_conflict() {
     let key = normalize("Ctrl+Alt+K", OTHER).unwrap();
     assert_eq!(
       with_workspace_override(true).conflict(&key, "menu.find"),
@@ -2211,18 +2278,219 @@ mod tests {
   }
 
   #[test]
-  fn lite_lets_another_row_take_the_hidden_workspace_key_and_keeps_its_override() {
+  fn lite_gives_the_hidden_custom_workspace_key_to_another_row_and_clears_the_workspace() {
     let lite = with_workspace_override(false);
     for id in ["menu.find-replace", "menu.line-numbers", "menu.word-wrap"] {
       let next = plan_set(&lite, id, Some("Ctrl+Alt+K"), OTHER)
         .unwrap_or_else(|e| panic!("{id}: {}", e.code()));
       assert_eq!(next.overrides[id], "Ctrl+Alt+K");
-      // The workspace override rides along exactly as stored.
-      assert_eq!(next.overrides["menu.workspace"], "Ctrl+Alt+K");
+      assert_eq!(next.overrides["menu.workspace"], "");
+      let full = back_in_full(&next);
+      assert_eq!(
+        full.accel(id).unwrap().canonical(OTHER),
+        "Ctrl+Alt+K",
+        "{id}"
+      );
+      assert!(full.accel("menu.workspace").is_none(), "{id}");
+      assert!(full.repaired.is_empty(), "{id}");
+      assert!(full.unset_defaults.is_empty(), "{id}");
     }
-    // The workspace default key is free too.
+  }
+
+  #[test]
+  fn lite_gives_the_hidden_default_workspace_key_to_another_row_and_clears_the_workspace() {
+    let lite = lite_with(&[]);
     let default = default_canonical("menu.workspace", OTHER);
-    assert!(plan_set(&lite, "menu.line-numbers", Some(&default), OTHER).is_ok());
+    assert!(!default.is_empty());
+    let next = plan_set(&lite, "menu.line-numbers", Some(&default), OTHER).unwrap();
+    assert_eq!(next.overrides["menu.line-numbers"], default);
+    assert_eq!(next.overrides["menu.workspace"], "");
+    let full = back_in_full(&next);
+    assert_eq!(
+      full.accel("menu.line-numbers").unwrap().canonical(OTHER),
+      default
+    );
+    assert!(full.accel("menu.workspace").is_none());
+    assert!(full.repaired.is_empty());
+    assert!(!full.unset_defaults.contains(&"menu.workspace".to_string()));
+  }
+
+  #[test]
+  fn lite_clears_the_workspace_when_the_global_sticky_key_takes_its_key() {
+    let next = plan_set(
+      &with_workspace_override(false),
+      GLOBAL_STICKY_ID,
+      Some("Ctrl+Alt+K"),
+      OTHER,
+    )
+    .unwrap();
+    assert_eq!(next.new_note_shortcut, "Ctrl+Alt+K");
+    assert_eq!(next.overrides["menu.workspace"], "");
+    let full = back_in_full(&next);
+    assert_eq!(full.new_note_shortcut, "Ctrl+Alt+K");
+    assert!(full.repaired.is_empty());
+    // The default key as well.
+    let default = default_canonical("menu.workspace", OTHER);
+    let next = plan_set(&lite_with(&[]), GLOBAL_STICKY_ID, Some(&default), OTHER).unwrap();
+    assert_eq!(next.overrides["menu.workspace"], "");
+  }
+
+  #[test]
+  fn lite_clears_the_workspace_when_a_reset_row_returns_to_its_key() {
+    // Find and replace sits on a custom key; the workspace holds that row's default.
+    let default = default_canonical("menu.find-replace", OTHER);
+    assert!(!default.is_empty());
+    let lite = lite_with(&[
+      ("menu.find-replace", "Ctrl+Alt+J"),
+      ("menu.workspace", &default),
+    ]);
+    let next = plan_reset(&lite, "menu.find-replace", OTHER).unwrap();
+    assert!(!next.overrides.contains_key("menu.find-replace"));
+    assert_eq!(next.overrides["menu.workspace"], "");
+    let full = back_in_full(&next);
+    assert_eq!(
+      full.accel("menu.find-replace").unwrap().canonical(OTHER),
+      default
+    );
+    assert!(full.accel("menu.workspace").is_none());
+    assert!(full.repaired.is_empty());
+  }
+
+  #[test]
+  fn lite_leaves_the_workspace_alone_when_the_new_key_is_a_different_one() {
+    let custom = plan_set(
+      &with_workspace_override(false),
+      "menu.word-wrap",
+      Some("Ctrl+Alt+J"),
+      OTHER,
+    )
+    .unwrap();
+    assert_eq!(custom.overrides["menu.word-wrap"], "Ctrl+Alt+J");
+    assert_eq!(custom.overrides["menu.workspace"], "Ctrl+Alt+K");
+    // Back in full nothing collides, so nothing is dropped.
+    let full = back_in_full(&custom);
+    assert!(full.repaired.is_empty());
+    assert_eq!(full.overrides["menu.workspace"], "Ctrl+Alt+K");
+    // With nothing stored for the workspace, nothing is stored.
+    let bare = plan_set(&lite_with(&[]), "menu.word-wrap", Some("Ctrl+Alt+J"), OTHER).unwrap();
+    assert!(!bare.overrides.contains_key("menu.workspace"));
+  }
+
+  #[test]
+  fn lite_keeps_a_workspace_key_that_a_row_already_has_as_its_default() {
+    // Find and replace sits on its default key, which the workspace override
+    // also holds; in full the override wins and the default goes unset.
+    let default = default_canonical("menu.find-replace", OTHER);
+    assert!(!default.is_empty());
+    let lite = lite_with(&[("menu.workspace", &default)]);
+    let kept = |next: &NextState| next.overrides.get("menu.workspace").cloned();
+    let set = plan_set(&lite, "menu.word-wrap", Some("Ctrl+Alt+J"), OTHER).unwrap();
+    assert_eq!(kept(&set), Some(default.clone()));
+    let cleared = plan_set(&lite, "menu.word-wrap", None, OTHER).unwrap();
+    assert_eq!(kept(&cleared), Some(default.clone()));
+    let reset = plan_reset(&lite, "menu.word-wrap", OTHER).unwrap();
+    assert_eq!(kept(&reset), Some(default.clone()));
+    let full = back_in_full(&set);
+    assert_eq!(full.overrides["menu.workspace"], default);
+    assert!(full.repaired.is_empty());
+    // Resetting everything returns find and replace to that key: the workspace
+    // gives way.
+    let all = plan_reset_all(&lite, OTHER);
+    assert_eq!(kept(&all), Some(String::new()));
+    let full = back_in_full(&all);
+    assert!(full.accel("menu.workspace").is_none());
+    assert!(full.repaired.is_empty());
+  }
+
+  #[test]
+  fn lite_clears_the_workspace_when_a_row_is_set_to_the_key_it_already_showed() {
+    for platform in [OTHER, MAC] {
+      let default = default_canonical("menu.find-replace", platform);
+      let lite = resolve_in(
+        &default_canonical(GLOBAL_STICKY_ID, platform),
+        &map(&[("menu.workspace", &default)]),
+        platform,
+        false,
+      );
+      let next = plan_set(&lite, "menu.find-replace", Some(&default), platform).unwrap();
+      assert_eq!(next.overrides["menu.workspace"], "");
+      assert_eq!(next.overrides["menu.find-replace"], default);
+      let full = resolve_in(&next.new_note_shortcut, &next.overrides, platform, true);
+      assert!(full.repaired.is_empty());
+      assert!(full.accel("menu.workspace").is_none());
+      assert_eq!(
+        full.accel("menu.find-replace").unwrap().canonical(platform),
+        default
+      );
+    }
+  }
+
+  #[test]
+  fn lite_clears_the_workspace_when_a_row_is_set_again_to_the_key_it_already_holds() {
+    // Settings written by an older version can hold both; setting again assigns
+    // the key, so the workspace gives way and nothing is repaired in full.
+    let lite = lite_with(&[
+      ("menu.word-wrap", "Ctrl+Alt+K"),
+      ("menu.workspace", "Ctrl+Alt+K"),
+    ]);
+    let next = plan_set(&lite, "menu.word-wrap", Some("Ctrl+Alt+K"), OTHER).unwrap();
+    assert_eq!(next.overrides["menu.workspace"], "");
+    let full = back_in_full(&next);
+    assert!(full.repaired.is_empty());
+    assert_eq!(
+      full.accel("menu.word-wrap").unwrap().canonical(OTHER),
+      "Ctrl+Alt+K"
+    );
+    let lite = resolve_in(
+      "Ctrl+Alt+K",
+      &map(&[("menu.workspace", "Ctrl+Alt+K")]),
+      OTHER,
+      false,
+    );
+    let next = plan_set(&lite, GLOBAL_STICKY_ID, Some("Ctrl+Alt+K"), OTHER).unwrap();
+    assert_eq!(next.overrides["menu.workspace"], "");
+    let full = back_in_full(&next);
+    assert!(full.repaired.is_empty());
+    assert_eq!(full.new_note_shortcut, "Ctrl+Alt+K");
+  }
+
+  #[test]
+  fn lite_never_clears_the_workspace_by_clearing_a_row() {
+    let default = default_canonical("menu.find-replace", OTHER);
+    let lite = lite_with(&[("menu.workspace", &default)]);
+    let next = plan_set(&lite, "menu.find-replace", None, OTHER).unwrap();
+    assert_eq!(next.overrides["menu.workspace"], default);
+    assert_eq!(next.overrides["menu.find-replace"], "");
+  }
+
+  #[test]
+  fn lite_with_a_cleared_workspace_has_no_hidden_key_and_keeps_it_cleared() {
+    let cleared = lite_with(&[("menu.workspace", "")]);
+    assert!(cleared.hidden_workspace.is_none());
+    let default = default_canonical("menu.workspace", OTHER);
+    let next = plan_set(&cleared, "menu.line-numbers", Some(&default), OTHER).unwrap();
+    assert_eq!(next.overrides["menu.workspace"], "");
+    let next = plan_set(&cleared, "menu.word-wrap", Some("Ctrl+Alt+J"), OTHER).unwrap();
+    assert_eq!(next.overrides["menu.workspace"], "");
+    // A stored value that is not a key holds none either.
+    assert!(lite_with(&[("menu.workspace", "nonsense")])
+      .hidden_workspace
+      .is_none());
+  }
+
+  #[test]
+  fn the_hidden_workspace_key_is_its_override_else_its_default() {
+    assert_eq!(
+      lite_with(&[("menu.workspace", "Ctrl+Alt+K")]).hidden_workspace,
+      Some(normalize("Ctrl+Alt+K", OTHER).unwrap())
+    );
+    assert_eq!(
+      lite_with(&[]).hidden_workspace,
+      Some(normalize(&default_canonical("menu.workspace", OTHER), OTHER).unwrap())
+    );
+    // In full there is no hidden key.
+    assert!(with_workspace_override(true).hidden_workspace.is_none());
+    assert!(defaults(OTHER).hidden_workspace.is_none());
   }
 
   #[test]
@@ -2230,6 +2498,24 @@ mod tests {
     let lite = with_workspace_override(false);
     let next = plan_reset(&lite, "menu.find-replace", OTHER).unwrap();
     assert_eq!(next.overrides["menu.workspace"], "Ctrl+Alt+K");
+  }
+
+  #[test]
+  fn a_reset_in_lite_leaves_the_workspace_when_another_row_already_held_its_key() {
+    // Settings written by an older version can hold both; the reset takes no key.
+    let lite = resolve_in(
+      &default_canonical(GLOBAL_STICKY_ID, OTHER),
+      &map(&[
+        ("menu.workspace", "Ctrl+Alt+K"),
+        ("menu.line-numbers", "Ctrl+Alt+K"),
+      ]),
+      OTHER,
+      false,
+    );
+    let next = plan_reset(&lite, "menu.word-wrap", OTHER)
+      .unwrap_or_else(|e| panic!("reset refused: {}", e.code()));
+    assert_eq!(next.overrides["menu.workspace"], "Ctrl+Alt+K");
+    assert_eq!(next.overrides["menu.line-numbers"], "Ctrl+Alt+K");
   }
 
   #[test]
@@ -3406,11 +3692,69 @@ mod tests {
 
   #[test]
   fn reset_all_clears_every_override_and_restores_the_global_default() {
-    let next = plan_reset_all(MAC);
+    let before = resolve("", &map(&[("editor.fold", "Ctrl+Alt+K")]), MAC);
+    let next = plan_reset_all(&before, MAC);
     assert!(next.overrides.is_empty());
     assert_eq!(next.new_note_shortcut, "Shift+Cmd+N");
     let r = resolve(&next.new_note_shortcut, &next.overrides, MAC);
     assert!(r.repaired.is_empty());
+  }
+
+  #[test]
+  fn reset_all_in_full_clears_the_workspace_override_too() {
+    let full = with_workspace_override(true);
+    let next = plan_reset_all(&full, OTHER);
+    assert!(next.overrides.is_empty());
+  }
+
+  #[test]
+  fn reset_all_in_lite_keeps_the_hidden_workspace_override_only() {
+    let lite = resolve_in(
+      &default_canonical(GLOBAL_STICKY_ID, OTHER),
+      &map(&[
+        ("menu.workspace", "Ctrl+Alt+K"),
+        ("menu.find-replace", "Ctrl+Alt+J"),
+      ]),
+      OTHER,
+      false,
+    );
+    let next = plan_reset_all(&lite, OTHER);
+    assert_eq!(next.overrides, map(&[("menu.workspace", "Ctrl+Alt+K")]));
+    assert_eq!(
+      next.new_note_shortcut,
+      default_canonical(GLOBAL_STICKY_ID, OTHER)
+    );
+    // Even a cleared workspace key survives, exactly as stored.
+    let cleared = resolve_in(
+      &default_canonical(GLOBAL_STICKY_ID, OTHER),
+      &map(&[("menu.workspace", "")]),
+      OTHER,
+      false,
+    );
+    assert_eq!(
+      plan_reset_all(&cleared, OTHER).overrides,
+      map(&[("menu.workspace", "")])
+    );
+    // Without a stored workspace override there is none to keep.
+    assert!(plan_reset_all(&lite_with(&[]), OTHER).overrides.is_empty());
+  }
+
+  #[test]
+  fn reset_all_in_lite_clears_the_workspace_override_a_default_key_now_takes() {
+    let default = default_canonical("menu.find-replace", OTHER);
+    let lite = lite_with(&[
+      ("menu.find-replace", "Ctrl+Alt+J"),
+      ("menu.workspace", &default),
+    ]);
+    let next = plan_reset_all(&lite, OTHER);
+    assert_eq!(next.overrides, map(&[("menu.workspace", "")]));
+    let full = back_in_full(&next);
+    assert_eq!(
+      full.accel("menu.find-replace").unwrap().canonical(OTHER),
+      default
+    );
+    assert!(full.accel("menu.workspace").is_none());
+    assert!(full.repaired.is_empty());
   }
   // ---- list handed to the frontend --------------------------------------
 

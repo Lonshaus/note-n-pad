@@ -17,6 +17,7 @@
   } from '../util/largeView';
   import { moveResultCursor, parseGotoRange } from '../util/largeSearch';
   import { detectBreakStyle } from '../util/windowedEdit';
+  import { readPageLines } from '../util/largePage';
   import {
     RANGE_EDIT_MAX,
     rangeWithinLimit,
@@ -285,46 +286,46 @@
       readFailed,
     });
   }
-
   /** Byte offset where `line` begins. Line 0 is trivially 0; otherwise the Rust
-   *  index resolves it (scanning from the nearest checkpoint). Returns null when
-   *  the line lies past the file's end. */
-  async function lineToOffset(line: number): Promise<number | null> {
+   *  index resolves it (scanning from the nearest checkpoint). Resolves null when
+   *  the line lies past the file's end; rejects on a real failure. */
+  async function lineOffset(line: number): Promise<number | null> {
     if (line <= 0) {
       return 0;
     }
     if (indexId === null) {
-      return null;
+      throw new Error('no line index');
     }
+    return await invoke<number | null>('line_to_offset', { id: indexId, line });
+  }
+  /** Like `lineOffset`, but null for a failure too: callers that treat both the
+   *  same (a range selection) read it this way. */
+  async function lineToOffset(line: number): Promise<number | null> {
     try {
-      return await invoke<number>('line_to_offset', { id: indexId, line });
+      return await lineOffset(line);
     } catch {
       return null;
     }
   }
-
   /** Read one page's lines, anchored at its first line's byte offset. The offset
    *  is a line start, so the chunk begins exactly on that line and the first
-   *  `LOAD_PAGE` split pieces are whole lines. */
-  async function readPage(page: number): Promise<string[] | null> {
-    const offset = await lineToOffset(page * LOAD_PAGE);
-    if (offset === null) {
-      return null;
-    }
-    // ponytail: one bounded read per page; a page whose lines exceed the read
-    // under-fills and shows blanks until scrolled — fine for a viewer. Bump the
-    // multiplier only if very long lines ever leave visible gaps.
-    const len = Math.min(
-      2 * 1024 * 1024,
-      Math.max(READ_LEN, avgBytes * LOAD_PAGE * 2),
-    );
-    let chunk: Chunk;
-    try {
-      chunk = await invoke<Chunk>('read_chunk', { path, offset, len });
-    } catch {
-      return null;
-    }
-    return chunk.text.split('\n').slice(0, LOAD_PAGE);
+   *  `LOAD_PAGE` split pieces are whole lines. A page past the end of the file
+   *  is empty; null means a read really failed. */
+  function readPage(page: number): Promise<string[] | null> {
+    return readPageLines(page, LOAD_PAGE, {
+      lineToOffset: lineOffset,
+      // ponytail: one bounded read per page; a page whose lines exceed the read
+      // under-fills and shows blanks until scrolled — fine for a viewer. Bump the
+      // multiplier only if very long lines ever leave visible gaps.
+      readText: async (offset) => {
+        const len = Math.min(
+          2 * 1024 * 1024,
+          Math.max(READ_LEN, avgBytes * LOAD_PAGE * 2),
+        );
+        const chunk = await invoke<Chunk>('read_chunk', { path, offset, len });
+        return chunk.text;
+      },
+    });
   }
 
   async function getPage(page: number): Promise<string[] | null> {

@@ -96,16 +96,28 @@ pub struct NoteSnapshot {
   pub range_fp_mtime: Option<u64>,
   /// 1-based line number of the range's first line, fixed at extraction time
   /// (nothing before this tab's content can shift while it stays open). The
-  /// frontend derives the displayed end line from the tab's own content line
-  /// count instead of persisting it, so the label follows an edit that
-  /// changes the line count and a language change instead of freezing a
-  /// formatted string. None for a non-range tab, and for a range tab
+  /// label is formatted from this and `range_end_line` when it is shown, so it
+  /// follows a language change. None for a non-range tab, and for a range tab
   /// restored from an older snapshot, which persisted a formatted label
   /// (`range_label`, removed) instead of a line number; the frontend falls
   /// back to the bare file name for such a tab rather than reconstructing a
   /// line span from the old string.
   #[serde(default)]
   pub range_start_line: Option<i64>,
+  /// 1-based line number of the range's last line, kept in step with the live
+  /// content on every write (so it also follows edits and saves, and is stored
+  /// when `content` is empty). Lets a view that never opens the tab, such as
+  /// the workspace list, label the range. None for a non-range tab and for a
+  /// record written before this field existed.
+  #[serde(default)]
+  pub range_end_line: Option<u64>,
+  /// Whether the source slice ended with a line break. The buffer keeps that
+  /// break; on write-back one is added only if the slice ended with one and
+  /// the non-empty buffer no longer does. None for a non-range tab and for a
+  /// record written before this field existed; restore then derives it from the
+  /// source slice.
+  #[serde(default)]
+  pub range_trailing_break: Option<bool>,
   /// Sparse line-checkpoint index of a windowed-editing tab (see
   /// `CheckpointIndex`), captured via `windowed_index` at snapshot
   /// time. Its presence is what marks the tab as "was unlocked" on restore —
@@ -371,7 +383,7 @@ pub fn delete(notes: &mut Vec<NoteSnapshot>, id: &str) -> bool {
 }
 
 /// One document window to open on restore: its group id plus the bounds of the
-/// group's lowest-tab_index tab (all tabs share the one window).
+/// group's lowest-tab_index tab that is shown (all tabs share the one window).
 #[derive(Debug, Clone, PartialEq)]
 pub struct DocWindowPlan {
   pub group: String,
@@ -389,10 +401,12 @@ fn resolved_group(note: &NoteSnapshot) -> &str {
 
 /// Plan one document window per group from stored notes. Stickies are ignored.
 /// Groups keep first-appearance order; each window inherits the bounds of its
-/// lowest-tab_index tab.
-pub fn plan_document_windows(notes: &[NoteSnapshot]) -> Vec<DocWindowPlan> {
+/// lowest-tab_index tab. In lite a kept tab is not shown and nothing writes its
+/// record, so its bounds go stale: the lowest shown tab is preferred, and only a
+/// group of kept tabs alone falls back to the lowest overall.
+pub fn plan_document_windows(notes: &[NoteSnapshot], lite: bool) -> Vec<DocWindowPlan> {
   let mut order: Vec<String> = Vec::new();
-  let mut plans: std::collections::HashMap<String, (i64, DocWindowPlan)> =
+  let mut plans: std::collections::HashMap<String, ((bool, i64), DocWindowPlan)> =
     std::collections::HashMap::new();
   for note in notes {
     if note.kind != "document" {
@@ -406,16 +420,17 @@ pub fn plan_document_windows(notes: &[NoteSnapshot]) -> Vec<DocWindowPlan> {
       width: note.width,
       height: note.height,
     };
+    let rank = (lite && needs_full_edition(note), note.tab_index);
     match plans.get_mut(&group) {
-      Some((best_index, plan)) => {
-        if note.tab_index < *best_index {
-          *best_index = note.tab_index;
+      Some((best, plan)) => {
+        if rank < *best {
+          *best = rank;
           *plan = candidate;
         }
       }
       None => {
         order.push(group.clone());
-        plans.insert(group, (note.tab_index, candidate));
+        plans.insert(group, (rank, candidate));
       }
     }
   }
@@ -458,12 +473,35 @@ pub fn migrate_group_less_documents(store: &NoteStore, notes: &[NoteSnapshot], l
     }
   }
 }
+/// Document groups whose window the app closed for the trial: the user
+/// dismissed the kept-tabs notice of a window that held nothing else. Only the
+/// frontend's `dismissKeptTabsAndHoldBack` adds to it. Held in memory only, and
+/// emptied when the edition turns full.
+#[derive(Default)]
+pub struct HeldBackGroups(Mutex<std::collections::HashSet<String>>);
 
-/// The windows to open when the edition turns full: every group holding a tab
-/// that lite kept and whose window is not open (`is_live`), planned exactly as a
-/// startup restore would.
+impl HeldBackGroups {
+  pub fn hold(&self, group: String) {
+    self.0.lock().unwrap().insert(group);
+  }
+  /// Every held group; the set is empty afterwards.
+  pub fn take_all(&self) -> std::collections::HashSet<String> {
+    std::mem::take(&mut *self.0.lock().unwrap())
+  }
+}
+/// Remember that the app closed the window of `group` for the trial, so it
+/// returns when the edition is full again.
+#[tauri::command]
+pub fn hold_back_group(state: State<HeldBackGroups>, group: String) {
+  state.hold(group);
+}
+/// The windows to open when the edition turns full: every group in `held` that
+/// holds a tab lite kept and whose window is not open (`is_live`), planned
+/// exactly as a startup restore would. A group missing from `held` is one the
+/// user closed, so its kept tabs wait for the next launch.
 pub fn groups_to_reopen(
   notes: &[NoteSnapshot],
+  held: &std::collections::HashSet<String>,
   is_live: impl Fn(&str) -> bool,
 ) -> Vec<DocWindowPlan> {
   let kept: std::collections::HashSet<&str> = notes
@@ -471,9 +509,12 @@ pub fn groups_to_reopen(
     .filter(|n| needs_full_edition(n))
     .map(resolved_group)
     .collect();
-  plan_document_windows(notes)
+  // Only called once the edition is full, when every tab is shown.
+  plan_document_windows(notes, false)
     .into_iter()
-    .filter(|plan| kept.contains(plan.group.as_str()) && !is_live(&plan.group))
+    .filter(|plan| {
+      held.contains(&plan.group) && kept.contains(plan.group.as_str()) && !is_live(&plan.group)
+    })
     .collect()
 }
 
@@ -1312,6 +1353,8 @@ mod tests {
       range_fp_size: None,
       range_fp_mtime: None,
       range_start_line: None,
+      range_end_line: None,
+      range_trailing_break: None,
       windowed_index: None,
       windowed_fp_size: None,
       windowed_fp_mtime: None,
@@ -2004,6 +2047,8 @@ mod tests {
     assert_eq!(notes[0].range_fp_size, None);
     assert_eq!(notes[0].range_fp_mtime, None);
     assert_eq!(notes[0].range_start_line, None);
+    assert_eq!(notes[0].range_end_line, None);
+    assert_eq!(notes[0].range_trailing_break, None);
     // An older document predates the windowed-restore fields entirely; a user
     // upgrading must not lose the tab (it deserializes, just as an ordinary tab).
     assert_eq!(notes[0].windowed_index, None);
@@ -2074,9 +2119,24 @@ mod tests {
     d.range_fp_size = Some(9_000_000);
     d.range_fp_mtime = Some(1_700_000_000_000);
     d.range_start_line = Some(3);
+    d.range_end_line = Some(9);
+    d.range_trailing_break = Some(true);
     store.upsert(d.clone()).unwrap();
     let reloaded = NoteStore::load(dir.path().to_path_buf()).unwrap().list();
     assert_eq!(reloaded, vec![d]);
+  }
+
+  #[test]
+  fn range_trailing_break_false_roundtrips_distinct_from_absent() {
+    let dir = tempdir().unwrap();
+    let store = NoteStore::load(dir.path().to_path_buf()).unwrap();
+    let mut d = doc("d", Some("grp-1"), 0);
+    d.file_path = Some(String::new());
+    d.range_source = Some("/tmp/big.log".into());
+    d.range_trailing_break = Some(false);
+    store.upsert(d.clone()).unwrap();
+    let reloaded = NoteStore::load(dir.path().to_path_buf()).unwrap().list();
+    assert_eq!(reloaded[0].range_trailing_break, Some(false));
   }
 
   fn kept_large(id: &str, group: Option<&str>, tab_index: i64) -> NoteSnapshot {
@@ -2207,7 +2267,7 @@ mod tests {
       .filter(needs_full_edition)
       .collect();
     assert_eq!(kept.len(), 2);
-    assert_eq!(plan_document_windows(&store.list()).len(), 3);
+    assert_eq!(plan_document_windows(&store.list(), true).len(), 3);
     // Full: they migrate like any other.
     migrate_group_less_documents(&store, &notes, false);
     let full = file_bytes(dir.path());
@@ -2215,24 +2275,86 @@ mod tests {
     assert_ne!(full["large.json"], before["large.json"]);
   }
 
+  fn held(groups: &[&str]) -> std::collections::HashSet<String> {
+    groups.iter().map(|g| g.to_string()).collect()
+  }
+
   #[test]
-  fn only_groups_holding_a_kept_tab_and_without_a_window_reopen() {
+  fn only_held_groups_holding_a_kept_tab_and_without_a_window_reopen() {
     let notes = vec![
       doc("a1", Some("plain"), 0),
       kept_large("b1", Some("kept-closed"), 0),
       doc("b2", Some("kept-closed"), 1),
       kept_range("c1", Some("kept-open"), 0),
       kept_windowed("d1", None, 0),
+      kept_range("e1", Some("user-closed"), 0),
       note("sticky"),
     ];
     let live = |group: &str| group == "kept-open";
-    let groups: Vec<String> = groups_to_reopen(&notes, live)
+    let all = held(&["plain", "kept-closed", "kept-open", "d1"]);
+    let groups: Vec<String> = groups_to_reopen(&notes, &all, live)
       .into_iter()
       .map(|p| p.group)
       .collect();
-    // A group-less kept tab is its own group, keyed by its id.
+    // A group-less kept tab is its own group, keyed by its id. The group the
+    // user closed is not held, so it stays closed; a plain group has nothing
+    // to bring back; a live group is not duplicated.
     assert_eq!(groups, vec!["kept-closed", "d1"]);
-    assert!(groups_to_reopen(&notes, |_| true).is_empty());
+    assert!(groups_to_reopen(&notes, &all, |_| true).is_empty());
+    assert!(groups_to_reopen(&notes, &held(&[]), |_| false).is_empty());
+  }
+
+  #[test]
+  fn a_group_closed_by_the_user_in_full_is_not_reopened_when_the_edition_returns() {
+    let notes = vec![kept_range("c1", Some("closed-in-full"), 0)];
+    assert!(groups_to_reopen(&notes, &held(&[]), |_| false).is_empty());
+    // The same group, once the app held it back for the trial, is.
+    let groups = groups_to_reopen(&notes, &held(&["closed-in-full"]), |_| false);
+    assert_eq!(groups.len(), 1);
+    assert_eq!(groups[0].group, "closed-in-full");
+  }
+
+  #[test]
+  fn held_back_groups_are_taken_once_and_the_set_is_left_empty() {
+    let state = HeldBackGroups::default();
+    assert!(state.take_all().is_empty());
+    state.hold("a".to_string());
+    state.hold("b".to_string());
+    state.hold("a".to_string());
+    assert_eq!(state.take_all(), held(&["a", "b"]));
+    assert!(state.take_all().is_empty());
+  }
+
+  fn at(mut note: NoteSnapshot, x: f64) -> NoteSnapshot {
+    note.x = Some(x);
+    note
+  }
+
+  #[test]
+  fn lite_takes_window_bounds_from_a_shown_tab_not_a_kept_one() {
+    // The kept record has the lowest tab_index but its bounds are stale.
+    let notes = vec![
+      at(kept_range("k", Some("g"), 0), 10.0),
+      at(doc("s", Some("g"), 1), 900.0),
+    ];
+    assert_eq!(plan_document_windows(&notes, true)[0].x, Some(900.0));
+    assert_eq!(plan_document_windows(&notes, false)[0].x, Some(10.0));
+    // Among shown tabs the lowest tab_index still wins.
+    let more = vec![
+      at(kept_range("k", Some("g"), 0), 10.0),
+      at(doc("s2", Some("g"), 3), 700.0),
+      at(doc("s1", Some("g"), 1), 900.0),
+    ];
+    assert_eq!(plan_document_windows(&more, true)[0].x, Some(900.0));
+  }
+
+  #[test]
+  fn lite_falls_back_to_the_lowest_kept_tab_when_a_group_holds_only_kept_ones() {
+    let notes = vec![
+      at(kept_large("k2", Some("g"), 2), 500.0),
+      at(kept_range("k1", Some("g"), 1), 10.0),
+    ];
+    assert_eq!(plan_document_windows(&notes, true)[0].x, Some(10.0));
   }
 
   #[test]
@@ -2254,6 +2376,8 @@ mod tests {
     assert_eq!(notes.len(), 1);
     assert_eq!(notes[0].range_source.as_deref(), Some("/tmp/big.log"));
     assert_eq!(notes[0].range_start_line, None);
+    assert_eq!(notes[0].range_end_line, None);
+    assert_eq!(notes[0].range_trailing_break, None);
   }
 
   #[test]
@@ -2286,7 +2410,7 @@ mod tests {
       doc("b", Some("g1"), 0),
       doc("c", Some("g2"), 0),
     ];
-    let plans = plan_document_windows(&notes);
+    let plans = plan_document_windows(&notes, false);
     assert_eq!(plans.len(), 2);
     // g1 keeps first-appearance order; its bounds come from the lowest tab_index (b).
     assert_eq!(plans[0].group, "g1");
@@ -2297,7 +2421,7 @@ mod tests {
   #[test]
   fn plan_treats_group_none_as_solo_group_by_id() {
     let notes = vec![doc("solo1", None, 0), doc("solo2", None, 0)];
-    let plans = plan_document_windows(&notes);
+    let plans = plan_document_windows(&notes, false);
     assert_eq!(plans.len(), 2);
     assert_eq!(plans[0].group, "solo1");
     assert_eq!(plans[1].group, "solo2");

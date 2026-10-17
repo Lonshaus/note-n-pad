@@ -3,6 +3,8 @@
 
 import { describe, expect, it } from 'vitest';
 import { en } from './en';
+import { ja } from './ja';
+import { zhTW } from './zh-TW';
 import { OLD_SHIPPED } from './pluralOldValues';
 
 const seeds = import.meta.glob<{ strings: Record<string, string> }>(
@@ -16,8 +18,13 @@ const rustSource = import.meta.glob<string>(
 );
 
 function current(locale: string): Record<string, string> {
-  if (locale === 'en') {
-    return en;
+  const compiled: Record<string, Record<string, string>> = {
+    en,
+    ja,
+    'zh-TW': zhTW,
+  };
+  if (compiled[locale]) {
+    return compiled[locale];
   }
   const entry = Object.entries(seeds).find(([path]) =>
     path.endsWith(`/${locale}.json`),

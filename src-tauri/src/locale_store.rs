@@ -424,6 +424,21 @@ const REWORDED: &[(&str, &str, &str)] = &[
   ("pl", "doc.restoreUnreadable", "Nie można odczytać: {names}. Otwórz pliki ponownie, aby kontynuować."),
   ("tr", "doc.restoreUnreadable", "{names} okunamadı. Devam etmek için dosyaları yeniden açın."),
   ("vi", "doc.restoreUnreadable", "Không đọc được {names}. Hãy mở lại các tệp để tiếp tục."),
+  ("en", "settings.editor.fontCustom", "Custom…"),
+  ("de", "settings.editor.fontCustom", "Benutzerdefiniert…"),
+  ("fr", "settings.editor.fontCustom", "Personnalisée…"),
+  ("es", "settings.editor.fontCustom", "Personalizada…"),
+  ("it", "settings.editor.fontCustom", "Personalizzato…"),
+  ("pt-BR", "settings.editor.fontCustom", "Personalizada…"),
+  ("ru", "settings.editor.fontCustom", "Другой…"),
+  ("pl", "settings.editor.fontCustom", "Niestandardowa…"),
+  ("tr", "settings.editor.fontCustom", "Özel…"),
+  ("vi", "settings.editor.fontCustom", "Tùy chỉnh…"),
+  ("ko", "settings.editor.fontCustom", "사용자 지정…"),
+  ("th", "settings.editor.fontCustom", "กำหนดเอง…"),
+  ("zh-CN", "settings.editor.fontCustom", "自定义…"),
+  ("zh-TW", "settings.editor.fontCustom", "自訂…"),
+  ("ja", "settings.editor.fontCustom", "カスタム…"),
 ];
 /// Replace unedited old shipped values with the new ones. A locale with a
 /// bundled seed gets the seed value. A compiled locale (no seed) has the key
@@ -470,7 +485,14 @@ fn update_reworded_with(table: &[(&str, &str, &str)], resource_dir: &Path, data_
       }
     }
     if changed {
-      if let Err(e) = save_locale_to(data_dir, &data) {
+      // A locale left with no strings cannot be saved; deleting the file lets
+      // the compiled dictionary apply.
+      let result = if data.strings.is_empty() {
+        delete_locale_file(data_dir, id)
+      } else {
+        save_locale_to(data_dir, &data)
+      };
+      if let Err(e) = result {
         log::warn!("failed to update reworded strings in locale {id}: {e}");
       }
     }
@@ -1091,6 +1113,20 @@ mod tests {
   }
 
   #[test]
+  fn reworded_deletes_a_compiled_locale_file_left_with_no_strings() {
+    let base = tempdir().unwrap();
+    let (res, data) = (base.path().join("res"), base.path().join("data"));
+    std::fs::create_dir_all(&res).unwrap();
+    std::fs::create_dir_all(&data).unwrap();
+    let table = [("en", "a", "old a")];
+    write_locale(&data, &locale_with("en", &[("a", "old a")]));
+    update_reworded_with(&table, &res, &data);
+    assert!(!locale_file(&data, "en").exists());
+    update_reworded_with(&table, &res, &data);
+    assert!(!locale_file(&data, "en").exists());
+  }
+
+  #[test]
   fn reworded_table_matches_the_bundled_seeds() {
     let res = Path::new(env!("CARGO_MANIFEST_DIR")).join("resources/locales");
     for (id, key, old) in REWORDED {
@@ -1099,6 +1135,82 @@ mod tests {
         let new = &seed.strings[*key];
         assert_ne!(new, old, "{id} {key} still holds the old value");
       }
+    }
+  }
+
+  const FONT_CUSTOM: &str = "settings.editor.fontCustom";
+
+  fn bundled_seed_ids() -> Vec<String> {
+    let res = Path::new(env!("CARGO_MANIFEST_DIR")).join("resources/locales");
+    let mut ids: Vec<String> = std::fs::read_dir(res)
+      .unwrap()
+      .flatten()
+      .filter_map(|entry| {
+        let path = entry.path();
+        if path.extension().and_then(|e| e.to_str()) != Some("json") {
+          return None;
+        }
+        path.file_stem().and_then(|n| n.to_str()).map(String::from)
+      })
+      .collect();
+    ids.sort();
+    ids
+  }
+
+  #[test]
+  fn every_seed_and_compiled_locale_has_a_font_custom_reworded_row() {
+    let seeds = bundled_seed_ids();
+    assert!(!seeds.is_empty());
+    for id in seeds.iter().map(String::as_str).chain(COMPILED_LOCALES) {
+      assert!(
+        REWORDED
+          .iter()
+          .any(|(i, k, _)| *i == id && *k == FONT_CUSTOM),
+        "{id} has no {FONT_CUSTOM} row in REWORDED"
+      );
+    }
+  }
+
+  #[test]
+  fn an_unedited_font_custom_label_is_replaced_in_every_locale() {
+    let res = Path::new(env!("CARGO_MANIFEST_DIR")).join("resources/locales");
+    let seeds = bundled_seed_ids();
+    for (id, _, old) in REWORDED.iter().filter(|(_, k, _)| *k == FONT_CUSTOM) {
+      let base = tempdir().unwrap();
+      let data = base.path().join("data");
+      std::fs::create_dir_all(&data).unwrap();
+      write_locale(
+        &data,
+        &locale_with(id, &[(FONT_CUSTOM, old), ("mine", "kept")]),
+      );
+      update_reworded_with(REWORDED, &res, &data);
+      let got = read_locale(&data, id);
+      if seeds.iter().any(|s| s == id) {
+        let seed = parse_locale(&std::fs::read_to_string(locale_file(&res, id)).unwrap()).unwrap();
+        assert_eq!(got.strings[FONT_CUSTOM], seed.strings[FONT_CUSTOM], "{id}");
+        assert_ne!(got.strings[FONT_CUSTOM], *old, "{id}");
+      } else {
+        assert!(!got.strings.contains_key(FONT_CUSTOM), "{id}");
+      }
+      assert_eq!(got.strings["mine"], "kept", "{id}");
+    }
+  }
+
+  #[test]
+  fn an_edited_font_custom_label_is_left_alone_in_every_locale() {
+    let res = Path::new(env!("CARGO_MANIFEST_DIR")).join("resources/locales");
+    for (id, _, _) in REWORDED.iter().filter(|(_, k, _)| *k == FONT_CUSTOM) {
+      let base = tempdir().unwrap();
+      let data = base.path().join("data");
+      std::fs::create_dir_all(&data).unwrap();
+      write_locale(
+        &data,
+        &locale_with(id, &[(FONT_CUSTOM, "my own label"), ("mine", "kept")]),
+      );
+      update_reworded_with(REWORDED, &res, &data);
+      let got = read_locale(&data, id);
+      assert_eq!(got.strings[FONT_CUSTOM], "my own label", "{id}");
+      assert_eq!(got.strings["mine"], "kept", "{id}");
     }
   }
 }

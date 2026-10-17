@@ -3,6 +3,7 @@
 
 import { invoke } from '@tauri-apps/api/core';
 import { listen, type UnlistenFn } from '@tauri-apps/api/event';
+import { withAddedFont } from '../util/font';
 import type { LineEnding } from '../util/text';
 import { resolveLocale, type Language, type Locale } from '../i18n/locale';
 import { localeRegistry } from '../i18n/localeRegistry.svelte';
@@ -48,6 +49,7 @@ interface AppSettings {
   preview_local_resources: boolean;
   open_target: OpenTarget;
   editor_font_family: string;
+  editor_extra_fonts: string[];
   default_line_ending: LineEnding;
   default_encoding: string;
   new_note_shortcut: string;
@@ -88,6 +90,8 @@ export class SettingsState {
   previewLocalResources = $state(false);
   openTarget = $state<OpenTarget>('tab');
   editorFontFamily = $state('');
+  /** Families the user added through the picker's "choose another font" list. */
+  editorExtraFonts = $state<string[]>([]);
   defaultLineEnding = $state<LineEnding>('LF');
   defaultEncoding = $state('UTF-8');
   newNoteShortcut = $state('CmdOrCtrl+Shift+N');
@@ -158,6 +162,7 @@ export class SettingsState {
     this.previewLocalResources = s.preview_local_resources;
     this.openTarget = s.open_target;
     this.editorFontFamily = s.editor_font_family;
+    this.editorExtraFonts = s.editor_extra_fonts;
     this.defaultLineEnding = s.default_line_ending;
     this.defaultEncoding = s.default_encoding;
     this.newNoteShortcut = s.new_note_shortcut;
@@ -371,6 +376,16 @@ export class SettingsState {
     const trimmed = family.trim();
     this.editorFontFamily = trimmed;
     await this.save({ editor_font_family: trimmed });
+  }
+  /** Remember `family` in the added-fonts list and select it, in one save. */
+  async addFontFamily(family: string): Promise<void> {
+    const trimmed = family.trim();
+    this.editorFontFamily = trimmed;
+    this.editorExtraFonts = withAddedFont(this.editorExtraFonts, trimmed);
+    await this.save({
+      editor_font_family: trimmed,
+      editor_extra_fonts: this.editorExtraFonts,
+    });
   }
 
   async setDefaultLineEnding(ending: LineEnding): Promise<void> {

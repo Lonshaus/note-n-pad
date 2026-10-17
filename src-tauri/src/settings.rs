@@ -100,6 +100,11 @@ pub struct AppSettings {
   /// Document editor font family. Empty means the built-in monospace stack.
   #[serde(default)]
   pub editor_font_family: String,
+  /// Font families the user added through the picker's "Choose another font"
+  /// list, listed in the dropdown in this order. Never holds a built-in picker
+  /// face (see `clean_extra_fonts`).
+  #[serde(default)]
+  pub editor_extra_fonts: Vec<String>,
   #[serde(default = "default_line_ending")]
   pub default_line_ending: String,
   #[serde(default = "default_encoding")]
@@ -265,6 +270,7 @@ impl Default for AppSettings {
       preview_local_resources: default_preview_local_resources(),
       open_target: default_open_target(),
       editor_font_family: String::new(),
+      editor_extra_fonts: Vec::new(),
       default_line_ending: default_line_ending(),
       default_encoding: default_encoding(),
       workspace_x: None,
@@ -340,6 +346,42 @@ pub fn load_or_default_for_write(path: &Path) -> Result<AppSettings, String> {
       } else {
         Ok(AppSettings::default())
       }
+    }
+  }
+}
+/// Normalize the free-form font family (empty allowed, no allow-list) and the
+/// added-fonts list.
+fn normalize_fonts(settings: &mut AppSettings) {
+  settings.editor_font_family = settings.editor_font_family.trim().to_string();
+  settings.editor_extra_fonts = clean_extra_fonts(&settings.editor_extra_fonts);
+}
+/// The added-fonts list with each name trimmed, blank and duplicate entries
+/// dropped (first occurrence wins) and every built-in picker face removed, since
+/// those already have their own dropdown rows.
+fn clean_extra_fonts(fonts: &[String]) -> Vec<String> {
+  let mut cleaned: Vec<String> = Vec::new();
+  for font in fonts {
+    let name = font.trim();
+    if name.is_empty()
+      || crate::fonts::BUILTIN_FONT_FAMILIES.contains(&name)
+      || cleaned.iter().any(|kept| kept == name)
+    {
+      continue;
+    }
+    cleaned.push(name.to_string());
+  }
+  cleaned
+}
+/// A font typed under the former "Custom…" option is a non-empty family that is
+/// neither a built-in picker face nor in the added-fonts list; append it there
+/// so the dropdown has a row for it.
+fn migrate_custom_font(settings: &mut AppSettings) {
+  normalize_fonts(settings);
+  let family = &settings.editor_font_family;
+  if !family.is_empty() && !crate::fonts::BUILTIN_FONT_FAMILIES.contains(&family.as_str()) {
+    let family = family.clone();
+    if !settings.editor_extra_fonts.contains(&family) {
+      settings.editor_extra_fonts.push(family);
     }
   }
 }
@@ -650,6 +692,7 @@ fn tolerant_settings(
     ),
     open_target: field_or_default(obj, "open_target", default_open_target, &mut dropped),
     editor_font_family: field_or_default(obj, "editor_font_family", String::new, &mut dropped),
+    editor_extra_fonts: field_or_default(obj, "editor_extra_fonts", Vec::new, &mut dropped),
     default_line_ending: field_or_default(
       obj,
       "default_line_ending",
@@ -725,6 +768,7 @@ pub fn load_from_with_report(path: &Path) -> Result<(AppSettings, Vec<String>), 
         }
       };
       repaired.extend(repair(&mut settings));
+      migrate_custom_font(&mut settings);
       Ok((settings, repaired))
     }
     Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok((AppSettings::default(), Vec::new())),
@@ -856,8 +900,7 @@ pub fn save_settings(app: AppHandle, settings: serde_json::Value) -> Result<(), 
     // being laundered into defaults that then overwrite the user's real file.
     let current = load_or_default_for_write(&path)?;
     let mut merged = merge_settings(&current, &settings)?;
-    // Normalize the free-form font family (empty allowed, no allow-list).
-    merged.editor_font_family = merged.editor_font_family.trim().to_string();
+    normalize_fonts(&mut merged);
     save_to(&path, &merged)?;
     (current, merged)
   };
@@ -1269,6 +1312,7 @@ mod tests {
       preview_local_resources: true,
       open_target: "window".into(),
       editor_font_family: "Menlo".into(),
+      editor_extra_fonts: vec!["Zapfino".into()],
       default_line_ending: "CRLF".into(),
       default_encoding: "Big5".into(),
       workspace_x: Some(40.0),
@@ -1715,6 +1759,88 @@ mod tests {
       };
       assert!(save_to(&path, &s).is_ok());
     }
+  }
+
+  fn strings(items: &[&str]) -> Vec<String> {
+    items.iter().map(|s| s.to_string()).collect()
+  }
+
+  #[test]
+  fn extra_fonts_default_to_empty_for_an_older_file() {
+    let settings = load_json(r#"{"editor_font_family": ""}"#);
+    assert!(settings.editor_extra_fonts.is_empty());
+    assert!(AppSettings::default().editor_extra_fonts.is_empty());
+  }
+
+  #[test]
+  fn extra_fonts_of_the_wrong_type_are_reset_and_reported() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("settings.json");
+    std::fs::write(&path, r#"{"editor_extra_fonts": "Arial"}"#).unwrap();
+    let (settings, repaired) = load_from_with_report(&path).unwrap();
+    assert!(settings.editor_extra_fonts.is_empty());
+    assert!(repaired.contains(&"editor_extra_fonts".to_string()));
+  }
+
+  #[test]
+  fn extra_fonts_keep_their_stored_order_through_save_and_load() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("settings.json");
+    let settings = AppSettings {
+      editor_extra_fonts: strings(&["Zapfino", "Arial"]),
+      ..AppSettings::default()
+    };
+    save_to(&path, &settings).unwrap();
+    assert_eq!(
+      load_from(&path).unwrap().editor_extra_fonts,
+      strings(&["Zapfino", "Arial"])
+    );
+  }
+
+  #[test]
+  fn merge_cleans_the_extra_fonts_list() {
+    let merged = merge_settings(
+      &AppSettings::default(),
+      &serde_json::json!({
+        "editor_extra_fonts": [" Zapfino ", "", "  ", "Arial", "Zapfino", "Menlo", "Arial"],
+      }),
+    )
+    .unwrap();
+    let mut merged = merged;
+    normalize_fonts(&mut merged);
+    assert_eq!(merged.editor_extra_fonts, strings(&["Zapfino", "Arial"]));
+  }
+
+  #[test]
+  fn a_previously_typed_custom_font_is_added_to_the_list_on_load() {
+    let settings = load_json(r#"{"editor_font_family": "Zapfino"}"#);
+    assert_eq!(settings.editor_font_family, "Zapfino");
+    assert_eq!(settings.editor_extra_fonts, strings(&["Zapfino"]));
+  }
+
+  #[test]
+  fn the_migration_appends_after_the_fonts_already_added() {
+    let settings =
+      load_json(r#"{"editor_font_family": "Zapfino", "editor_extra_fonts": ["Arial"]}"#);
+    assert_eq!(settings.editor_extra_fonts, strings(&["Arial", "Zapfino"]));
+  }
+
+  #[test]
+  fn the_migration_skips_built_in_empty_and_already_listed_families() {
+    let builtin = load_json(r#"{"editor_font_family": "Menlo"}"#);
+    assert!(builtin.editor_extra_fonts.is_empty());
+    let empty = load_json(r#"{"editor_font_family": ""}"#);
+    assert!(empty.editor_extra_fonts.is_empty());
+    let listed =
+      load_json(r#"{"editor_font_family": "Zapfino", "editor_extra_fonts": ["Zapfino"]}"#);
+    assert_eq!(listed.editor_extra_fonts, strings(&["Zapfino"]));
+  }
+
+  #[test]
+  fn the_migration_trims_the_stored_family() {
+    let settings = load_json(r#"{"editor_font_family": "  Zapfino "}"#);
+    assert_eq!(settings.editor_font_family, "Zapfino");
+    assert_eq!(settings.editor_extra_fonts, strings(&["Zapfino"]));
   }
 
   #[test]
