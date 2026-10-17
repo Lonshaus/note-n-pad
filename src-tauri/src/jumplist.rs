@@ -112,6 +112,7 @@ fn build_tasks(exe: &HSTRING, locale: i18n::Locale) -> windows::core::Result<IOb
   let tasks = new_collection()?;
   let new_sticky = make_link(exe, "--new-sticky", i18n::tr(locale, Key::TrayNewNote))?;
   unsafe { tasks.AddObject(&new_sticky)? };
+  #[cfg(not(feature = "lite"))]
   if crate::edition::workspace_enabled(crate::edition::is_lite()) {
     let workspace = make_link(exe, "--workspace", i18n::tr(locale, Key::DockOpenWorkspace))?;
     unsafe { tasks.AddObject(&workspace)? };

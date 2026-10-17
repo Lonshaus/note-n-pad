@@ -8,6 +8,19 @@ use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use tauri::{AppHandle, Emitter, Manager, State};
+/// Serializable form of the sparse line-checkpoint index of a windowed-editing
+/// session: the `(offset, newlines_before_offset)` checkpoint pairs plus the
+/// original's total newline count. Compact by construction — a 512-entry array
+/// of two `u64`s each is the whole cost, no per-entry object wrapper — since
+/// this crosses the IPC boundary and gets written into a JSON snapshot.
+/// Ascending offsets seeded with `(0, 0)`, each carrying the newline count
+/// strictly before it. Lives here, not in `windowed`, because a snapshot holds
+/// one in every build, including the one without windowed editing.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct CheckpointIndex {
+  pub checkpoints: Vec<(u64, u64)>,
+  pub total_newlines: u64,
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct NoteSnapshot {
@@ -94,12 +107,12 @@ pub struct NoteSnapshot {
   #[serde(default)]
   pub range_start_line: Option<i64>,
   /// Sparse line-checkpoint index of a windowed-editing tab (see
-  /// `windowed::CheckpointIndex`), captured via `windowed_index` at snapshot
+  /// `CheckpointIndex`), captured via `windowed_index` at snapshot
   /// time. Its presence is what marks the tab as "was unlocked" on restore —
   /// there is deliberately no separate boolean for that fact. None for every
   /// tab that was never unlocked into windowed editing.
   #[serde(default)]
-  pub windowed_index: Option<crate::windowed::CheckpointIndex>,
+  pub windowed_index: Option<CheckpointIndex>,
   /// Fingerprint (size + mtime) `windowed_index` above was built against, so
   /// restore's `windowed_reopen` call can validate it before trusting it.
   #[serde(default)]
@@ -2006,7 +2019,7 @@ mod tests {
     let store = NoteStore::load(dir.path().to_path_buf()).unwrap();
     let mut d = doc("d", Some("grp-1"), 0);
     d.large = Some(200 * 1024 * 1024);
-    d.windowed_index = Some(crate::windowed::CheckpointIndex {
+    d.windowed_index = Some(CheckpointIndex {
       checkpoints: vec![(0, 0), (1_048_576, 12)],
       total_newlines: 5000,
     });
@@ -2020,6 +2033,33 @@ mod tests {
     store.upsert(d.clone()).unwrap();
     let reloaded = NoteStore::load(dir.path().to_path_buf()).unwrap().list();
     assert_eq!(reloaded, vec![d]);
+  }
+
+  #[test]
+  fn a_checkpoint_index_keeps_its_json_shape() {
+    let json = r#"{"checkpoints":[[0,0],[1048576,12]],"total_newlines":5000}"#;
+    let index: CheckpointIndex = serde_json::from_str(json).unwrap();
+    assert_eq!(index.checkpoints, vec![(0, 0), (1_048_576, 12)]);
+    assert_eq!(index.total_newlines, 5000);
+    assert_eq!(serde_json::to_string(&index).unwrap(), json);
+  }
+
+  #[test]
+  fn a_snapshot_written_with_an_index_loads_it_back() {
+    let json = r#"{"id":"d","content":"","file_path":null,"windowed_index":{"checkpoints":[[0,0]],"total_newlines":1}}"#;
+    let note: NoteSnapshot = serde_json::from_str(json).unwrap();
+    assert_eq!(
+      note.windowed_index,
+      Some(CheckpointIndex {
+        checkpoints: vec![(0, 0)],
+        total_newlines: 1,
+      })
+    );
+    let again = serde_json::to_value(&note).unwrap();
+    assert_eq!(
+      again["windowed_index"],
+      serde_json::json!({"checkpoints": [[0, 0]], "total_newlines": 1})
+    );
   }
 
   #[test]
@@ -2049,7 +2089,7 @@ mod tests {
   fn kept_windowed(id: &str, group: Option<&str>, tab_index: i64) -> NoteSnapshot {
     NoteSnapshot {
       large: Some(200 * 1024 * 1024),
-      windowed_index: Some(crate::windowed::CheckpointIndex {
+      windowed_index: Some(CheckpointIndex {
         checkpoints: vec![(0, 0)],
         total_newlines: 1,
       }),

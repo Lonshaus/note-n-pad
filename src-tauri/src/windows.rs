@@ -122,6 +122,7 @@ pub(crate) fn fix_inner_size(window: &tauri::WebviewWindow, want: (f64, f64)) {
 /// Win32 wraps a menu bar that will not fit and never scrolls one, so a
 /// workspace narrower than its own menu spends a whole extra row of panel
 /// height on it.
+#[cfg(not(feature = "lite"))]
 #[cfg(target_os = "windows")]
 fn menu_bar_rows(window: &tauri::WebviewWindow) -> usize {
   use windows_sys::Win32::Foundation::RECT;
@@ -154,6 +155,7 @@ fn menu_bar_rows(window: &tauri::WebviewWindow) -> usize {
   distinct_rows(&tops)
 }
 
+#[cfg(not(feature = "lite"))]
 #[cfg(not(target_os = "windows"))]
 fn menu_bar_rows(_window: &tauri::WebviewWindow) -> usize {
   1
@@ -161,7 +163,7 @@ fn menu_bar_rows(_window: &tauri::WebviewWindow) -> usize {
 
 /// Distinct values in a list of menu item tops, i.e. how many rows they sit on.
 /// An empty list is one row, not zero: nothing to wrap.
-#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+#[cfg_attr(any(feature = "lite", not(target_os = "windows")), allow(dead_code))]
 fn distinct_rows(tops: &[i32]) -> usize {
   let mut rows: Vec<i32> = Vec::new();
   for top in tops {
@@ -176,6 +178,7 @@ fn distinct_rows(tops: &[i32]) -> usize {
 /// row, in logical pixels: the widths of its top-level items added up. It reads
 /// a little short of what the bar actually asks for, so it is a starting point
 /// to widen from, not an answer. `None` when the window has no menu bar.
+#[cfg(not(feature = "lite"))]
 #[cfg(target_os = "windows")]
 fn menu_bar_item_span(window: &tauri::WebviewWindow) -> Option<f64> {
   use windows_sys::Win32::Foundation::RECT;
@@ -206,6 +209,7 @@ fn menu_bar_item_span(window: &tauri::WebviewWindow) -> Option<f64> {
   Some(f64::from(total) / scale)
 }
 
+#[cfg(not(feature = "lite"))]
 #[cfg(not(target_os = "windows"))]
 fn menu_bar_item_span(_window: &tauri::WebviewWindow) -> Option<f64> {
   None
@@ -214,7 +218,9 @@ fn menu_bar_item_span(_window: &tauri::WebviewWindow) -> Option<f64> {
 /// How far each attempt widens the window when the menu bar still wraps, and how
 /// many attempts before giving up and leaving it wrapped. Twelve steps covers
 /// far more than the ~8px the first guess is ever short by.
+#[cfg(not(feature = "lite"))]
 const MENU_FIT_STEP: f64 = 8.0;
+#[cfg(not(feature = "lite"))]
 const MENU_FIT_MAX_STEPS: u32 = 12;
 
 /// Size the workspace so its menu bar sits on one row, measured rather than
@@ -224,6 +230,7 @@ const MENU_FIT_MAX_STEPS: u32 = 12;
 ///
 /// Only ever called with the untouched default width. A stored width the user
 /// chose is theirs, wrapped bar or not.
+#[cfg(not(feature = "lite"))]
 fn fit_menu_bar(window: &tauri::WebviewWindow, width: f64, height: f64) {
   let mut width = menu_bar_item_span(window).map_or(width, |span| width.max(span));
   fix_inner_size(window, (width, height));
@@ -938,7 +945,9 @@ fn focus_launch_window_after(window: &tauri::WebviewWindow, consume: bool) {
   }
 }
 
+#[cfg(not(feature = "lite"))]
 const WORKSPACE_MIN_WIDTH: f64 = 260.0;
+#[cfg(not(feature = "lite"))]
 const WORKSPACE_MIN_HEIGHT: f64 = 320.0;
 
 /// Raise the existing helper, or reveal a focused window.
@@ -951,6 +960,7 @@ pub(crate) fn reveal(win: &tauri::WebviewWindow) {
 
 /// Open (or focus, if already open) the singleton workspace window at its
 /// remembered bounds.
+#[cfg(not(feature = "lite"))]
 pub fn show_workspace(app: &AppHandle) -> Result<(), String> {
   crate::edition::require_full("the workspace")?;
   if let Some(win) = app.get_webview_window("workspace") {
@@ -989,6 +999,7 @@ pub fn show_workspace(app: &AppHandle) -> Result<(), String> {
   Ok(())
 }
 
+#[cfg(not(feature = "lite"))]
 #[tauri::command(async)]
 pub fn show_workspace_window(app: AppHandle) -> Result<(), String> {
   show_workspace(&app)
@@ -1245,6 +1256,7 @@ pub fn focus_note_window(
 
 /// Validate a workspace sticky-row action. Only "save" and "close" cross into a
 /// sticky window; any other payload is rejected before the emit.
+#[cfg(not(feature = "lite"))]
 fn validate_sticky_action(action: &str) -> Result<&str, String> {
   match action {
     "save" | "close" => Ok(action),
@@ -1256,6 +1268,7 @@ fn validate_sticky_action(action: &str) -> Result<&str, String> {
 /// reimplementing either. Ensures the sticky window exists (recreating it from
 /// the store when closed) and reveals it so any save dialog or confirm modal is
 /// visible, then emits the action for StickyApp to run.
+#[cfg(not(feature = "lite"))]
 #[tauri::command(async)]
 pub fn sticky_row_action(
   app: AppHandle,
@@ -1381,6 +1394,7 @@ fn filter_live_groups(labels: &[String], groups: &[String]) -> Vec<String> {
 
 /// Ask a document window to close the tab at `tab_index` from the workspace. The
 /// window runs its own `requestCloseTab` flow, so a dirty tab still prompts.
+#[cfg(not(feature = "lite"))]
 #[tauri::command]
 pub fn close_doc_tab(app: AppHandle, group: String, tab_index: i64) -> Result<(), String> {
   let label = format!("doc-{group}");
@@ -1393,9 +1407,10 @@ pub fn close_doc_tab(app: AppHandle, group: String, tab_index: i64) -> Result<()
 
 #[cfg(test)]
 mod tests {
+  #[cfg(not(feature = "lite"))]
+  use super::validate_sticky_action;
   use super::{
-    filter_live_groups, fixed_window_titles, is_sticky_window_label, validate_sticky_action,
-    DocTabInfo, DocWindowTabs,
+    filter_live_groups, fixed_window_titles, is_sticky_window_label, DocTabInfo, DocWindowTabs,
   };
 
   #[test]
@@ -1555,12 +1570,14 @@ mod tests {
     assert!(stale.active_tab().is_none());
   }
 
+  #[cfg(not(feature = "lite"))]
   #[test]
   fn accepts_known_actions() {
     assert_eq!(validate_sticky_action("save"), Ok("save"));
     assert_eq!(validate_sticky_action("close"), Ok("close"));
   }
 
+  #[cfg(not(feature = "lite"))]
   #[test]
   fn rejects_unknown_actions() {
     assert!(validate_sticky_action("delete").is_err());

@@ -780,7 +780,7 @@
         </div>
       </div>
     {/if}
-    {#if section === 'editor' && editorTabs.length > 1}
+    {#if !__LITE__ && section === 'editor' && editorTabs.length > 1}
       <div class="subtabs" role="tablist">
         {#each editorTabs as tab (tab)}
           <button
@@ -795,7 +795,7 @@
         {/each}
       </div>
     {/if}
-    {#if section === 'editor' && shownTab === 'theme'}
+    {#if !__LITE__ && section === 'editor' && shownTab === 'theme'}
       <div class="theme-layout">
         <div class="theme-side">
           <!-- An open listbox: optgroup headers + tight option rows, like an
@@ -1085,7 +1085,7 @@
         <span>{t('settings.editor.lineNumbers')}</span>
       </label>
 
-      {#if ui.workerHighlight}
+      {#if !__LITE__ && ui.workerHighlight}
         <div class="field">
           <label class="toggle">
             <input
@@ -1226,7 +1226,7 @@
         <span class="hint">{t('settings.general.snapshotCloudHint')}</span>
       </div>
 
-      {#if ui.largeFileSettings}
+      {#if !__LITE__ && ui.largeFileSettings}
         <div class="field">
           <span class="field-label">{t('settings.general.largeOpenMode')}</span>
           <select
@@ -1306,7 +1306,7 @@
         <span>{t('settings.general.showTrayIcon')}</span>
       </label>
 
-      {#if ui.openWorkspaceOnStartup}
+      {#if !__LITE__ && ui.openWorkspaceOnStartup}
         <label class="toggle">
           <input
             type="checkbox"
@@ -1367,7 +1367,7 @@
               {/each}
             {/if}
           </div>
-          {#if ui.localeImport || ui.localeDelete}
+          {#if !__LITE__ && (ui.localeImport || ui.localeDelete)}
             <div class="theme-actions">
               {#if ui.localeImport}
                 <button class="btn" onclick={() => void importLocale()}>
@@ -1395,7 +1395,7 @@
             items={localeRegistry.skipped}
             kind="locales"
             actions={true}
-            deletable={ui.localeDelete}
+            deletable={!__LITE__ && ui.localeDelete}
             onchanged={() => void localeRegistry.load()}
           />
         </div>

@@ -23,7 +23,7 @@ const mode = new URLSearchParams(window.location.search).get('mode');
 const Component =
   mode === 'document'
     ? DocumentApp
-    : mode === 'workspace'
+    : !__LITE__ && mode === 'workspace'
       ? WorkspaceApp
       : mode === 'settings'
         ? SettingsApp
