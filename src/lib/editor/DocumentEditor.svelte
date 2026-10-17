@@ -7,6 +7,7 @@
     Compartment,
     EditorState,
     type Extension,
+    type StateEffect,
     type Text,
   } from '@codemirror/state';
   import {
@@ -19,7 +20,6 @@
     rectangularSelection,
     crosshairCursor,
     highlightActiveLine,
-    keymap,
     type ViewUpdate,
   } from '@codemirror/view';
   import {
@@ -28,18 +28,11 @@
     syntaxHighlighting,
     defaultHighlightStyle,
     bracketMatching,
-    foldKeymap,
   } from '@codemirror/language';
-  import { history, defaultKeymap, historyKeymap } from '@codemirror/commands';
-  import { highlightSelectionMatches, searchKeymap } from '@codemirror/search';
+  import { history } from '@codemirror/commands';
+  import { highlightSelectionMatches } from '@codemirror/search';
   import { searchWithInSelection } from './searchPanel';
-  import {
-    closeBrackets,
-    autocompletion,
-    closeBracketsKeymap,
-    completionKeymap,
-  } from '@codemirror/autocomplete';
-  import { lintKeymap } from '@codemirror/lint';
+  import { closeBrackets, autocompletion } from '@codemirror/autocomplete';
   import {
     loadLanguage,
     docHasLongLine,
@@ -54,6 +47,12 @@
   import { isWorkerHighlightEnabled } from '../highlight/workerHighlight.svelte';
   import { focusEditorIfIdle } from '../util/editorFocus';
   import { readCspNonce } from '../util/cspNonce';
+  import { keymapExtension } from './keymap';
+  import { compositionCancel } from './composition';
+  import { isUndoKey } from './imeShortcuts';
+  import { cmPhraseExtension, cmPhraseSignature } from './cmPhrases';
+  import { shortcutsState } from '../state/shortcuts.svelte';
+  import { platform } from '../state/platform.svelte';
 
   interface Props {
     activeId: string;
@@ -66,6 +65,18 @@
     lineNumbers: boolean;
     openIds: string[];
     reloadSeq: number;
+    // The tab id the last reloadSeq bump targeted; a bump aimed at another tab
+    // is ignored while this editor is hidden.
+    reloadTarget: string;
+    // True while a windowed or large-file tab is shown instead: the editor
+    // stays mounted to keep every tab's state, but takes no focus and reports
+    // nothing to the status bar.
+    hidden?: boolean;
+    // True while a table, JSON, XML or Markdown view is drawn over this editor.
+    // Separate from `hidden` so the per-tab state rules stay as they are: the
+    // editor is still mounted and still holds the tab's state, but nothing can
+    // be typed, deleted or pasted into it, and it never takes focus.
+    overlay?: boolean;
     // True while any dialog/modal is up in the host window; suppresses the
     // automatic focus handoff so a gate/confirm keeps the keyboard.
     modalOpen?: boolean;
@@ -89,6 +100,9 @@
     lineNumbers: showLineNumbers,
     openIds,
     reloadSeq,
+    reloadTarget,
+    hidden = false,
+    overlay = false,
     modalOpen = false,
     onchange,
     onselection,
@@ -110,7 +124,9 @@
     syntaxHighlighting(defaultHighlightStyle, { fallback: true }),
     bracketMatching(),
     closeBrackets(),
-    autocompletion(),
+    // The completion list's keys come from the keymap compartment below, so
+    // the trigger key can be rebound.
+    autocompletion({ defaultKeymap: false }),
     rectangularSelection(),
     crosshairCursor(),
     highlightActiveLine(),
@@ -118,16 +134,13 @@
     // Custom search panel with an "in selection" option; replaces the default
     // panel that openSearchPanel would otherwise self-install.
     searchWithInSelection,
-    keymap.of([
-      ...closeBracketsKeymap,
-      ...defaultKeymap,
-      ...searchKeymap,
-      ...historyKeymap,
-      ...foldKeymap,
-      ...completionKeymap,
-      ...lintKeymap,
-    ]),
   ];
+  // The key bindings, rebuilt whenever the effective shortcuts change.
+  function currentKeymap(): Extension {
+    return keymapExtension('document', platform.os, (id) =>
+      shortcutsState.accel(id),
+    );
+  }
 
   // The whole gutter column (line numbers + fold + active-line gutter) toggles
   // together, so turning line numbers off removes the gutter entirely.
@@ -142,13 +155,27 @@
   const themeCompartment = new Compartment();
   const wrapCompartment = new Compartment();
   const gutterCompartment = new Compartment();
+  const keymapCompartment = new Compartment();
+  // CodeMirror's own UI text in the active UI language.
+  const phraseCompartment = new Compartment();
   // Off-main-thread highlighting for oversized documents, reconfigured in place
   // so switching tabs or toggling the flag adds/removes it (and disposes the
   // worker) without rebuilding the state.
   const workerCompartment = new Compartment();
+  // Not editable while hidden or covered by a view: WebKit's `inert` blocks
+  // typed text but not native editing commands (Delete, menu Select All) on a
+  // still-focused editor.
+  const editableCompartment = new Compartment();
   // Per-tab EditorState (doc + selection + history), keyed by tab id. Swapping
   // via view.setState keeps each tab's undo history and cursor isolated.
   const states = new Map<string, EditorState>();
+  // Per-tab scroll snapshot (scroll is not part of EditorState), saved with the
+  // state on switch-out and dispatched after setState on switch-in.
+  const scrolls = new Map<string, StateEffect<unknown>>();
+  // The last snapshot dispatched but not yet applied: CodeMirror applies a
+  // scroll target only in its next measure pass, so until then the live view
+  // does not show it and a capture must use this record instead.
+  let pendingScroll: { id: string; snap: StateEffect<unknown> } | null = null;
   let mountedId = '';
   let langSeq = 0;
   let selRaf = 0;
@@ -157,6 +184,8 @@
   // is added, or the last long line is shortened back). Per-tab: rescanned on
   // mount and on every tab switch, updated incrementally on each edit.
   let hasLongLine = $state(false);
+  // Phrases baked into every state so far; a reconfigure is skipped when equal.
+  let appliedPhrases = cmPhraseSignature();
 
   function buildState(doc: Text): EditorState {
     return EditorState.create({
@@ -165,11 +194,16 @@
         // Required in every view, see the note in Editor.svelte.
         EditorView.cspNonce.of(readCspNonce()),
         coreSetup,
+        keymapCompartment.of(currentKeymap()),
+        // Undo while composing cancels the composition, as TextEdit does.
+        platform.isMacOS ? compositionCancel(isUndoKey, afterCancel) : [],
+        phraseCompartment.of(cmPhraseExtension()),
         gutterCompartment.of(gutterExtension(showLineNumbers)),
         wrapCompartment.of(wordWrap ? EditorView.lineWrapping : []),
         languageCompartment.of([]),
         workerCompartment.of([]),
         themeCompartment.of(varEditorTheme(dark)),
+        editableCompartment.of(EditorView.editable.of(!hidden && !overlay)),
         EditorView.updateListener.of((update) => {
           if (update.docChanged) {
             // Zero-copy: hand the rope reference to state, no whole-buffer string.
@@ -183,6 +217,33 @@
       ],
     });
   }
+  // Bring everything that mirrors the document back in line after a cancelled
+  // composition replaced the state (setState runs no update listeners).
+  function afterCancel(v: EditorView): void {
+    onchange(v.state.doc);
+    rescanLongLine(v.state.doc);
+    reportSelection();
+  }
+  // The current scroll position of the mounted tab as a snapshot effect.
+  function captureScroll(v: EditorView): StateEffect<unknown> {
+    if (pendingScroll !== null && pendingScroll.id === mountedId) {
+      return pendingScroll.snap;
+    }
+    return v.scrollSnapshot();
+  }
+  // Dispatch a scroll snapshot for the mounted tab and track it as pending
+  // until the measure pass that applies it has run (CodeMirror's measure frame
+  // is scheduled during the dispatch, so this later frame runs after it).
+  function dispatchScroll(v: EditorView, snap: StateEffect<unknown>): void {
+    v.dispatch({ effects: snap });
+    const record = { id: mountedId, snap };
+    pendingScroll = record;
+    requestAnimationFrame(() => {
+      if (pendingScroll === record) {
+        pendingScroll = null;
+      }
+    });
+  }
 
   // Report the caret's Ln/Col, coalesced to one update per frame so a burst of
   // keystrokes never churns the status-bar $state more than once per paint.
@@ -193,7 +254,7 @@
     selRaf = requestAnimationFrame(() => {
       selRaf = 0;
       const state = view?.state;
-      if (state === undefined) {
+      if (state === undefined || hidden) {
         return;
       }
       const head = state.selection.main.head;
@@ -273,7 +334,7 @@
   // Reconfiguring to the same empty value on every call is cheap and keeps the
   // enable/disable logic in one place.
   function applyWorkerHighlight(name: string | null, longLine: boolean): void {
-    if (view === undefined) {
+    if (__LITE__ || view === undefined) {
       return;
     }
     const id = name === null ? null : resolveLanguageId(name);
@@ -298,7 +359,9 @@
     onview?.(view);
     // Claim keyboard focus on load (initial mount, restore, or first open) so a
     // window opened programmatically does not silently drop the first keystrokes.
-    focusEditorIfIdle(view, modalOpen);
+    if (!hidden && !overlay) {
+      focusEditorIfIdle(view, modalOpen);
+    }
     if (import.meta.env.DEV) {
       void import('../dev/editorRegistry').then((m) => m.setActiveView(view!));
     }
@@ -324,20 +387,74 @@
       if (view === undefined || id === mountedId) {
         return;
       }
-      states.set(mountedId, view.state);
+      // A closed tab's state is dropped, never saved.
+      if (openIds.includes(mountedId)) {
+        states.set(mountedId, view.state);
+        scrolls.set(mountedId, captureScroll(view));
+      }
       const incoming = states.get(id) ?? buildState(content);
       view.setState(incoming);
       mountedId = id;
       view.dispatch({
-        effects: themeCompartment.reconfigure(varEditorTheme(dark)),
+        effects: [
+          themeCompartment.reconfigure(varEditorTheme(dark)),
+          editableCompartment.reconfigure(
+            EditorView.editable.of(!hidden && !overlay),
+          ),
+        ],
       });
+      const snap = scrolls.get(id);
+      if (snap !== undefined) {
+        dispatchScroll(view, snap);
+      }
       rescanLongLine(incoming.doc);
       void applyLanguage(language, hasLongLine);
       applyWorkerHighlight(language, hasLongLine);
       reportSelection();
       // Re-claim focus after a tab switch (read untracked, so this never re-runs
       // on a modal toggle) so typing works without clicking the switched-to tab.
-      focusEditorIfIdle(view, modalOpen);
+      if (!hidden && !overlay) {
+        focusEditorIfIdle(view, modalOpen);
+      }
+    });
+  });
+  // Coming back from a windowed or large-file tab: report the caret and claim
+  // focus again, as a fresh mount used to.
+  let wasHidden = false;
+  $effect(() => {
+    const isHidden = hidden;
+    const covered = overlay;
+    untrack(() => {
+      const returning = wasHidden && !isHidden;
+      wasHidden = isHidden;
+      if (view === undefined) {
+        return;
+      }
+      view.dispatch({
+        effects: editableCompartment.reconfigure(
+          EditorView.editable.of(!isHidden && !covered),
+        ),
+      });
+      if ((isHidden || covered) && view.hasFocus) {
+        view.contentDOM.blur();
+      }
+      if (import.meta.env.DEV) {
+        // The DEV automation hook drives the visible editor only.
+        const v = view;
+        void import('../dev/editorRegistry').then((m) => {
+          if (!isHidden) {
+            m.setActiveView(v);
+          } else if (m.activeView() === v) {
+            m.setActiveView(null);
+          }
+        });
+      }
+      if (returning) {
+        reportSelection();
+        if (!covered) {
+          focusEditorIfIdle(view, modalOpen);
+        }
+      }
     });
   });
 
@@ -348,6 +465,9 @@
     const seq = reloadSeq;
     untrack(() => {
       if (view === undefined || seq === 0) {
+        return;
+      }
+      if (hidden && reloadTarget !== mountedId) {
         return;
       }
       view.dispatch({
@@ -410,6 +530,45 @@
       });
     }
   });
+  // Rebind the customizable commands when the effective shortcuts change. The
+  // view takes the new bindings through its compartment; the states saved for
+  // the other tabs are updated too, or they would bring the old keys back when
+  // their tab is switched to.
+  $effect(() => {
+    const accels = shortcutsState.accelerators;
+    const os = platform.os;
+    untrack(() => {
+      const ext = keymapExtension('document', os, (id) => accels[id] ?? null);
+      const effects = keymapCompartment.reconfigure(ext);
+      for (const [id, saved] of states) {
+        states.set(id, saved.update({ effects }).state);
+      }
+      view?.dispatch({ effects });
+    });
+  });
+  // Swap the CodeMirror phrases when the UI language changes; saved tab states
+  // are updated too, or switching to one would bring the old language back.
+  $effect(() => {
+    const ext = cmPhraseExtension();
+    const sig = cmPhraseSignature();
+    untrack(() => {
+      if (sig === appliedPhrases) {
+        return;
+      }
+      appliedPhrases = sig;
+      const effects = phraseCompartment.reconfigure(ext);
+      for (const [id, saved] of states) {
+        states.set(id, saved.update({ effects }).state);
+      }
+      if (view !== undefined) {
+        // The phrase change rebuilds the view and drops its scroll, so put the
+        // pre-change position back in a separate transaction.
+        const snap = captureScroll(view);
+        view.dispatch({ effects });
+        dispatchScroll(view, snap);
+      }
+    });
+  });
 
   // Forget saved states for tabs that have been closed.
   $effect(() => {
@@ -418,6 +577,7 @@
       for (const key of states.keys()) {
         if (!ids.has(key)) {
           states.delete(key);
+          scrolls.delete(key);
         }
       }
     });

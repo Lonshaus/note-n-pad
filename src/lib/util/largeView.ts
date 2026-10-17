@@ -91,3 +91,42 @@ export function computeVisibleWindow(
   const endLine = Math.min(totalLines, firstVisible + visibleCount + overscan);
   return { firstVisible, visibleCount, startLine, endLine };
 }
+/** Indices of the first and last row lying fully inside the viewport (1 px
+ *  tolerance). With no fully visible row, the first row that intersects the
+ *  viewport; null when no row does. */
+export function fullyVisibleSpan(
+  rows: readonly { top: number; bottom: number }[],
+  viewTop: number,
+  viewBottom: number,
+): { first: number; last: number } | null {
+  let first = -1;
+  let last = -1;
+  rows.forEach((r, i) => {
+    if (r.top >= viewTop - 1 && r.bottom <= viewBottom + 1) {
+      if (first < 0) {
+        first = i;
+      }
+      last = i;
+    }
+  });
+  if (first >= 0) {
+    return { first, last };
+  }
+  const hit = rows.findIndex((r) => r.bottom > viewTop && r.top < viewBottom);
+  return hit < 0 ? null : { first: hit, last: hit };
+}
+/** One rendered row's share of a selection: its text, and the offsets the
+ *  selection starts/ends at when it starts/ends inside that row. */
+export interface SelectedRow {
+  text: string;
+  from?: number;
+  to?: number;
+}
+/** The selected text of `rows`, one line per row. Rows are split on `\n` only,
+ *  so a CRLF file's rows end in `\r`; one is dropped per row to match what an
+ *  ordinary tab copies. */
+export function joinSelectedRows(rows: readonly SelectedRow[]): string {
+  return rows
+    .map((r) => r.text.slice(r.from ?? 0, r.to).replace(/\r$/, ''))
+    .join('\n');
+}

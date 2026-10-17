@@ -30,11 +30,44 @@ pub struct LargeFileState {
 
 /// A byte-offset index over a file's lines. Checkpoints are `(line, byte offset
 /// of that line's start)` recorded every `interval` lines, always seeded with
-/// `(0, 0)`. `total_lines` is `None` until the background scan completes.
+/// `(0, 0)`. `total_lines` is `None` until the background scan completes, and
+/// stays `None` with `failed` set when the scan died.
 struct LineIndex {
   path: PathBuf,
   checkpoints: Vec<(u64, u64)>,
   total_lines: Option<u64>,
+  failed: bool,
+}
+/// Where an index's background scan stands, as `index_line_count` reports it.
+#[derive(Serialize, Debug, PartialEq, Eq)]
+#[serde(tag = "state", content = "lines", rename_all = "lowercase")]
+pub enum IndexStatus {
+  Running,
+  Done(u64),
+  Failed,
+}
+
+fn index_status(index: &LineIndex) -> IndexStatus {
+  if index.failed {
+    IndexStatus::Failed
+  } else {
+    match index.total_lines {
+      Some(total) => IndexStatus::Done(total),
+      None => IndexStatus::Running,
+    }
+  }
+}
+/// Look an index up by id and report its scan status.
+fn status_of(indexes: &Mutex<HashMap<String, LineIndex>>, id: &str) -> Result<IndexStatus, String> {
+  let map = indexes.lock().unwrap();
+  let index = map.get(id).ok_or_else(|| "unknown index id".to_string())?;
+  Ok(index_status(index))
+}
+/// Record that an index's scan failed, unless the index was already dropped.
+fn mark_failed(indexes: &Mutex<HashMap<String, LineIndex>>, id: &str) {
+  if let Some(entry) = indexes.lock().unwrap().get_mut(id) {
+    entry.failed = true;
+  }
 }
 
 #[derive(Serialize)]
@@ -197,10 +230,11 @@ fn nearest_checkpoint(checkpoints: &[(u64, u64)], line: u64) -> (u64, u64) {
   let idx = checkpoints.partition_point(|&(l, _)| l <= line);
   checkpoints[idx - 1]
 }
-
+/// Error text of `offset_of_line` for a line past the file's last line.
+const LINE_OUT_OF_RANGE: &str = "line out of range";
 /// Byte offset of `target` line's start, scanning forward from a checkpoint that
-/// begins at `start_line` / `start_offset`. Errors when `target` lies past the
-/// file's last line.
+/// begins at `start_line` / `start_offset`. Errors with `LINE_OUT_OF_RANGE` when
+/// `target` lies past the file's last line.
 fn offset_of_line<R: Read>(
   mut reader: R,
   start_offset: u64,
@@ -219,7 +253,7 @@ fn offset_of_line<R: Read>(
   loop {
     let n = reader.read(&mut buf).map_err(|e| e.to_string())?;
     if n == 0 {
-      return Err("line out of range".to_string());
+      return Err(LINE_OUT_OF_RANGE.to_string());
     }
     for &b in &buf[..n] {
       pos += 1;
@@ -233,10 +267,27 @@ fn offset_of_line<R: Read>(
     }
   }
 }
+/// Open `path` and scan forward from `checkpoint` (line index, byte offset) to
+/// the start of `line`. `Ok(None)` when `line` is past the last line.
+fn line_offset_in_file(
+  path: &Path,
+  checkpoint: (u64, u64),
+  line: u64,
+) -> Result<Option<u64>, String> {
+  let mut file = File::open(path).map_err(|e| e.to_string())?;
+  file
+    .seek(SeekFrom::Start(checkpoint.1))
+    .map_err(|e| e.to_string())?;
+  match offset_of_line(BufReader::new(file), checkpoint.1, checkpoint.0, line) {
+    Ok(offset) => Ok(Some(offset)),
+    Err(e) if e == LINE_OUT_OF_RANGE => Ok(None),
+    Err(e) => Err(e),
+  }
+}
 
 /// Case-aware substring search over bytes. Case-insensitive matching folds ASCII
 /// letters only; non-ASCII bytes compare verbatim.
-fn find_sub(hay: &[u8], needle: &[u8], case_sensitive: bool) -> Option<usize> {
+pub(crate) fn find_sub(hay: &[u8], needle: &[u8], case_sensitive: bool) -> Option<usize> {
   if needle.is_empty() || needle.len() > hay.len() {
     return None;
   }
@@ -252,7 +303,7 @@ fn find_sub(hay: &[u8], needle: &[u8], case_sensitive: bool) -> Option<usize> {
 }
 
 /// Count newline bytes in a slice.
-fn count_newlines(b: &[u8]) -> u64 {
+pub(crate) fn count_newlines(b: &[u8]) -> u64 {
   b.iter().filter(|&&c| c == b'\n').count() as u64
 }
 
@@ -267,7 +318,7 @@ fn truncate_chars(s: &str, max: usize) -> String {
 /// Preview of the line containing the match at `idx` within `buf`, bounded to the
 /// surrounding newlines and truncated to `PREVIEW_CHARS`. The line may be clipped
 /// when it crosses a read boundary, which is acceptable for a preview.
-fn preview_at(buf: &[u8], idx: usize) -> String {
+pub(crate) fn preview_at(buf: &[u8], idx: usize) -> String {
   let start = buf[..idx]
     .iter()
     .rposition(|&b| b == b'\n')
@@ -376,6 +427,7 @@ pub fn start_line_index(
       path: path_buf.clone(),
       checkpoints: vec![(0, 0)],
       total_lines: None,
+      failed: false,
     },
   );
   let thread_id = id.clone();
@@ -384,6 +436,7 @@ pub fn start_line_index(
       Ok(f) => f,
       Err(e) => {
         log::warn!("line index open failed: {e}");
+        mark_failed(&app.state::<LargeFileState>().indexes, &thread_id);
         let _ = app.emit(
           "large-index-progress",
           IndexProgress {
@@ -420,6 +473,7 @@ pub fn start_line_index(
       }
       Err(e) => {
         log::warn!("line index scan failed: {e}");
+        mark_failed(&app.state::<LargeFileState>().indexes, &thread_id);
         let _ = app.emit(
           "large-index-progress",
           IndexProgress {
@@ -459,9 +513,13 @@ pub fn start_line_index(
 }
 
 /// Byte offset where `line` begins, using the index's nearest checkpoint and
-/// scanning forward from there.
+/// scanning forward from there. `None` when `line` is past the last line.
 #[tauri::command]
-pub fn line_to_offset(state: State<LargeFileState>, id: String, line: u64) -> Result<u64, String> {
+pub fn line_to_offset(
+  state: State<LargeFileState>,
+  id: String,
+  line: u64,
+) -> Result<Option<u64>, String> {
   let (path, checkpoint) = {
     let map = state.indexes.lock().unwrap();
     let index = map.get(&id).ok_or_else(|| "unknown index id".to_string())?;
@@ -470,20 +528,13 @@ pub fn line_to_offset(state: State<LargeFileState>, id: String, line: u64) -> Re
       nearest_checkpoint(&index.checkpoints, line),
     )
   };
-  let mut file = File::open(&path).map_err(|e| e.to_string())?;
-  file
-    .seek(SeekFrom::Start(checkpoint.1))
-    .map_err(|e| e.to_string())?;
-  offset_of_line(BufReader::new(file), checkpoint.1, checkpoint.0, line)
+  line_offset_in_file(&path, checkpoint, line)
 }
-
-/// The index's total line count once known, otherwise `None` while it is still
-/// being built.
+/// Where the index's scan stands: still running, done with the total line count,
+/// or failed. Errors with "unknown index id" once the index has been dropped.
 #[tauri::command]
-pub fn index_line_count(state: State<LargeFileState>, id: String) -> Result<Option<u64>, String> {
-  let map = state.indexes.lock().unwrap();
-  let index = map.get(&id).ok_or_else(|| "unknown index id".to_string())?;
-  Ok(index.total_lines)
+pub fn index_line_count(state: State<LargeFileState>, id: String) -> Result<IndexStatus, String> {
+  status_of(&state.indexes, &id)
 }
 
 /// Release a line index and its memory.
@@ -695,6 +746,44 @@ mod tests {
   }
 
   #[test]
+  fn line_offset_in_file_maps_past_end_to_none() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("short.txt");
+    for content in ["a\nb\nc", "a\nb\nc\n"] {
+      std::fs::write(&path, content).unwrap();
+      let (cp, _) = build_index(Cursor::new(content), 100, |_, _| {}).unwrap();
+      for target in [400u64, 800] {
+        let c = nearest_checkpoint(&cp, target);
+        assert_eq!(line_offset_in_file(&path, c, target), Ok(None));
+      }
+      let c = nearest_checkpoint(&cp, 2);
+      assert_eq!(line_offset_in_file(&path, c, 2), Ok(Some(4)));
+    }
+  }
+
+  #[test]
+  fn line_offset_in_file_maps_a_single_long_line_past_end_to_none() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("one-line.txt");
+    let content = "x".repeat(1000);
+    std::fs::write(&path, &content).unwrap();
+    let (cp, _) = build_index(Cursor::new(content), 100, |_, _| {}).unwrap();
+    let c = nearest_checkpoint(&cp, 400);
+    assert_eq!(line_offset_in_file(&path, c, 400), Ok(None));
+  }
+
+  #[test]
+  fn line_offset_in_file_keeps_real_failures_as_errors() {
+    let dir = tempdir().unwrap();
+    let missing = dir.path().join("gone.txt");
+    assert!(line_offset_in_file(&missing, (0, 0), 3).is_err());
+    let path = dir.path().join("f.txt");
+    std::fs::write(&path, "a\nb\n").unwrap();
+    // A target before the checkpoint is a caller bug, not a past-end answer.
+    assert!(line_offset_in_file(&path, (5, 0), 3).is_err());
+  }
+
+  #[test]
   fn search_finds_match_across_chunk_boundary() {
     // Chunk size 2 forces "ABC" to straddle a boundary.
     let cancel = AtomicBool::new(false);
@@ -828,6 +917,62 @@ mod tests {
     // the terminal `large-index-progress` event with `error: true` instead of
     // returning silently.
     assert!(build_index(FailingReader, 1, |_, _| {}).is_err());
+  }
+
+  fn index_entry() -> LineIndex {
+    LineIndex {
+      path: PathBuf::from("x"),
+      checkpoints: vec![(0, 0)],
+      total_lines: None,
+      failed: false,
+    }
+  }
+
+  #[test]
+  fn index_status_running_while_scan_unfinished() {
+    let indexes = Mutex::new(HashMap::new());
+    indexes.lock().unwrap().insert("a".into(), index_entry());
+    assert_eq!(status_of(&indexes, "a").unwrap(), IndexStatus::Running);
+  }
+
+  #[test]
+  fn index_status_done_reports_total() {
+    let indexes = Mutex::new(HashMap::new());
+    let mut entry = index_entry();
+    entry.total_lines = Some(42);
+    indexes.lock().unwrap().insert("a".into(), entry);
+    assert_eq!(status_of(&indexes, "a").unwrap(), IndexStatus::Done(42));
+  }
+
+  #[test]
+  fn index_status_failed_after_mark_failed() {
+    let indexes = Mutex::new(HashMap::new());
+    indexes.lock().unwrap().insert("a".into(), index_entry());
+    mark_failed(&indexes, "a");
+    assert_eq!(status_of(&indexes, "a").unwrap(), IndexStatus::Failed);
+  }
+
+  #[test]
+  fn index_status_unknown_id_errors_and_mark_failed_ignores_it() {
+    let indexes = Mutex::new(HashMap::new());
+    mark_failed(&indexes, "gone");
+    assert_eq!(status_of(&indexes, "gone").unwrap_err(), "unknown index id");
+  }
+
+  #[test]
+  fn index_status_serializes_with_a_state_tag() {
+    assert_eq!(
+      serde_json::to_string(&IndexStatus::Running).unwrap(),
+      r#"{"state":"running"}"#
+    );
+    assert_eq!(
+      serde_json::to_string(&IndexStatus::Done(7)).unwrap(),
+      r#"{"state":"done","lines":7}"#
+    );
+    assert_eq!(
+      serde_json::to_string(&IndexStatus::Failed).unwrap(),
+      r#"{"state":"failed"}"#
+    );
   }
 
   #[test]

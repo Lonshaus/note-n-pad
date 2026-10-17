@@ -36,6 +36,8 @@ function doc(over: Partial<NoteSnapshot>): NoteSnapshot {
     range_fp_size: null,
     range_fp_mtime: null,
     range_start_line: null,
+    range_end_line: null,
+    range_trailing_break: null,
     windowed_index: null,
     windowed_fp_size: null,
     windowed_fp_mtime: null,
@@ -65,7 +67,9 @@ describe('orphanCandidates', () => {
         window_group: 'other',
       }),
     ];
-    const got = orphanCandidates(notes, '/x.txt', 'mine').map((n) => n.id);
+    const got = orphanCandidates(notes, '/x.txt', 'mine', false).map(
+      (n) => n.id,
+    );
     expect(got).toEqual(['b']);
   });
 });
@@ -73,31 +77,33 @@ describe('orphanCandidates', () => {
 describe('routeOpen', () => {
   it('is fresh when no other group holds the path', () => {
     const notes = [doc({ id: 'a', window_group: 'mine' })];
-    expect(routeOpen(notes, '/x.txt', 'mine', new Set()).kind).toBe('fresh');
+    expect(routeOpen(notes, '/x.txt', 'mine', new Set(), false).kind).toBe(
+      'fresh',
+    );
   });
 
   it('switches to a live window holding the path', () => {
     const notes = [doc({ id: 'b', window_group: 'other', tab_index: 3 })];
-    const route = routeOpen(notes, '/x.txt', 'mine', new Set(['other']));
+    const route = routeOpen(notes, '/x.txt', 'mine', new Set(['other']), false);
     expect(route).toEqual({ kind: 'switch', group: 'other', tabIndex: 3 });
   });
 
   it('adopts an orphan whose window is dead', () => {
     const note = doc({ id: 'b', window_group: 'dead', dirty: true });
-    const route = routeOpen([note], '/x.txt', 'mine', new Set());
+    const route = routeOpen([note], '/x.txt', 'mine', new Set(), false);
     expect(route).toEqual({ kind: 'adopt', note });
   });
 
   it('adopts a solo (group-less) orphan by its own id', () => {
     const note = doc({ id: 'solo', window_group: null, dirty: true });
-    const route = routeOpen([note], '/x.txt', 'mine', new Set());
+    const route = routeOpen([note], '/x.txt', 'mine', new Set(), false);
     expect(route).toEqual({ kind: 'adopt', note });
   });
 
   it('prefers a dirty orphan over a clean one when several match', () => {
     const clean = doc({ id: 'clean', window_group: 'g1' });
     const dirty = doc({ id: 'dirty', window_group: 'g2', dirty: true });
-    const route = routeOpen([clean, dirty], '/x.txt', 'mine', new Set());
+    const route = routeOpen([clean, dirty], '/x.txt', 'mine', new Set(), false);
     expect(route).toEqual({ kind: 'adopt', note: dirty });
   });
 
@@ -109,7 +115,51 @@ describe('routeOpen', () => {
       dirty: true,
       tab_index: 2,
     });
-    const route = routeOpen([clean, dirty], '/x.txt', 'mine', new Set(['g2']));
+    const route = routeOpen(
+      [clean, dirty],
+      '/x.txt',
+      'mine',
+      new Set(['g2']),
+      false,
+    );
     expect(route).toEqual({ kind: 'switch', group: 'g2', tabIndex: 2 });
+  });
+});
+
+describe('kept tabs in lite', () => {
+  const kept = [
+    doc({ id: 'large', window_group: 'g1', large: 200_000_000 }),
+    doc({ id: 'range', window_group: 'g1', range_source: '/x.txt' }),
+    doc({
+      id: 'windowed',
+      window_group: 'g1',
+      large: 200_000_000,
+      windowed_index: { checkpoints: [[0, 0]], total_newlines: 1 },
+    }),
+  ];
+
+  it('are not candidates in lite, so an open never adopts or deletes them', () => {
+    for (const note of kept) {
+      expect(orphanCandidates([note], '/x.txt', 'mine', true)).toEqual([]);
+      expect(routeOpen([note], '/x.txt', 'mine', new Set(), true)).toEqual({
+        kind: 'fresh',
+      });
+    }
+  });
+
+  it('are candidates in full', () => {
+    for (const note of kept) {
+      expect(orphanCandidates([note], '/x.txt', 'mine', false)).toEqual([note]);
+      expect(routeOpen([note], '/x.txt', 'mine', new Set(), false).kind).toBe(
+        'adopt',
+      );
+    }
+  });
+
+  it('do not hide an ordinary orphan of the same path in lite', () => {
+    const plain = doc({ id: 'plain', window_group: 'g2' });
+    expect(
+      routeOpen([...kept, plain], '/x.txt', 'mine', new Set(), true),
+    ).toEqual({ kind: 'adopt', note: plain });
   });
 });

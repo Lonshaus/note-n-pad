@@ -26,6 +26,7 @@ import {
   selectMatches,
   setSearchQuery,
 } from '@codemirror/search';
+import { TEXT_FIELD_ATTRS } from './textFieldAttrs';
 
 // Custom search/replace panel: a faithful rebuild of @codemirror/search's
 // built-in SearchPanel that adds an "in selection" checkbox. It reuses the CM
@@ -159,23 +160,25 @@ class InSelectionSearchPanel implements Panel {
     this.commit = this.commit.bind(this);
     this.searchField = input({
       value: query.search,
-      placeholder: phrase('Find'),
-      'aria-label': phrase('Find'),
       class: 'cm-textfield',
       name: 'search',
       form: '',
       'main-field': 'true',
+      ...TEXT_FIELD_ATTRS,
     });
+    this.searchField.setAttribute('placeholder', phrase('Find'));
+    this.searchField.setAttribute('aria-label', phrase('Find'));
     this.searchField.onchange = this.commit;
     this.searchField.onkeyup = this.commit;
     this.replaceField = input({
       value: query.replace,
-      placeholder: phrase('Replace'),
-      'aria-label': phrase('Replace'),
       class: 'cm-textfield',
       name: 'replace',
       form: '',
+      ...TEXT_FIELD_ATTRS,
     });
+    this.replaceField.setAttribute('placeholder', phrase('Replace'));
+    this.replaceField.setAttribute('aria-label', phrase('Replace'));
     this.replaceField.onchange = this.commit;
     this.replaceField.onkeyup = this.commit;
     this.caseField = input({ type: 'checkbox', name: 'case', form: '' });
@@ -199,19 +202,22 @@ class InSelectionSearchPanel implements Panel {
     const button = (
       name: string,
       onclick: () => void,
-      label: string,
+      text: () => string,
     ): HTMLButtonElement => {
       const el = document.createElement('button');
       el.className = 'cm-button';
       el.setAttribute('name', name);
       el.type = 'button';
-      el.textContent = phrase(label);
+      el.textContent = text();
       el.onclick = onclick;
       return el;
     };
-    const label = (field: HTMLInputElement, text: string): HTMLLabelElement => {
+    const label = (
+      field: HTMLInputElement,
+      text: () => string,
+    ): HTMLLabelElement => {
       const el = document.createElement('label');
-      el.append(field, phrase(text));
+      el.append(field, text());
       return el;
     };
     // Rows instead of the stock flat layout so a narrow window wraps cleanly:
@@ -229,16 +235,28 @@ class InSelectionSearchPanel implements Panel {
       row(
         'cm-search-row',
         this.searchField,
-        button('next', () => findNext(view), 'next'),
-        button('prev', () => findPrevious(view), 'previous'),
-        button('select', () => selectMatches(view), 'all'),
+        button(
+          'next',
+          () => findNext(view),
+          () => phrase('next'),
+        ),
+        button(
+          'prev',
+          () => findPrevious(view),
+          () => phrase('previous'),
+        ),
+        button(
+          'select',
+          () => selectMatches(view),
+          () => phrase('all'),
+        ),
       ),
       row(
         'cm-search-row cm-search-opts',
-        label(this.caseField, 'match case'),
-        label(this.reField, 'regexp'),
-        label(this.wordField, 'by word'),
-        label(this.inSelField, 'in selection'),
+        label(this.caseField, () => phrase('match case')),
+        label(this.reField, () => phrase('regexp')),
+        label(this.wordField, () => phrase('by word')),
+        label(this.inSelField, () => phrase('in selection')),
       ),
     );
     if (!view.state.readOnly) {
@@ -246,8 +264,16 @@ class InSelectionSearchPanel implements Panel {
         row(
           'cm-search-row',
           this.replaceField,
-          button('replace', () => replaceNext(view), 'replace'),
-          button('replaceAll', () => replaceAll(view), 'replace all'),
+          button(
+            'replace',
+            () => replaceNext(view),
+            () => phrase('replace'),
+          ),
+          button(
+            'replaceAll',
+            () => replaceAll(view),
+            () => phrase('replace all'),
+          ),
         ),
       );
     }

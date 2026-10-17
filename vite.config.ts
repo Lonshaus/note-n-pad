@@ -3,11 +3,33 @@
 
 import { defineConfig } from 'vite';
 import { svelte } from '@sveltejs/vite-plugin-svelte';
+import { codemirrorScalerPatch } from './scripts/codemirror-scaler-patch.ts';
 
 // https://vite.dev/config/
 export default defineConfig({
-  plugins: [svelte()],
+  plugins: [svelte(), codemirrorScalerPatch()],
+  // The Lite build command sets NOTENPAD_LITE=1 (alongside `--features lite` on
+  // the Rust side). `__LITE__` becomes a literal, so a branch guarded by it
+  // directly is dropped together with the imports only it used. A call to
+  // `isLite()` is not folded: the bundler does not inline across modules.
+  define: {
+    __LITE__: JSON.stringify(process.env['NOTENPAD_LITE'] === '1'),
+  },
+  build: {
+    // A @lezer package only defines parsers, so an import nothing uses can go.
+    // Without this the Lite build keeps the XML grammar of the tree view it drops.
+    rolldownOptions: {
+      treeshake: {
+        moduleSideEffects: [
+          { test: /[\\/]node_modules[\\/]@lezer[\\/]/, sideEffects: false },
+        ],
+      },
+    },
+  },
   optimizeDeps: {
+    rolldownOptions: {
+      plugins: [codemirrorScalerPatch()],
+    },
     // Parsers reach the dev server only through the dynamic import() in
     // src/lib/highlight/languages.ts, so vite discovers them the first time a
     // document is highlighted and forces a client reload right then, which

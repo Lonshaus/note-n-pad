@@ -47,9 +47,20 @@ fn resolve(
   Ok(dir.join(name))
 }
 
+/// Lite removes deleting theme and locale files; a damaged snapshot can still
+/// be deleted.
+fn delete_allowed(lite: bool, kind: DataKind) -> Result<(), String> {
+  match kind {
+    DataKind::Snapshots => Ok(()),
+    DataKind::Themes => crate::edition::refuse_if(lite, "deleting a theme file"),
+    DataKind::Locales => crate::edition::refuse_if(lite, "deleting a language file"),
+  }
+}
+
 /// Delete one file that failed to load. It is addressed by name because the
-/// per-store delete commands all build `{id}.json` from an id, which cannot
-/// name a conflict copy or a file whose id is the reason it was skipped.
+/// per-store delete commands work from an id (`{id}.json`, or for themes the
+/// file declaring that id), which cannot name a conflict copy or a file whose
+/// id is the reason it was skipped.
 #[tauri::command]
 pub fn delete_data_file(
   app: AppHandle,
@@ -57,6 +68,7 @@ pub fn delete_data_file(
   kind: DataKind,
   name: String,
 ) -> Result<(), String> {
+  delete_allowed(crate::edition::is_lite(), kind)?;
   let path = resolve(&app, &store, kind, &name)?;
   std::fs::remove_file(&path).map_err(|e| e.to_string())
 }
@@ -76,6 +88,16 @@ pub fn reveal_data_file(
 #[cfg(test)]
 mod tests {
   use super::*;
+
+  #[test]
+  fn lite_cannot_delete_theme_or_locale_files_but_can_delete_snapshots() {
+    assert!(delete_allowed(true, DataKind::Snapshots).is_ok());
+    assert!(delete_allowed(true, DataKind::Themes).is_err());
+    assert!(delete_allowed(true, DataKind::Locales).is_err());
+    for kind in [DataKind::Snapshots, DataKind::Themes, DataKind::Locales] {
+      assert!(delete_allowed(false, kind).is_ok());
+    }
+  }
 
   #[test]
   fn a_plain_file_name_is_accepted() {

@@ -10,17 +10,21 @@
 //! (`windowed_close`). Byte coordinates and split-style line counting match the
 //! piece table and `large_file`.
 
-use crate::piece_table::{OriginalIndex, PieceTable};
+use crate::large_file::{count_newlines, preview_at};
+use crate::note_store::CheckpointIndex;
+use crate::piece_table::{OriginalIndex, OriginalSource, PieceTable};
 use crate::range_edit::{Fingerprint, FINGERPRINT_MISMATCH};
-use serde::{Deserialize, Serialize};
+use crate::replace_layer::{self, Builder, ChangeList, Dir, Src, Table};
+use crate::windowed_scan::{scan_backward, scan_forward, Event, Flow, ScanStop};
+use serde::Serialize;
 use std::collections::HashMap;
 use std::fs::{self, File};
 use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::time::{SystemTime, UNIX_EPOCH};
-use tauri::State;
+use tauri::{AppHandle, Emitter, Manager, State};
 
 /// One-pass scan / streaming-copy buffer (1 MiB): the same size the range-edit
 /// path uses, keeping syscall overhead low without holding much of the file.
@@ -40,6 +44,9 @@ const NOT_UTF8: &str = "not-utf8";
 /// Protocol error string returned by every command whose session id is not (or is
 /// no longer) live. A single constant so the frontend can match one value.
 const UNKNOWN_SESSION: &str = "unknown-session";
+/// Bytes a search or replace-all pass reads per chunk (256 KiB), the same as the
+/// viewer's search. The session lock is held for one chunk at a time.
+const SCAN_CHUNK: usize = 256 * 1024;
 
 /// Protocol error strings returned when there is nothing left to undo / redo. The
 /// frontend keys silent no-ops off these exact values.
@@ -165,6 +172,21 @@ struct InverseEdit {
 /// were applied. Undone by reverse-order sequential application, which walks the
 /// document back through each intermediate state in its own coordinate frame.
 type EditGroup = Vec<InverseEdit>;
+/// A replace-all in the journal: only its change list, never a file handle or an
+/// older piece table (a save can overwrite the file such a table reads).
+/// `layer_id` names the forward layer this entry installed while that layer may
+/// still be the table's top, unedited layer, so undoing it can simply take the
+/// layer off.
+struct ReplaceEntry {
+  list: Arc<ChangeList>,
+  layer_id: Option<u64>,
+}
+/// One undo step: a coalesced group of typing edits, or a replace-all. A typing
+/// edit never coalesces into a replace-all.
+enum JournalEntry {
+  Edits(EditGroup),
+  Replace(ReplaceEntry),
+}
 
 /// A live editing session: the piece table over the file, the path it was opened
 /// from (updated on save-as), the file's fingerprint at open / last save, the
@@ -172,30 +194,50 @@ type EditGroup = Vec<InverseEdit>;
 /// digest computed against it (kept alongside so the frontend can read them
 /// back out for persistence — see `windowed_index`), and the global-coordinate
 /// undo/redo journal.
+///
+/// `index`, `digest` and `fingerprint` always describe the file at `path` (what
+/// `windowed_index` returns and a snapshot persists), whatever layers the table
+/// is stacked on.
 struct Session {
-  table: PieceTable<File>,
+  table: Table,
   path: PathBuf,
   fingerprint: Fingerprint,
   index: CheckpointIndex,
   digest: u64,
-  /// Undo groups, oldest first; each entry undoes one coalesced edit step.
-  undo_stack: Vec<EditGroup>,
-  /// Redo groups, populated by undo and cleared by any fresh apply.
-  redo_stack: Vec<EditGroup>,
+  /// Undo entries, oldest first; each undoes one coalesced edit step or one
+  /// replace-all.
+  undo_stack: Vec<JournalEntry>,
+  /// Redo entries, populated by undo and cleared by any fresh apply.
+  redo_stack: Vec<JournalEntry>,
+  /// Bumped by every change of the content: apply, undo, redo, replace-all and
+  /// the save that retargets the session. A scan records it when it starts and
+  /// checks it at every chunk.
+  generation: u64,
+  /// True while a replace-all pass runs. The commands that read or change the
+  /// session wait for it to clear (see `WindowedState::lock_idle`).
+  busy: bool,
 }
 
-/// Serializable form of the sparse line-checkpoint index `OriginalIndex` holds:
-/// the `(offset, newlines_before_offset)` checkpoint pairs plus the original's
-/// total newline count. Compact by construction — a 512-entry array of two
-/// `u64`s each is the whole cost, no per-entry object wrapper — since this
-/// crosses the IPC boundary and gets written into a JSON snapshot. See
-/// `OriginalIndex` for the checkpoint contract this must satisfy: ascending
-/// offsets seeded with `(0, 0)`, each carrying the newline count strictly
-/// before it.
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-pub struct CheckpointIndex {
-  pub checkpoints: Vec<(u64, u64)>,
-  pub total_newlines: u64,
+impl Session {
+  fn new(
+    table: Table,
+    path: PathBuf,
+    fingerprint: Fingerprint,
+    index: CheckpointIndex,
+    digest: u64,
+  ) -> Self {
+    Session {
+      table,
+      path,
+      fingerprint,
+      index,
+      digest,
+      undo_stack: Vec::new(),
+      redo_stack: Vec::new(),
+      generation: 0,
+      busy: false,
+    }
+  }
 }
 
 /// A session's checkpoint index plus the fingerprint and sampled digest it was
@@ -240,7 +282,51 @@ pub struct ReopenResult {
 #[derive(Default)]
 pub struct WindowedState {
   sessions: Mutex<HashMap<u64, Session>>,
+  /// Signalled when a replace-all pass ends and its session is idle again.
+  idle: Condvar,
   next_id: AtomicU64,
+  /// Cancel flags of the running result-list searches, by search id.
+  searches: Mutex<HashMap<String, Arc<AtomicBool>>>,
+}
+
+impl WindowedState {
+  /// The sessions map locked, once session `id` is not running a replace-all.
+  /// An unknown session is `UNKNOWN_SESSION`. Commands that touch a session wait
+  /// here, so none can land between two chunks of a pass; they are all
+  /// `#[tauri::command(async)]`, so the wait never blocks the main thread.
+  fn lock_idle(&self, id: u64) -> Result<MutexGuard<'_, HashMap<u64, Session>>, String> {
+    let mut map = self.sessions.lock().unwrap();
+    loop {
+      let busy = map
+        .get(&id)
+        .ok_or_else(|| UNKNOWN_SESSION.to_string())?
+        .busy;
+      if !busy {
+        return Ok(map);
+      }
+      map = self.idle.wait(map).unwrap();
+    }
+  }
+}
+/// Clears a session's busy flag and wakes the commands waiting on it, however
+/// the pass ends.
+struct BusyGuard<'a> {
+  state: &'a WindowedState,
+  id: u64,
+}
+
+impl Drop for BusyGuard<'_> {
+  fn drop(&mut self) {
+    let mut map = self
+      .state
+      .sessions
+      .lock()
+      .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if let Some(session) = map.get_mut(&self.id) {
+      session.busy = false;
+    }
+    self.state.idle.notify_all();
+  }
 }
 
 /// Result of opening a file for windowed editing.
@@ -300,13 +386,17 @@ pub struct AppliedEdit {
 
 /// Result of a successful undo/redo: the edits just applied (in application order),
 /// the 0-based line of the first edit's start (for a jump-to-change window reload),
-/// and the current document statistics.
+/// and the current document statistics. For a replace-all there are no edits:
+/// `reload_only` is set and `first_line` is the line of its first hit.
 #[derive(Serialize, Debug)]
 pub struct UndoResult {
   pub edits: Vec<AppliedEdit>,
   pub first_line: u64,
   pub total_bytes: u64,
   pub total_lines: u64,
+  /// True for a replace-all undone or redone: `edits` is empty and the
+  /// frontend reloads its window instead of mirroring edits.
+  pub reload_only: bool,
 }
 
 /// Modification time in milliseconds since the Unix epoch, degrading to 0 when the
@@ -411,14 +501,17 @@ fn scan_file(path: &Path) -> Result<ScanResult, String> {
 /// table, its total byte length, the file's fingerprint, the checkpoint index
 /// the scan produced (see `CheckpointIndex`), and the sampled digest computed
 /// against that index (see `sample_digest`).
-fn build_table(
-  path: &Path,
-) -> Result<(PieceTable<File>, u64, Fingerprint, CheckpointIndex, u64), String> {
+fn build_table(path: &Path) -> Result<(Table, u64, Fingerprint, CheckpointIndex, u64), String> {
   let (total_bytes, checkpoints, total_newlines) = scan_file(path)?;
   let fingerprint = fingerprint_of(path)?;
   let digest = sample_digest(path, total_bytes, &checkpoints)?;
   let file = File::open(path).map_err(|e| e.to_string())?;
-  let index = OriginalIndex::new(file, total_bytes, total_newlines, checkpoints.clone());
+  let index = OriginalIndex::new(
+    Src::File(file),
+    total_bytes,
+    total_newlines,
+    checkpoints.clone(),
+  );
   let table = PieceTable::new(index);
   let checkpoint_index = CheckpointIndex {
     checkpoints,
@@ -523,7 +616,7 @@ fn valid_checkpoint_index(index: &CheckpointIndex, total_bytes: u64) -> bool {
 /// Document byte offset at which `line` begins, extended over the piece table's
 /// own `line_to_offset` so a line index equal to the line count maps to the end
 /// of the document (the exclusive end of the last line's window).
-fn line_offset(table: &PieceTable<File>, line: u64) -> Result<u64, String> {
+fn line_offset<O: OriginalSource>(table: &PieceTable<O>, line: u64) -> Result<u64, String> {
   if line >= table.line_count() {
     Ok(table.len())
   } else {
@@ -580,15 +673,15 @@ impl Session {
       self.table.delete(edit.start, edit.end)?;
       self.table.insert(edit.start, edit.text.as_bytes())?;
     }
-    let coalesce = !new_group && !self.undo_stack.is_empty() && self.redo_stack.is_empty();
+    self.generation += 1;
+    // Only a group of typing edits can take more; a replace-all stays alone.
+    let coalesce = !new_group
+      && matches!(self.undo_stack.last(), Some(JournalEntry::Edits(_)))
+      && self.redo_stack.is_empty();
     self.redo_stack.clear();
-    if coalesce {
-      self.undo_stack.last_mut().unwrap().extend(inverses);
-    } else {
-      self.undo_stack.push(inverses);
-      if self.undo_stack.len() > UNDO_LIMIT {
-        self.undo_stack.remove(0);
-      }
+    match self.undo_stack.last_mut() {
+      Some(JournalEntry::Edits(group)) if coalesce => group.extend(inverses),
+      _ => self.push_undo(JournalEntry::Edits(inverses)),
     }
     Ok(DocStats {
       total_bytes: self.table.len(),
@@ -626,29 +719,119 @@ impl Session {
     }
     Ok((applied, opposite))
   }
-
-  /// Pop and apply the newest undo group, pushing its opposite onto the redo
+  /// Push an undo entry, dropping the oldest past `UNDO_LIMIT`. Dropping a
+  /// replace-all entry does not delete its change list while a layer in the
+  /// table still reads it: the list is shared and goes with its last holder.
+  fn push_undo(&mut self, entry: JournalEntry) {
+    self.undo_stack.push(entry);
+    if self.undo_stack.len() > UNDO_LIMIT {
+      self.undo_stack.remove(0);
+    }
+  }
+  /// Pop and apply the newest undo entry, pushing its opposite onto the redo
   /// stack. Errors with `NOTHING_TO_UNDO` when the stack is empty.
   fn undo(&mut self) -> Result<UndoResult, String> {
-    let group = self
+    let entry = self
       .undo_stack
       .pop()
       .ok_or_else(|| NOTHING_TO_UNDO.to_string())?;
-    let (applied, opposite) = self.apply_inverse_group(group)?;
-    self.redo_stack.push(opposite);
-    Ok(self.outcome(applied))
+    match entry {
+      JournalEntry::Edits(group) => {
+        let (applied, opposite) = self.apply_inverse_group(group)?;
+        self.redo_stack.push(JournalEntry::Edits(opposite));
+        self.generation += 1;
+        Ok(self.outcome(applied))
+      }
+      JournalEntry::Replace(entry) => {
+        self.take_back_replace(&entry)?;
+        let result = self.reload_outcome(&entry.list)?;
+        self.redo_stack.push(JournalEntry::Replace(ReplaceEntry {
+          list: entry.list,
+          layer_id: None,
+        }));
+        Ok(result)
+      }
+    }
   }
-
-  /// Pop and apply the newest redo group, pushing its opposite back onto the undo
+  /// Pop and apply the newest redo entry, pushing its opposite back onto the undo
   /// stack. Errors with `NOTHING_TO_REDO` when the stack is empty.
   fn redo(&mut self) -> Result<UndoResult, String> {
-    let group = self
+    let entry = self
       .redo_stack
       .pop()
       .ok_or_else(|| NOTHING_TO_REDO.to_string())?;
-    let (applied, opposite) = self.apply_inverse_group(group)?;
-    self.undo_stack.push(opposite);
-    Ok(self.outcome(applied))
+    match entry {
+      JournalEntry::Edits(group) => {
+        let (applied, opposite) = self.apply_inverse_group(group)?;
+        self.undo_stack.push(JournalEntry::Edits(opposite));
+        self.generation += 1;
+        Ok(self.outcome(applied))
+      }
+      JournalEntry::Replace(entry) => {
+        let layer_id = self.stack_layer(Dir::Forward, entry.list.clone());
+        let result = self.reload_outcome(&entry.list)?;
+        self.undo_stack.push(JournalEntry::Replace(ReplaceEntry {
+          list: entry.list,
+          layer_id: Some(layer_id),
+        }));
+        Ok(result)
+      }
+    }
+  }
+  /// Put a layer over the table, returning its id. Content changes, so the
+  /// generation moves.
+  fn stack_layer(&mut self, dir: Dir, list: Arc<ChangeList>) -> u64 {
+    let id = replace_layer::next_layer_id();
+    let under = std::mem::replace(&mut self.table, replace_layer::placeholder());
+    self.table = replace_layer::stack(id, dir, under, list);
+    self.generation += 1;
+    id
+  }
+  /// Install a finished replace-all: a forward layer over the current content,
+  /// one undo entry, redo cleared.
+  fn install_replace(&mut self, list: Arc<ChangeList>) {
+    let layer_id = self.stack_layer(Dir::Forward, list.clone());
+    self.redo_stack.clear();
+    self.push_undo(JournalEntry::Replace(ReplaceEntry {
+      list,
+      layer_id: Some(layer_id),
+    }));
+  }
+  /// Revert the replace-all `entry` records. Undo is last-in-first-out: every
+  /// later edit is already undone, so the content is exactly what the replace
+  /// produced, and the change list's positions hold. When nothing at all changed
+  /// since (no edit, no save) the layer it installed is still the unedited top
+  /// of the table and is simply taken off; otherwise the inverse layer puts the
+  /// original text back over whatever the table is now.
+  fn take_back_replace(&mut self, entry: &ReplaceEntry) -> Result<(), String> {
+    let removable = match entry.layer_id {
+      Some(id) => replace_layer::top_forward_layer(&self.table) == Some(id),
+      None => false,
+    };
+    if removable {
+      let table = std::mem::replace(&mut self.table, replace_layer::placeholder());
+      self.table = replace_layer::unstack(table)?;
+      self.generation += 1;
+    } else {
+      self.stack_layer(Dir::Inverse, entry.list.clone());
+    }
+    Ok(())
+  }
+  /// The result of a replace-all undone or redone: nothing to mirror, the
+  /// window is reloaded at the first hit.
+  fn reload_outcome(&self, list: &ChangeList) -> Result<UndoResult, String> {
+    let first = list.first_hit_offset()?;
+    let first_line = self
+      .table
+      .offset_to_line(first.min(self.table.len()))
+      .unwrap_or(0);
+    Ok(UndoResult {
+      edits: Vec::new(),
+      first_line,
+      total_bytes: self.table.len(),
+      total_lines: self.table.line_count(),
+      reload_only: true,
+    })
   }
 
   /// Package applied edits into an `UndoResult`, resolving the jump-to-change
@@ -664,6 +847,7 @@ impl Session {
       first_line,
       total_bytes: self.table.len(),
       total_lines: self.table.line_count(),
+      reload_only: false,
     }
   }
 }
@@ -680,15 +864,7 @@ fn open_new_session(
   let (table, total_bytes, fingerprint, index, digest) = build_table(&path)?;
   let total_lines = table.line_count();
   let session_id = next_id.fetch_add(1, Ordering::Relaxed);
-  let session = Session {
-    table,
-    path,
-    fingerprint: fingerprint.clone(),
-    index,
-    digest,
-    undo_stack: Vec::new(),
-    redo_stack: Vec::new(),
-  };
+  let session = Session::new(table, path, fingerprint.clone(), index, digest);
   let result = OpenResult {
     session_id,
     total_bytes,
@@ -703,6 +879,9 @@ fn open_new_session(
 /// Refuses a file at or above `LARGE_EDIT_MAX` with the `TOO_LARGE` error.
 #[tauri::command(async)]
 pub fn windowed_open(state: State<WindowedState>, path: String) -> Result<OpenResult, String> {
+  // Starting a new editing session is the removed feature; every other command
+  // works on a session that already exists, which only a full session opened.
+  crate::edition::require_full("large-file editing")?;
   let path = PathBuf::from(path);
   let (session_id, session, result) = open_new_session(&state.next_id, path)?;
   state.sessions.lock().unwrap().insert(session_id, session);
@@ -750,7 +929,7 @@ fn reopen_session(
   let (table, total_bytes, out_fingerprint, out_index, out_digest, rescanned) = if trusted {
     let file = File::open(&path).map_err(|e| e.to_string())?;
     let original = OriginalIndex::new(
-      file,
+      Src::File(file),
       meta.len(),
       index.total_newlines,
       index.checkpoints.clone(),
@@ -773,15 +952,7 @@ fn reopen_session(
   };
   let total_lines = table.line_count();
   let session_id = next_id.fetch_add(1, Ordering::Relaxed);
-  let session = Session {
-    table,
-    path,
-    fingerprint: out_fingerprint.clone(),
-    index: out_index,
-    digest: out_digest,
-    undo_stack: Vec::new(),
-    redo_stack: Vec::new(),
-  };
+  let session = Session::new(table, path, out_fingerprint.clone(), out_index, out_digest);
   let result = ReopenResult {
     session_id,
     total_bytes,
@@ -848,14 +1019,14 @@ pub fn windowed_index(
 /// byte range it spans and the current global statistics. The content must be
 /// valid UTF-8 (the file was validated at open and inserts come from JS strings);
 /// a decode failure is a defensive error rather than a lossy substitution.
-#[tauri::command]
+#[tauri::command(async)]
 pub fn windowed_read(
   state: State<WindowedState>,
   session_id: u64,
   start_line: u64,
   end_line: u64,
 ) -> Result<WindowResult, String> {
-  let map = state.sessions.lock().unwrap();
+  let map = state.lock_idle(session_id)?;
   let session = map
     .get(&session_id)
     .ok_or_else(|| UNKNOWN_SESSION.to_string())?;
@@ -884,14 +1055,14 @@ pub fn windowed_read(
 /// edit's coordinates valid. All bounds are validated before any mutation, so an
 /// out-of-range edit rejects the whole batch and leaves the session untouched.
 /// `new_group` controls undo coalescing (see `Session::apply`).
-#[tauri::command]
+#[tauri::command(async)]
 pub fn windowed_apply(
   state: State<WindowedState>,
   session_id: u64,
   edits: Vec<Edit>,
   new_group: bool,
 ) -> Result<DocStats, String> {
-  let mut map = state.sessions.lock().unwrap();
+  let mut map = state.lock_idle(session_id)?;
   let session = map
     .get_mut(&session_id)
     .ok_or_else(|| UNKNOWN_SESSION.to_string())?;
@@ -902,9 +1073,9 @@ pub fn windowed_apply(
 /// to the redo stack. Returns the applied global-byte edits (for the frontend to
 /// mirror into its window) plus the jump-to-change line and fresh statistics. An
 /// empty undo stack returns the `NOTHING_TO_UNDO` protocol error for a silent skip.
-#[tauri::command]
+#[tauri::command(async)]
 pub fn windowed_undo(state: State<WindowedState>, session_id: u64) -> Result<UndoResult, String> {
-  let mut map = state.sessions.lock().unwrap();
+  let mut map = state.lock_idle(session_id)?;
   let session = map
     .get_mut(&session_id)
     .ok_or_else(|| UNKNOWN_SESSION.to_string())?;
@@ -913,9 +1084,9 @@ pub fn windowed_undo(state: State<WindowedState>, session_id: u64) -> Result<Und
 
 /// Redo the newest undone group (inverse of `windowed_undo`). An empty redo stack
 /// returns the `NOTHING_TO_REDO` protocol error for a silent skip.
-#[tauri::command]
+#[tauri::command(async)]
 pub fn windowed_redo(state: State<WindowedState>, session_id: u64) -> Result<UndoResult, String> {
-  let mut map = state.sessions.lock().unwrap();
+  let mut map = state.lock_idle(session_id)?;
   let session = map
     .get_mut(&session_id)
     .ok_or_else(|| UNKNOWN_SESSION.to_string())?;
@@ -984,16 +1155,33 @@ fn save_session(
   // instead of rereading the whole file.
   let (table, total_bytes, fingerprint, index, digest) = build_table(&target)?;
   let total_lines = table.line_count();
+  // The old table, layers included, is dropped here: the saved file now holds
+  // the flattened content, and a change list goes once no journal entry refers
+  // to it either.
   session.table = table;
   session.path = target;
   session.fingerprint = fingerprint.clone();
   session.index = index;
   session.digest = digest;
+  session.generation += 1;
   Ok(SaveResult {
     fingerprint,
     total_bytes,
     total_lines,
   })
+}
+/// Core of `windowed_save`: waits for a running replace-all, then saves.
+fn save_core(
+  state: &WindowedState,
+  session_id: u64,
+  expected: Option<Fingerprint>,
+  path_override: Option<PathBuf>,
+) -> Result<SaveResult, String> {
+  let mut map = state.lock_idle(session_id)?;
+  let session = map
+    .get_mut(&session_id)
+    .ok_or_else(|| UNKNOWN_SESSION.to_string())?;
+  save_session(session, expected, path_override)
 }
 
 #[tauri::command(async)]
@@ -1003,19 +1191,618 @@ pub fn windowed_save(
   expected: Option<Fingerprint>,
   path_override: Option<String>,
 ) -> Result<SaveResult, String> {
-  let mut map = state.sessions.lock().unwrap();
-  let session = map
-    .get_mut(&session_id)
-    .ok_or_else(|| UNKNOWN_SESSION.to_string())?;
-  save_session(session, expected, path_override.map(PathBuf::from))
+  save_core(
+    &state,
+    session_id,
+    expected,
+    path_override.map(PathBuf::from),
+  )
+}
+/// Core of `windowed_close`: waits for a running replace-all, then drops the
+/// session. Its layers and journal go with it, and with them every change-list
+/// file nothing else reads; the user's file is never touched.
+fn close_core(state: &WindowedState, session_id: u64) {
+  if let Ok(mut map) = state.lock_idle(session_id) {
+    map.remove(&session_id);
+  }
 }
 
 /// Release a session and its resources. No-op if the id is unknown or already
 /// closed. Remaining sessions are dropped when the app exits; no explicit cleanup
 /// is needed there.
-#[tauri::command]
+#[tauri::command(async)]
 pub fn windowed_close(state: State<WindowedState>, session_id: u64) {
-  state.sessions.lock().unwrap().remove(&session_id);
+  close_core(&state, session_id);
+}
+/// Reads session content one chunk at a time. Each read takes the sessions lock
+/// for that chunk only and refuses once the content has changed since the scan
+/// began, so a hit with an older generation's offsets is never reported.
+struct SessionReader<'a> {
+  state: &'a WindowedState,
+  id: u64,
+  generation: u64,
+}
+
+impl SessionReader<'_> {
+  fn read(&self, offset: u64, len: usize) -> Result<Vec<u8>, ScanStop> {
+    let map = self.state.sessions.lock().unwrap();
+    let session = map
+      .get(&self.id)
+      .ok_or_else(|| ScanStop::Failed(UNKNOWN_SESSION.to_string()))?;
+    if session.generation != self.generation {
+      return Err(ScanStop::Stale);
+    }
+    session
+      .table
+      .read(offset, offset + len as u64)
+      .map_err(ScanStop::Failed)
+  }
+}
+/// A position as a 0-based line and a column counted in UTF-16 code units, the
+/// unit CodeMirror uses.
+#[derive(Serialize, Debug, PartialEq, Eq)]
+pub struct Pos {
+  pub line: u64,
+  pub col: u64,
+}
+/// A match found by Find Next / Previous.
+#[derive(Serialize, Debug, PartialEq, Eq)]
+pub struct FindHit {
+  pub start: Pos,
+  pub end: Pos,
+  pub start_offset: u64,
+  pub end_offset: u64,
+}
+/// Byte offset of `line` / `col` (UTF-16 units, line break excluded). A column
+/// past the end of the line lands at its end.
+fn pos_to_offset<O: OriginalSource>(
+  table: &PieceTable<O>,
+  line: u64,
+  col: u64,
+) -> Result<u64, String> {
+  if table.line_count() == 0 {
+    return Ok(0);
+  }
+  let line = line.min(table.line_count() - 1);
+  let start = table.line_to_offset(line)?;
+  let end = line_offset(table, line + 1)?;
+  let bytes = table.read(start, end)?;
+  let text = std::str::from_utf8(&bytes).map_err(|_| NOT_UTF8.to_string())?;
+  let text = text.strip_suffix('\n').unwrap_or(text);
+  let text = text.strip_suffix('\r').unwrap_or(text);
+  let mut units = 0u64;
+  for (i, ch) in text.char_indices() {
+    if units >= col {
+      return Ok(start + i as u64);
+    }
+    units += ch.len_utf16() as u64;
+  }
+  Ok(start + text.len() as u64)
+}
+/// Line and UTF-16 column of byte `offset`.
+fn offset_to_pos<O: OriginalSource>(table: &PieceTable<O>, offset: u64) -> Result<Pos, String> {
+  if table.len() == 0 {
+    return Ok(Pos { line: 0, col: 0 });
+  }
+  let line = table.offset_to_line(offset)?;
+  let start = table.line_to_offset(line)?;
+  let bytes = table.read(start, offset)?;
+  let col = String::from_utf8_lossy(&bytes).encode_utf16().count() as u64;
+  Ok(Pos { line, col })
+}
+/// Why one attempt at a find did not produce an answer.
+enum FindFailure {
+  /// The content changed under the scan: try again.
+  Stale,
+  Failed(String),
+}
+
+impl From<ScanStop> for FindFailure {
+  fn from(stop: ScanStop) -> Self {
+    match stop {
+      ScanStop::Stale => FindFailure::Stale,
+      ScanStop::Cancelled => FindFailure::Failed("cancelled".to_string()),
+      ScanStop::Failed(e) => FindFailure::Failed(e),
+    }
+  }
+}
+/// One scan for the next (or previous) hit from `line` / `col`, wrapping.
+/// `between` runs before every chunk read; tests use it to land an edit mid-scan.
+#[allow(clippy::too_many_arguments)]
+fn find_once(
+  state: &WindowedState,
+  session_id: u64,
+  needle: &[u8],
+  case_sensitive: bool,
+  line: u64,
+  col: u64,
+  backward: bool,
+  chunk: usize,
+  between: &mut dyn FnMut(usize),
+) -> Result<Option<FindHit>, FindFailure> {
+  let (generation, len, from) = {
+    let map = state.lock_idle(session_id).map_err(FindFailure::Failed)?;
+    let session = map
+      .get(&session_id)
+      .ok_or_else(|| FindFailure::Failed(UNKNOWN_SESSION.to_string()))?;
+    (
+      session.generation,
+      session.table.len(),
+      pos_to_offset(&session.table, line, col).map_err(FindFailure::Failed)?,
+    )
+  };
+  let m = needle.len() as u64;
+  let reader = SessionReader {
+    state,
+    id: session_id,
+    generation,
+  };
+  let mut chunks = 0usize;
+  let mut read = |offset: u64, n: usize| {
+    between(chunks);
+    chunks += 1;
+    reader.read(offset, n)
+  };
+  let found = if backward {
+    match scan_backward(0, from, needle, case_sensitive, chunk, &mut read)? {
+      Some(off) => Some(off),
+      None => scan_backward(
+        from.saturating_sub(m - 1),
+        len,
+        needle,
+        case_sensitive,
+        chunk,
+        &mut read,
+      )?,
+    }
+  } else {
+    let mut first: Option<u64> = None;
+    for (start, limit) in [(from, len), (0, len.min(from + m - 1))] {
+      scan_forward(
+        start,
+        limit,
+        needle,
+        case_sensitive,
+        chunk,
+        &mut read,
+        &mut |event| {
+          if let Event::Hit { off, .. } = event {
+            first = Some(off);
+            return Ok(Flow::Stop);
+          }
+          Ok(Flow::Continue)
+        },
+      )?;
+      if first.is_some() {
+        break;
+      }
+    }
+    first
+  };
+  let Some(offset) = found else {
+    return Ok(None);
+  };
+  let map = state.sessions.lock().unwrap();
+  let session = map
+    .get(&session_id)
+    .ok_or_else(|| FindFailure::Failed(UNKNOWN_SESSION.to_string()))?;
+  if session.generation != generation {
+    return Err(FindFailure::Stale);
+  }
+  Ok(Some(FindHit {
+    start: offset_to_pos(&session.table, offset).map_err(FindFailure::Failed)?,
+    end: offset_to_pos(&session.table, offset + m).map_err(FindFailure::Failed)?,
+    start_offset: offset,
+    end_offset: offset + m,
+  }))
+}
+/// Core of `windowed_find`: restarted once when an edit lands mid-scan.
+#[allow(clippy::too_many_arguments)]
+fn find_core(
+  state: &WindowedState,
+  session_id: u64,
+  query: &str,
+  case_sensitive: bool,
+  line: u64,
+  col: u64,
+  backward: bool,
+  chunk: usize,
+  between: &mut dyn FnMut(usize),
+) -> Result<Option<FindHit>, String> {
+  if query.is_empty() {
+    return Err("empty-query".to_string());
+  }
+  for _ in 0..2 {
+    match find_once(
+      state,
+      session_id,
+      query.as_bytes(),
+      case_sensitive,
+      line,
+      col,
+      backward,
+      chunk,
+      between,
+    ) {
+      Ok(hit) => return Ok(hit),
+      Err(FindFailure::Stale) => continue,
+      Err(FindFailure::Failed(e)) => return Err(e),
+    }
+  }
+  Err("stale".to_string())
+}
+/// Find the next hit of `query` after the line / column given (or the previous
+/// one before it, `backward`), over the session's current content, edits
+/// included. Wraps around the end. `None` when the query does not occur.
+#[tauri::command(async)]
+pub fn windowed_find(
+  state: State<WindowedState>,
+  session_id: u64,
+  query: String,
+  case_sensitive: bool,
+  line: u64,
+  col: u64,
+  backward: bool,
+) -> Result<Option<FindHit>, String> {
+  find_core(
+    &state,
+    session_id,
+    &query,
+    case_sensitive,
+    line,
+    col,
+    backward,
+    SCAN_CHUNK,
+    &mut |_| {},
+  )
+}
+/// One result row of the whole-file search. `col` counts UTF-16 units from the
+/// start of the line, CodeMirror's unit.
+#[derive(Debug, PartialEq, Eq)]
+struct ResultHit {
+  offset: u64,
+  line: u64,
+  col: u64,
+  preview: String,
+}
+/// UTF-16 code units in `bytes` of UTF-8 text, counted without decoding so a
+/// slice may start or end inside a character: every lead byte is one unit, or
+/// two for a four-byte character, and continuation bytes add nothing.
+fn utf16_units(bytes: &[u8]) -> u64 {
+  bytes
+    .iter()
+    .map(|&b| match b {
+      0x80..=0xBF => 0,
+      0xF0..=0xFF => 2,
+      _ => 1,
+    })
+    .sum()
+}
+/// The column after `bytes`, given the column before them: counting restarts
+/// after the last newline.
+fn advance_col(col: u64, bytes: &[u8]) -> u64 {
+  match bytes.iter().rposition(|&b| b == b'\n') {
+    Some(at) => utf16_units(&bytes[at + 1..]),
+    None => col + utf16_units(bytes),
+  }
+}
+/// How a whole-file search ended.
+#[derive(Debug, PartialEq, Eq)]
+enum SearchEnd {
+  Done {
+    hits: u64,
+    truncated: bool,
+  },
+  /// An edit landed: the hits reported so far are out of date.
+  Stale,
+  Cancelled,
+  Failed,
+}
+/// Whole-file search for the results list. Streams every hit through `emit`
+/// with its 0-based line and a preview, stopping at `max_results`.
+#[allow(clippy::too_many_arguments)]
+fn search_core(
+  state: &WindowedState,
+  session_id: u64,
+  query: &str,
+  case_sensitive: bool,
+  max_results: u32,
+  cancel: &AtomicBool,
+  chunk: usize,
+  emit: &mut dyn FnMut(ResultHit),
+  between: &mut dyn FnMut(usize),
+) -> SearchEnd {
+  if query.is_empty() {
+    return SearchEnd::Failed;
+  }
+  let (generation, len) = match state.lock_idle(session_id) {
+    Ok(map) => match map.get(&session_id) {
+      Some(session) => (session.generation, session.table.len()),
+      None => return SearchEnd::Failed,
+    },
+    Err(_) => return SearchEnd::Failed,
+  };
+  let needle = query.as_bytes();
+  let nl_needle = count_newlines(needle);
+  let reader = SessionReader {
+    state,
+    id: session_id,
+    generation,
+  };
+  let mut chunks = 0usize;
+  let mut read = |offset: u64, n: usize| {
+    if cancel.load(Ordering::Relaxed) {
+      return Err(ScanStop::Cancelled);
+    }
+    between(chunks);
+    chunks += 1;
+    reader.read(offset, n)
+  };
+  let mut hits = 0u64;
+  let mut truncated = false;
+  let mut line = 0u64;
+  let mut col = 0u64;
+  let result = scan_forward(
+    0,
+    len,
+    needle,
+    case_sensitive,
+    chunk,
+    &mut read,
+    &mut |event| {
+      match event {
+        Event::Gap { bytes } => {
+          line += count_newlines(bytes);
+          col = advance_col(col, bytes);
+        }
+        Event::Hit { off, buf, idx } => {
+          emit(ResultHit {
+            offset: off,
+            line,
+            col,
+            preview: preview_at(buf, idx),
+          });
+          hits += 1;
+          line += nl_needle;
+          col = advance_col(col, needle);
+          if hits >= max_results as u64 {
+            truncated = true;
+            return Ok(Flow::Stop);
+          }
+        }
+      }
+      if cancel.load(Ordering::Relaxed) {
+        return Err(ScanStop::Cancelled);
+      }
+      Ok(Flow::Continue)
+    },
+  );
+  match result {
+    Ok(()) => SearchEnd::Done { hits, truncated },
+    Err(ScanStop::Stale) => SearchEnd::Stale,
+    Err(ScanStop::Cancelled) => SearchEnd::Cancelled,
+    Err(ScanStop::Failed(e)) => {
+      log::warn!("windowed search failed: {e}");
+      SearchEnd::Failed
+    }
+  }
+}
+
+#[derive(Clone, Serialize)]
+struct SearchHitPayload {
+  search_id: String,
+  offset: u64,
+  line: u64,
+  col: u64,
+  preview: String,
+}
+
+#[derive(Clone, Serialize)]
+struct SearchDonePayload {
+  search_id: String,
+  hits: u64,
+  truncated: bool,
+  /// An edit landed during the scan; the hits sent are out of date.
+  stale: bool,
+  /// The scan failed instead of finishing; `hits` is then meaningless.
+  error: bool,
+}
+/// Start a whole-file search of the session's current content for the results
+/// list, emitting `windowed-search-hit` per match and a final
+/// `windowed-search-done`. A change to the content ends it as stale; the
+/// frontend starts a fresh one once the edits settle.
+#[tauri::command(async)]
+pub fn windowed_search(
+  app: AppHandle,
+  state: State<WindowedState>,
+  session_id: u64,
+  query: String,
+  case_sensitive: bool,
+  max_results: u32,
+  search_id: String,
+) -> Result<(), String> {
+  if query.is_empty() {
+    return Err("query must not be empty".to_string());
+  }
+  let cancel = Arc::new(AtomicBool::new(false));
+  state
+    .searches
+    .lock()
+    .unwrap()
+    .insert(search_id.clone(), cancel.clone());
+  std::thread::spawn(move || {
+    let state = app.state::<WindowedState>();
+    let emit_id = search_id.clone();
+    let end = search_core(
+      &state,
+      session_id,
+      &query,
+      case_sensitive,
+      max_results,
+      &cancel,
+      SCAN_CHUNK,
+      &mut |hit| {
+        let _ = app.emit(
+          "windowed-search-hit",
+          SearchHitPayload {
+            search_id: emit_id.clone(),
+            offset: hit.offset,
+            line: hit.line,
+            col: hit.col,
+            preview: hit.preview,
+          },
+        );
+      },
+      &mut |_| {},
+    );
+    let (hits, truncated, stale, error) = match end {
+      SearchEnd::Done { hits, truncated } => (hits, truncated, false, false),
+      SearchEnd::Stale => (0, false, true, false),
+      SearchEnd::Cancelled => (0, false, false, false),
+      SearchEnd::Failed => (0, false, false, true),
+    };
+    let _ = app.emit(
+      "windowed-search-done",
+      SearchDonePayload {
+        search_id: search_id.clone(),
+        hits,
+        truncated,
+        stale,
+        error,
+      },
+    );
+    state.searches.lock().unwrap().remove(&search_id);
+  });
+  Ok(())
+}
+/// Signal a running search to stop. No-op if the id is unknown or already done.
+#[tauri::command]
+pub fn windowed_search_cancel(state: State<WindowedState>, search_id: String) {
+  if let Some(flag) = state.searches.lock().unwrap().get(&search_id) {
+    flag.store(true, Ordering::Relaxed);
+  }
+}
+/// What a finished replace-all reports.
+#[derive(Serialize, Debug)]
+pub struct ReplaceAllOutcome {
+  pub count: u64,
+  pub total_bytes: u64,
+  pub total_lines: u64,
+}
+/// Core of `windowed_replace_all`. One streaming pass over the current content
+/// finds every leftmost non-overlapping hit and writes the change list to
+/// `tmp_dir`; the session's table then becomes a forward layer over the table it
+/// had, with one undo entry. The session is busy for the whole pass, so no
+/// other command lands between two chunks. `between` runs before every chunk.
+#[allow(clippy::too_many_arguments)]
+fn replace_all_core(
+  state: &WindowedState,
+  tmp_dir: &Path,
+  session_id: u64,
+  query: &str,
+  case_sensitive: bool,
+  replacement: &str,
+  chunk: usize,
+  interval: u64,
+  between: &mut dyn FnMut(usize),
+) -> Result<ReplaceAllOutcome, String> {
+  if query.is_empty() {
+    return Err("empty-query".to_string());
+  }
+  let (generation, len) = {
+    let mut map = state.lock_idle(session_id)?;
+    let session = map
+      .get_mut(&session_id)
+      .ok_or_else(|| UNKNOWN_SESSION.to_string())?;
+    session.busy = true;
+    (session.generation, session.table.len())
+  };
+  let _busy = BusyGuard {
+    state,
+    id: session_id,
+  };
+  let needle = query.as_bytes();
+  let mut builder = Builder::create(tmp_dir, needle, replacement.as_bytes(), interval)?;
+  let reader = SessionReader {
+    state,
+    id: session_id,
+    generation,
+  };
+  let mut chunks = 0usize;
+  let mut read = |offset: u64, n: usize| {
+    between(chunks);
+    chunks += 1;
+    reader.read(offset, n)
+  };
+  scan_forward(
+    0,
+    len,
+    needle,
+    case_sensitive,
+    chunk,
+    &mut read,
+    &mut |event| {
+      match event {
+        Event::Gap { bytes } => builder.gap(bytes),
+        Event::Hit { buf, idx, .. } => builder
+          .hit(&buf[idx..idx + needle.len()])
+          .map_err(ScanStop::Failed)?,
+      }
+      Ok(Flow::Continue)
+    },
+  )
+  .map_err(|stop| match stop {
+    // Nothing else can change a busy session, so a changed generation is a bug.
+    ScanStop::Stale => "replace-all aborted: the content changed during the pass".to_string(),
+    ScanStop::Cancelled => "cancelled".to_string(),
+    ScanStop::Failed(e) => e,
+  })?;
+  let list = builder.finish(len)?;
+  let count = list.hits();
+  let mut map = state.sessions.lock().unwrap();
+  let session = map
+    .get_mut(&session_id)
+    .ok_or_else(|| UNKNOWN_SESSION.to_string())?;
+  if count > 0 {
+    if session.generation != generation {
+      return Err("replace-all aborted: the content changed during the pass".to_string());
+    }
+    session.install_replace(Arc::new(list));
+  }
+  Ok(ReplaceAllOutcome {
+    count,
+    total_bytes: session.table.len(),
+    total_lines: session.table.line_count(),
+  })
+}
+/// Replace every occurrence of `query` in the session's current content with
+/// `replacement`, as one undoable step. Memory stays independent of the file
+/// size and the hit count: see `replace_layer`.
+#[tauri::command(async)]
+pub fn windowed_replace_all(
+  app: AppHandle,
+  state: State<WindowedState>,
+  session_id: u64,
+  query: String,
+  case_sensitive: bool,
+  replacement: String,
+) -> Result<ReplaceAllOutcome, String> {
+  let tmp_dir = app
+    .path()
+    .app_data_dir()
+    .map_err(|e| e.to_string())?
+    .join(replace_layer::TMP_DIR);
+  replace_all_core(
+    &state,
+    &tmp_dir,
+    session_id,
+    &query,
+    case_sensitive,
+    &replacement,
+    SCAN_CHUNK,
+    CHECKPOINT_INTERVAL,
+    &mut |_| {},
+  )
 }
 
 #[cfg(test)]
@@ -1066,15 +1853,7 @@ mod tests {
   /// exercising the table + save helpers without a Tauri runtime.
   fn open_session(path: &Path) -> Session {
     let (table, _, fingerprint, index, digest) = build_table(path).unwrap();
-    Session {
-      table,
-      path: path.to_path_buf(),
-      fingerprint,
-      index,
-      digest,
-      undo_stack: Vec::new(),
-      redo_stack: Vec::new(),
-    }
+    Session::new(table, path.to_path_buf(), fingerprint, index, digest)
   }
 
   /// Build a global-byte `Edit` from a triple, for the journal tests.
@@ -2415,6 +3194,1160 @@ mod tests {
     );
   }
 }
+/// Search, find and replace-all over a session's edited content.
+#[cfg(test)]
+mod replace_tests {
+  use super::*;
+  use crate::large_file::find_sub;
+  use crate::replace_layer::{layer_depth, list_paths, resident_units};
+  use std::sync::mpsc;
+  use std::time::{Duration, Instant};
+  use tempfile::{tempdir, TempDir};
+
+  const ID: u64 = 1;
+
+  struct Fixture {
+    dir: TempDir,
+    path: PathBuf,
+    tmp: PathBuf,
+    state: WindowedState,
+  }
+
+  fn fixture(content: &[u8]) -> Fixture {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("doc.txt");
+    fs::write(&path, content).unwrap();
+    let (table, _, fingerprint, index, digest) = build_table(&path).unwrap();
+    let state = WindowedState::default();
+    state.sessions.lock().unwrap().insert(
+      ID,
+      Session::new(table, path.clone(), fingerprint, index, digest),
+    );
+    let tmp = dir.path().join(replace_layer::TMP_DIR);
+    Fixture {
+      dir,
+      path,
+      tmp,
+      state,
+    }
+  }
+
+  fn ed(start: u64, end: u64, text: &str) -> Edit {
+    Edit {
+      start,
+      end,
+      text: text.to_string(),
+    }
+  }
+
+  impl Fixture {
+    fn with<R>(&self, f: impl FnOnce(&mut Session) -> R) -> R {
+      let mut map = self.state.sessions.lock().unwrap();
+      f(map.get_mut(&ID).unwrap())
+    }
+
+    fn whole(&self) -> Vec<u8> {
+      self.with(|s| s.table.read(0, s.table.len()).unwrap())
+    }
+
+    fn edit(&self, edits: Vec<Edit>, new_group: bool) {
+      self.with(|s| s.apply(edits, new_group).unwrap());
+    }
+
+    fn replace_with(
+      &self,
+      q: &str,
+      case: bool,
+      r: &str,
+      chunk: usize,
+      interval: u64,
+    ) -> ReplaceAllOutcome {
+      replace_all_core(
+        &self.state,
+        &self.tmp,
+        ID,
+        q,
+        case,
+        r,
+        chunk,
+        interval,
+        &mut |_| {},
+      )
+      .unwrap()
+    }
+
+    fn replace(&self, q: &str, r: &str) -> ReplaceAllOutcome {
+      self.replace_with(q, true, r, SCAN_CHUNK, CHECKPOINT_INTERVAL)
+    }
+
+    fn undo(&self) -> UndoResult {
+      self.with(|s| s.undo().unwrap())
+    }
+
+    fn redo(&self) -> UndoResult {
+      self.with(|s| s.redo().unwrap())
+    }
+
+    fn save(&self) {
+      save_core(&self.state, ID, None, None).unwrap();
+    }
+
+    fn change_lists_on_disk(&self) -> usize {
+      match fs::read_dir(&self.tmp) {
+        Ok(entries) => entries.flatten().count(),
+        Err(_) => 0,
+      }
+    }
+
+    fn live_lists(&self) -> Vec<PathBuf> {
+      self.with(|s| list_paths(&s.table))
+    }
+  }
+  /// A flat in-memory leftmost non-overlapping replace.
+  fn flat_replace(hay: &[u8], needle: &[u8], repl: &[u8], case: bool) -> (Vec<u8>, u64) {
+    let mut out = Vec::new();
+    let mut count = 0;
+    let mut from = 0usize;
+    while let Some(rel) = find_sub(&hay[from..], needle, case) {
+      out.extend_from_slice(&hay[from..from + rel]);
+      out.extend_from_slice(repl);
+      from += rel + needle.len();
+      count += 1;
+    }
+    out.extend_from_slice(&hay[from..]);
+    (out, count)
+  }
+
+  fn line_starts(flat: &[u8]) -> Vec<u64> {
+    let mut starts = vec![0u64];
+    for (i, &b) in flat.iter().enumerate() {
+      if b == b'\n' {
+        starts.push(i as u64 + 1);
+      }
+    }
+    starts
+  }
+  /// The table equals `flat` in length, bytes, line count, every line start,
+  /// the line of every (sampled) offset and a spread of line windows.
+  fn assert_table_is(table: &Table, flat: &[u8]) {
+    assert_eq!(table.len(), flat.len() as u64, "len");
+    let starts = line_starts(flat);
+    let lines = if flat.is_empty() {
+      0
+    } else {
+      starts.len() as u64
+    };
+    assert_eq!(table.line_count(), lines, "line_count");
+    assert_eq!(table.read(0, table.len()).unwrap(), flat, "bytes");
+    for line in 0..lines {
+      assert_eq!(
+        table.line_to_offset(line).unwrap(),
+        starts[line as usize],
+        "line_to_offset({line})"
+      );
+    }
+    let step = (flat.len() / 3000).max(1);
+    let mut off = 0usize;
+    while off <= flat.len() {
+      let want = starts.partition_point(|&s| s <= off as u64) as u64 - 1;
+      assert_eq!(
+        table.offset_to_line(off as u64).unwrap(),
+        want,
+        "offset_to_line({off})"
+      );
+      off += step;
+    }
+    let end = flat.len() as u64;
+    assert_eq!(
+      table.offset_to_line(end).unwrap(),
+      starts.partition_point(|&s| s <= end) as u64 - 1
+    );
+    // Line windows, as `windowed_read` reads them.
+    for (a, b) in [
+      (0u64, 3u64),
+      (1, 2),
+      (2, 9),
+      (lines.saturating_sub(4), lines),
+      (0, lines),
+    ] {
+      let a = a.min(lines);
+      let b = b.clamp(a, lines);
+      let from = line_offset(table, a).unwrap();
+      let to = line_offset(table, b).unwrap();
+      assert_eq!(
+        table.read(from, to).unwrap(),
+        flat[from as usize..to as usize],
+        "window {a}..{b}"
+      );
+    }
+  }
+  /// Every checkpoint of the table's index is at most `interval` bytes after the
+  /// previous one, and so is the end.
+  fn assert_segments_within(table: &Table, interval: u64) {
+    let cks = table.index_checkpoints();
+    for pair in cks.windows(2) {
+      assert!(pair[1].0 - pair[0].0 <= interval, "segment {pair:?}");
+    }
+    assert!(
+      table.len() - cks.last().unwrap().0 <= interval,
+      "last segment"
+    );
+  }
+
+  fn lcg_content(seed: u64, len: usize) -> Vec<u8> {
+    let vocab: [&str; 9] = ["tok", "x", "a\nb", " ", "\n", "foo", "bar", "é", "tokx"];
+    let mut state = seed;
+    let mut out = String::new();
+    while out.len() < len {
+      state = state
+        .wrapping_mul(6364136223846793005)
+        .wrapping_add(1442695040888963407);
+      out.push_str(vocab[((state >> 33) % vocab.len() as u64) as usize]);
+    }
+    out.into_bytes()
+  }
+  // --- search over the edited session ----------------------------------------
+
+  fn all_hits(fx: &Fixture, q: &str, case: bool, chunk: usize) -> Vec<(u64, u64, String)> {
+    all_hits_with_cols(fx, q, case, chunk)
+      .into_iter()
+      .map(|(offset, line, _, preview)| (offset, line, preview))
+      .collect()
+  }
+
+  fn all_hits_with_cols(
+    fx: &Fixture,
+    q: &str,
+    case: bool,
+    chunk: usize,
+  ) -> Vec<(u64, u64, u64, String)> {
+    let mut hits = Vec::new();
+    let cancel = AtomicBool::new(false);
+    let end = search_core(
+      &fx.state,
+      ID,
+      q,
+      case,
+      u32::MAX,
+      &cancel,
+      chunk,
+      &mut |h| hits.push((h.offset, h.line, h.col, h.preview)),
+      &mut |_| {},
+    );
+    assert!(
+      matches!(
+        end,
+        SearchEnd::Done {
+          truncated: false,
+          ..
+        }
+      ),
+      "{end:?}"
+    );
+    hits
+  }
+
+  fn flat_hits(hay: &[u8], q: &str, case: bool) -> Vec<(u64, u64)> {
+    let starts = line_starts(hay);
+    let mut out = Vec::new();
+    let mut from = 0usize;
+    while let Some(rel) = find_sub(&hay[from..], q.as_bytes(), case) {
+      let off = (from + rel) as u64;
+      out.push((off, starts.partition_point(|&s| s <= off) as u64 - 1));
+      from += rel + q.len();
+    }
+    out
+  }
+
+  fn offsets_and_lines(hits: &[(u64, u64, String)]) -> Vec<(u64, u64)> {
+    hits.iter().map(|h| (h.0, h.1)).collect()
+  }
+
+  #[test]
+  fn search_finds_hits_across_chunk_boundaries() {
+    let content =
+      b"needle at the start, a needle\nin the middle, and needle needleneedle\nend needle";
+    let fx = fixture(content);
+    let want = flat_hits(content, "needle", true);
+    assert!(want.len() >= 6);
+    for chunk in 1..=content.len() + 2 {
+      assert_eq!(
+        offsets_and_lines(&all_hits(&fx, "needle", true, chunk)),
+        want,
+        "chunk {chunk}"
+      );
+    }
+  }
+
+  #[test]
+  fn search_finds_hits_across_a_piece_boundary() {
+    let fx = fixture(b"hello wor");
+    // The added text continues the original, so "world" spans two pieces.
+    fx.edit(vec![ed(9, 9, "ld there")], true);
+    assert_eq!(fx.whole(), b"hello world there");
+    for chunk in 1..=20 {
+      assert_eq!(
+        offsets_and_lines(&all_hits(&fx, "world", true, chunk)),
+        vec![(6, 0)],
+        "chunk {chunk}"
+      );
+    }
+    // And one spanning an added piece, an original piece and another added one.
+    fx.edit(vec![ed(0, 0, "AB")], true);
+    fx.edit(vec![ed(11, 11, "CD")], true);
+    let whole = fx.whole();
+    let want = flat_hits(&whole, "ABhello", true);
+    assert_eq!(want.len(), 1);
+    assert_eq!(offsets_and_lines(&all_hits(&fx, "ABhello", true, 3)), want);
+  }
+
+  #[test]
+  fn search_finds_hits_inside_inserted_text_and_not_inside_deleted_text() {
+    let fx = fixture(b"xx needle yy needle zz\nsecond line\n");
+    // Inserted text is searched; the file on disk has none of it.
+    fx.edit(vec![ed(12, 12, "[NEEDLE inserted]")], true);
+    let whole = fx.whole();
+    let want = flat_hits(&whole, "needle", false);
+    assert_eq!(want.len(), 3);
+    assert_eq!(offsets_and_lines(&all_hits(&fx, "needle", false, 5)), want);
+    // Deleted text is not.
+    fx.edit(vec![ed(3, 9, "")], true);
+    let whole = fx.whole();
+    assert!(!String::from_utf8_lossy(&whole).contains("xx needle"));
+    let want = flat_hits(&whole, "needle", false);
+    assert_eq!(offsets_and_lines(&all_hits(&fx, "needle", false, 4)), want);
+    // A hit that would only exist across the deleted gap is not invented.
+    let fx = fixture(b"nee--dle and needle");
+    fx.edit(vec![ed(3, 5, "")], true);
+    assert_eq!(fx.whole(), b"needle and needle");
+    assert_eq!(all_hits(&fx, "needle", true, 3).len(), 2);
+    let fx = fixture(b"nee--XXdle");
+    fx.edit(vec![ed(3, 5, "")], true);
+    assert!(all_hits(&fx, "needle", true, 3).is_empty());
+  }
+
+  #[test]
+  fn search_is_case_insensitive_when_asked() {
+    let content = b"Foo foo FOO\nfOo";
+    let fx = fixture(content);
+    assert_eq!(all_hits(&fx, "foo", true, 4).len(), 1);
+    let hits = all_hits(&fx, "foo", false, 4);
+    assert_eq!(
+      offsets_and_lines(&hits),
+      vec![(0, 0), (4, 0), (8, 0), (12, 1)]
+    );
+    assert_eq!(hits[3].2, "fOo");
+  }
+
+  #[test]
+  fn search_reports_lines_for_needles_with_newlines_and_caps_results() {
+    let content = b"a\nb a\nb\nxa\nb";
+    let fx = fixture(content);
+    assert_eq!(
+      offsets_and_lines(&all_hits(&fx, "a\nb", true, 2)),
+      flat_hits(content, "a\nb", true)
+    );
+    let cancel = AtomicBool::new(false);
+    let mut got = 0;
+    let end = search_core(
+      &fx.state,
+      ID,
+      "a",
+      true,
+      2,
+      &cancel,
+      3,
+      &mut |_| got += 1,
+      &mut |_| {},
+    );
+    assert_eq!(
+      end,
+      SearchEnd::Done {
+        hits: 2,
+        truncated: true
+      }
+    );
+    assert_eq!(got, 2);
+  }
+
+  #[test]
+  fn search_reports_utf16_columns_across_chunk_boundaries() {
+    // The emoji is four bytes and two UTF-16 units; "é" two bytes and one.
+    let content = "😀é needle\nab 😀😀 needle é\r\nneedle\nx".as_bytes();
+    let fx = fixture(content);
+    let want = vec![(0u64, 4u64), (1, 8), (2, 0)];
+    for chunk in 1..=content.len() + 2 {
+      let got: Vec<(u64, u64)> = all_hits_with_cols(&fx, "needle", true, chunk)
+        .iter()
+        .map(|h| (h.1, h.2))
+        .collect();
+      assert_eq!(got, want, "chunk {chunk}");
+    }
+    // A needle with a newline restarts the column after it.
+    let fx = fixture(b"ab\ncd ab\ncd ab\ncd");
+    let cols: Vec<u64> = all_hits_with_cols(&fx, "ab\ncd", true, 3)
+      .iter()
+      .map(|h| h.2)
+      .collect();
+    assert_eq!(cols, vec![0, 3, 3]);
+  }
+
+  #[test]
+  fn search_can_be_cancelled_and_reports_unknown_sessions() {
+    let fx = fixture(b"aaaa aaaa aaaa");
+    let cancel = AtomicBool::new(true);
+    let end = search_core(
+      &fx.state,
+      ID,
+      "a",
+      true,
+      10,
+      &cancel,
+      3,
+      &mut |_| {},
+      &mut |_| {},
+    );
+    assert_eq!(end, SearchEnd::Cancelled);
+    let cancel = AtomicBool::new(false);
+    let end = search_core(
+      &fx.state,
+      99,
+      "a",
+      true,
+      10,
+      &cancel,
+      3,
+      &mut |_| {},
+      &mut |_| {},
+    );
+    assert_eq!(end, SearchEnd::Failed);
+  }
+
+  fn find(
+    fx: &Fixture,
+    q: &str,
+    case: bool,
+    line: u64,
+    col: u64,
+    backward: bool,
+  ) -> Option<FindHit> {
+    find_core(&fx.state, ID, q, case, line, col, backward, 4, &mut |_| {}).unwrap()
+  }
+
+  #[test]
+  fn find_next_and_previous_wrap_and_report_positions() {
+    // "one" at bytes 0, 8, 16 on line 0 and 27 on line 1.
+    let content = b"one two one two one\nsecond one line\n";
+    let fx = fixture(content);
+    let hit = find(&fx, "one", true, 0, 0, false).unwrap();
+    assert_eq!((hit.start_offset, hit.end_offset), (0, 3));
+    assert_eq!(hit.start, Pos { line: 0, col: 0 });
+    assert_eq!(hit.end, Pos { line: 0, col: 3 });
+    // From the end of that hit: the next one.
+    let hit = find(&fx, "one", true, 0, 3, false).unwrap();
+    assert_eq!(hit.start_offset, 8);
+    // From the last hit's end: wraps to the first.
+    let hit = find(&fx, "one", true, 1, 10, false).unwrap();
+    assert_eq!(hit.start_offset, 0);
+    let hit = find(&fx, "one", true, 1, 7, false).unwrap();
+    assert_eq!((hit.start.line, hit.start.col), (1, 7));
+    // Backward: the nearest hit that ends before the position.
+    let hit = find(&fx, "one", true, 1, 0, true).unwrap();
+    assert_eq!(hit.start_offset, 16);
+    let hit = find(&fx, "one", true, 0, 8, true).unwrap();
+    assert_eq!(hit.start_offset, 0);
+    // Backward from before the first one wraps to the last.
+    let hit = find(&fx, "one", true, 0, 0, true).unwrap();
+    assert_eq!((hit.start.line, hit.start.col), (1, 7));
+    assert!(find(&fx, "absent", true, 0, 0, false).is_none());
+    assert!(find(&fx, "absent", true, 0, 0, true).is_none());
+    assert!(find(&fx, "ONE", true, 0, 0, false).is_none());
+    assert!(find(&fx, "ONE", false, 0, 0, false).is_some());
+  }
+
+  #[test]
+  fn a_lone_hit_is_found_again_from_itself() {
+    let fx = fixture(b"abc needle def");
+    let hit = find(&fx, "needle", true, 0, 10, false).unwrap();
+    assert_eq!(hit.start_offset, 4);
+    let hit = find(&fx, "needle", true, 0, 4, true).unwrap();
+    assert_eq!(hit.start_offset, 4);
+  }
+
+  #[test]
+  fn find_columns_count_utf16_units_and_skip_the_line_break() {
+    // The emoji is 4 bytes and 2 UTF-16 units.
+    let fx = fixture("😀a needle\r\nzz needle\r\n".as_bytes());
+    let hit = find(&fx, "needle", true, 0, 0, false).unwrap();
+    assert_eq!(hit.start, Pos { line: 0, col: 4 });
+    assert_eq!(hit.end, Pos { line: 0, col: 10 });
+    assert_eq!(hit.start_offset, 6);
+    // A column past the end of the line (CodeMirror's line has no \r\n) lands
+    // at the end of the line, not inside the break.
+    let hit = find(&fx, "needle", true, 0, 999, false).unwrap();
+    assert_eq!(hit.start, Pos { line: 1, col: 3 });
+    let hit = find(&fx, "needle", true, 1, 3, false).unwrap();
+    assert_eq!(hit.start, Pos { line: 1, col: 3 });
+    let hit = find(&fx, "needle", true, 1, 4, false).unwrap();
+    assert_eq!(hit.start, Pos { line: 0, col: 4 });
+  }
+
+  #[test]
+  fn find_sees_edits_and_pieces() {
+    let fx = fixture(b"line one\nline two\n");
+    fx.edit(vec![ed(5, 8, "needle")], true);
+    let hit = find(&fx, "needle", true, 0, 0, false).unwrap();
+    assert_eq!((hit.start.line, hit.start.col), (0, 5));
+  }
+
+  #[test]
+  fn an_edit_mid_scan_makes_a_results_search_stale() {
+    let mut content = vec![b'.'; 40];
+    content.extend_from_slice(b"needle");
+    content.extend(vec![b'.'; 40]);
+    let fx = fixture(&content);
+    let cancel = AtomicBool::new(false);
+    let mut hits = Vec::new();
+    let mut edited = false;
+    let end = search_core(
+      &fx.state,
+      ID,
+      "needle",
+      true,
+      100,
+      &cancel,
+      8,
+      &mut |h| hits.push(h.offset),
+      &mut |chunk| {
+        if chunk == 2 && !edited {
+          edited = true;
+          fx.edit(vec![ed(0, 0, "ZZZZ")], true);
+        }
+      },
+    );
+    assert_eq!(end, SearchEnd::Stale);
+    assert!(hits.is_empty(), "no hit from the old generation: {hits:?}");
+  }
+
+  #[test]
+  fn an_edit_mid_scan_restarts_a_find_on_the_new_content() {
+    let mut content = vec![b'.'; 40];
+    content.extend_from_slice(b"needle");
+    content.extend(vec![b'.'; 40]);
+    let fx = fixture(&content);
+    let mut edited = false;
+    let hit = find_core(
+      &fx.state,
+      ID,
+      "needle",
+      true,
+      0,
+      0,
+      false,
+      8,
+      &mut |chunk| {
+        if chunk == 2 && !edited {
+          edited = true;
+          fx.edit(vec![ed(0, 0, "ZZZZ")], true);
+        }
+      },
+    )
+    .unwrap()
+    .unwrap();
+    assert_eq!(
+      hit.start_offset, 44,
+      "offsets of the new content, not the old"
+    );
+    assert_eq!(&fx.whole()[44..50], b"needle");
+  }
+
+  #[test]
+  fn a_find_that_keeps_going_stale_gives_up() {
+    let fx = fixture(&[b'.'; 64]);
+    let r = find_core(&fx.state, ID, "x", true, 0, 0, false, 8, &mut |chunk| {
+      if chunk == 1 {
+        fx.edit(vec![ed(0, 0, "y")], true);
+      }
+    });
+    assert_eq!(r.unwrap_err(), "stale");
+  }
+  // --- replace all -----------------------------------------------------------
+
+  fn big_doc(rows: usize, hit_every: usize) -> Vec<u8> {
+    let mut s = String::with_capacity(rows * 24);
+    for i in 0..rows {
+      if i % hit_every == 0 {
+        s.push_str(&format!("row {i:06} tok payload\n"));
+      } else {
+        s.push_str(&format!("row {i:06} xxx payload\n"));
+      }
+    }
+    s.into_bytes()
+  }
+
+  fn within(limit: Duration, what: &str, f: impl FnOnce()) {
+    let t = Instant::now();
+    f();
+    assert!(t.elapsed() < limit, "{what} took {:?}", t.elapsed());
+  }
+
+  #[test]
+  fn replace_all_of_100k_hits_then_undo_and_redo_are_exact_and_fast() {
+    let original = big_doc(100_000, 1);
+    let fx = fixture(&original);
+    let (replaced, count) = flat_replace(&original, b"tok", b"TOKEN_LONGER", true);
+    assert_eq!(count, 100_000);
+    within(Duration::from_secs(10), "replace all", || {
+      let out = fx.replace("tok", "TOKEN_LONGER");
+      assert_eq!(out.count, 100_000);
+      assert_eq!(out.total_bytes, replaced.len() as u64);
+      assert_eq!(fx.whole(), replaced);
+    });
+    fx.with(|s| assert_eq!(s.table.line_count(), 100_001));
+    within(Duration::from_secs(10), "undo", || {
+      let r = fx.undo();
+      assert!(r.reload_only && r.edits.is_empty());
+      assert_eq!(r.first_line, 0);
+      assert_eq!(fx.whole(), original);
+    });
+    within(Duration::from_secs(10), "redo", || {
+      let r = fx.redo();
+      assert!(r.reload_only && r.edits.is_empty());
+      assert_eq!(fx.whole(), replaced);
+    });
+    // Windows read through the layer.
+    fx.with(|s| {
+      let a = line_offset(&s.table, 77_000).unwrap();
+      let b = line_offset(&s.table, 77_010).unwrap();
+      assert_eq!(
+        s.table.read(a, b).unwrap(),
+        replaced[a as usize..b as usize]
+      );
+    });
+  }
+
+  #[test]
+  fn memory_after_replace_all_does_not_follow_the_hit_count() {
+    let units = |fx: &Fixture| {
+      fx.with(|s| {
+        assert_eq!(
+          s.table.piece_count(),
+          1,
+          "one piece over the layer, not one per hit"
+        );
+        assert_eq!(layer_depth(&s.table), 1);
+        assert_eq!(s.table.add_len(), 0);
+        resident_units(&s.table)
+      })
+    };
+    let few = fixture(&big_doc(100_000, 100));
+    let many = fixture(&big_doc(100_000, 1));
+    assert_eq!(few.whole().len(), many.whole().len());
+    let a = few.replace("tok", "TOK");
+    assert_eq!(a.count, 1_000);
+    let few_units = units(&few);
+    let b = many.replace("tok", "TOK");
+    assert_eq!(b.count, 100_000);
+    let many_units = units(&many);
+    assert!(
+      few_units.abs_diff(many_units) <= 2,
+      "{few_units} units for 10^3 hits, {many_units} for 10^5"
+    );
+    // Checkpoints are one per MiB, not one per hit.
+    assert!(many_units < 40, "{many_units}");
+    // The change list is the part that grows with the hits.
+    let size = |fx: &Fixture| fs::metadata(&fx.live_lists()[0]).unwrap().len();
+    assert!(size(&many) > 50 * size(&few));
+  }
+
+  #[test]
+  fn replace_all_is_one_step_and_a_typing_edit_after_it_opens_a_new_group() {
+    let fx = fixture(b"a tok b tok\nc\n");
+    assert_eq!(fx.replace("tok", "X").count, 2);
+    fx.edit(vec![ed(0, 0, "Q")], false);
+    fx.with(|s| {
+      assert_eq!(
+        s.undo_stack.len(),
+        2,
+        "the edit did not coalesce into the replace-all"
+      );
+      assert!(matches!(s.undo_stack[0], JournalEntry::Replace(_)));
+      assert!(matches!(s.undo_stack[1], JournalEntry::Edits(_)));
+    });
+    let r = fx.undo();
+    assert!(!r.reload_only);
+    assert_eq!(fx.whole(), b"a X b X\nc\n");
+    let r = fx.undo();
+    assert!(r.reload_only);
+    assert_eq!(fx.whole(), b"a tok b tok\nc\n");
+    assert_eq!(fx.redo().edits.len(), 0);
+    assert_eq!(fx.whole(), b"a X b X\nc\n");
+    assert_eq!(fx.redo().edits.len(), 1);
+    assert_eq!(fx.whole(), b"Qa X b X\nc\n");
+  }
+
+  #[test]
+  fn replace_all_with_no_hits_changes_nothing() {
+    let fx = fixture(b"nothing here\n");
+    let out = fx.replace("tok", "X");
+    assert_eq!((out.count, out.total_bytes), (0, 13));
+    fx.with(|s| {
+      assert!(s.undo_stack.is_empty());
+      assert_eq!(s.generation, 0);
+    });
+    assert_eq!(fx.change_lists_on_disk(), 0);
+    let err = replace_all_core(&fx.state, &fx.tmp, ID, "", true, "x", 8, 100, &mut |_| {});
+    assert_eq!(err.unwrap_err(), "empty-query");
+  }
+
+  #[test]
+  fn replace_all_then_typing_edits_then_undo_all_restores_the_original() {
+    let original = big_doc(2_000, 3);
+    let fx = fixture(&original);
+    fx.replace("tok", "TOKEN");
+    fx.edit(vec![ed(5, 5, "first")], true);
+    fx.edit(vec![ed(50, 60, "")], true);
+    fx.edit(vec![ed(100, 100, "tok\n")], true);
+    for _ in 0..3 {
+      assert!(!fx.undo().reload_only);
+    }
+    let (replaced, _) = flat_replace(&original, b"tok", b"TOKEN", true);
+    assert_eq!(fx.whole(), replaced);
+    assert!(fx.undo().reload_only);
+    assert_eq!(fx.whole(), original);
+  }
+
+  fn assert_save_roundtrip(fx: &Fixture, original: &[u8]) {
+    let (replaced, _) = flat_replace(original, b"tok", b"TOKEN-LONG", true);
+    fx.replace("tok", "TOKEN-LONG");
+    assert_eq!(fx.whole(), replaced);
+    fx.save();
+    assert_eq!(
+      fs::read(&fx.path).unwrap(),
+      replaced,
+      "the saved file is the replaced content"
+    );
+    assert_eq!(fx.whole(), replaced);
+    assert!(fx.live_lists().is_empty(), "a save flattens the layers");
+    fx.undo();
+    assert_eq!(fx.whole(), original, "undo after a save");
+    fx.with(|s| assert_table_is(&s.table, original));
+    fx.save();
+    assert_eq!(fs::read(&fx.path).unwrap(), original);
+    fx.redo();
+    assert_eq!(fx.whole(), replaced, "redo after a save");
+    fx.with(|s| assert_table_is(&s.table, &replaced));
+    fx.save();
+    assert_eq!(fs::read(&fx.path).unwrap(), replaced);
+    fx.undo();
+    assert_eq!(fx.whole(), original);
+  }
+
+  #[test]
+  fn replace_all_save_undo_redo_by_rename() {
+    let original = big_doc(3_000, 2);
+    let fx = fixture(&original);
+    assert_save_roundtrip(&fx, &original);
+  }
+
+  #[test]
+  fn replace_all_save_undo_redo_by_pouring_in_place() {
+    let original = big_doc(3_000, 2);
+    let fx = fixture(&original);
+    let other = fx.dir.path().join("other-name.txt");
+    fs::hard_link(&fx.path, &other).unwrap();
+    assert_eq!(crate::fs_ops::linktest::links(&fx.path), 2);
+    assert_save_roundtrip(&fx, &original);
+    // The write went into the shared file: both names saw every step.
+    assert_eq!(crate::fs_ops::linktest::links(&fx.path), 2);
+    assert_eq!(
+      fs::read(&other).unwrap(),
+      flat_replace(&original, b"tok", b"TOKEN-LONG", true).0
+    );
+  }
+
+  #[test]
+  fn stacked_replace_alls_undo_to_the_original_and_read_exactly() {
+    let original = lcg_content(7, 6_000);
+    let fx = fixture(&original);
+    let steps: [(&str, &str); 3] = [("tok", "tokentoken"), ("entok", "E\nE"), ("E", "")];
+    let mut flats = vec![original.clone()];
+    for (q, r) in steps {
+      let (next, _) = flat_replace(flats.last().unwrap(), q.as_bytes(), r.as_bytes(), true);
+      assert_ne!(&next, flats.last().unwrap());
+      flats.push(next);
+      fx.replace_with(q, true, r, 13, 200);
+      fx.with(|s| assert_table_is(&s.table, flats.last().unwrap()));
+    }
+    fx.with(|s| assert_eq!(layer_depth(&s.table), 3));
+    // Window reads through three layers, as the editor makes them.
+    fx.with(|s| {
+      let lines = s.table.line_count();
+      let flat = flats.last().unwrap();
+      let starts = line_starts(flat);
+      for (a, b) in [(0, 20), (lines / 2, lines / 2 + 30), (lines - 7, lines)] {
+        let from = line_offset(&s.table, a).unwrap();
+        let to = line_offset(&s.table, b).unwrap();
+        assert_eq!(from, starts[a as usize]);
+        assert_eq!(
+          s.table.read(from, to).unwrap(),
+          flat[from as usize..to as usize]
+        );
+      }
+    });
+    for want in flats.iter().rev().skip(1) {
+      assert!(fx.undo().reload_only);
+      fx.with(|s| assert_table_is(&s.table, want));
+    }
+    for want in flats.iter().skip(1) {
+      assert!(fx.redo().reload_only);
+      fx.with(|s| assert_table_is(&s.table, want));
+    }
+    // Undo again after a save puts inverse layers over the saved file.
+    fx.save();
+    for want in flats.iter().rev().skip(1) {
+      fx.undo();
+      fx.with(|s| assert_table_is(&s.table, want));
+    }
+  }
+
+  #[test]
+  fn self_overlapping_needles_replace_like_a_flat_replace_at_every_alignment() {
+    let docs: [&[u8]; 3] = [
+      b"aaaaaaaaaaaaaaaaaaaaaaa bab aaa\naaaa a aa",
+      b"abababababab xabababx ababab\nabab abab ab",
+      b"aabaabaab aaa aaaa aaaaa b\naa",
+    ];
+    for content in docs {
+      for needle in ["aa", "abab", "aab", "a"] {
+        let (want, count) = flat_replace(content, needle.as_bytes(), b"Z", true);
+        for chunk in 1..=content.len() + 2 {
+          let fx = fixture(content);
+          let out = fx.replace_with(needle, true, "Z", chunk, 1 << 20);
+          assert_eq!(out.count, count, "needle {needle} chunk {chunk}");
+          assert_eq!(fx.whole(), want, "needle {needle} chunk {chunk}");
+          // The results list reports the same hits.
+          assert_eq!(
+            all_hits(&fixture(content), needle, true, chunk).len() as u64,
+            count,
+            "needle {needle} chunk {chunk}"
+          );
+        }
+      }
+    }
+  }
+
+  #[test]
+  fn growing_shrinking_and_multiline_replacements_match_a_flat_replace() {
+    let long = "0123456789".repeat(7);
+    let needles = ["tok", "x", "a\nb", "é"];
+    let repls = ["", "T", "tok", long.as_str(), "p\nq\nr", "é\n"];
+    for (n, needle) in needles.iter().enumerate() {
+      for (r, repl) in repls.iter().enumerate() {
+        let original = lcg_content((n * 10 + r) as u64 + 1, 2_500);
+        let (replaced, count) = flat_replace(&original, needle.as_bytes(), repl.as_bytes(), true);
+        assert!(count > 3, "{needle:?} has few hits");
+        let fx = fixture(&original);
+        let interval = 100;
+        let out = fx.replace_with(needle, true, repl, 7, interval);
+        assert_eq!(out.count, count);
+        fx.with(|s| {
+          assert_table_is(&s.table, &replaced);
+          assert_segments_within(&s.table, interval);
+        });
+        // The inverse layer after a save, over the saved file.
+        fx.save();
+        fx.undo();
+        fx.with(|s| {
+          assert_table_is(&s.table, &original);
+          assert_eq!(layer_depth(&s.table), 1);
+          assert_segments_within(&s.table, interval);
+        });
+        fx.redo();
+        fx.with(|s| {
+          assert_table_is(&s.table, &replaced);
+          assert_segments_within(&s.table, interval);
+        });
+        // Three stacked layers on top of that.
+        let mut flat = replaced.clone();
+        for (q, rr) in [("tok", "TT"), ("o", "oo\n"), ("é", "")] {
+          let (next, _) = flat_replace(&flat, q.as_bytes(), rr.as_bytes(), true);
+          fx.replace_with(q, true, rr, 11, interval);
+          flat = next;
+          fx.with(|s| {
+            assert_table_is(&s.table, &flat);
+            assert_segments_within(&s.table, interval);
+          });
+        }
+      }
+    }
+  }
+
+  #[test]
+  fn replace_all_is_case_insensitive_when_asked() {
+    let fx = fixture(b"Tok tok TOK tOk\n");
+    assert_eq!(fx.replace_with("tok", false, "x", 5, 100).count, 4);
+    assert_eq!(fx.whole(), b"x x x x\n");
+    let fx = fixture(b"Tok tok TOK tOk\n");
+    assert_eq!(fx.replace_with("tok", true, "x", 5, 100).count, 1);
+    assert_eq!(fx.whole(), b"Tok x TOK tOk\n");
+  }
+  // --- the change list's life ------------------------------------------------
+
+  #[test]
+  fn the_session_index_stays_the_on_disk_files_through_replace_undo_and_redo() {
+    let original = big_doc(100_000, 1);
+    let fx = fixture(&original);
+    let (index, fingerprint, digest) =
+      fx.with(|s| (s.index.clone(), s.fingerprint.clone(), s.digest));
+    assert!(index.checkpoints.len() >= 3);
+    let check = |fx: &Fixture| {
+      let (idx, fp, dg) = fx.with(|s| (s.index.clone(), s.fingerprint.clone(), s.digest));
+      assert_eq!(idx, index);
+      assert_eq!(fp, fingerprint);
+      assert_eq!(dg, digest);
+      assert_eq!(fingerprint_of(&fx.path).unwrap(), fp);
+      // What a restore does with it rebuilds the on-disk content exactly.
+      let next_id = AtomicU64::new(50);
+      let (_, reopened, result) =
+        reopen_session(&next_id, fx.path.clone(), idx, fp, Some(dg)).unwrap();
+      assert!(!result.rescanned);
+      assert_eq!(
+        reopened.table.read(0, reopened.table.len()).unwrap(),
+        original
+      );
+    };
+    check(&fx);
+    fx.replace("tok", "TOKEN");
+    check(&fx);
+    fx.undo();
+    check(&fx);
+    fx.redo();
+    check(&fx);
+  }
+
+  #[test]
+  fn a_change_list_outlives_its_journal_entry_while_a_layer_reads_it() {
+    let original = lcg_content(3, 4_000);
+    let fx = fixture(&original);
+    let (replaced, _) = flat_replace(&original, b"tok", b"TT", true);
+    fx.replace("tok", "TT");
+    let lists = fx.live_lists();
+    assert_eq!(lists.len(), 1);
+    // More edit groups than the journal keeps push the replace-all out of it.
+    for i in 0..=UNDO_LIMIT {
+      fx.edit(vec![ed(0, 0, "e")], true);
+      assert!(i < 10_000);
+    }
+    fx.with(|s| {
+      assert_eq!(s.undo_stack.len(), UNDO_LIMIT);
+      assert!(s
+        .undo_stack
+        .iter()
+        .all(|e| matches!(e, JournalEntry::Edits(_))));
+    });
+    assert!(lists[0].exists(), "the layer still reads it");
+    let mut want = vec![b'e'; UNDO_LIMIT + 1];
+    want.extend_from_slice(&replaced);
+    assert_eq!(fx.whole(), want);
+    fx.with(|s| assert_table_is(&s.table, &want));
+    fx.save();
+    assert!(!lists[0].exists(), "a save flattens it away");
+    assert_eq!(fs::read(&fx.path).unwrap(), want);
+  }
+
+  #[test]
+  fn replace_save_undo_then_a_fresh_edit_keeps_the_file_until_the_next_save_or_close() {
+    let original = lcg_content(5, 4_000);
+    let fx = fixture(&original);
+    let (replaced, _) = flat_replace(&original, b"tok", b"TT", true);
+    fx.replace("tok", "TT");
+    let first = fx.live_lists()[0].clone();
+    fx.save();
+    assert!(first.exists(), "the journal entry still refers to it");
+    assert!(fx.live_lists().is_empty(), "but no layer reads it any more");
+    fx.undo();
+    let lists = fx.live_lists();
+    assert_eq!(
+      lists.len(),
+      1,
+      "the inverse layer reads the same change list"
+    );
+    assert_eq!(lists[0], first.clone());
+    assert!(first.exists());
+    fx.edit(vec![ed(0, 0, "fresh")], true);
+    fx.with(|s| assert!(s.redo_stack.is_empty()));
+    let mut want = original.clone();
+    want.splice(0..0, b"fresh".iter().copied());
+    assert_eq!(fx.whole(), want);
+    fx.with(|s| assert_table_is(&s.table, &want));
+    assert!(
+      first.exists(),
+      "the live layer holds it after the redo entry is gone"
+    );
+    fx.save();
+    assert!(!first.exists());
+    assert_eq!(fs::read(&fx.path).unwrap(), want);
+    let _ = replaced;
+    // Closing deletes every change list and never the user's file.
+    let fx = fixture(&original);
+    fx.replace("tok", "TT");
+    fx.replace("foo", "FOOO");
+    assert_eq!(fx.change_lists_on_disk(), 2);
+    close_core(&fx.state, ID);
+    assert_eq!(fx.change_lists_on_disk(), 0);
+    assert_eq!(fs::read(&fx.path).unwrap(), original);
+    assert!(fx.state.sessions.lock().unwrap().is_empty());
+  }
+
+  #[test]
+  fn a_failed_pass_leaves_the_content_and_no_file_behind() {
+    let fx = fixture(&lcg_content(9, 3_000));
+    let before = fx.whole();
+    let r = replace_all_core(
+      &fx.state,
+      &fx.tmp,
+      ID,
+      "tok",
+      true,
+      "T",
+      8,
+      100,
+      &mut |chunk| {
+        if chunk == 3 {
+          fx.edit(vec![ed(0, 0, "sneaked in")], true);
+        }
+      },
+    );
+    assert!(r.unwrap_err().contains("changed during the pass"));
+    assert_eq!(fx.change_lists_on_disk(), 0);
+    fx.with(|s| {
+      assert!(!s.busy, "the session is released");
+      assert!(s.undo_stack.len() == 1);
+    });
+    let mut want = b"sneaked in".to_vec();
+    want.extend_from_slice(&before);
+    assert_eq!(fx.whole(), want);
+  }
+  // --- save and close wait for a running pass ---------------------------------
+  /// Run a replace-all of "tok" with the pass paused after its first chunk, run
+  /// `other` meanwhile, and say whether `other` had already finished by the time
+  /// the pass resumed.
+  fn while_a_pass_is_paused<R: Send>(
+    fx: &Fixture,
+    other: impl FnOnce(&Fixture) -> R + Send,
+  ) -> (R, bool) {
+    let (paused_tx, paused_rx) = mpsc::channel::<()>();
+    let (resume_tx, resume_rx) = mpsc::channel::<()>();
+    let finished = AtomicBool::new(false);
+    std::thread::scope(|scope| {
+      let pass = scope.spawn(move || {
+        let mut hook = |chunk: usize| {
+          if chunk == 1 {
+            paused_tx.send(()).unwrap();
+            resume_rx.recv().unwrap();
+          }
+        };
+        replace_all_core(
+          &fx.state, &fx.tmp, ID, "tok", true, "TOKEN", 16, 100, &mut hook,
+        )
+      });
+      paused_rx.recv().unwrap();
+      let finished = &finished;
+      let waiter = scope.spawn(move || {
+        let r = other(fx);
+        finished.store(true, Ordering::SeqCst);
+        r
+      });
+      std::thread::sleep(Duration::from_millis(300));
+      let early = finished.load(Ordering::SeqCst);
+      resume_tx.send(()).unwrap();
+      pass.join().unwrap().unwrap();
+      (waiter.join().unwrap(), early)
+    })
+  }
+
+  fn tok_doc() -> Vec<u8> {
+    "tok one\ntwo tok\nthree\nfour tok tok\nfive\n"
+      .repeat(8)
+      .into_bytes()
+  }
+
+  #[test]
+  fn a_save_waits_for_a_running_pass_by_rename() {
+    let original = tok_doc();
+    let fx = fixture(&original);
+    let (saved, early) = while_a_pass_is_paused(&fx, |fx| save_core(&fx.state, ID, None, None));
+    assert!(!early, "the save must wait for the pass");
+    saved.unwrap();
+    let (replaced, _) = flat_replace(&original, b"tok", b"TOKEN", true);
+    assert_eq!(fs::read(&fx.path).unwrap(), replaced);
+    assert_eq!(fx.whole(), replaced);
+  }
+
+  #[test]
+  fn a_save_waits_for_a_running_pass_by_pouring_in_place() {
+    let original = tok_doc();
+    let fx = fixture(&original);
+    fs::hard_link(&fx.path, fx.dir.path().join("link.txt")).unwrap();
+    let (saved, early) = while_a_pass_is_paused(&fx, |fx| save_core(&fx.state, ID, None, None));
+    assert!(!early, "the save must wait for the pass");
+    saved.unwrap();
+    let (replaced, _) = flat_replace(&original, b"tok", b"TOKEN", true);
+    assert_eq!(fs::read(&fx.path).unwrap(), replaced);
+    assert_eq!(crate::fs_ops::linktest::links(&fx.path), 2);
+    assert_eq!(fx.whole(), replaced);
+  }
+
+  #[test]
+  fn a_close_waits_for_a_running_pass_and_leaves_no_change_list() {
+    let original = tok_doc();
+    let fx = fixture(&original);
+    let ((), early) = while_a_pass_is_paused(&fx, |fx| close_core(&fx.state, ID));
+    assert!(!early, "the close must wait for the pass");
+    assert!(fx.state.sessions.lock().unwrap().is_empty());
+    assert_eq!(fx.change_lists_on_disk(), 0);
+    assert_eq!(
+      fs::read(&fx.path).unwrap(),
+      original,
+      "the user's file is untouched"
+    );
+  }
+
+  #[test]
+  fn read_apply_undo_and_redo_wait_for_a_running_pass() {
+    let original = tok_doc();
+    let fx = fixture(&original);
+    let (_, early) = while_a_pass_is_paused(&fx, |fx| {
+      let map = fx.state.lock_idle(ID).unwrap();
+      let s = map.get(&ID).unwrap();
+      // By the time the session is handed out the replace has been installed.
+      assert_eq!(s.undo_stack.len(), 1);
+    });
+    assert!(!early, "a read must wait for the pass");
+  }
+
+  #[test]
+  fn the_busy_guard_clears_the_flag_even_when_the_pass_fails() {
+    let fx = fixture(&tok_doc());
+    let r = replace_all_core(
+      &fx.state,
+      Path::new("/nonexistent-root-for-test/\0/windowed-tmp"),
+      ID,
+      "tok",
+      true,
+      "x",
+      8,
+      100,
+      &mut |_| {},
+    );
+    assert!(r.is_err());
+    fx.with(|s| assert!(!s.busy));
+    // A command that waits on idle returns at once.
+    assert!(fx.state.lock_idle(ID).is_ok());
+    assert_eq!(fx.state.lock_idle(404).err().unwrap(), UNKNOWN_SESSION);
+  }
+}
 
 /// Guards the broader "heavy file I/O must not run on the UI thread" rule (see
 /// the doc comment on `windows.rs`'s window-builder rule, which this extends).
@@ -2425,8 +4358,19 @@ mod tests {
 #[cfg(test)]
 mod heavy_io_command_threading_tests {
   const SOURCE: &str = include_str!("windowed.rs");
-  const MUST_RUN_OFF_THE_MAIN_THREAD: &[&str] =
-    &["windowed_open", "windowed_reopen", "windowed_save"];
+  const MUST_RUN_OFF_THE_MAIN_THREAD: &[&str] = &[
+    "windowed_open",
+    "windowed_reopen",
+    "windowed_save",
+    "windowed_read",
+    "windowed_apply",
+    "windowed_undo",
+    "windowed_redo",
+    "windowed_close",
+    "windowed_find",
+    "windowed_search",
+    "windowed_replace_all",
+  ];
 
   #[test]
   fn every_heavy_io_command_is_async() {
@@ -2445,11 +4389,49 @@ mod heavy_io_command_threading_tests {
   }
 
   #[test]
+  fn every_command_that_touches_a_session_waits_for_a_running_pass() {
+    // A replace-all marks its session busy; these take the session through
+    // `lock_idle`, which waits, so none lands between two chunks of the pass.
+    for name in [
+      "windowed_read",
+      "windowed_apply",
+      "windowed_undo",
+      "windowed_redo",
+    ] {
+      let at = SOURCE
+        .find(&format!("pub fn {name}"))
+        .unwrap_or_else(|| panic!("{name} is gone"));
+      let body = &SOURCE[at..];
+      let body = &body[..body.find("\n}\n").unwrap()];
+      assert!(
+        body.contains("lock_idle"),
+        "{name} must wait for a running pass"
+      );
+    }
+    for core in [
+      "fn save_core",
+      "fn close_core",
+      "fn find_once",
+      "fn search_core",
+    ] {
+      let at = SOURCE
+        .find(core)
+        .unwrap_or_else(|| panic!("{core} is gone"));
+      let body = &SOURCE[at..];
+      let body = &body[..body.find("\n}\n").unwrap()];
+      assert!(
+        body.contains("lock_idle"),
+        "{core} must wait for a running pass"
+      );
+    }
+  }
+
+  #[test]
   fn the_guard_would_notice_a_dropped_async() {
     // Proves the assertion above can fail, against a command not in the list.
     let at = SOURCE
-      .find("pub fn windowed_close")
-      .expect("windowed_close");
+      .find("pub fn windowed_index")
+      .expect("windowed_index");
     let attribute = SOURCE[..at].trim_end();
     assert!(attribute.ends_with("#[tauri::command]"));
     assert!(!attribute.ends_with("#[tauri::command(async)]"));

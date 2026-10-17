@@ -85,25 +85,28 @@ unsafe fn build_menu(
     .iter()
     .find(|(_, win)| win.is_focused().unwrap_or(false))
     .map(|(label, _)| label.clone());
-  // Workspace: a plain action button whose click opens the workspace. Shown
-  // only while the workspace window is not visible — a visible one already sits
-  // in the system window list at the top of the Dock menu, so listing it here
-  // too would be a duplicate. (Closing the workspace only hides it, so "not
-  // visible" covers both a never-opened and a closed workspace.)
-  let workspace_visible = windows
-    .get("workspace")
-    .map(|w| w.is_visible().unwrap_or(false))
-    .unwrap_or(false);
-  if !workspace_visible {
-    let ws_title = NSString::from_str(i18n::tr(locale, Key::DockOpenWorkspace));
-    let ws_item = NSMenuItem::initWithTitle_action_keyEquivalent(
-      NSMenuItem::alloc(mtm),
-      &ws_title,
-      Some(sel!(noteNPadOpenWorkspace:)),
-      &empty,
-    );
-    ws_item.setTarget(Some(&*delegate));
-    menu.addItem(&ws_item);
+  #[cfg(not(feature = "lite"))]
+  {
+    // Workspace: a plain action button whose click opens the workspace. Shown
+    // only while the workspace window is not visible — a visible one already sits
+    // in the system window list at the top of the Dock menu, so listing it here
+    // too would be a duplicate. (Closing the workspace only hides it, so "not
+    // visible" covers both a never-opened and a closed workspace.)
+    let workspace_visible = windows
+      .get("workspace")
+      .map(|w| w.is_visible().unwrap_or(false))
+      .unwrap_or(false);
+    if !workspace_visible && crate::edition::workspace_enabled(crate::edition::is_lite()) {
+      let ws_title = NSString::from_str(i18n::tr(locale, Key::DockOpenWorkspace));
+      let ws_item = NSMenuItem::initWithTitle_action_keyEquivalent(
+        NSMenuItem::alloc(mtm),
+        &ws_title,
+        Some(sel!(noteNPadOpenWorkspace:)),
+        &empty,
+      );
+      ws_item.setTarget(Some(&*delegate));
+      menu.addItem(&ws_item);
+    }
   }
   // Documents: one item per open tab, from each live window's own report (so
   // untitled tabs, which are never persisted to the store, still appear). Groups
@@ -206,6 +209,7 @@ extern "C-unwind" fn dock_menu(
 }
 
 /// `-[delegate noteNPadOpenWorkspace:]`: the workspace item's action.
+#[cfg(not(feature = "lite"))]
 extern "C-unwind" fn open_workspace(_this: *mut AnyObject, _cmd: Sel, _sender: *mut AnyObject) {
   if let Some(app) = APP.get() {
     let _ = crate::windows::show_workspace(app);
@@ -287,6 +291,7 @@ pub fn install(app: &tauri::AppHandle) {
     let dock_imp: Imp = std::mem::transmute(
       dock_menu as extern "C-unwind" fn(*mut AnyObject, Sel, *mut AnyObject) -> *mut NSMenu,
     );
+    #[cfg(not(feature = "lite"))]
     let ws_imp: Imp = std::mem::transmute(
       open_workspace as extern "C-unwind" fn(*mut AnyObject, Sel, *mut AnyObject),
     );
@@ -295,7 +300,11 @@ pub fn install(app: &tauri::AppHandle) {
     let focus_doc_imp: Imp =
       std::mem::transmute(focus_doc as extern "C-unwind" fn(*mut AnyObject, Sel, *mut AnyObject));
     let ok_menu = class_addMethod(cls, sel!(applicationDockMenu:), dock_imp, c"@@:@".as_ptr());
-    let ok_ws = class_addMethod(cls, sel!(noteNPadOpenWorkspace:), ws_imp, c"v@:@".as_ptr());
+    #[cfg(not(feature = "lite"))]
+    let ok_ws =
+      class_addMethod(cls, sel!(noteNPadOpenWorkspace:), ws_imp, c"v@:@".as_ptr()).as_bool();
+    #[cfg(feature = "lite")]
+    let ok_ws = true;
     let ok_focus = class_addMethod(cls, sel!(noteNPadFocusNote:), focus_imp, c"v@:@".as_ptr());
     let ok_focus_doc = class_addMethod(
       cls,
@@ -303,7 +312,7 @@ pub fn install(app: &tauri::AppHandle) {
       focus_doc_imp,
       c"v@:@".as_ptr(),
     );
-    if !ok_menu.as_bool() || !ok_ws.as_bool() || !ok_focus.as_bool() || !ok_focus_doc.as_bool() {
+    if !ok_menu.as_bool() || !ok_ws || !ok_focus.as_bool() || !ok_focus_doc.as_bool() {
       log::warn!("failed to add dock menu methods to the delegate class");
     }
   }

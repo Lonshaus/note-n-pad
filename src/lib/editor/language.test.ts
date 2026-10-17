@@ -5,7 +5,11 @@ import { describe, expect, it } from 'vitest';
 import { Text } from '@codemirror/state';
 import {
   detectByContent,
+  availableLanguageNames,
   detectByFilename,
+  effectiveLanguage,
+  languageNames,
+  loadLanguage,
   docHasLongLine,
   fileExtension,
   LONG_LINE_THRESHOLD,
@@ -168,5 +172,54 @@ describe('nextLongLineState', () => {
   it('pasting multi-line text that splits a long line short lifts the gate', () => {
     // Line break inserted, halves short -> rescan; no long line remains.
     expect(nextLongLineState(true, 200, 0, true, () => false)).toBe(false);
+  });
+});
+
+describe('syntax in lite', () => {
+  it('still detects the real language, so a tab opened in lite is right in full', () => {
+    // Detection is not edition-dependent; only what is shown and colored is.
+    for (const [path, name] of [
+      ['/a/x.py', 'Python'],
+      ['/a/x.json', 'JSON'],
+      ['/a/x.md', 'Markdown'],
+      ['/a/x.csv', 'CSV'],
+    ] as const) {
+      expect(detectByFilename(path)).toBe(name);
+    }
+    expect(detectByContent('#!/usr/bin/env python3\nprint(1)\n')).toBe(
+      'Python',
+    );
+  });
+
+  it('loads no language extension, in full it does', async () => {
+    expect(await loadLanguage('JavaScript', true)).toBeNull();
+    expect(await loadLanguage('JavaScript', false)).not.toBeNull();
+  });
+
+  it('lists no languages to pick from, in full it lists them all', () => {
+    expect(availableLanguageNames(true)).toEqual([]);
+    expect(availableLanguageNames(false)).toBe(languageNames);
+    expect(languageNames.length).toBeGreaterThan(50);
+  });
+
+  it('shows a tab saved with a language as plain text, keeping the saved one', () => {
+    expect(effectiveLanguage('Python', true)).toBeNull();
+    expect(effectiveLanguage('Python', false)).toBe('Python');
+    expect(effectiveLanguage(null, false)).toBeNull();
+  });
+
+  it('follows the edition state when no value is passed', async () => {
+    const { editionState } = await import('../state/edition.svelte');
+    const before = editionState.lite;
+    try {
+      editionState.lite = true;
+      expect(effectiveLanguage('Python')).toBeNull();
+      expect(await loadLanguage('JavaScript')).toBeNull();
+      editionState.lite = false;
+      expect(effectiveLanguage('Python')).toBe('Python');
+      expect(await loadLanguage('JavaScript')).not.toBeNull();
+    } finally {
+      editionState.lite = before;
+    }
   });
 });

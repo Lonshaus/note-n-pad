@@ -85,6 +85,23 @@ export function pickDefaultTheme(
   return (themes.find((t) => t.variant === want) ?? themes[0])?.id;
 }
 
+/** The theme the editor is colored with. Full: the chosen one, else the first
+ *  available so the editor is never unthemed. Lite has no theme choice: it is the
+ *  default theme of the interface's own appearance (`dark`), whatever id is
+ *  stored; the stored choice is left alone for when the edition is full. */
+export function resolveEditorTheme(
+  themes: Theme[],
+  id: string,
+  lite: boolean,
+  dark: boolean,
+): Theme | undefined {
+  if (lite) {
+    const picked = pickDefaultTheme(dark, themes);
+    return themes.find((t) => t.id === picked);
+  }
+  return themes.find((t) => t.id === id) ?? themes[0];
+}
+
 /** The CSS custom properties (without the leading `--`) a theme sets on the
  *  document root: only the editor surface (`--e-*`) and the 9 `--tok-*` syntax
  *  roles read by both the synchronous HighlightStyle and the worker-highlight

@@ -3,33 +3,37 @@
 
 import { describe, expect, it } from 'vitest';
 import { matchMenuAccelerator } from './menuAccelerator';
-
+// The canonical accelerators of the native menu items on Windows.
 const TABLE = [
-  'CmdOrCtrl+Q',
-  'CmdOrCtrl+,',
-  'CmdOrCtrl+N',
-  'CmdOrCtrl+T',
-  'CmdOrCtrl+O',
-  'CmdOrCtrl+S',
-  'CmdOrCtrl+Shift+S',
-  'CmdOrCtrl+W',
-  'CmdOrCtrl+F',
-  'CmdOrCtrl+Alt+F',
-  'CmdOrCtrl+G',
-  'CmdOrCtrl+Shift+G',
-  'CmdOrCtrl+Shift+E',
+  'Ctrl+Q',
+  'Ctrl+,',
+  'Ctrl+N',
+  'Ctrl+T',
+  'Ctrl+O',
+  'Ctrl+S',
+  'Ctrl+Shift+S',
+  'Ctrl+W',
+  'Ctrl+F',
+  'Ctrl+Alt+F',
+  'Ctrl+G',
+  'Ctrl+Shift+G',
+  'Ctrl+Shift+E',
+  'Ctrl+Z',
 ];
+
+type Mods = Partial<{
+  ctrlKey: boolean;
+  shiftKey: boolean;
+  altKey: boolean;
+  metaKey: boolean;
+  defaultPrevented: boolean;
+  code: string;
+  isComposing: boolean;
+}>;
 
 function key(
   k: string,
-  mods: Partial<{
-    ctrlKey: boolean;
-    shiftKey: boolean;
-    altKey: boolean;
-    metaKey: boolean;
-    defaultPrevented: boolean;
-    code: string;
-  }> = {},
+  mods: Mods = {},
 ): {
   ctrlKey: boolean;
   shiftKey: boolean;
@@ -59,14 +63,14 @@ describe('matchMenuAccelerator on Windows', () => {
         'windows',
         TABLE,
       ),
-    ).toBe('CmdOrCtrl+S');
+    ).toBe('Ctrl+S');
     expect(
       matchMenuAccelerator(
         key('б', { ctrlKey: true, code: 'Comma' }),
         'windows',
         TABLE,
       ),
-    ).toBe('CmdOrCtrl+,');
+    ).toBe('Ctrl+,');
   });
 
   it('keeps the modifiers of an event whose fields are prototype getters', () => {
@@ -95,7 +99,7 @@ describe('matchMenuAccelerator on Windows', () => {
       },
     };
     const event = Object.create(proto) as ReturnType<typeof key>;
-    expect(matchMenuAccelerator(event, 'windows', TABLE)).toBe('CmdOrCtrl+S');
+    expect(matchMenuAccelerator(event, 'windows', TABLE)).toBe('Ctrl+S');
   });
 
   it('prefers the typed Latin letter over its physical position', () => {
@@ -112,7 +116,7 @@ describe('matchMenuAccelerator on Windows', () => {
   it('matches a plain table combo', () => {
     expect(
       matchMenuAccelerator(key('s', { ctrlKey: true }), 'windows', TABLE),
-    ).toBe('CmdOrCtrl+S');
+    ).toBe('Ctrl+S');
   });
 
   it('distinguishes Ctrl+S from Ctrl+Shift+S', () => {
@@ -122,25 +126,25 @@ describe('matchMenuAccelerator on Windows', () => {
         'windows',
         TABLE,
       ),
-    ).toBe('CmdOrCtrl+Shift+S');
+    ).toBe('Ctrl+Shift+S');
   });
 
   it('distinguishes Ctrl+F from Ctrl+Alt+F', () => {
     expect(
       matchMenuAccelerator(key('f', { ctrlKey: true }), 'windows', TABLE),
-    ).toBe('CmdOrCtrl+F');
+    ).toBe('Ctrl+F');
     expect(
       matchMenuAccelerator(
         key('f', { ctrlKey: true, altKey: true }),
         'windows',
         TABLE,
       ),
-    ).toBe('CmdOrCtrl+Alt+F');
+    ).toBe('Ctrl+Alt+F');
   });
 
   it('returns null for a combo not in the table', () => {
     expect(
-      matchMenuAccelerator(key('z', { ctrlKey: true }), 'windows', TABLE),
+      matchMenuAccelerator(key('x', { ctrlKey: true }), 'windows', TABLE),
     ).toBeNull();
   });
 
@@ -154,7 +158,7 @@ describe('matchMenuAccelerator on Windows', () => {
     ).toBeNull();
   });
 
-  it('returns null when Meta is held instead of/alongside Ctrl', () => {
+  it('does not match when Meta is held alongside Ctrl', () => {
     expect(
       matchMenuAccelerator(
         key('s', { ctrlKey: true, metaKey: true }),
@@ -164,8 +168,27 @@ describe('matchMenuAccelerator on Windows', () => {
     ).toBeNull();
   });
 
-  it('returns null with no Ctrl held', () => {
+  it('returns null with no modifier held', () => {
     expect(matchMenuAccelerator(key('s'), 'windows', TABLE)).toBeNull();
+  });
+
+  it('matches a function key on its own, and a modifier-less key never', () => {
+    expect(matchMenuAccelerator(key('F6'), 'windows', ['F6', 'Ctrl+S'])).toBe(
+      'F6',
+    );
+    expect(
+      matchMenuAccelerator(key('F6', { shiftKey: true }), 'windows', ['F6']),
+    ).toBeNull();
+    expect(matchMenuAccelerator(key('Enter'), 'windows', ['Enter'])).toBeNull();
+  });
+
+  it('accepts a modifier other than Ctrl, since the key moved', () => {
+    expect(
+      matchMenuAccelerator(key('j', { altKey: true }), 'windows', ['Alt+J']),
+    ).toBe('Alt+J');
+    expect(
+      matchMenuAccelerator(key('e', { metaKey: true }), 'windows', ['Win+E']),
+    ).toBe('Win+E');
   });
 });
 
@@ -175,9 +198,39 @@ describe('matchMenuAccelerator key source', () => {
       matchMenuAccelerator(
         key('z', { ctrlKey: true, code: 'KeyW' }),
         'windows',
-        ['CmdOrCtrl+Z', 'CmdOrCtrl+W'],
+        ['Ctrl+Z', 'Ctrl+W'],
       ),
-    ).toBe('CmdOrCtrl+Z');
+    ).toBe('Ctrl+Z');
+  });
+
+  it('matches Ctrl+Shift+digit although Shift turns key into a symbol', () => {
+    expect(
+      matchMenuAccelerator(
+        key('!', { ctrlKey: true, shiftKey: true, code: 'Digit1' }),
+        'windows',
+        ['Ctrl+Shift+1', 'Ctrl+Shift+E'],
+      ),
+    ).toBe('Ctrl+Shift+1');
+  });
+
+  it('matches Ctrl+digit on an AZERTY number row', () => {
+    expect(
+      matchMenuAccelerator(
+        key('&', { ctrlKey: true, code: 'Digit1' }),
+        'windows',
+        ['Ctrl+1'],
+      ),
+    ).toBe('Ctrl+1');
+  });
+
+  it('takes a typed comma although AZERTY puts it on the M key', () => {
+    expect(
+      matchMenuAccelerator(
+        key(',', { ctrlKey: true, code: 'KeyM' }),
+        'windows',
+        TABLE,
+      ),
+    ).toBe('Ctrl+,');
   });
 });
 
@@ -198,5 +251,48 @@ describe('matchMenuAccelerator off Windows', () => {
     expect(
       matchMenuAccelerator(key('s', { ctrlKey: true }), '', TABLE),
     ).toBeNull();
+  });
+});
+
+describe('matchMenuAccelerator while an IME composes', () => {
+  // WebView2 names a composing keydown `Process` and keeps the physical code.
+  const composingSave = key('Process', {
+    ctrlKey: true,
+    code: 'KeyS',
+    isComposing: true,
+  });
+
+  it('leaves the Save key alone', () => {
+    expect(
+      matchMenuAccelerator(composingSave, 'windows', TABLE, 'Ctrl+S'),
+    ).toBeNull();
+  });
+
+  it('still matches the other menu keys', () => {
+    expect(
+      matchMenuAccelerator(
+        key('Process', { ctrlKey: true, code: 'KeyO', isComposing: true }),
+        'windows',
+        TABLE,
+        'Ctrl+S',
+      ),
+    ).toBe('Ctrl+O');
+  });
+
+  it('still saves once the composition is over', () => {
+    expect(
+      matchMenuAccelerator(
+        key('s', { ctrlKey: true }),
+        'windows',
+        TABLE,
+        'Ctrl+S',
+      ),
+    ).toBe('Ctrl+S');
+  });
+
+  it('follows a rebound Save key', () => {
+    expect(
+      matchMenuAccelerator(composingSave, 'windows', TABLE, 'Ctrl+Alt+S'),
+    ).toBe('Ctrl+S');
   });
 });

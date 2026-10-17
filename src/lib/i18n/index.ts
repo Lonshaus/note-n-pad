@@ -3,6 +3,7 @@
 
 import { settingsState } from '../state/settings.svelte';
 import { interpolate } from './locale';
+import { brandTemplate } from './brand';
 import { localeRegistry } from './localeRegistry.svelte';
 import { zhTW } from './zh-TW';
 import { ja } from './ja';
@@ -66,11 +67,24 @@ export function t(
   key: I18nKey,
   params?: Record<string, string | number>,
 ): string {
+  return translate(key, params, __LITE__);
+}
+
+/** `t` for a given edition. The Lite build names the app "Note&Pad Lite": the
+ *  template (data file, else compiled, else English) is rewritten before the
+ *  parameters go in, so values such as a file name keep "Note&Pad" as it is. */
+export function translate(
+  key: I18nKey,
+  params: Record<string, string | number> | undefined,
+  lite: boolean,
+): string {
   const locale = settingsState.resolvedLocale;
-  const template =
+  const template = brandTemplate(
     localeRegistry.get(locale)?.strings[key] ??
-    BUILTIN_DICTS[locale]?.[key] ??
-    en[key];
+      BUILTIN_DICTS[locale]?.[key] ??
+      en[key],
+    lite,
+  );
   if (params === undefined) {
     return template;
   }

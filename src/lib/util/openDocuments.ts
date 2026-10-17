@@ -2,6 +2,8 @@
 // SPDX-License-Identifier: GPL-3.0-only
 
 import type { NoteSnapshot } from '../state/stickyNote.svelte';
+import { t } from '../i18n';
+import { rangeLabel, sourceBaseName } from './rangeLabel';
 
 /** One document tab row in the workspace list. */
 export interface DocRow {
@@ -41,19 +43,34 @@ export function shouldCollapseEmptyWindow(
     !openFailed
   );
 }
-
-/** Basename of a file path, or "Untitled" for an empty/null path. */
-function basename(path: string | null): string {
-  if (path === null || path === '') {
-    return 'Untitled';
+/** The workspace list's label for a document tab, in the UI language. A range
+ *  tab (its file lives in `range_source`) reads like its tab bar label,
+ *  "{name} (lines X–Y)"; a record without the stored end line shows the source
+ *  name alone. A tab with no path is the translated "Untitled". */
+export function docLabel(note: NoteSnapshot): string {
+  if (note.range_source !== null) {
+    if (note.range_start_line !== null && note.range_end_line !== null) {
+      return rangeLabel(
+        note.range_source,
+        note.range_start_line,
+        note.range_end_line,
+      );
+    }
+    return sourceBaseName(note.range_source);
   }
-  return path.split(/[/\\]/).pop() || 'Untitled';
+  if (note.file_path === null || note.file_path === '') {
+    return t('doc.untitled');
+  }
+  return note.file_path.split(/[/\\]/).pop() || t('doc.untitled');
 }
 
 /** Group document-kind notes into their windows (by window_group, falling back
  *  to the note id). Groups keep first-appearance order; rows sort by tab_index.
- *  Stickies and other non-document notes are ignored. */
-export function groupOpenDocuments(notes: NoteSnapshot[]): DocGroup[] {
+ *  Stickies and other non-document notes are ignored. `label` names each row. */
+export function groupOpenDocuments(
+  notes: NoteSnapshot[],
+  label: (note: NoteSnapshot) => string,
+): DocGroup[] {
   const order: string[] = [];
   const byGroup = new Map<string, DocRow[]>();
   for (const note of notes) {
@@ -71,7 +88,7 @@ export function groupOpenDocuments(notes: NoteSnapshot[]): DocGroup[] {
       id: note.id,
       group,
       tabIndex: note.tab_index,
-      name: basename(note.file_path),
+      name: label(note),
       dirty: note.dirty,
       filePath: note.file_path,
     });

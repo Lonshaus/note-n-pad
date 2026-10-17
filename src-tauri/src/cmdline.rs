@@ -70,9 +70,31 @@ pub fn parse_args(args: &[String]) -> Action {
   }
 }
 
+/// What the Lite edition does with a parsed launch: `--workspace` is ignored,
+/// everything else goes through.
+// Called on Windows/Linux; compiled (and tested) on every platform.
+#[allow(dead_code)]
+pub fn for_edition(action: Action, lite: bool) -> Action {
+  match action {
+    Action::Workspace if !crate::edition::workspace_enabled(lite) => Action::None,
+    other => other,
+  }
+}
+
 #[cfg(test)]
 mod tests {
   use super::*;
+
+  #[test]
+  fn lite_ignores_the_workspace_flag_only() {
+    assert_eq!(for_edition(Action::Workspace, true), Action::None);
+    assert_eq!(for_edition(Action::Workspace, false), Action::Workspace);
+    assert_eq!(for_edition(Action::NewSticky, true), Action::NewSticky);
+    assert_eq!(
+      for_edition(Action::Doc("g".into(), 1), true),
+      Action::Doc("g".into(), 1)
+    );
+  }
 
   fn args(items: &[&str]) -> Vec<String> {
     items.iter().map(|s| s.to_string()).collect()

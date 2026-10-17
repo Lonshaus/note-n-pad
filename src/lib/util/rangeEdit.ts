@@ -43,3 +43,23 @@ export function rangeWithinLimit(
 ): boolean {
   return endByte - startByte <= max;
 }
+/** Whether a source slice ends with a line break (`\n`, or `\r\n`). */
+export function sliceEndsWithBreak(slice: string): boolean {
+  return slice.endsWith('\n');
+}
+/** The text a range tab writes back into its source. A slice that ended with a
+ *  line break (`trailingBreak`) gets one in the file's line ending when the
+ *  buffer is not empty and does not already end with one, so text typed on the
+ *  buffer's last line cannot join the next source line. An empty buffer writes
+ *  nothing, which removes the whole span. `buffer` is LF-normalized. */
+export function rangeWriteText(
+  buffer: string,
+  trailingBreak: boolean,
+  ending: LineEnding,
+): string {
+  const withBreak =
+    trailingBreak && buffer !== '' && !buffer.endsWith('\n')
+      ? buffer + '\n'
+      : buffer;
+  return applyLineEnding(withBreak, ending);
+}

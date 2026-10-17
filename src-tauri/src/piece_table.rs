@@ -161,6 +161,14 @@ impl<O: OriginalSource> OriginalIndex<O> {
   fn read_into(&self, offset: u64, len: usize, out: &mut Vec<u8>) -> Result<(), String> {
     self.source.read_into(offset, len, out)
   }
+  /// The source this index reads through.
+  fn source(&self) -> &O {
+    &self.source
+  }
+  /// Give the source back, dropping the index around it.
+  fn into_source(self) -> O {
+    self.source
+  }
 
   /// Index of the checkpoint segment containing `offset`: the last checkpoint
   /// whose offset does not exceed `offset`. `offset == len` lands on the final
@@ -317,6 +325,45 @@ impl<O: OriginalSource> PieceTable<O> {
       self.offset_prefix.push(off);
       self.newline_prefix.push(nl);
     }
+  }
+  /// The source the original run draws from.
+  pub fn source(&self) -> &O {
+    self.index.source()
+  }
+  /// Give the original's source back, dropping the table around it. A table
+  /// stacked on another one (see `OriginalSource for PieceTable`) hands that
+  /// table back this way.
+  pub fn into_source(self) -> O {
+    self.index.into_source()
+  }
+  /// Whether the document is exactly the unedited original: one piece that
+  /// spans all of it.
+  pub fn is_pristine(&self) -> bool {
+    matches!(
+      self.pieces.as_slice(),
+      [Piece { source: Source::Original, start: 0, len, .. }] if *len == self.index.len
+    )
+  }
+  /// Number of pieces, for tests that assert memory does not grow per edit.
+  #[cfg(test)]
+  pub fn piece_count(&self) -> usize {
+    self.pieces.len()
+  }
+  /// Bytes held by the add buffer, for the same tests.
+  #[cfg(test)]
+  pub fn add_len(&self) -> usize {
+    self.add.len()
+  }
+  /// Number of sparse checkpoints the original's index holds, for the same
+  /// tests.
+  #[cfg(test)]
+  pub fn checkpoint_count(&self) -> usize {
+    self.index.checkpoints.len()
+  }
+  /// The original's sparse `(offset, newlines_before)` checkpoints.
+  #[cfg(test)]
+  pub fn index_checkpoints(&self) -> &[(u64, u64)] {
+    &self.index.checkpoints
   }
 
   /// Total document length in bytes.
@@ -605,6 +652,17 @@ impl<O: OriginalSource> PieceTable<O> {
     Ok(())
   }
 }
+/// A piece table is itself readable by byte range, so another table can be
+/// stacked over it as its original (a replace layer reads the table below).
+impl<O: OriginalSource> OriginalSource for PieceTable<O> {
+  fn read_into(&self, offset: u64, len: usize, out: &mut Vec<u8>) -> Result<(), String> {
+    let end = offset
+      .checked_add(len as u64)
+      .ok_or_else(|| "read range overflows u64".to_string())?;
+    out.extend_from_slice(&self.read(offset, end)?);
+    Ok(())
+  }
+}
 
 #[cfg(test)]
 mod tests {
@@ -801,6 +859,39 @@ mod tests {
         "offset_to_line mismatch"
       );
     }
+  }
+
+  #[test]
+  fn a_table_is_an_original_source_for_another_table() {
+    let content = b"one\ntwo\nthree\n";
+    let mut below = PieceTable::new(slice_index(content));
+    below.insert(4, b"ZZ\n").unwrap();
+    let flat = below.read(0, below.len()).unwrap();
+    let above = PieceTable::new(build_index(below, &flat, TEST_INTERVAL));
+    assert!(above.is_pristine());
+    assert_eq!(above.read(0, above.len()).unwrap(), flat);
+    assert_eq!(above.read(5, 9).unwrap(), flat[5..9].to_vec());
+    assert_eq!(above.line_count(), 5);
+    assert_eq!(above.line_to_offset(2).unwrap(), 7);
+    // The table underneath comes back out intact.
+    let below = above.into_source();
+    assert_eq!(below.read(0, below.len()).unwrap(), flat);
+  }
+
+  #[test]
+  fn pristine_means_one_unedited_run() {
+    let content = b"abc\ndef\n";
+    let mut t = PieceTable::new(slice_index(content));
+    assert!(t.is_pristine());
+    t.insert(2, b"x").unwrap();
+    assert!(!t.is_pristine());
+    t.delete(2, 3).unwrap();
+    assert!(
+      !t.is_pristine(),
+      "an edit and its undo leave the pieces split"
+    );
+    let empty = PieceTable::new(slice_index(b""));
+    assert!(!empty.is_pristine());
   }
 
   #[test]

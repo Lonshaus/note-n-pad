@@ -19,28 +19,49 @@
   import { getColor, setColor } from './lib/theme/themeColor';
   import { open, save, ask } from '@tauri-apps/plugin-dialog';
   import { debounce } from './lib/util/debounce';
+  import { recordAccelerator, formatKeyDisplay } from './lib/util/accelerator';
   import {
-    isValidRecordedShortcut,
-    keyEventToAccelerator,
-    formatAccelerator,
-  } from './lib/util/accelerator';
+    shortcutsState,
+    type ShortcutRow,
+  } from './lib/state/shortcuts.svelte';
+  import {
+    groupShortcutRows,
+    recorderScope,
+    shownOtherGroups,
+  } from './lib/util/shortcutRows';
+  import {
+    rejectionMessage,
+    setErrorMessage,
+    type ShortcutMessage,
+  } from './lib/util/shortcutMessages';
   import {
     FONT_CANDIDATES,
     availableFonts,
+    dropdownFontFamilies,
     filterInstalledFonts,
     makeCanvasMeasurer,
+    pickableFontFamilies,
   } from './lib/util/font';
   import { invoke } from '@tauri-apps/api/core';
+  import { getCurrentWindow } from '@tauri-apps/api/window';
+  import { nativeFieldHistory, nativeSelectAll } from './lib/util/menuBar';
   import { ENCODINGS, type LineEnding } from './lib/util/text';
   import { t, type I18nKey } from './lib/i18n';
   import { BUILTIN_IDS, BUILTIN_LABELS } from './lib/i18n/locale';
   import { localeRegistry } from './lib/i18n/localeRegistry.svelte';
   import LocaleEditor from './lib/i18n/LocaleEditor.svelte';
+  import { isLite } from './lib/state/edition.svelte';
+  import {
+    editionUi,
+    editorTabsFor,
+    shownEditorTab,
+    type EditorTab,
+  } from './lib/util/editionUi';
 
-  type Section = 'sticky' | 'editor' | 'general' | 'language';
+  type Section = 'sticky' | 'editor' | 'shortcuts' | 'general' | 'language';
   // The editor section has two sub-tabs: its own settings, and the theme editor
   // (a theme only colors the editor, so it belongs here, not a top-level tab).
-  type EditorTab = 'general' | 'theme';
+  // Lite has no theme editor, so no sub-tabs.
 
   // Theme colors only the editor surface, so the color editor drops the
   // interface chrome group (that is the interface mode's job now).
@@ -53,14 +74,15 @@
     { id: 'general', key: 'settings.section.general' },
     { id: 'sticky', key: 'settings.section.sticky' },
     { id: 'editor', key: 'settings.section.editor' },
+    { id: 'shortcuts', key: 'settings.section.shortcuts' },
     { id: 'language', key: 'settings.section.language' },
   ];
 
   // Sub-tabs of the editor section (reusing the General label for the first).
-  const EDITOR_TABS: { id: EditorTab; key: I18nKey }[] = [
-    { id: 'general', key: 'settings.section.general' },
-    { id: 'theme', key: 'settings.editor.tabTheme' },
-  ];
+  const EDITOR_TAB_KEYS: Record<EditorTab, I18nKey> = {
+    general: 'settings.section.general',
+    theme: 'settings.editor.tabTheme',
+  };
 
   // Interface (chrome) appearance options, shown in the General section.
   const INTERFACE_MODES: { id: InterfaceMode; key: I18nKey }[] = [
@@ -71,11 +93,17 @@
 
   let section = $state<Section>('general');
   let editorTab = $state<EditorTab>('general');
-
-  // Shortcut recorder state.
-  let recording = $state(false);
-  let shortcutError = $state('');
-  let recorderEl = $state<HTMLButtonElement | undefined>(undefined);
+  // What the edition has of this window; read in the template so a license
+  // change shows or hides it live.
+  const ui = $derived(editionUi(isLite()));
+  const editorTabs = $derived(editorTabsFor(isLite()));
+  const shownTab = $derived(shownEditorTab(editorTab, isLite()));
+  // Shortcut recorder state: the row being recorded, the last message and the
+  // row it belongs to, and whether the read-only key list is open.
+  let recordingId = $state<string | null>(null);
+  let notice = $state<{ id: string; message: ShortcutMessage } | null>(null);
+  let otherExpanded = $state(false);
+  const shortcutGroups = $derived(groupShortcutRows(shortcutsState.rows));
 
   let snapshotDirError = $state('');
 
@@ -192,31 +220,75 @@
     await switchSnapshotDir(null);
   }
 
-  function onRecorderKeydown(e: KeyboardEvent): void {
+  function onRecorderKeydown(e: KeyboardEvent, row: ShortcutRow): void {
     e.preventDefault();
+    const button = e.currentTarget as HTMLButtonElement;
     // Esc (with no modifiers) cancels recording and restores the display.
     if (e.key === 'Escape' && !e.metaKey && !e.ctrlKey && !e.altKey) {
-      recorderEl?.blur();
+      button.blur();
       return;
     }
-    const accel = keyEventToAccelerator(e, platform.os);
-    // A bare modifier press is ignored; keep waiting for a full combo.
-    if (accel === null || !isValidRecordedShortcut(accel)) {
-      return;
-    }
-    void applyShortcut(accel);
+    void recordShortcut(e, row, button);
+  }
+  /** The letter the keyboard layout types on a physical key (macOS). */
+  async function layoutChar(code: string): Promise<string | null> {
+    return await invoke<string | null>('layout_char_for_code', { code });
   }
 
-  async function applyShortcut(accel: string): Promise<void> {
-    try {
-      await settingsState.setNewNoteShortcut(accel);
-      shortcutError = '';
-    } catch (err) {
-      // Registration failed (invalid/conflicting): show it and keep the old one.
-      shortcutError = String(err);
+  async function recordShortcut(
+    e: KeyboardEvent,
+    row: ShortcutRow,
+    button: HTMLButtonElement,
+  ): Promise<void> {
+    const result = await recordAccelerator(e, {
+      os: platform.os,
+      scope: recorderScope(row.scopes),
+      layoutChar,
+    });
+    // Ended (blur) while the lookup ran: the keystroke no longer belongs here.
+    if (recordingId !== row.id) {
+      return;
     }
-    recording = false;
-    recorderEl?.blur();
+    // A bare modifier press: keep waiting for the rest of the combo.
+    if (result.status === 'ignore') {
+      return;
+    }
+    if (result.status === 'rejected') {
+      notice = {
+        id: row.id,
+        message: rejectionMessage(result.reason, platform.isMacOS),
+      };
+      return;
+    }
+    await changeShortcut(row.id, 'set_shortcut', {
+      id: row.id,
+      accel: result.accel,
+    });
+    button.blur();
+  }
+  /** Run a shortcut command; a refusal is shown under the row `id` and the old
+   *  key stays in effect. */
+  async function changeShortcut(
+    id: string,
+    command: 'set_shortcut' | 'reset_shortcut' | 'reset_all_shortcuts',
+    args: Record<string, unknown>,
+  ): Promise<void> {
+    try {
+      await invoke<void>(command, args);
+      notice = null;
+    } catch (err) {
+      notice = {
+        id,
+        message: setErrorMessage(err, platform.isMacOS, shortcutsState.rows),
+      };
+    }
+    await shortcutsState.load();
+  }
+
+  function keysText(row: ShortcutRow): string {
+    return row.keys
+      .map((k) => formatKeyDisplay(k, platform.isMacOS))
+      .join(', ');
   }
 
   function commitFontSize(raw: string): void {
@@ -231,45 +303,77 @@
   function stepFontSize(delta: number): void {
     commitFontSize(String(settingsState.editorFontSize + delta));
   }
-
-  // Font picker rows. '' is the built-in stack whose label is translated
-  // (labelKey); the concrete faces are detected per host in onMount (only the
-  // ones actually installed are listed), so brand face names stay verbatim.
-  let fontFamilies = $state<{ value: string; labelKey?: I18nKey }[]>([
-    { value: '', labelKey: 'settings.editor.fontDefault' },
-  ]);
-  const CUSTOM_FONT = '__custom__';
-
-  // Sticky flag set once the user picks the custom option, so the text input stays visible
-  // even while its value is empty or matches a listed face.
-  let fontCustom = $state(false);
-  // A stored value not in the list is inherently custom (e.g. loaded from disk).
-  const fontValueIsCustom = $derived(
-    settingsState.editorFontFamily !== '' &&
-      !fontFamilies.some((f) => f.value === settingsState.editorFontFamily),
+  // Font picker rows. '' is the built-in stack whose label is translated; the
+  // built-in faces are detected per host in onMount (only the ones actually
+  // installed are listed), then come the families the user added, so brand face
+  // names stay verbatim.
+  let installedFonts = $state<string[]>([]);
+  const fontFamilies = $derived(
+    dropdownFontFamilies(
+      installedFonts,
+      settingsState.editorExtraFonts,
+      settingsState.editorFontFamily,
+    ),
   );
-  const showFontInput = $derived(fontCustom || fontValueIsCustom);
+  const PICK_FONT = '__pick__';
+  // Whether the second list of every installed family is open. It is filled on
+  // opening; null while the host is being asked.
+  let pickingFont = $state(false);
+  let hostFonts = $state<string[] | null>(null);
+  const pickableFonts = $derived(
+    pickableFontFamilies(hostFonts ?? [], fontFamilies),
+  );
   const fontSelectValue = $derived(
-    showFontInput ? CUSTOM_FONT : settingsState.editorFontFamily,
+    pickingFont ? PICK_FONT : settingsState.editorFontFamily,
   );
 
   function onFontSelect(value: string): void {
-    if (value === CUSTOM_FONT) {
-      fontCustom = true;
+    if (value === PICK_FONT) {
+      pickingFont = true;
+      hostFonts = null;
+      // A failed call reads as an empty list: the second list then says so.
+      void invoke<string[]>('list_font_families')
+        .catch(() => [] as string[])
+        .then((families) => {
+          hostFonts = families;
+        });
     } else {
-      fontCustom = false;
+      pickingFont = false;
       void settingsState.setFontFamily(value);
     }
   }
 
-  function commitFontFamily(raw: string): void {
-    const value = raw.trim();
-    // A typed value matching a listed face collapses back to the dropdown.
-    if (fontFamilies.some((f) => f.value === value)) {
-      fontCustom = false;
+  function onPickFont(value: string): void {
+    pickingFont = false;
+    if (value !== '') {
+      void settingsState.addFontFamily(value);
     }
-    void settingsState.setFontFamily(value);
   }
+
+  let mainFontSelect = $state<HTMLSelectElement | null>(null);
+  let pickFontSelect = $state<HTMLSelectElement | null>(null);
+  // Clicking a label or an empty part of the pane never blurs the select, so
+  // while the second list is open any press outside both font selects closes it.
+  // The main select closes it through its own change path.
+  $effect(() => {
+    if (!pickingFont) {
+      return;
+    }
+    const closeOnOutsidePress = (e: PointerEvent): void => {
+      const target = e.target;
+      if (
+        target instanceof Node &&
+        !mainFontSelect?.contains(target) &&
+        !pickFontSelect?.contains(target)
+      ) {
+        pickingFont = false;
+      }
+    };
+    document.addEventListener('pointerdown', closeOnOutsidePress, true);
+    return () => {
+      document.removeEventListener('pointerdown', closeOnOutsidePress, true);
+    };
+  });
 
   // Reflect the resolved theme onto the document root.
   $effect(() => {
@@ -282,6 +386,19 @@
     const unlistenChanges = settingsState.listenChanges();
     const unlistenThemes = themeRegistry.listen();
     const unlistenLocales = localeRegistry.listen();
+    // Edit > Undo/Redo/Select All reach the focused window as menu actions (the
+    // macOS items are no longer native); the theme-name and locale fields keep
+    // their own history and selection.
+    const unlistenMenuAction = getCurrentWindow().listen<string>(
+      'menu-action',
+      (event) => {
+        if (event.payload === 'undo' || event.payload === 'redo') {
+          nativeFieldHistory(event.payload);
+        } else if (event.payload === 'select-all') {
+          nativeSelectAll();
+        }
+      },
+    );
     void platform.init();
     void invoke<boolean>('default_apps_page_supported')
       .catch(() => false)
@@ -298,15 +415,16 @@
     void invoke<string[] | null>('installed_font_families')
       .catch(() => null)
       .then((installed) => {
-        const filtered =
+        installedFonts =
           installed === null
             ? availableFonts(FONT_CANDIDATES, makeCanvasMeasurer())
             : filterInstalledFonts(FONT_CANDIDATES, installed);
-        fontFamilies.push(...filtered.map((value) => ({ value })));
       });
     // Reveal the window only after the theme is loaded and applied, so a
-    // dark-theme window never flashes its default white background.
-    void revealWhenThemed();
+    // dark-theme window never flashes its default white background. The
+    // unset-default notice counts as shown only once the reveal succeeded: a
+    // failed reveal leaves it unseen, so it is reported again next launch.
+    void revealWhenThemed().then(() => settingsState.ackUnsetDefaults());
     // DEV-only automation hook; dynamic import keeps it out of production.
     if (import.meta.env.DEV) {
       void import('./lib/dev/auto').then((m) =>
@@ -333,6 +451,7 @@
       void unlistenChanges.then((u) => u());
       void unlistenThemes.then((u) => u());
       void unlistenLocales.then((u) => u());
+      void unlistenMenuAction.then((u) => u());
     };
   });
 
@@ -386,9 +505,8 @@
       cancelSaveAs();
     }
   }
-
-  // Focus the modal's input as soon as it mounts.
-  function autofocus(node: HTMLInputElement): void {
+  // Focus the element as soon as it mounts.
+  function autofocus(node: HTMLElement): void {
     node.focus();
   }
 
@@ -694,22 +812,22 @@
         </div>
       </div>
     {/if}
-    {#if section === 'editor'}
+    {#if !__LITE__ && section === 'editor' && editorTabs.length > 1}
       <div class="subtabs" role="tablist">
-        {#each EDITOR_TABS as tab (tab.id)}
+        {#each editorTabs as tab (tab)}
           <button
             class="subtab"
-            class:active={editorTab === tab.id}
+            class:active={shownTab === tab}
             role="tab"
-            aria-selected={editorTab === tab.id}
-            onclick={() => (editorTab = tab.id)}
+            aria-selected={shownTab === tab}
+            onclick={() => (editorTab = tab)}
           >
-            {t(tab.key)}
+            {t(EDITOR_TAB_KEYS[tab])}
           </button>
         {/each}
       </div>
     {/if}
-    {#if section === 'editor' && editorTab === 'theme'}
+    {#if !__LITE__ && section === 'editor' && shownTab === 'theme'}
       <div class="theme-layout">
         <div class="theme-side">
           <!-- An open listbox: optgroup headers + tight option rows, like an
@@ -869,41 +987,6 @@
       {/if}
     {:else if section === 'sticky'}
       <div class="field">
-        <span class="field-label">{t('settings.sticky.newNoteShortcut')}</span>
-        <button
-          class="recorder"
-          class:recording
-          bind:this={recorderEl}
-          onfocus={() => {
-            recording = true;
-            shortcutError = '';
-          }}
-          onblur={() => (recording = false)}
-          onclick={() => {
-            recorderEl?.focus();
-            recording = true;
-            shortcutError = '';
-          }}
-          onkeydown={onRecorderKeydown}
-        >
-          {recording
-            ? t('settings.sticky.recording')
-            : formatAccelerator(
-                settingsState.newNoteShortcut,
-                platform.isMacOS,
-              )}
-        </button>
-        {#if recording}
-          <span class="hint">{t('settings.sticky.recordCancelHint')}</span>
-        {:else}
-          <span class="hint">{t('settings.sticky.recordHint')}</span>
-        {/if}
-        {#if shortcutError !== ''}
-          <span class="error">{t('settings.sticky.shortcutError')}</span>
-        {/if}
-      </div>
-
-      <div class="field">
         <span class="field-label">{t('settings.sticky.defaultSize')}</span>
         <div class="size-row">
           <span class="size-value"
@@ -915,7 +998,106 @@
           </button>
         </div>
       </div>
-    {:else if section === 'editor' && editorTab === 'general'}
+    {:else if section === 'shortcuts'}
+      <p class="hint">{t('settings.sticky.recordHint')}</p>
+      <div class="shortcut-actions">
+        <button
+          class="btn"
+          onclick={() => changeShortcut('', 'reset_all_shortcuts', {})}
+        >
+          {t('settings.shortcuts.resetAll')}
+        </button>
+      </div>
+      {#if notice !== null && notice.id === ''}
+        <span class="error">{t(notice.message.key, notice.message.params)}</span
+        >
+      {/if}
+      {#each shortcutGroups.sections as group (group.section)}
+        <section class="shortcut-group">
+          <h2 class="group-title">{group.section}</h2>
+          {#each group.rows as row (row.id)}
+            <div class="shortcut-row">
+              <span class="shortcut-name">{row.label}</span>
+              {#if row.customizable}
+                <button
+                  class="recorder"
+                  class:recording={recordingId === row.id}
+                  onfocus={() => {
+                    recordingId = row.id;
+                    notice = null;
+                  }}
+                  onblur={() => {
+                    if (recordingId === row.id) {
+                      recordingId = null;
+                    }
+                  }}
+                  onclick={(e) => e.currentTarget.focus()}
+                  onkeydown={(e) => onRecorderKeydown(e, row)}
+                >
+                  {#if recordingId === row.id}
+                    {t('settings.sticky.recording')}
+                  {:else if row.accelerator === ''}
+                    {t('settings.shortcuts.notSet')}
+                  {:else}
+                    {formatKeyDisplay(row.accelerator, platform.isMacOS)}
+                  {/if}
+                </button>
+                <button
+                  class="btn"
+                  disabled={row.accelerator === ''}
+                  onclick={() =>
+                    changeShortcut(row.id, 'set_shortcut', {
+                      id: row.id,
+                      accel: null,
+                    })}
+                >
+                  {t('settings.shortcuts.clear')}
+                </button>
+                <button
+                  class="btn"
+                  disabled={row.accelerator === row.default}
+                  onclick={() =>
+                    changeShortcut(row.id, 'reset_shortcut', { id: row.id })}
+                >
+                  {t('settings.shortcuts.reset')}
+                </button>
+              {:else}
+                <span class="shortcut-keys">{keysText(row)}</span>
+                <span class="badge">{t('settings.shortcuts.system')}</span>
+              {/if}
+            </div>
+            {#if notice !== null && notice.id === row.id}
+              <span class="error"
+                >{t(notice.message.key, notice.message.params)}</span
+              >
+            {:else if recordingId === row.id}
+              <span class="hint">{t('settings.sticky.recordCancelHint')}</span>
+            {/if}
+          {/each}
+        </section>
+      {/each}
+      <section class="shortcut-group">
+        <button
+          class="group-toggle"
+          aria-expanded={otherExpanded}
+          onclick={() => (otherExpanded = !otherExpanded)}
+        >
+          <span class="chevron" aria-hidden="true"
+            >{otherExpanded ? '▾' : '▸'}</span
+          >
+          {t('settings.shortcuts.otherGroup')}
+        </button>
+        {#each shownOtherGroups(shortcutGroups.otherGroups, otherExpanded) as group (group.heading)}
+          <h2 class="group-title">{group.section}</h2>
+          {#each group.rows as row (row.id)}
+            <div class="shortcut-row">
+              <span class="shortcut-name">{row.label}</span>
+              <span class="shortcut-keys">{keysText(row)}</span>
+            </div>
+          {/each}
+        {/each}
+      </section>
+    {:else if section === 'editor' && shownTab === 'general'}
       <label class="toggle">
         <input
           type="checkbox"
@@ -935,46 +1117,78 @@
         <span>{t('settings.editor.lineNumbers')}</span>
       </label>
 
-      <div class="field">
-        <label class="toggle">
-          <input
-            type="checkbox"
-            checked={settingsState.workerHighlight}
-            onchange={(e) =>
-              settingsState.setWorkerHighlight(e.currentTarget.checked)}
-          />
-          <span>{t('settings.editor.workerHighlight')}</span>
-        </label>
-        <span class="hint">{t('settings.editor.workerHighlightHint')}</span>
-      </div>
+      {#if !__LITE__ && ui.workerHighlight}
+        <div class="field">
+          <label class="toggle">
+            <input
+              type="checkbox"
+              checked={settingsState.workerHighlight}
+              onchange={(e) =>
+                settingsState.setWorkerHighlight(e.currentTarget.checked)}
+            />
+            <span>{t('settings.editor.workerHighlight')}</span>
+          </label>
+          <span class="hint">{t('settings.editor.workerHighlightHint')}</span>
+        </div>
+      {/if}
 
       <div class="field">
         <span class="field-label">{t('settings.editor.font')}</span>
         <select
           class="select"
+          bind:this={mainFontSelect}
           value={fontSelectValue}
           onchange={(e) => onFontSelect(e.currentTarget.value)}
         >
-          {#each fontFamilies as f (f.value)}
-            <option value={f.value}
-              >{f.labelKey ? t(f.labelKey) : f.value}</option
-            >
+          <option value="">{t('settings.editor.fontDefault')}</option>
+          {#each fontFamilies as family (family)}
+            <option value={family}>{family}</option>
           {/each}
-          <option value={CUSTOM_FONT}>{t('settings.editor.fontCustom')}</option>
+          <option value={PICK_FONT}>{t('settings.editor.fontCustom')}</option>
         </select>
-        {#if showFontInput}
-          <input
-            class="text-input"
-            type="text"
-            placeholder={t('settings.editor.fontNamePlaceholder')}
-            value={settingsState.editorFontFamily}
+        {#if pickingFont}
+          <select
+            class="select"
+            bind:this={pickFontSelect}
+            value=""
+            onchange={(e) => onPickFont(e.currentTarget.value)}
             onkeydown={(e) => {
-              if (e.key === 'Enter') {
-                e.currentTarget.blur();
+              if (e.key === 'Escape') {
+                pickingFont = false;
               }
             }}
-            onblur={(e) => commitFontFamily(e.currentTarget.value)}
-          />
+            onblur={(e) => {
+              const select = e.currentTarget;
+              // Opening the native popup or switching apps also blurs the select
+              // while the window itself loses focus, and WebKit may not have
+              // updated document.hasFocus() yet. Decide one task later: close
+              // only when the window kept focus, the select is no longer the
+              // active element and no family was chosen (onchange handles that).
+              setTimeout(() => {
+                if (
+                  document.hasFocus() &&
+                  document.activeElement !== select &&
+                  select.value === ''
+                ) {
+                  pickingFont = false;
+                }
+              }, 0);
+            }}
+            use:autofocus
+          >
+            {#if hostFonts !== null && pickableFonts.length === 0}
+              <option value="" disabled
+                >{t('settings.editor.fontNoneFound')}</option
+              >
+            {:else}
+              <option value=""
+                >{t('settings.editor.fontPickPlaceholder')}</option
+              >
+              {#each pickableFonts as family (family)}
+                <option value={family}>{family}</option>
+              {/each}
+            {/if}
+          </select>
         {/if}
       </div>
 
@@ -1074,33 +1288,38 @@
         <span class="hint">{t('settings.general.snapshotCloudHint')}</span>
       </div>
 
-      <div class="field">
-        <span class="field-label">{t('settings.general.largeOpenMode')}</span>
-        <select
-          class="select"
-          value={settingsState.largeOpenMode}
-          onchange={(e) =>
-            settingsState.setLargeOpenMode(
-              e.currentTarget.value as LargeOpenMode,
-            )}
-        >
-          <option value="ask">{t('settings.general.largeOpenModeAsk')}</option>
-          <option value="view">{t('settings.general.largeOpenModeView')}</option
+      {#if !__LITE__ && ui.largeFileSettings}
+        <div class="field">
+          <span class="field-label">{t('settings.general.largeOpenMode')}</span>
+          <select
+            class="select"
+            value={settingsState.largeOpenMode}
+            onchange={(e) =>
+              settingsState.setLargeOpenMode(
+                e.currentTarget.value as LargeOpenMode,
+              )}
           >
-          <option value="edit">{t('settings.general.largeOpenModeEdit')}</option
-          >
-        </select>
-      </div>
+            <option value="ask">{t('settings.general.largeOpenModeAsk')}</option
+            >
+            <option value="view"
+              >{t('settings.general.largeOpenModeView')}</option
+            >
+            <option value="edit"
+              >{t('settings.general.largeOpenModeEdit')}</option
+            >
+          </select>
+        </div>
 
-      <label class="toggle">
-        <input
-          type="checkbox"
-          checked={settingsState.askLongLineOpen}
-          onchange={(e) =>
-            settingsState.setAskLongLineOpen(e.currentTarget.checked)}
-        />
-        <span>{t('settings.general.askLongLineOpen')}</span>
-      </label>
+        <label class="toggle">
+          <input
+            type="checkbox"
+            checked={settingsState.askLongLineOpen}
+            onchange={(e) =>
+              settingsState.setAskLongLineOpen(e.currentTarget.checked)}
+          />
+          <span>{t('settings.general.askLongLineOpen')}</span>
+        </label>
+      {/if}
 
       <label class="toggle">
         <input
@@ -1149,15 +1368,17 @@
         <span>{t('settings.general.showTrayIcon')}</span>
       </label>
 
-      <label class="toggle">
-        <input
-          type="checkbox"
-          checked={settingsState.openWorkspaceOnStartup}
-          onchange={(e) =>
-            settingsState.setOpenWorkspaceOnStartup(e.currentTarget.checked)}
-        />
-        <span>{t('settings.general.openWorkspaceOnStartup')}</span>
-      </label>
+      {#if !__LITE__ && ui.openWorkspaceOnStartup}
+        <label class="toggle">
+          <input
+            type="checkbox"
+            checked={settingsState.openWorkspaceOnStartup}
+            onchange={(e) =>
+              settingsState.setOpenWorkspaceOnStartup(e.currentTarget.checked)}
+          />
+          <span>{t('settings.general.openWorkspaceOnStartup')}</span>
+        </label>
+      {/if}
     {:else if section === 'language'}
       <div class="lang-layout">
         <div class="lang-side">
@@ -1208,18 +1429,24 @@
               {/each}
             {/if}
           </div>
-          <div class="theme-actions">
-            <button class="btn" onclick={() => void importLocale()}>
-              {t('settings.language.import')}
-            </button>
-            <button
-              class="btn"
-              disabled={!canDeleteSelected}
-              onclick={() => void deleteLocale()}
-            >
-              {t('settings.language.delete')}
-            </button>
-          </div>
+          {#if !__LITE__ && (ui.localeImport || ui.localeDelete)}
+            <div class="theme-actions">
+              {#if ui.localeImport}
+                <button class="btn" onclick={() => void importLocale()}>
+                  {t('settings.language.import')}
+                </button>
+              {/if}
+              {#if ui.localeDelete}
+                <button
+                  class="btn"
+                  disabled={!canDeleteSelected}
+                  onclick={() => void deleteLocale()}
+                >
+                  {t('settings.language.delete')}
+                </button>
+              {/if}
+            </div>
+          {/if}
           {#if importError !== ''}
             <span class="error">{importError}</span>
           {/if}
@@ -1230,6 +1457,7 @@
             items={localeRegistry.skipped}
             kind="locales"
             actions={true}
+            deletable={!__LITE__ && ui.localeDelete}
             onchanged={() => void localeRegistry.load()}
           />
         </div>
@@ -1454,6 +1682,65 @@
   }
   .size-value {
     font-variant-numeric: tabular-nums;
+  }
+  .shortcut-actions {
+    display: flex;
+    gap: 0.5rem;
+  }
+  .shortcut-group {
+    display: flex;
+    flex-direction: column;
+    gap: 0.35rem;
+  }
+  .group-title {
+    margin: 0.4rem 0 0.1rem;
+    font-size: 0.78rem;
+    font-weight: 600;
+    opacity: 0.6;
+  }
+  .shortcut-row {
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+  }
+  .shortcut-name {
+    flex: 1 1 auto;
+    min-width: 0;
+  }
+  .shortcut-row .recorder {
+    flex: 0 0 auto;
+    min-width: 9rem;
+    padding: 0.3rem 0.5rem;
+  }
+  .shortcut-keys {
+    font-family: ui-monospace, monospace;
+    opacity: 0.7;
+    white-space: nowrap;
+  }
+  .badge {
+    padding: 0.05rem 0.45rem;
+    border: 1px solid var(--topbar-border);
+    border-radius: 999px;
+    font-size: 0.72rem;
+    opacity: 0.6;
+    white-space: nowrap;
+  }
+  .group-toggle {
+    align-self: flex-start;
+    display: inline-flex;
+    align-items: center;
+    gap: 0.35rem;
+    padding: 0.2rem 0;
+    border: none;
+    background: none;
+    color: inherit;
+    font: inherit;
+    font-weight: 600;
+    cursor: default;
+  }
+  .chevron {
+    display: inline-block;
+    width: 0.8rem;
   }
   .btn {
     padding: 0.35rem 0.8rem;

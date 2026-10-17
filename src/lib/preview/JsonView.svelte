@@ -21,9 +21,22 @@
   // character document in WebKit, which is well inside a frame budget that the
   // markdown path (358ms) will not be.
   const result = $derived(parseJsonForPreview(doc.toString()));
+
+  let rootEl: HTMLDivElement;
+  /** Takes keyboard focus, so typing and editing commands stop reaching the
+   *  source editor underneath. */
+  export function focus(): void {
+    rootEl.focus({ preventScroll: true });
+  }
+  /** Select the rendered content and nothing outside the view. The JSON view
+   *  renders the whole tree, so a DOM range covers all of it. */
+  export function selectAll(): void {
+    focus();
+    document.getSelection()?.selectAllChildren(rootEl);
+  }
 </script>
 
-<div class="json-view" class:dark>
+<div class="json-view" class:dark tabindex="-1" bind:this={rootEl}>
   {#if result.ok}
     <JsonRow node={result.root} depth={0} startOpen={true} />
   {:else}
@@ -51,6 +64,9 @@
     color: var(--fg);
     font-family: var(--editor-font, monospace);
     font-size: 0.85rem;
+  }
+  .json-view:focus {
+    outline: none;
   }
   .error {
     margin: 0;
