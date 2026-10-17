@@ -6,6 +6,7 @@ import {
   keptTabsToLoad,
   partitionRestorable,
   requiresFullEdition,
+  windowBoundsRecord,
 } from './keptTabs';
 import type { NoteSnapshot } from '../state/stickyNote.svelte';
 
@@ -39,6 +40,8 @@ function note(over: Partial<NoteSnapshot>): NoteSnapshot {
     range_fp_size: null,
     range_fp_mtime: null,
     range_start_line: null,
+    range_end_line: null,
+    range_trailing_break: null,
     windowed_index: null,
     windowed_fp_size: null,
     windowed_fp_mtime: null,
@@ -122,5 +125,33 @@ describe('keptTabsToLoad', () => {
   it('treats a group-less record as the group of its own id', () => {
     expect(keptTabsToLoad([solo], 'solo', new Set())).toEqual([solo]);
     expect(keptTabsToLoad([solo], 'g', new Set())).toEqual([]);
+  });
+});
+
+describe('windowBoundsRecord', () => {
+  const keptFirst = note({
+    id: 'k',
+    tab_index: 0,
+    x: 10,
+    range_source: '/big.log',
+  });
+  const shownLater = note({ id: 's', tab_index: 1, x: 900 });
+  const shownLatest = note({ id: 's2', tab_index: 4, x: 700 });
+
+  it('is the lowest shown tab in lite, skipping a kept one before it', () => {
+    expect(windowBoundsRecord([keptFirst, shownLater, shownLatest], true)).toBe(
+      shownLater,
+    );
+  });
+
+  it('is the lowest tab overall in full', () => {
+    expect(
+      windowBoundsRecord([keptFirst, shownLater, shownLatest], false),
+    ).toBe(keptFirst);
+  });
+
+  it('falls back to the lowest kept tab when every tab is kept', () => {
+    const second = note({ id: 'k2', tab_index: 2, large: 1 });
+    expect(windowBoundsRecord([keptFirst, second], true)).toBe(keptFirst);
   });
 });

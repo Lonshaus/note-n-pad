@@ -50,3 +50,13 @@ export function keptTabsToLoad(
     )
     .sort((a, b) => a.tab_index - b.tab_index);
 }
+/** The stored tab a window takes its position and size from: the lowest-index
+ *  one that is shown. A kept tab in lite is never written, so its bounds go
+ *  stale; only a group of kept tabs alone falls back to the lowest overall.
+ *  `entries` is ordered by stored index and not empty. */
+export function windowBoundsRecord(
+  entries: NoteSnapshot[],
+  lite: boolean,
+): NoteSnapshot {
+  return partitionRestorable(entries, lite).restorable[0] ?? entries[0]!;
+}

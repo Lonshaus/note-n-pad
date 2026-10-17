@@ -230,10 +230,11 @@ fn nearest_checkpoint(checkpoints: &[(u64, u64)], line: u64) -> (u64, u64) {
   let idx = checkpoints.partition_point(|&(l, _)| l <= line);
   checkpoints[idx - 1]
 }
-
+/// Error text of `offset_of_line` for a line past the file's last line.
+const LINE_OUT_OF_RANGE: &str = "line out of range";
 /// Byte offset of `target` line's start, scanning forward from a checkpoint that
-/// begins at `start_line` / `start_offset`. Errors when `target` lies past the
-/// file's last line.
+/// begins at `start_line` / `start_offset`. Errors with `LINE_OUT_OF_RANGE` when
+/// `target` lies past the file's last line.
 fn offset_of_line<R: Read>(
   mut reader: R,
   start_offset: u64,
@@ -252,7 +253,7 @@ fn offset_of_line<R: Read>(
   loop {
     let n = reader.read(&mut buf).map_err(|e| e.to_string())?;
     if n == 0 {
-      return Err("line out of range".to_string());
+      return Err(LINE_OUT_OF_RANGE.to_string());
     }
     for &b in &buf[..n] {
       pos += 1;
@@ -264,6 +265,23 @@ fn offset_of_line<R: Read>(
         }
       }
     }
+  }
+}
+/// Open `path` and scan forward from `checkpoint` (line index, byte offset) to
+/// the start of `line`. `Ok(None)` when `line` is past the last line.
+fn line_offset_in_file(
+  path: &Path,
+  checkpoint: (u64, u64),
+  line: u64,
+) -> Result<Option<u64>, String> {
+  let mut file = File::open(path).map_err(|e| e.to_string())?;
+  file
+    .seek(SeekFrom::Start(checkpoint.1))
+    .map_err(|e| e.to_string())?;
+  match offset_of_line(BufReader::new(file), checkpoint.1, checkpoint.0, line) {
+    Ok(offset) => Ok(Some(offset)),
+    Err(e) if e == LINE_OUT_OF_RANGE => Ok(None),
+    Err(e) => Err(e),
   }
 }
 
@@ -495,9 +513,13 @@ pub fn start_line_index(
 }
 
 /// Byte offset where `line` begins, using the index's nearest checkpoint and
-/// scanning forward from there.
+/// scanning forward from there. `None` when `line` is past the last line.
 #[tauri::command]
-pub fn line_to_offset(state: State<LargeFileState>, id: String, line: u64) -> Result<u64, String> {
+pub fn line_to_offset(
+  state: State<LargeFileState>,
+  id: String,
+  line: u64,
+) -> Result<Option<u64>, String> {
   let (path, checkpoint) = {
     let map = state.indexes.lock().unwrap();
     let index = map.get(&id).ok_or_else(|| "unknown index id".to_string())?;
@@ -506,11 +528,7 @@ pub fn line_to_offset(state: State<LargeFileState>, id: String, line: u64) -> Re
       nearest_checkpoint(&index.checkpoints, line),
     )
   };
-  let mut file = File::open(&path).map_err(|e| e.to_string())?;
-  file
-    .seek(SeekFrom::Start(checkpoint.1))
-    .map_err(|e| e.to_string())?;
-  offset_of_line(BufReader::new(file), checkpoint.1, checkpoint.0, line)
+  line_offset_in_file(&path, checkpoint, line)
 }
 /// Where the index's scan stands: still running, done with the total line count,
 /// or failed. Errors with "unknown index id" once the index has been dropped.
@@ -725,6 +743,44 @@ mod tests {
     let mut r = Cursor::new(content);
     r.seek(SeekFrom::Start(c.1)).unwrap();
     assert!(offset_of_line(r, c.1, c.0, 5).is_err());
+  }
+
+  #[test]
+  fn line_offset_in_file_maps_past_end_to_none() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("short.txt");
+    for content in ["a\nb\nc", "a\nb\nc\n"] {
+      std::fs::write(&path, content).unwrap();
+      let (cp, _) = build_index(Cursor::new(content), 100, |_, _| {}).unwrap();
+      for target in [400u64, 800] {
+        let c = nearest_checkpoint(&cp, target);
+        assert_eq!(line_offset_in_file(&path, c, target), Ok(None));
+      }
+      let c = nearest_checkpoint(&cp, 2);
+      assert_eq!(line_offset_in_file(&path, c, 2), Ok(Some(4)));
+    }
+  }
+
+  #[test]
+  fn line_offset_in_file_maps_a_single_long_line_past_end_to_none() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("one-line.txt");
+    let content = "x".repeat(1000);
+    std::fs::write(&path, &content).unwrap();
+    let (cp, _) = build_index(Cursor::new(content), 100, |_, _| {}).unwrap();
+    let c = nearest_checkpoint(&cp, 400);
+    assert_eq!(line_offset_in_file(&path, c, 400), Ok(None));
+  }
+
+  #[test]
+  fn line_offset_in_file_keeps_real_failures_as_errors() {
+    let dir = tempdir().unwrap();
+    let missing = dir.path().join("gone.txt");
+    assert!(line_offset_in_file(&missing, (0, 0), 3).is_err());
+    let path = dir.path().join("f.txt");
+    std::fs::write(&path, "a\nb\n").unwrap();
+    // A target before the checkpoint is a caller bug, not a past-end answer.
+    assert!(line_offset_in_file(&path, (5, 0), 3).is_err());
   }
 
   #[test]

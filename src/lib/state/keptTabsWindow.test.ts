@@ -56,6 +56,8 @@ function note(over: Partial<NoteSnapshot>): NoteSnapshot {
     range_fp_size: null,
     range_fp_mtime: null,
     range_start_line: null,
+    range_end_line: null,
+    range_trailing_break: null,
     windowed_index: null,
     windowed_fp_size: null,
     windowed_fp_mtime: null,
@@ -91,6 +93,8 @@ const stored = [
     range_fp_size: SIZE,
     range_fp_mtime: 1,
     range_start_line: 1,
+    range_end_line: null,
+    range_trailing_break: null,
   }),
 ];
 const KEPT_IDS = ['large', 'windowed', 'range'];
@@ -340,6 +344,97 @@ describe('the edition turning full', () => {
   });
 });
 
+describe('a lite window taking its bounds', () => {
+  const bounds = (): { x: number | null } =>
+    (documentWindow as unknown as { bounds: { x: number | null } }).bounds;
+
+  it('from the lowest shown tab, not a kept record before it', async () => {
+    editionState.lite = true;
+    backend({
+      list_notes: [
+        note({ id: 'kept', tab_index: 0, x: 10, large: SIZE }),
+        note({ id: 'shown', tab_index: 1, x: 900 }),
+      ],
+    });
+    await documentWindow.init('g', null, null);
+    expect(bounds().x).toBe(900);
+  });
+
+  it('from the lowest record when every tab is kept', async () => {
+    editionState.lite = true;
+    backend({
+      list_notes: [
+        note({ id: 'kept2', tab_index: 3, x: 500, large: SIZE }),
+        note({ id: 'kept', tab_index: 0, x: 10, large: SIZE }),
+      ],
+    });
+    await documentWindow.init('g', null, null);
+    expect(bounds().x).toBe(10);
+  });
+
+  it('from the lowest record in full', async () => {
+    editionState.lite = false;
+    backend({
+      list_notes: [
+        note({ id: 'kept', tab_index: 0, x: 10, large: SIZE }),
+        note({ id: 'shown', tab_index: 1, x: 900 }),
+      ],
+    });
+    await documentWindow.init('g', null, null);
+    expect(bounds().x).toBe(10);
+  });
+});
+// A group is held back for the trial from one place only: dismissing the
+// kept-tabs notice of a window that has nothing else to show.
+describe('holding a group back for the trial', () => {
+  const heldBack = (): unknown[][] =>
+    mockInvoke.mock.calls.filter(([cmd]) => cmd === 'hold_back_group');
+
+  it('invokes hold_back_group before resolving true when only kept tabs were there', async () => {
+    editionState.lite = true;
+    backend({
+      list_notes: stored.filter((n) => KEPT_IDS.includes(n.id)),
+    });
+    await documentWindow.init('g', null, null);
+    expect(documentWindow.keptTabs).toBe(3);
+
+    expect(await documentWindow.dismissKeptTabsAndHoldBack()).toBe(true);
+    expect(heldBack()).toEqual([['hold_back_group', { group: 'g' }]]);
+    expect(documentWindow.keptTabs).toBe(0);
+  });
+
+  it('does not invoke it and resolves false when tabs remain', async () => {
+    editionState.lite = true;
+    backend();
+    await documentWindow.init('g', null, null);
+
+    expect(await documentWindow.dismissKeptTabsAndHoldBack()).toBe(false);
+    expect(heldBack()).toEqual([]);
+    expect(documentWindow.keptTabs).toBe(0);
+  });
+
+  it('is never invoked by closing the last tab or the window', async () => {
+    editionState.lite = false;
+    backend({ list_notes: [stored[0]] });
+    await documentWindow.init('g', null, null);
+    expect(documentWindow.tabs).toHaveLength(1);
+
+    await documentWindow.deleteTab(0);
+    expect(documentWindow.tabs).toHaveLength(0);
+    await documentWindow.dropClosedTabs('doc-g');
+    expect(heldBack()).toEqual([]);
+  });
+
+  it('is never invoked by closing a window in the trial either', async () => {
+    editionState.lite = true;
+    backend();
+    await documentWindow.init('g', null, null);
+    await documentWindow.deleteTab(0);
+    await documentWindow.dropClosedTabs('doc-g');
+    expect(heldBack()).toEqual([]);
+  });
+});
+
 describe('opening a file over 100 MB', () => {
   async function open(lite: boolean): Promise<void> {
     editionState.lite = lite;
@@ -487,16 +582,26 @@ describe('tabs opened while full, after the edition turns lite', () => {
     );
   });
 
-  it('keep a windowed tab on its session when a fresh one is refused', async () => {
+  it('keep a windowed tab on its session when neither a fresh open nor the baseline reopen works', async () => {
     await openFullThenTurnLite({
       windowed_open: () =>
         Promise.reject(
           'large-file editing is not available in the Lite edition',
         ),
+      windowed_index: {
+        index: { checkpoints: [[0, 0]], total_newlines: 1 },
+        fingerprint: { size: 10, mtime_ms: 1 },
+        digest: '7',
+      },
+      windowed_reopen: () => Promise.reject('reopen failed'),
     });
     const tab = windowedTab();
     documentWindow.tabs.push(tab);
     await documentWindow.discardWindowed(tab);
+    expect(mockInvoke).toHaveBeenCalledWith('windowed_index', { sessionId: 5 });
+    expect(mockInvoke.mock.calls.map(([cmd]) => cmd)).toContain(
+      'windowed_reopen',
+    );
     expect(tab.windowed?.sessionId).toBe(5);
     expect(tab.windowed?.dirty).toBe(true);
     expect(mockInvoke.mock.calls.map(([cmd]) => cmd)).not.toContain(
@@ -630,6 +735,8 @@ describe('a restore that the edition interrupts', () => {
     range_fp_size: SIZE,
     range_fp_mtime: 1,
     range_start_line: 1,
+    range_end_line: null,
+    range_trailing_break: null,
   });
   const refused = (): Promise<never> => {
     editionState.lite = true;
@@ -655,6 +762,22 @@ describe('a restore that the edition interrupts', () => {
     await documentWindow.restoreKeptTabs();
     expect(writesTo(['crange'])).toEqual([]);
     expect(documentWindow.restoreUnreadable).toEqual([]);
+    expect(documentWindow.keptTabs).toBe(1);
+  });
+
+  it('keeps a range record whose read fails for another reason once the edition is lite', async () => {
+    editionState.lite = false;
+    backend({
+      list_notes: [cleanRange],
+      read_range: () => {
+        editionState.lite = true;
+        return Promise.reject('permission-denied');
+      },
+    });
+    await documentWindow.init('g', null, null);
+    expect(writesTo(['crange'])).toEqual([]);
+    expect(documentWindow.restoreUnreadable).toEqual([]);
+    expect(documentWindow.tabs).toEqual([]);
     expect(documentWindow.keptTabs).toBe(1);
   });
 
@@ -758,6 +881,8 @@ describe('a refusal that arrives before the edition-changed event', () => {
     range_fp_size: SIZE,
     range_fp_mtime: 1,
     range_start_line: 1,
+    range_end_line: null,
+    range_trailing_break: null,
   });
 
   it('keeps a range record while isLite() still says full', async () => {

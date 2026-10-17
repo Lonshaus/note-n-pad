@@ -38,6 +38,7 @@ mod mac_single_instance;
 mod navigation;
 mod note_store;
 mod path_guard;
+mod pending_opens;
 #[cfg(not(feature = "lite"))]
 mod piece_table;
 mod platform;
@@ -664,9 +665,6 @@ fn send_to_first_responder(id: &str) {
   let _: bool = unsafe { msg_send![&*ns_app, sendAction: action, to: none, from: none] };
 }
 
-/// Keep the menu's mode-dependent items in sync with the focused window. On
-/// focus-gain the last-focused window wins; on focus-loss or destruction of the
-/// tracked window we fall back to the no-focus (all-disabled) state.
 /// Label of the document window the user was in most recently. Unlike
 /// `MenuItems::focused`, which is cleared the moment focus leaves so the menu
 /// can grey out, this survives focus loss — which is the whole point, since the
@@ -698,7 +696,57 @@ fn last_doc_window(app: &tauri::AppHandle) -> Option<tauri::WebviewWindow> {
   let label = LAST_DOC_WINDOW.lock().unwrap().clone()?;
   app.get_webview_window(&label)
 }
-
+/// The menu focus a window event leads to: the tracked label and the kind to
+/// apply. On loss of the tracked window the window that has focus now takes
+/// over, and only when none has focus does the menu fall back to `None`.
+fn focus_after_loss(
+  tracked: Option<&str>,
+  lost: &str,
+  focused_now: &[String],
+) -> (Option<String>, FocusKind) {
+  if tracked != Some(lost) {
+    return (
+      tracked.map(str::to_string),
+      tracked.map_or(FocusKind::None, focus_kind),
+    );
+  }
+  match focused_now.iter().find(|label| label.as_str() != lost) {
+    Some(label) => (Some(label.clone()), focus_kind(label)),
+    None => (None, FocusKind::None),
+  }
+}
+/// One focus event for the menu. `None` means nothing changes: a loss of a
+/// window that is not the tracked one must not clobber the window that gained
+/// focus.
+fn menu_focus_step(
+  tracked: Option<&str>,
+  label: &str,
+  gained: bool,
+  focused_now: &[String],
+) -> Option<(Option<String>, FocusKind)> {
+  if gained {
+    Some((Some(label.to_string()), focus_kind(label)))
+  } else if tracked == Some(label) {
+    Some(focus_after_loss(tracked, label, focused_now))
+  } else {
+    None
+  }
+}
+/// Labels of the webview windows that report focus, other than `except`, in a
+/// stable order.
+fn focused_labels(app: &tauri::AppHandle, except: &str) -> Vec<String> {
+  let mut labels: Vec<String> = app
+    .webview_windows()
+    .into_iter()
+    .filter(|(label, window)| label != except && window.is_focused().unwrap_or(false))
+    .map(|(label, _)| label)
+    .collect();
+  labels.sort();
+  labels
+}
+/// Keep the menu's mode-dependent items in sync with the focused window. On
+/// focus-gain the last-focused window wins; on loss or destruction of the
+/// tracked window the window that has focus now takes over.
 fn sync_menu_focus(window: &tauri::Window, event: &tauri::WindowEvent) {
   let (label, gained) = match event {
     tauri::WindowEvent::Focused(true) => (window.label().to_string(), true),
@@ -711,19 +759,34 @@ fn sync_menu_focus(window: &tauri::Window, event: &tauri::WindowEvent) {
   let Some(items) = app.try_state::<MenuItems>() else {
     return;
   };
+  // Queried before the lock is taken: asking a window for its state must not
+  // happen while other threads wait on the tracked label.
+  let focused_now = if gained {
+    Vec::new()
+  } else {
+    focused_labels(app, &label)
+  };
   let mut focused = items.focused.lock().unwrap();
-  if gained {
-    *focused = Some(label.clone());
-    drop(focused);
-    items.apply(app, focus_kind(&label), Some(&label));
-  } else if focused.as_deref() == Some(label.as_str()) {
-    // Only the currently tracked window losing focus resets the menu, so a
-    // stale focus-loss from a previously focused window can't clobber the
-    // window that just gained focus.
-    *focused = None;
-    drop(focused);
-    items.apply(app, FocusKind::None, None);
-  }
+  let Some((next, kind)) = menu_focus_step(focused.as_deref(), &label, gained, &focused_now) else {
+    return;
+  };
+  *focused = next.clone();
+  drop(focused);
+  items.apply(app, kind, next.as_deref());
+}
+/// Re-read which window has focus and apply its menu state. Run after a window
+/// is given focus programmatically, where the focus events alone can leave the
+/// menu on the state of a window that lost focus during startup. Does nothing
+/// while no window reports focus; the focus event that follows settles it.
+pub(crate) fn resync_menu_focus(app: &tauri::AppHandle) {
+  let Some(items) = app.try_state::<MenuItems>() else {
+    return;
+  };
+  let Some(label) = focused_labels(app, "").into_iter().next() else {
+    return;
+  };
+  *items.focused.lock().unwrap() = Some(label.clone());
+  items.apply(app, focus_kind(&label), Some(&label));
 }
 
 /// What the same-event-loop-pass batch-close rule decides, given every
@@ -904,6 +967,7 @@ fn handle_window_event(window: &tauri::Window, event: &tauri::WindowEvent) {
     if let Some(items) = window.app_handle().try_state::<MenuItems>() {
       items.on_top.lock().unwrap().remove(window.label());
     }
+    release_pending_opens(window.app_handle(), window.label());
     // A destroyed window has nothing left to flush; ack it on its behalf so
     // a quit whose wait list still names it (it was already let through and
     // is mid-destroy when the quit starts) doesn't stall out the full
@@ -2202,6 +2266,7 @@ mod rebuild_app_menu_guard_tests {
 static TRAY_MENU_LABELS: std::sync::OnceLock<std::sync::Mutex<Vec<String>>> =
   std::sync::OnceLock::new();
 
+#[cfg_attr(not(debug_assertions), allow(dead_code))]
 pub(crate) fn tray_menu_labels() -> Vec<String> {
   TRAY_MENU_LABELS
     .get_or_init(Default::default)
@@ -2417,20 +2482,39 @@ where
   for path in paths {
     if as_tabs {
       if let Some(window) = last_doc_window(app) {
-        if window
-          .emit_to(window.label(), "open-file-here", &path)
-          .is_ok()
-        {
-          windows::reveal(&window);
+        if pending_opens::open_in_window(&window, &path) {
           launch_windows::record_routed_if_starting(window.label());
           continue;
         }
       }
     }
-    match windows::open_document_labeled(app, &path, None) {
-      Ok(label) => launch_windows::record_if_starting(&label),
-      Err(err) => log::warn!("could not open {path} handed over by the shell: {err}"),
+    open_in_new_window(app, &path);
+  }
+}
+/// A document window went away: files queued for it and never delivered open in
+/// windows of their own, so a launch's file is not lost with it.
+fn release_pending_opens(app: &tauri::AppHandle, label: &str) {
+  let Some(pending) = app.try_state::<pending_opens::PendingOpens>() else {
+    return;
+  };
+  let paths = pending.forget(label);
+  if paths.is_empty() {
+    return;
+  }
+  // Off the event loop: building a window from a window-event handler can
+  // deadlock on Windows.
+  let app = app.clone();
+  std::thread::spawn(move || {
+    for path in paths {
+      open_in_new_window(&app, &path);
     }
+  });
+}
+/// Open `path` in a document window of its own.
+fn open_in_new_window(app: &tauri::AppHandle, path: &str) {
+  match windows::open_document_labeled(app, path, None) {
+    Ok(label) => launch_windows::record_if_starting(&label),
+    Err(err) => log::warn!("could not open {path} handed over by the shell: {err}"),
   }
 }
 
@@ -2632,6 +2716,7 @@ pub fn run() {
       // held here until the report window asks for it.
       let had_snapshot_skips = !snapshot_skips.is_empty();
       app.manage(note_store::StartupSkips::holding(snapshot_skips));
+      app.manage(note_store::HeldBackGroups::default());
       // Grants must be live before any window reads a restored path.
       match handle.path().app_data_dir() {
         Ok(app_data) => {
@@ -2659,6 +2744,7 @@ pub fn run() {
         app.manage(windowed::WindowedState::default());
       }
       app.manage(windows::OpenDocTabs::default());
+      app.manage(pending_opens::PendingOpens::default());
       app.manage(MenuLists::default());
       app.manage(preview_img::PreviewBases::default());
       let store = app.state::<NoteStore>();
@@ -2682,11 +2768,21 @@ pub fn run() {
           }
         }
       }
-      for plan in note_store::plan_document_windows(&notes) {
+      let mut restored_docs: Vec<String> = Vec::new();
+      for plan in note_store::plan_document_windows(&notes, edition::is_lite()) {
         match windows::create_document_window(handle, &plan, None) {
-          Ok(()) => opened += 1,
+          Ok(()) => {
+            opened += 1;
+            restored_docs.push(format!("doc-{}", plan.group));
+          }
           Err(e) => log::warn!("failed to restore document window {}: {e}", plan.group),
         }
+      }
+      // A file passed at launch joins a restored window as a tab when the open
+      // target is "tab", and no window has been focused yet to name one.
+      {
+        let mut last = LAST_DOC_WINDOW.lock().unwrap();
+        *last = pending_opens::choose_tab_target(last.as_deref(), &restored_docs);
       }
       // A fresh install has nothing to restore, and so does a store whose every
       // window failed above. Either way the app must not sit there windowless.
@@ -2781,6 +2877,7 @@ pub fn run() {
       encoding::write_file_encoded,
       note_store::list_notes,
       note_store::take_startup_skips,
+      note_store::hold_back_group,
       windows::show_load_problems_window,
       data_files::delete_data_file,
       data_files::reveal_data_file,
@@ -2826,6 +2923,7 @@ pub fn run() {
       add_recent_file,
       windows::set_window_opacity,
       windows::reveal_self,
+      pending_opens::doc_window_ready,
       #[cfg(not(feature = "lite"))]
       windows::show_workspace_window,
       windows::show_settings_window,
@@ -2925,6 +3023,7 @@ pub fn run() {
       default_apps::default_apps_page_supported,
       default_apps::open_default_apps_page,
       fonts::installed_font_families,
+      fonts::list_font_families,
       linux_clipboard::read_clipboard_text,
       preview_img::set_preview_base,
       navigation::open_external_link,
@@ -3449,5 +3548,104 @@ mod windows_crt_config_tests {
          redistributable"
       );
     }
+  }
+}
+#[cfg(test)]
+mod menu_focus_tests {
+  use super::{focus_after_loss, menu_focus_step, FocusKind};
+
+  fn labels(items: &[&str]) -> Vec<String> {
+    items.iter().map(|s| s.to_string()).collect()
+  }
+
+  #[test]
+  fn a_lost_document_window_hands_over_to_the_focused_sibling() {
+    assert_eq!(
+      focus_after_loss(Some("doc-a"), "doc-a", &labels(&["doc-b"])),
+      (Some("doc-b".to_string()), FocusKind::Doc)
+    );
+  }
+
+  #[test]
+  fn a_lost_window_with_nothing_focused_clears_the_menu() {
+    assert_eq!(
+      focus_after_loss(Some("doc-a"), "doc-a", &[]),
+      (None, FocusKind::None)
+    );
+  }
+
+  #[test]
+  fn the_lost_window_never_takes_over_from_itself() {
+    assert_eq!(
+      focus_after_loss(Some("doc-a"), "doc-a", &labels(&["doc-a"])),
+      (None, FocusKind::None)
+    );
+  }
+
+  #[test]
+  fn the_loss_of_an_untracked_window_changes_nothing() {
+    assert_eq!(
+      focus_after_loss(Some("doc-b"), "doc-a", &labels(&["workspace"])),
+      (Some("doc-b".to_string()), FocusKind::Doc)
+    );
+    assert_eq!(
+      focus_after_loss(None, "doc-a", &[]),
+      (None, FocusKind::None)
+    );
+  }
+
+  #[test]
+  fn a_destroyed_tracked_window_hands_over_to_the_workspace() {
+    assert_eq!(
+      focus_after_loss(Some("doc-a"), "doc-a", &labels(&["workspace"])),
+      (Some("workspace".to_string()), FocusKind::Workspace)
+    );
+  }
+  /// Feed `events` (label, gained) through the step function. `focused` is the
+  /// labels the windows report as focused when each loss is handled.
+  fn replay(events: &[(&str, bool)], focused: &[&str]) -> (Option<String>, FocusKind) {
+    let focused_now = labels(focused);
+    let mut tracked: Option<String> = None;
+    let mut kind = FocusKind::None;
+    for (label, gained) in events {
+      if let Some((next, next_kind)) =
+        menu_focus_step(tracked.as_deref(), label, *gained, &focused_now)
+      {
+        tracked = next;
+        kind = next_kind;
+      }
+    }
+    (tracked, kind)
+  }
+
+  #[test]
+  fn a_spurious_focus_pair_on_a_hidden_window_leaves_the_focused_window_menu() {
+    // B gains focus, hidden A gains and loses it again while B stays focused.
+    assert_eq!(
+      replay(
+        &[("doc-b", true), ("doc-a", true), ("doc-a", false)],
+        &["doc-b"]
+      ),
+      (Some("doc-b".to_string()), FocusKind::Doc)
+    );
+  }
+
+  #[test]
+  fn a_loss_with_no_window_focused_ends_on_the_none_state() {
+    assert_eq!(
+      replay(&[("doc-a", true), ("doc-a", false)], &[]),
+      (None, FocusKind::None)
+    );
+  }
+
+  #[test]
+  fn a_stale_loss_does_not_clobber_the_window_that_gained_focus() {
+    assert_eq!(
+      replay(
+        &[("doc-a", true), ("workspace", true), ("doc-a", false)],
+        &["workspace"]
+      ),
+      (Some("workspace".to_string()), FocusKind::Workspace)
+    );
   }
 }

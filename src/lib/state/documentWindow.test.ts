@@ -97,6 +97,8 @@ function baseNote(overrides: Partial<NoteSnapshot>): NoteSnapshot {
     range_fp_size: null,
     range_fp_mtime: null,
     range_start_line: null,
+    range_end_line: null,
+    range_trailing_break: null,
     windowed_index: null,
     windowed_fp_size: null,
     windowed_fp_mtime: null,
@@ -201,6 +203,7 @@ describe('rangeDisplayName (derived, not frozen at extraction)', () => {
         endByte: 10,
         fingerprint: null,
         startLine: null,
+        trailingBreak: false,
       },
     });
     expect(rangeDisplayName(tab)).toBe(null);
@@ -215,6 +218,7 @@ describe('rangeDisplayName (derived, not frozen at extraction)', () => {
         endByte: 10,
         fingerprint: null,
         startLine: 5,
+        trailingBreak: false,
       },
     });
     // Lines 5,6,7 for a 3-line buffer starting at line 5.
@@ -232,6 +236,7 @@ describe('rangeDisplayName (derived, not frozen at extraction)', () => {
         endByte: 10,
         fingerprint: null,
         startLine: 5,
+        trailingBreak: false,
       },
     });
     expect(rangeDisplayName(tab)).toBe(
@@ -252,6 +257,7 @@ describe('rangeDisplayName (derived, not frozen at extraction)', () => {
         endByte: 10,
         fingerprint: null,
         startLine: 5,
+        trailingBreak: false,
       },
     });
     expect(rangeDisplayName(tab)).toBe(
@@ -268,6 +274,7 @@ describe('rangeDisplayName (derived, not frozen at extraction)', () => {
         endByte: 10,
         fingerprint: null,
         startLine: 5,
+        trailingBreak: false,
       },
     });
     expect(rangeDisplayName(tab)).toBe(
@@ -284,6 +291,7 @@ describe('rangeDisplayName (derived, not frozen at extraction)', () => {
         endByte: 0,
         fingerprint: null,
         startLine: 5,
+        trailingBreak: false,
       },
     });
     expect(rangeDisplayName(tab)).toBe(
@@ -383,6 +391,8 @@ describe('loadTab size gate on the restore fallback path (F2 regression)', () =>
               range_fp_size: null,
               range_fp_mtime: null,
               range_start_line: null,
+              range_end_line: null,
+              range_trailing_break: null,
               windowed_index: null,
               windowed_fp_size: null,
               windowed_fp_mtime: null,
@@ -821,6 +831,7 @@ describe('splice on a read-only-destination refusal', () => {
         endByte: 10,
         fingerprint: null,
         startLine: 1,
+        trailingBreak: false,
       },
     });
     documentWindow.tabs.push(tab);
@@ -946,6 +957,7 @@ describe('splice reports a failure that is not a refusal', () => {
         endByte: 10,
         fingerprint: null,
         startLine: 1,
+        trailingBreak: false,
       },
     });
     documentWindow.tabs.push(tab);

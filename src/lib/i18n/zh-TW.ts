@@ -90,9 +90,10 @@ export const zhTW = {
   'settings.editor.workerHighlightHint':
     '以背景處理超過門檻的檔案，顏色會較晚顯示；結構極複雜的內容仍可能緩慢並占用較多記憶體。',
   'settings.editor.font': '字型',
-  'settings.editor.fontCustom': '自訂…',
+  'settings.editor.fontCustom': '選擇其他字型…',
   'settings.editor.fontDefault': '系統預設',
-  'settings.editor.fontNamePlaceholder': '字型名稱',
+  'settings.editor.fontPickPlaceholder': '選擇字型…',
+  'settings.editor.fontNoneFound': '找不到其他字型',
   'settings.editor.fontSize': '字級',
   'settings.editor.fontSizeDecrease': '縮小',
   'settings.editor.fontSizeIncrease': '放大',
