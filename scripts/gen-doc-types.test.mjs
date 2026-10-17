@@ -146,7 +146,7 @@ describe('the Lite bundle config', () => {
     expect(liteConf.identifier).toBe('net.lonshaus.note-n-pad-lite');
     expect(liteConf.identifier).not.toBe(conf.identifier);
     expect(liteConf.version).toBe(conf.version);
-    expect(liteConf.version).toBe('1.1.0');
+    expect(liteConf.version).toBe('1.1.3');
   });
 
   it('builds the frontend as Lite', () => {
