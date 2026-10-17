@@ -17,12 +17,15 @@
      *  was just placed in the folder by hand, so its location is already
      *  known; a locale or a snapshot sits somewhere never visited. */
     actions: boolean;
+    /** Whether the rows offer delete. Off where the edition has no way to delete
+     *  that kind of file; reveal stays. */
+    deletable?: boolean;
     /** Called with the file name after a successful delete, so the caller can
      *  reload its list or drop that one row. */
     onchanged?: (name: string) => void;
   }
 
-  let { items, kind, actions, onchanged }: Props = $props();
+  let { items, kind, actions, deletable = true, onchanged }: Props = $props();
 
   let failure = $state('');
   let open = $state(false);
@@ -113,12 +116,14 @@
                 <button class="link" onclick={() => void reveal(file.name)}>
                   {t(revealKey(platform))}
                 </button>
-                <button
-                  class="link danger"
-                  onclick={() => void remove(file.name)}
-                >
-                  {t('skipped.delete')}
-                </button>
+                {#if deletable}
+                  <button
+                    class="link danger"
+                    onclick={() => void remove(file.name)}
+                  >
+                    {t('skipped.delete')}
+                  </button>
+                {/if}
               </div>
             {/if}
           </li>

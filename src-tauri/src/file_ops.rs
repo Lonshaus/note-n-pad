@@ -1,12 +1,16 @@
 // Copyright © 2026 Lonshaus
 // SPDX-License-Identifier: GPL-3.0-only
 
+#[cfg(not(feature = "lite"))]
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::Path;
+#[cfg(not(feature = "lite"))]
+use std::path::PathBuf;
 
 /// Validate a user-entered file or folder name. Trims surrounding whitespace and
 /// rejects empty names, the `.`/`..` directory aliases, and any path separator so
 /// the name can only ever create a sibling inside its parent directory.
+#[cfg(not(feature = "lite"))]
 fn validate_name(name: &str) -> Result<&str, String> {
   let trimmed = name.trim();
   if trimmed.is_empty() {
@@ -23,6 +27,7 @@ fn validate_name(name: &str) -> Result<&str, String> {
 
 /// Create an empty file named `name` inside `parent`. Errors on a bad name, a
 /// missing parent directory, or an existing target (collision).
+#[cfg(not(feature = "lite"))]
 fn create_file_at(parent: &Path, name: &str) -> Result<PathBuf, String> {
   let name = validate_name(name)?;
   if !parent.is_dir() {
@@ -41,6 +46,7 @@ fn create_file_at(parent: &Path, name: &str) -> Result<PathBuf, String> {
 
 /// Create a folder named `name` inside `parent`. Same validation and collision
 /// rules as `create_file_at`.
+#[cfg(not(feature = "lite"))]
 fn create_folder_at(parent: &Path, name: &str) -> Result<PathBuf, String> {
   let name = validate_name(name)?;
   if !parent.is_dir() {
@@ -59,6 +65,7 @@ fn create_folder_at(parent: &Path, name: &str) -> Result<PathBuf, String> {
 
 /// Rename `path` to `new_name`, keeping it in the same parent directory. A rename
 /// to the current name is a no-op; any other existing sibling is a collision.
+#[cfg(not(feature = "lite"))]
 fn rename_to(path: &Path, new_name: &str) -> Result<PathBuf, String> {
   let new_name = validate_name(new_name)?;
   let parent = path
@@ -78,6 +85,7 @@ fn rename_to(path: &Path, new_name: &str) -> Result<PathBuf, String> {
 /// Pre-validate a trash request. The actual `trash::delete` is not covered by a
 /// unit test (it would pollute the real system Trash), so this split keeps the
 /// "missing path" guard testable on its own.
+#[cfg(not(feature = "lite"))]
 fn ensure_trashable(path: &Path) -> Result<(), String> {
   if !path.exists() {
     return Err(format!("path does not exist: {}", path.display()));
@@ -85,16 +93,19 @@ fn ensure_trashable(path: &Path) -> Result<(), String> {
   Ok(())
 }
 
+#[cfg(not(feature = "lite"))]
 #[tauri::command]
 pub fn create_file(parent: String, name: String) -> Result<String, String> {
   create_file_at(Path::new(&parent), &name).map(|p| p.to_string_lossy().to_string())
 }
 
+#[cfg(not(feature = "lite"))]
 #[tauri::command]
 pub fn create_folder(parent: String, name: String) -> Result<String, String> {
   create_folder_at(Path::new(&parent), &name).map(|p| p.to_string_lossy().to_string())
 }
 
+#[cfg(not(feature = "lite"))]
 #[tauri::command]
 pub fn rename_path(path: String, new_name: String) -> Result<String, String> {
   rename_to(Path::new(&path), &new_name).map(|p| p.to_string_lossy().to_string())
@@ -104,6 +115,7 @@ pub fn rename_path(path: String, new_name: String) -> Result<String, String> {
 /// item lands where the OS "Put Back" expects it. The actual delete must run on
 /// the main thread: macOS's trashItemAtURL hangs forever when called from a
 /// Tauri command worker thread (found live in E2E).
+#[cfg(not(feature = "lite"))]
 #[tauri::command]
 pub fn trash_path(app: tauri::AppHandle, path: String) -> Result<(), String> {
   ensure_trashable(Path::new(&path))?;
@@ -178,6 +190,52 @@ fn reveal_command(path: &str) -> Result<(&'static str, Vec<String>), String> {
 
 #[cfg(test)]
 mod tests {
+  use super::*;
+  use tempfile::tempdir;
+
+  #[test]
+  fn reveal_refuses_a_path_that_is_gone() {
+    let dir = tempdir().unwrap();
+    let missing = dir.path().join("deleted.txt");
+    assert!(reveal_in_finder(missing.to_string_lossy().to_string()).is_err());
+  }
+
+  #[test]
+  fn reveal_command_is_assembled_per_platform() {
+    let (program, args) = reveal_command("/tmp/dir/note.txt").unwrap();
+    #[cfg(target_os = "macos")]
+    {
+      assert_eq!(program, "open");
+      assert_eq!(
+        args,
+        vec!["-R".to_string(), "/tmp/dir/note.txt".to_string()]
+      );
+    }
+    #[cfg(target_os = "windows")]
+    {
+      assert_eq!(program, "explorer");
+      // Separators normalised: forward slashes make explorer open the home
+      // folder with nothing selected.
+      assert_eq!(args, vec!["/select,\\tmp\\dir\\note.txt".to_string()]);
+    }
+    #[cfg(target_os = "linux")]
+    {
+      // Linux opens the containing directory, not the file itself.
+      assert_eq!(program, "xdg-open");
+      assert_eq!(args, vec!["/tmp/dir".to_string()]);
+    }
+  }
+
+  #[cfg(target_os = "windows")]
+  #[test]
+  fn reveal_keeps_a_native_windows_path_intact() {
+    let (_, args) = reveal_command("C:\\Users\\me\\note.txt").unwrap();
+    assert_eq!(args, vec!["/select,C:\\Users\\me\\note.txt".to_string()]);
+  }
+}
+
+#[cfg(all(test, not(feature = "lite")))]
+mod tree_tests {
   use super::*;
   use tempfile::tempdir;
 
@@ -266,46 +324,6 @@ mod tests {
     let src = create_file_at(dir.path(), "a.txt").unwrap();
     assert!(rename_to(&src, "").is_err());
     assert!(rename_to(&src, "x/y").is_err());
-  }
-
-  #[test]
-  fn reveal_refuses_a_path_that_is_gone() {
-    let dir = tempdir().unwrap();
-    let missing = dir.path().join("deleted.txt");
-    assert!(reveal_in_finder(missing.to_string_lossy().to_string()).is_err());
-  }
-
-  #[test]
-  fn reveal_command_is_assembled_per_platform() {
-    let (program, args) = reveal_command("/tmp/dir/note.txt").unwrap();
-    #[cfg(target_os = "macos")]
-    {
-      assert_eq!(program, "open");
-      assert_eq!(
-        args,
-        vec!["-R".to_string(), "/tmp/dir/note.txt".to_string()]
-      );
-    }
-    #[cfg(target_os = "windows")]
-    {
-      assert_eq!(program, "explorer");
-      // Separators normalised: forward slashes make explorer open the home
-      // folder with nothing selected.
-      assert_eq!(args, vec!["/select,\\tmp\\dir\\note.txt".to_string()]);
-    }
-    #[cfg(target_os = "linux")]
-    {
-      // Linux opens the containing directory, not the file itself.
-      assert_eq!(program, "xdg-open");
-      assert_eq!(args, vec!["/tmp/dir".to_string()]);
-    }
-  }
-
-  #[cfg(target_os = "windows")]
-  #[test]
-  fn reveal_keeps_a_native_windows_path_intact() {
-    let (_, args) = reveal_command("C:\\Users\\me\\note.txt").unwrap();
-    assert_eq!(args, vec!["/select,C:\\Users\\me\\note.txt".to_string()]);
   }
 
   #[test]

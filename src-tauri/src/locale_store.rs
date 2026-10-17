@@ -3,7 +3,7 @@
 
 use crate::fs_ops::{is_ignored_file, write_text_atomic, Loaded, SkipReason, SkippedFile};
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use tauri::{AppHandle, Emitter, Manager};
 
@@ -280,11 +280,234 @@ fn restore_default_from(
   save_locale_to(data_dir, &locale)?;
   Ok(locale)
 }
+/// Manifest of the seed keys already offered to each data locale, so a key the
+/// user later emptied is never added back. Dot-prefixed: `load_dir` skips it.
+const SEEDED_KEYS_FILE: &str = ".seeded-keys.json";
 
-/// Seed the app-data `locales` dir from the bundled resources on first run.
+type SeededKeys = BTreeMap<String, BTreeSet<String>>;
+/// Add seed keys that an existing data file lacks and that no earlier merge
+/// offered. Existing values, label, order, extra keys, missing and unparsable
+/// files are never touched. A manifest entry only grows for a file that parsed
+/// and was either complete or written, so a failed file is retried next run.
+pub fn merge_new_seed_keys(resource_dir: &Path, data_dir: &Path) {
+  let Ok(entries) = std::fs::read_dir(resource_dir) else {
+    return;
+  };
+  let manifest_path = data_dir.join(SEEDED_KEYS_FILE);
+  let stored: SeededKeys = std::fs::read_to_string(&manifest_path)
+    .ok()
+    .and_then(|text| serde_json::from_str(&text).ok())
+    .unwrap_or_default();
+  let mut manifest = stored.clone();
+  for entry in entries.flatten() {
+    let path = entry.path();
+    if path.extension().and_then(|e| e.to_str()) != Some("json") {
+      continue;
+    }
+    let Some(id) = path.file_stem().and_then(|n| n.to_str()) else {
+      continue;
+    };
+    if !valid_id(id) {
+      continue;
+    }
+    let Some(seed) = std::fs::read_to_string(&path)
+      .ok()
+      .and_then(|text| parse_locale(&text).ok())
+    else {
+      continue;
+    };
+    let Some(mut data) = std::fs::read_to_string(locale_file(data_dir, id))
+      .ok()
+      .and_then(|text| parse_locale(&text).ok())
+    else {
+      continue;
+    };
+    let offered = stored.get(id);
+    let mut added = false;
+    for (key, value) in &seed.strings {
+      if !data.strings.contains_key(key) && !offered.is_some_and(|set| set.contains(key)) {
+        data.strings.insert(key.clone(), value.clone());
+        added = true;
+      }
+    }
+    if added {
+      if data.id != id {
+        continue;
+      }
+      if let Err(e) = save_locale_to(data_dir, &data) {
+        log::warn!("failed to merge new keys into locale {id}: {e}");
+        continue;
+      }
+    }
+    manifest
+      .entry(id.to_string())
+      .or_default()
+      .extend(seed.strings.keys().cloned());
+  }
+  if manifest != stored {
+    let result = serde_json::to_string_pretty(&manifest)
+      .map_err(|e| e.to_string())
+      .and_then(|json| write_text_atomic(&manifest_path, &json));
+    if let Err(e) = result {
+      log::warn!("failed to write {SEEDED_KEYS_FILE}: {e}");
+    }
+  }
+}
+/// (locale id, key, old shipped value) for every string reworded to read
+/// correctly for any count. A data-folder value that still equals the old
+/// shipped value is replaced; anything the user edited is never touched.
+const REWORDED: &[(&str, &str, &str)] = &[
+  ("en", "skipped.heading", "{count} files could not be loaded"),
+  ("en", "skipped.snapshotHeading", "{count} sticky or document snapshots could not be loaded"),
+  ("en", "settings.general.snapshotMoveBody", "The current folder has {count} sticky notes and unsaved document content. If you don't move them, they won't show up in Note&Pad anymore — they'll stay in the original folder."),
+  ("en", "settings.general.snapshotCollisionTitle", "The chosen folder already has {count} matching snapshots"),
+  ("en", "large.range.info", "Lines {start}–{end} ({count} lines, ~{size})"),
+  ("en", "large.search.results", "{count} results"),
+  ("en", "status.indexing", "Indexing… {count} lines"),
+  ("en", "status.lines", "{count} lines"),
+  ("en", "doc.restoreUnreadable", "Couldn’t read {names}. Open them again to continue."),
+  ("de", "skipped.heading", "{count} Dateien konnten nicht geladen werden"),
+  ("de", "skipped.snapshotHeading", "{count} Notiz- oder Dokument-Sicherungen konnten nicht geladen werden"),
+  ("de", "settings.general.snapshotCollisionTitle", "Der ausgewählte Ordner enthält bereits {count} gleiche Schnappschüsse"),
+  ("de", "large.range.info", "Zeilen {start}–{end} ({count} Zeilen, ca. {size})"),
+  ("de", "large.search.results", "{count} Ergebnisse"),
+  ("de", "status.indexing", "Indizierung… {count} Zeilen"),
+  ("de", "status.lines", "{count} Zeilen"),
+  ("de", "doc.restoreUnreadable", "{names} konnte nicht gelesen werden. Öffne die Dateien erneut, um fortzufahren."),
+  ("fr", "skipped.heading", "{count} fichiers n’ont pas pu être chargés"),
+  ("fr", "skipped.snapshotHeading", "{count} instantanés de notes ou de documents n’ont pas pu être chargés"),
+  ("fr", "settings.general.snapshotMoveBody", "Le dossier actuel contient {count} pense-bêtes et du contenu de document non enregistré. Si vous ne les déplacez pas, ils n'apparaîtront plus dans Note&Pad et resteront uniquement dans le dossier d'origine."),
+  ("fr", "settings.general.snapshotCollisionTitle", "Le dossier choisi contient déjà {count} instantanés identiques"),
+  ("fr", "large.range.info", "Lignes {start}–{end} ({count} lignes, ~{size})"),
+  ("fr", "large.search.results", "{count} résultats"),
+  ("fr", "status.indexing", "Indexation… {count} lignes"),
+  ("fr", "status.lines", "{count} lignes"),
+  ("fr", "doc.restoreUnreadable", "Impossible de lire {names}. Rouvrez les fichiers pour continuer."),
+  ("es", "skipped.heading", "No se pudieron cargar {count} archivos"),
+  ("es", "skipped.snapshotHeading", "No se pudieron cargar {count} instantáneas de notas o documentos"),
+  ("es", "settings.general.snapshotMoveBody", "La carpeta actual tiene {count} notas adhesivas y contenido de documentos sin guardar. Si no las mueve, dejarán de aparecer en Note&Pad y solo permanecerán en la carpeta original."),
+  ("es", "settings.general.snapshotCollisionTitle", "La carpeta seleccionada ya tiene {count} instantáneas iguales"),
+  ("es", "large.range.info", "Líneas {start}–{end} ({count} líneas, ~{size})"),
+  ("es", "large.search.searching", "Buscando… {count} encontrados"),
+  ("es", "large.search.results", "{count} resultados"),
+  ("es", "status.indexing", "Indexando… {count} líneas"),
+  ("es", "status.lines", "{count} líneas"),
+  ("es", "doc.restoreUnreadable", "No se pudo leer {names}. Ábrelos de nuevo para continuar."),
+  ("it", "skipped.snapshotHeading", "Non è stato possibile caricare {count} istantanee di note o documenti"),
+  ("it", "settings.general.snapshotCollisionTitle", "La cartella scelta contiene già {count} snapshot identici"),
+  ("it", "large.range.info", "Righe {start}–{end} ({count} righe, ~{size})"),
+  ("it", "large.search.searching", "Ricerca in corso… {count} trovati"),
+  ("it", "large.search.results", "{count} risultati"),
+  ("it", "status.indexing", "Indicizzazione… {count} righe"),
+  ("it", "status.lines", "{count} righe"),
+  ("it", "doc.restoreUnreadable", "Impossibile leggere {names}. Riaprili per continuare."),
+  ("pt-BR", "skipped.heading", "Não foi possível carregar {count} arquivos"),
+  ("pt-BR", "skipped.snapshotHeading", "Não foi possível carregar {count} instantâneos de notas ou documentos"),
+  ("pt-BR", "settings.general.snapshotMoveBody", "A pasta atual tem {count} notas adesivas e conteúdo de documentos não salvo. Se você não movê-las, elas deixarão de aparecer no Note&Pad e permanecerão apenas na pasta original."),
+  ("pt-BR", "settings.general.snapshotCollisionTitle", "A pasta escolhida já tem {count} instantâneos iguais"),
+  ("pt-BR", "large.range.info", "Linhas {start}–{end} ({count} linhas, ~{size})"),
+  ("pt-BR", "large.search.searching", "Pesquisando… {count} encontrados"),
+  ("pt-BR", "large.search.results", "{count} resultados"),
+  ("pt-BR", "status.indexing", "Indexando… {count} linhas"),
+  ("pt-BR", "status.lines", "{count} linhas"),
+  ("pt-BR", "doc.restoreUnreadable", "Não foi possível ler {names}. Abra os arquivos novamente para continuar."),
+  ("ru", "settings.general.snapshotMoveBody", "В текущей папке находится {count} стикеров и несохранённое содержимое документов. Если их не переместить, они больше не будут отображаться в Note&Pad и останутся только в исходной папке."),
+  ("ru", "settings.general.snapshotCollisionTitle", "В выбранной папке уже есть {count} таких же снимков"),
+  ("ru", "large.range.info", "Строки {start}–{end} ({count} строк, ~{size})"),
+  ("ru", "status.indexing", "Индексирование… {count} строк"),
+  ("ru", "doc.restoreUnreadable", "Не удалось прочитать: {names}. Откройте файлы снова, чтобы продолжить."),
+  ("pl", "settings.general.snapshotMoveBody", "Bieżący folder zawiera {count} karteczek i niezapisaną zawartość dokumentów. Jeśli ich nie przeniesiesz, nie będą już widoczne w Note&Pad i pozostaną tylko w pierwotnym folderze."),
+  ("pl", "settings.general.snapshotCollisionTitle", "Wybrany folder zawiera już {count} takich samych migawek"),
+  ("pl", "large.range.info", "Wiersze {start}–{end} ({count} wierszy, ~{size})"),
+  ("pl", "status.indexing", "Indeksowanie… {count} wierszy"),
+  ("pl", "status.lines", "{count} wierszy"),
+  ("pl", "doc.restoreUnreadable", "Nie można odczytać: {names}. Otwórz pliki ponownie, aby kontynuować."),
+  ("tr", "doc.restoreUnreadable", "{names} okunamadı. Devam etmek için dosyaları yeniden açın."),
+  ("vi", "doc.restoreUnreadable", "Không đọc được {names}. Hãy mở lại các tệp để tiếp tục."),
+  ("en", "settings.editor.fontCustom", "Custom…"),
+  ("de", "settings.editor.fontCustom", "Benutzerdefiniert…"),
+  ("fr", "settings.editor.fontCustom", "Personnalisée…"),
+  ("es", "settings.editor.fontCustom", "Personalizada…"),
+  ("it", "settings.editor.fontCustom", "Personalizzato…"),
+  ("pt-BR", "settings.editor.fontCustom", "Personalizada…"),
+  ("ru", "settings.editor.fontCustom", "Другой…"),
+  ("pl", "settings.editor.fontCustom", "Niestandardowa…"),
+  ("tr", "settings.editor.fontCustom", "Özel…"),
+  ("vi", "settings.editor.fontCustom", "Tùy chỉnh…"),
+  ("ko", "settings.editor.fontCustom", "사용자 지정…"),
+  ("th", "settings.editor.fontCustom", "กำหนดเอง…"),
+  ("zh-CN", "settings.editor.fontCustom", "自定义…"),
+  ("zh-TW", "settings.editor.fontCustom", "自訂…"),
+  ("ja", "settings.editor.fontCustom", "カスタム…"),
+];
+/// Replace unedited old shipped values with the new ones. A locale with a
+/// bundled seed gets the seed value. A compiled locale (no seed) has the key
+/// removed from its data file so lookup falls through to the compiled string.
+pub fn update_reworded_values(resource_dir: &Path, data_dir: &Path) {
+  update_reworded_with(REWORDED, resource_dir, data_dir);
+}
+
+fn update_reworded_with(table: &[(&str, &str, &str)], resource_dir: &Path, data_dir: &Path) {
+  let ids: BTreeSet<&str> = table.iter().map(|(id, _, _)| *id).collect();
+  for id in ids {
+    if !valid_id(id) {
+      continue;
+    }
+    let Some(mut data) = std::fs::read_to_string(locale_file(data_dir, id))
+      .ok()
+      .and_then(|text| parse_locale(&text).ok())
+    else {
+      continue;
+    };
+    if data.id != id {
+      continue;
+    }
+    let seed = std::fs::read_to_string(locale_file(resource_dir, id))
+      .ok()
+      .and_then(|text| parse_locale(&text).ok());
+    let mut changed = false;
+    for (_, key, old) in table.iter().filter(|(i, _, _)| *i == id) {
+      if data.strings.get(*key).map(String::as_str) != Some(*old) {
+        continue;
+      }
+      match &seed {
+        Some(seed) => match seed.strings.get(*key) {
+          Some(new) if new != old => {
+            data.strings.insert((*key).to_string(), new.clone());
+            changed = true;
+          }
+          _ => {}
+        },
+        None => {
+          data.strings.remove(*key);
+          changed = true;
+        }
+      }
+    }
+    if changed {
+      // A locale left with no strings cannot be saved; deleting the file lets
+      // the compiled dictionary apply.
+      let result = if data.strings.is_empty() {
+        delete_locale_file(data_dir, id)
+      } else {
+        save_locale_to(data_dir, &data)
+      };
+      if let Err(e) = result {
+        log::warn!("failed to update reworded strings in locale {id}: {e}");
+      }
+    }
+  }
+}
+/// Seed the app-data `locales` dir from the bundled resources on first run,
+/// then fold in seed keys added by later releases.
 /// Called once from setup, before any locale command touches the dir.
 pub fn seed_on_startup(app: &AppHandle) -> Result<(), String> {
-  seed_defaults_if_missing(&resource_locales_dir(app)?, &app_data_locales_dir(app)?)
+  let resource_dir = resource_locales_dir(app)?;
+  let data_dir = app_data_locales_dir(app)?;
+  seed_defaults_if_missing(&resource_dir, &data_dir)?;
+  merge_new_seed_keys(&resource_dir, &data_dir);
+  update_reworded_values(&resource_dir, &data_dir);
+  Ok(())
 }
 
 #[tauri::command]
@@ -314,15 +537,32 @@ pub fn restore_default_locale(app: AppHandle, id: String) -> Result<LocaleData, 
   Ok(locale)
 }
 
+/// The locales compiled into the app. Deleting the data file of one of them only
+/// drops its override, which is how "restore" works for it, so lite allows
+/// that and nothing else.
+const COMPILED_LOCALES: [&str; 3] = ["zh-TW", "ja", "en"];
+
+/// What lite leaves of `delete_locale`: dropping a compiled locale's override.
+/// Deleting any other locale is a removed feature.
+fn delete_allowed(lite: bool, id: &str) -> Result<(), String> {
+  if COMPILED_LOCALES.contains(&id) {
+    return Ok(());
+  }
+  crate::edition::refuse_if(lite, "deleting a language")
+}
+
 #[tauri::command]
 pub fn delete_locale(app: AppHandle, id: String) -> Result<(), String> {
+  delete_allowed(crate::edition::is_lite(), &id)?;
   delete_locale_file(&locales_dir(&app)?, &id)?;
   let _ = app.emit("locales-changed", ());
   Ok(())
 }
 
+#[cfg(not(feature = "lite"))]
 #[tauri::command]
 pub fn import_locale(app: AppHandle, path: String) -> Result<LocaleData, String> {
+  crate::edition::require_full("importing a language")?;
   let text = std::fs::read_to_string(&path).map_err(|e| e.to_string())?;
   let locale = parse_locale(&text)?;
   validate(&locale)?;
@@ -336,16 +576,20 @@ pub fn import_locale(app: AppHandle, path: String) -> Result<LocaleData, String>
 /// Read and validate a locale file *without* installing it — the source for
 /// "update from JSON", where the caller merges the file's strings into the
 /// locale currently open in the editor instead of adding a new language.
+#[cfg(not(feature = "lite"))]
 #[tauri::command]
 pub fn read_locale_file(path: String) -> Result<LocaleData, String> {
+  crate::edition::require_full("importing a language")?;
   let text = std::fs::read_to_string(&path).map_err(|e| e.to_string())?;
   let locale = parse_locale(&text)?;
   validate(&locale)?;
   Ok(locale)
 }
 
+#[cfg(not(feature = "lite"))]
 #[tauri::command]
 pub fn export_locale(locale: LocaleData, path: String) -> Result<(), String> {
+  crate::edition::require_full("exporting a language")?;
   validate(&locale)?;
   let json = serde_json::to_string_pretty(&locale).map_err(|e| e.to_string())?;
   std::fs::write(&path, json).map_err(|e| e.to_string())
@@ -419,6 +663,17 @@ mod tests {
     let dir = tempdir().unwrap();
     write_locale(dir.path(), &locale("de"));
     assert_eq!(load_dir(dir.path()).unwrap().items, vec![locale("de")]);
+  }
+
+  #[test]
+  fn lite_deletes_a_compiled_locales_override_and_nothing_else() {
+    for id in ["en", "ja", "zh-TW"] {
+      assert!(delete_allowed(true, id).is_ok(), "{id}");
+    }
+    for id in ["de", "zh-CN", "mine"] {
+      assert!(delete_allowed(true, id).is_err(), "{id}");
+      assert!(delete_allowed(false, id).is_ok(), "{id}");
+    }
   }
 
   #[test]
@@ -597,5 +852,365 @@ mod tests {
     write_locale(&data, &edited);
     seed_defaults_if_missing(&resources, &data).unwrap();
     assert_eq!(load_dir(&data).unwrap().items, vec![edited]);
+  }
+
+  fn locale_with(id: &str, pairs: &[(&str, &str)]) -> LocaleData {
+    LocaleData {
+      id: id.into(),
+      label: format!("{id} label"),
+      order: 3,
+      strings: pairs
+        .iter()
+        .map(|(k, v)| (k.to_string(), v.to_string()))
+        .collect(),
+    }
+  }
+
+  fn read_locale(dir: &Path, id: &str) -> LocaleData {
+    parse_locale(&std::fs::read_to_string(locale_file(dir, id)).unwrap()).unwrap()
+  }
+
+  fn manifest_of(dir: &Path) -> SeededKeys {
+    serde_json::from_str(&std::fs::read_to_string(dir.join(SEEDED_KEYS_FILE)).unwrap()).unwrap()
+  }
+
+  fn keys(items: &[&str]) -> BTreeSet<String> {
+    items.iter().map(|k| k.to_string()).collect()
+  }
+
+  #[test]
+  fn merge_adds_missing_keys_and_keeps_edits() {
+    let base = tempdir().unwrap();
+    let (res, data) = (base.path().join("res"), base.path().join("data"));
+    std::fs::create_dir_all(&res).unwrap();
+    std::fs::create_dir_all(&data).unwrap();
+    write_locale(
+      &res,
+      &locale_with("de", &[("a", "A seed"), ("b", "B seed"), ("c", "C seed")]),
+    );
+    let mut old = locale_with("de", &[("a", "A edited"), ("extra", "mine")]);
+    old.label = "Deutsch (custom)".into();
+    old.order = 9;
+    write_locale(&data, &old);
+    merge_new_seed_keys(&res, &data);
+    let merged = read_locale(&data, "de");
+    assert_eq!(merged.strings["a"], "A edited");
+    assert_eq!(merged.strings["b"], "B seed");
+    assert_eq!(merged.strings["c"], "C seed");
+    assert_eq!(merged.strings["extra"], "mine");
+    assert_eq!(merged.label, "Deutsch (custom)");
+    assert_eq!(merged.order, 9);
+    assert_eq!(manifest_of(&data)["de"], keys(&["a", "b", "c"]));
+  }
+
+  #[test]
+  fn merge_does_not_rewrite_when_nothing_is_new() {
+    let base = tempdir().unwrap();
+    let (res, data) = (base.path().join("res"), base.path().join("data"));
+    std::fs::create_dir_all(&res).unwrap();
+    std::fs::create_dir_all(&data).unwrap();
+    write_locale(&res, &locale_with("de", &[("a", "A"), ("b", "B")]));
+    // Hand-formatted, not what save_locale_to would produce.
+    let hand = "{\"id\":\"de\",\"label\":\"D\",\"strings\":{\"a\":\"x\",\"b\":\"y\"}}";
+    std::fs::write(locale_file(&data, "de"), hand).unwrap();
+    merge_new_seed_keys(&res, &data);
+    assert_eq!(
+      std::fs::read_to_string(locale_file(&data, "de")).unwrap(),
+      hand
+    );
+    let manifest_before = std::fs::read(data.join(SEEDED_KEYS_FILE)).unwrap();
+    merge_new_seed_keys(&res, &data);
+    assert_eq!(
+      std::fs::read_to_string(locale_file(&data, "de")).unwrap(),
+      hand
+    );
+    assert_eq!(
+      std::fs::read(data.join(SEEDED_KEYS_FILE)).unwrap(),
+      manifest_before
+    );
+  }
+
+  #[test]
+  fn merge_does_not_readd_a_key_the_user_emptied() {
+    let base = tempdir().unwrap();
+    let (res, data) = (base.path().join("res"), base.path().join("data"));
+    std::fs::create_dir_all(&res).unwrap();
+    std::fs::create_dir_all(&data).unwrap();
+    write_locale(&res, &locale_with("de", &[("a", "A"), ("b", "B")]));
+    write_locale(&data, &locale_with("de", &[("a", "A")]));
+    merge_new_seed_keys(&res, &data);
+    assert!(read_locale(&data, "de").strings.contains_key("b"));
+    let mut emptied = read_locale(&data, "de");
+    emptied.strings.remove("b");
+    save_locale_to(&data, &emptied).unwrap();
+    merge_new_seed_keys(&res, &data);
+    assert!(!read_locale(&data, "de").strings.contains_key("b"));
+  }
+
+  #[test]
+  fn merge_leaves_missing_unparsable_and_unseeded_files_alone() {
+    let base = tempdir().unwrap();
+    let (res, data) = (base.path().join("res"), base.path().join("data"));
+    std::fs::create_dir_all(&res).unwrap();
+    std::fs::create_dir_all(&data).unwrap();
+    write_locale(&res, &locale_with("de", &[("a", "A")]));
+    write_locale(&res, &locale_with("fr", &[("a", "A")]));
+    // de: deleted. fr: unparsable. pirate: user-made, no seed.
+    std::fs::write(locale_file(&data, "fr"), "{ not json").unwrap();
+    let pirate = locale_with("pirate", &[("z", "Z")]);
+    write_locale(&data, &pirate);
+    let pirate_bytes = std::fs::read(locale_file(&data, "pirate")).unwrap();
+    merge_new_seed_keys(&res, &data);
+    assert!(!locale_file(&data, "de").exists());
+    assert_eq!(
+      std::fs::read_to_string(locale_file(&data, "fr")).unwrap(),
+      "{ not json"
+    );
+    assert_eq!(
+      std::fs::read(locale_file(&data, "pirate")).unwrap(),
+      pirate_bytes
+    );
+    assert!(!data.join(SEEDED_KEYS_FILE).exists());
+  }
+
+  #[test]
+  fn merge_treats_an_unparsable_manifest_as_absent() {
+    let base = tempdir().unwrap();
+    let (res, data) = (base.path().join("res"), base.path().join("data"));
+    std::fs::create_dir_all(&res).unwrap();
+    std::fs::create_dir_all(&data).unwrap();
+    write_locale(&res, &locale_with("de", &[("a", "A"), ("b", "B")]));
+    write_locale(&data, &locale_with("de", &[("a", "A")]));
+    std::fs::write(data.join(SEEDED_KEYS_FILE), "garbage").unwrap();
+    merge_new_seed_keys(&res, &data);
+    assert!(read_locale(&data, "de").strings.contains_key("b"));
+    assert_eq!(manifest_of(&data)["de"], keys(&["a", "b"]));
+  }
+
+  #[cfg(unix)]
+  #[test]
+  fn merge_failure_does_not_extend_the_manifest_and_is_retried() {
+    use std::os::unix::fs::PermissionsExt;
+    let base = tempdir().unwrap();
+    let (res, data) = (base.path().join("res"), base.path().join("data"));
+    std::fs::create_dir_all(&res).unwrap();
+    std::fs::create_dir_all(&data).unwrap();
+    write_locale(&res, &locale_with("de", &[("a", "A"), ("b", "B")]));
+    write_locale(&res, &locale_with("fr", &[("a", "A"), ("b", "B")]));
+    write_locale(&data, &locale_with("de", &[("a", "A")]));
+    write_locale(&data, &locale_with("fr", &[("a", "A")]));
+    let de_file = locale_file(&data, "de");
+    std::fs::set_permissions(&de_file, std::fs::Permissions::from_mode(0o444)).unwrap();
+    if std::fs::OpenOptions::new()
+      .write(true)
+      .open(&de_file)
+      .is_ok()
+    {
+      // Permission bits are not enforced (running as root): nothing to exercise.
+      return;
+    }
+    // fr: unparsable on the first run.
+    let fr_good = std::fs::read_to_string(locale_file(&data, "fr")).unwrap();
+    std::fs::write(locale_file(&data, "fr"), "{ not json").unwrap();
+    merge_new_seed_keys(&res, &data);
+    let manifest = std::fs::read_to_string(data.join(SEEDED_KEYS_FILE));
+    assert!(manifest.is_err() || !manifest.unwrap().contains("\"de\""));
+    std::fs::set_permissions(&de_file, std::fs::Permissions::from_mode(0o644)).unwrap();
+    std::fs::write(locale_file(&data, "fr"), fr_good).unwrap();
+    merge_new_seed_keys(&res, &data);
+    assert!(read_locale(&data, "de").strings.contains_key("b"));
+    assert!(read_locale(&data, "fr").strings.contains_key("b"));
+    assert_eq!(manifest_of(&data)["de"], keys(&["a", "b"]));
+    assert_eq!(manifest_of(&data)["fr"], keys(&["a", "b"]));
+  }
+
+  #[test]
+  fn merge_after_fresh_seed_records_keys_so_later_removal_sticks() {
+    let base = tempdir().unwrap();
+    let (res, data) = (base.path().join("res"), base.path().join("data"));
+    std::fs::create_dir_all(&res).unwrap();
+    write_locale(&res, &locale_with("de", &[("a", "A"), ("b", "B")]));
+    seed_defaults_if_missing(&res, &data).unwrap();
+    merge_new_seed_keys(&res, &data);
+    assert_eq!(manifest_of(&data)["de"], keys(&["a", "b"]));
+    let mut cut = read_locale(&data, "de");
+    cut.strings.remove("b");
+    save_locale_to(&data, &cut).unwrap();
+    write_locale(
+      &res,
+      &locale_with("de", &[("a", "A"), ("b", "B"), ("c", "C")]),
+    );
+    merge_new_seed_keys(&res, &data);
+    let merged = read_locale(&data, "de");
+    assert!(!merged.strings.contains_key("b"));
+    assert_eq!(merged.strings["c"], "C");
+  }
+
+  #[test]
+  fn merge_overwrites_nothing_when_edited_value_differs_from_seed() {
+    let base = tempdir().unwrap();
+    let (res, data) = (base.path().join("res"), base.path().join("data"));
+    std::fs::create_dir_all(&res).unwrap();
+    std::fs::create_dir_all(&data).unwrap();
+    write_locale(&res, &locale_with("de", &[("a", "seed"), ("b", "B")]));
+    write_locale(&data, &locale_with("de", &[("a", "edited")]));
+    merge_new_seed_keys(&res, &data);
+    assert_eq!(read_locale(&data, "de").strings["a"], "edited");
+  }
+
+  #[test]
+  fn reworded_replaces_old_shipped_values_and_keeps_edits() {
+    let base = tempdir().unwrap();
+    let (res, data) = (base.path().join("res"), base.path().join("data"));
+    std::fs::create_dir_all(&res).unwrap();
+    std::fs::create_dir_all(&data).unwrap();
+    let table = [
+      ("de", "a", "old a"),
+      ("de", "b", "old b"),
+      ("de", "c", "old c"),
+    ];
+    write_locale(
+      &res,
+      &locale_with("de", &[("a", "new a"), ("b", "new b"), ("c", "new c")]),
+    );
+    write_locale(
+      &data,
+      &locale_with(
+        "de",
+        &[("a", "old a"), ("b", "my b"), ("c", "old c"), ("x", "mine")],
+      ),
+    );
+    update_reworded_with(&table, &res, &data);
+    let got = read_locale(&data, "de");
+    assert_eq!(got.strings["a"], "new a");
+    assert_eq!(got.strings["b"], "my b");
+    assert_eq!(got.strings["c"], "new c");
+    assert_eq!(got.strings["x"], "mine");
+    let before = std::fs::read_to_string(locale_file(&data, "de")).unwrap();
+    update_reworded_with(&table, &res, &data);
+    assert_eq!(
+      std::fs::read_to_string(locale_file(&data, "de")).unwrap(),
+      before
+    );
+  }
+
+  #[test]
+  fn reworded_removes_old_values_from_a_compiled_locale_file() {
+    let base = tempdir().unwrap();
+    let (res, data) = (base.path().join("res"), base.path().join("data"));
+    std::fs::create_dir_all(&res).unwrap();
+    std::fs::create_dir_all(&data).unwrap();
+    let table = [("en", "a", "old a"), ("en", "b", "old b")];
+    write_locale(
+      &data,
+      &locale_with("en", &[("a", "old a"), ("b", "my b"), ("c", "mine")]),
+    );
+    update_reworded_with(&table, &res, &data);
+    let got = read_locale(&data, "en");
+    assert!(!got.strings.contains_key("a"));
+    assert_eq!(got.strings["b"], "my b");
+    assert_eq!(got.strings["c"], "mine");
+  }
+
+  #[test]
+  fn reworded_deletes_a_compiled_locale_file_left_with_no_strings() {
+    let base = tempdir().unwrap();
+    let (res, data) = (base.path().join("res"), base.path().join("data"));
+    std::fs::create_dir_all(&res).unwrap();
+    std::fs::create_dir_all(&data).unwrap();
+    let table = [("en", "a", "old a")];
+    write_locale(&data, &locale_with("en", &[("a", "old a")]));
+    update_reworded_with(&table, &res, &data);
+    assert!(!locale_file(&data, "en").exists());
+    update_reworded_with(&table, &res, &data);
+    assert!(!locale_file(&data, "en").exists());
+  }
+
+  #[test]
+  fn reworded_table_matches_the_bundled_seeds() {
+    let res = Path::new(env!("CARGO_MANIFEST_DIR")).join("resources/locales");
+    for (id, key, old) in REWORDED {
+      if let Ok(text) = std::fs::read_to_string(locale_file(&res, id)) {
+        let seed = parse_locale(&text).unwrap();
+        let new = &seed.strings[*key];
+        assert_ne!(new, old, "{id} {key} still holds the old value");
+      }
+    }
+  }
+
+  const FONT_CUSTOM: &str = "settings.editor.fontCustom";
+
+  fn bundled_seed_ids() -> Vec<String> {
+    let res = Path::new(env!("CARGO_MANIFEST_DIR")).join("resources/locales");
+    let mut ids: Vec<String> = std::fs::read_dir(res)
+      .unwrap()
+      .flatten()
+      .filter_map(|entry| {
+        let path = entry.path();
+        if path.extension().and_then(|e| e.to_str()) != Some("json") {
+          return None;
+        }
+        path.file_stem().and_then(|n| n.to_str()).map(String::from)
+      })
+      .collect();
+    ids.sort();
+    ids
+  }
+
+  #[test]
+  fn every_seed_and_compiled_locale_has_a_font_custom_reworded_row() {
+    let seeds = bundled_seed_ids();
+    assert!(!seeds.is_empty());
+    for id in seeds.iter().map(String::as_str).chain(COMPILED_LOCALES) {
+      assert!(
+        REWORDED
+          .iter()
+          .any(|(i, k, _)| *i == id && *k == FONT_CUSTOM),
+        "{id} has no {FONT_CUSTOM} row in REWORDED"
+      );
+    }
+  }
+
+  #[test]
+  fn an_unedited_font_custom_label_is_replaced_in_every_locale() {
+    let res = Path::new(env!("CARGO_MANIFEST_DIR")).join("resources/locales");
+    let seeds = bundled_seed_ids();
+    for (id, _, old) in REWORDED.iter().filter(|(_, k, _)| *k == FONT_CUSTOM) {
+      let base = tempdir().unwrap();
+      let data = base.path().join("data");
+      std::fs::create_dir_all(&data).unwrap();
+      write_locale(
+        &data,
+        &locale_with(id, &[(FONT_CUSTOM, old), ("mine", "kept")]),
+      );
+      update_reworded_with(REWORDED, &res, &data);
+      let got = read_locale(&data, id);
+      if seeds.iter().any(|s| s == id) {
+        let seed = parse_locale(&std::fs::read_to_string(locale_file(&res, id)).unwrap()).unwrap();
+        assert_eq!(got.strings[FONT_CUSTOM], seed.strings[FONT_CUSTOM], "{id}");
+        assert_ne!(got.strings[FONT_CUSTOM], *old, "{id}");
+      } else {
+        assert!(!got.strings.contains_key(FONT_CUSTOM), "{id}");
+      }
+      assert_eq!(got.strings["mine"], "kept", "{id}");
+    }
+  }
+
+  #[test]
+  fn an_edited_font_custom_label_is_left_alone_in_every_locale() {
+    let res = Path::new(env!("CARGO_MANIFEST_DIR")).join("resources/locales");
+    for (id, _, _) in REWORDED.iter().filter(|(_, k, _)| *k == FONT_CUSTOM) {
+      let base = tempdir().unwrap();
+      let data = base.path().join("data");
+      std::fs::create_dir_all(&data).unwrap();
+      write_locale(
+        &data,
+        &locale_with(id, &[(FONT_CUSTOM, "my own label"), ("mine", "kept")]),
+      );
+      update_reworded_with(REWORDED, &res, &data);
+      let got = read_locale(&data, id);
+      assert_eq!(got.strings[FONT_CUSTOM], "my own label", "{id}");
+      assert_eq!(got.strings["mine"], "kept", "{id}");
+    }
   }
 }

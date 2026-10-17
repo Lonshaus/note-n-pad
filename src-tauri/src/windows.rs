@@ -122,6 +122,7 @@ pub(crate) fn fix_inner_size(window: &tauri::WebviewWindow, want: (f64, f64)) {
 /// Win32 wraps a menu bar that will not fit and never scrolls one, so a
 /// workspace narrower than its own menu spends a whole extra row of panel
 /// height on it.
+#[cfg(not(feature = "lite"))]
 #[cfg(target_os = "windows")]
 fn menu_bar_rows(window: &tauri::WebviewWindow) -> usize {
   use windows_sys::Win32::Foundation::RECT;
@@ -154,6 +155,7 @@ fn menu_bar_rows(window: &tauri::WebviewWindow) -> usize {
   distinct_rows(&tops)
 }
 
+#[cfg(not(feature = "lite"))]
 #[cfg(not(target_os = "windows"))]
 fn menu_bar_rows(_window: &tauri::WebviewWindow) -> usize {
   1
@@ -161,7 +163,7 @@ fn menu_bar_rows(_window: &tauri::WebviewWindow) -> usize {
 
 /// Distinct values in a list of menu item tops, i.e. how many rows they sit on.
 /// An empty list is one row, not zero: nothing to wrap.
-#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+#[cfg_attr(any(feature = "lite", not(target_os = "windows")), allow(dead_code))]
 fn distinct_rows(tops: &[i32]) -> usize {
   let mut rows: Vec<i32> = Vec::new();
   for top in tops {
@@ -176,6 +178,7 @@ fn distinct_rows(tops: &[i32]) -> usize {
 /// row, in logical pixels: the widths of its top-level items added up. It reads
 /// a little short of what the bar actually asks for, so it is a starting point
 /// to widen from, not an answer. `None` when the window has no menu bar.
+#[cfg(not(feature = "lite"))]
 #[cfg(target_os = "windows")]
 fn menu_bar_item_span(window: &tauri::WebviewWindow) -> Option<f64> {
   use windows_sys::Win32::Foundation::RECT;
@@ -206,6 +209,7 @@ fn menu_bar_item_span(window: &tauri::WebviewWindow) -> Option<f64> {
   Some(f64::from(total) / scale)
 }
 
+#[cfg(not(feature = "lite"))]
 #[cfg(not(target_os = "windows"))]
 fn menu_bar_item_span(_window: &tauri::WebviewWindow) -> Option<f64> {
   None
@@ -214,7 +218,9 @@ fn menu_bar_item_span(_window: &tauri::WebviewWindow) -> Option<f64> {
 /// How far each attempt widens the window when the menu bar still wraps, and how
 /// many attempts before giving up and leaving it wrapped. Twelve steps covers
 /// far more than the ~8px the first guess is ever short by.
+#[cfg(not(feature = "lite"))]
 const MENU_FIT_STEP: f64 = 8.0;
+#[cfg(not(feature = "lite"))]
 const MENU_FIT_MAX_STEPS: u32 = 12;
 
 /// Size the workspace so its menu bar sits on one row, measured rather than
@@ -224,6 +230,7 @@ const MENU_FIT_MAX_STEPS: u32 = 12;
 ///
 /// Only ever called with the untouched default width. A stored width the user
 /// chose is theirs, wrapped bar or not.
+#[cfg(not(feature = "lite"))]
 fn fit_menu_bar(window: &tauri::WebviewWindow, width: f64, height: f64) {
   let mut width = menu_bar_item_span(window).map_or(width, |span| width.max(span));
   fix_inner_size(window, (width, height));
@@ -243,6 +250,12 @@ fn show_after_grace(window: tauri::WebviewWindow) {
       let _ = window.show();
       let _ = window.set_focus();
       detach_menu_unless_document(&window);
+      focus_launch_window_after(&window, false);
+      // Menu items are only ever touched on the main thread.
+      let app = window.app_handle().clone();
+      let _ = app.clone().run_on_main_thread(move || {
+        crate::resync_menu_focus(&app);
+      });
     }
   });
 }
@@ -428,6 +441,7 @@ fn clip_sticky_corners(window: &tauri::WebviewWindow) -> Result<(), String> {
 /// lives on the window, not in CSS — so a test that a sticky really is as
 /// translucent as the setting says has no other source. Returns -1.0 where the
 /// platform has no reader wired up.
+#[cfg_attr(not(debug_assertions), allow(dead_code))]
 pub fn window_alpha(window: &tauri::WebviewWindow) -> f64 {
   #[cfg(target_os = "macos")]
   {
@@ -615,25 +629,16 @@ pub fn create_sticky_window(app: &AppHandle, note: &NoteSnapshot) -> Result<(), 
 
 const DOC_DEFAULT_WIDTH: f64 = 800.0;
 const DOC_DEFAULT_HEIGHT: f64 = 600.0;
-
-/// Build a normal-chrome document window labeled `doc-{group}`, carrying the
-/// window group (and, for a fresh open, an initial file path and project root)
-/// in the URL so the frontend can load every tab in the group and restore it.
-fn build_document_window(
-  app: &AppHandle,
+/// The URL a document window loads, carrying the window group (and, for a fresh
+/// open, an initial file path and project root) so the frontend can load every
+/// tab in the group and restore it.
+fn document_window_query(
   group: &str,
   initial_path: Option<&str>,
   project: Option<&str>,
   tab: Option<i64>,
-  bounds: WindowBounds,
-) -> Result<(), String> {
-  let WindowBounds {
-    x,
-    y,
-    width,
-    height,
-  } = bounds;
-  let label = format!("doc-{group}");
+  blank: bool,
+) -> String {
   let mut query = format!("index.html?mode=document&group={}", percent_encode(group));
   if let Some(path) = initial_path {
     query.push_str(&format!("&path={}", percent_encode(path)));
@@ -648,6 +653,30 @@ fn build_document_window(
   if let Some(tab) = tab {
     query.push_str(&format!("&tab={tab}"));
   }
+  // A new window with nothing stored asks the frontend for one blank tab.
+  if blank {
+    query.push_str("&blank=1");
+  }
+  query
+}
+/// Build a normal-chrome document window labeled `doc-{group}`.
+fn build_document_window(
+  app: &AppHandle,
+  group: &str,
+  initial_path: Option<&str>,
+  project: Option<&str>,
+  tab: Option<i64>,
+  blank: bool,
+  bounds: WindowBounds,
+) -> Result<(), String> {
+  let WindowBounds {
+    x,
+    y,
+    width,
+    height,
+  } = bounds;
+  let label = format!("doc-{group}");
+  let query = document_window_query(group, initial_path, project, tab, blank);
   let url = WebviewUrl::App(query.into());
   // Set a real title at birth so macOS never shows its own empty-title
   // placeholder (e.g. "無題" on Japanese systems) before the frontend loads and
@@ -677,6 +706,14 @@ fn build_document_window(
 /// records the path in the recent-files menu via `add_recent_file`). A `project`
 /// root, when given, tags every tab opened in the fresh window.
 pub fn open_document(app: &AppHandle, path: &str, project: Option<&str>) -> Result<(), String> {
+  open_document_labeled(app, path, project).map(|_| ())
+}
+/// `open_document`, returning the new window's label.
+pub fn open_document_labeled(
+  app: &AppHandle,
+  path: &str,
+  project: Option<&str>,
+) -> Result<String, String> {
   let group = uuid::Uuid::new_v4().to_string();
   build_document_window(
     app,
@@ -684,6 +721,27 @@ pub fn open_document(app: &AppHandle, path: &str, project: Option<&str>) -> Resu
     Some(path),
     project,
     None,
+    false,
+    WindowBounds {
+      x: None,
+      y: None,
+      width: DOC_DEFAULT_WIDTH,
+      height: DOC_DEFAULT_HEIGHT,
+    },
+  )?;
+  Ok(format!("doc-{group}"))
+}
+/// Open a fresh document window holding one blank tab, minting a new window
+/// group. The tab is created by the frontend, which stores it on first edit.
+pub fn new_blank_document(app: &AppHandle) -> Result<(), String> {
+  let group = uuid::Uuid::new_v4().to_string();
+  build_document_window(
+    app,
+    &group,
+    None,
+    None,
+    None,
+    true,
     WindowBounds {
       x: None,
       y: None,
@@ -708,6 +766,7 @@ pub fn create_document_window(
     None,
     None,
     tab,
+    false,
     WindowBounds {
       x: plan.x,
       y: plan.y,
@@ -762,6 +821,8 @@ fn blank_sticky(id: String, width: f64, height: f64, paper: String) -> NoteSnaps
     range_fp_size: None,
     range_fp_mtime: None,
     range_start_line: None,
+    range_end_line: None,
+    range_trailing_break: None,
     windowed_index: None,
     windowed_fp_size: None,
     windowed_fp_mtime: None,
@@ -803,6 +864,23 @@ pub fn new_sticky_note(app: AppHandle, store: State<NoteStore>) -> Result<NoteSn
 pub fn open_document_window(app: AppHandle, path: String) -> Result<(), String> {
   open_document(&app, &path, None)
 }
+/// A document window is about to destroy itself without ever showing a document.
+/// When it was opened for a launch's file and nothing else is on screen, the
+/// app would be left windowless, so the fallback sticky opens instead.
+#[tauri::command(async)]
+pub fn launch_window_collapsing(app: AppHandle, store: State<NoteStore>, label: String) {
+  let recorded = crate::launch_windows::take(&label);
+  let others = app
+    .webview_windows()
+    .keys()
+    .filter(|l| **l != label)
+    .count();
+  if crate::launch_windows::collapse_needs_fallback(recorded, others) {
+    if let Err(e) = new_sticky(&app, &store) {
+      log::warn!("failed to open the fallback sticky after a launch window collapsed: {e}");
+    }
+  }
+}
 
 /// Open a document window for a group that already exists in the store, exactly
 /// as a startup restore would. Used by the sticky-to-document conversion (the
@@ -819,11 +897,27 @@ pub fn open_document_group(
   tab: Option<i64>,
 ) -> Result<(), String> {
   let notes = store.list();
-  let plan = crate::note_store::plan_document_windows(&notes)
+  let plan = crate::note_store::plan_document_windows(&notes, crate::edition::is_lite())
     .into_iter()
     .find(|p| p.group == group)
     .ok_or_else(|| format!("no stored document group: {group}"))?;
   create_document_window(&app, &plan, tab)
+}
+/// The edition just turned full: open a window for every group the app closed
+/// for the trial (`HeldBackGroups`) that lite kept tabs of and whose window is
+/// not open, so those tabs return as at a startup restore. Windows still open
+/// reload their own kept tabs; groups the user closed wait for the next launch.
+pub fn reopen_kept_groups(app: &AppHandle) {
+  let notes = app.state::<NoteStore>().list();
+  let held = app.state::<crate::note_store::HeldBackGroups>().take_all();
+  let plans = crate::note_store::groups_to_reopen(&notes, &held, |group| {
+    app.get_webview_window(&format!("doc-{group}")).is_some()
+  });
+  for plan in plans {
+    if let Err(e) = create_document_window(app, &plan, None) {
+      log::warn!("failed to reopen document window {}: {e}", plan.group);
+    }
+  }
 }
 
 #[tauri::command]
@@ -841,10 +935,29 @@ pub fn reveal_self(window: tauri::WebviewWindow) -> Result<(), String> {
   window.show().map_err(|e| e.to_string())?;
   window.set_focus().map_err(|e| e.to_string())?;
   detach_menu_unless_document(&window);
+  focus_launch_window_after(&window, true);
+  crate::resync_menu_focus(window.app_handle());
   Ok(())
 }
+/// After the startup workspace is revealed, give focus back to the window of a
+/// file the app was launched with.
+fn focus_launch_window_after(window: &tauri::WebviewWindow, consume: bool) {
+  if window.label() != "workspace" {
+    return;
+  }
+  let Some(label) = crate::launch_windows::focus_target(consume) else {
+    return;
+  };
+  if let Some(target) = window.app_handle().get_webview_window(&label) {
+    if target.is_visible().unwrap_or(false) {
+      let _ = target.set_focus();
+    }
+  }
+}
 
+#[cfg(not(feature = "lite"))]
 const WORKSPACE_MIN_WIDTH: f64 = 260.0;
+#[cfg(not(feature = "lite"))]
 const WORKSPACE_MIN_HEIGHT: f64 = 320.0;
 
 /// Raise the existing helper, or reveal a focused window.
@@ -857,7 +970,9 @@ pub(crate) fn reveal(win: &tauri::WebviewWindow) {
 
 /// Open (or focus, if already open) the singleton workspace window at its
 /// remembered bounds.
+#[cfg(not(feature = "lite"))]
 pub fn show_workspace(app: &AppHandle) -> Result<(), String> {
+  crate::edition::require_full("the workspace")?;
   if let Some(win) = app.get_webview_window("workspace") {
     reveal(&win);
     return Ok(());
@@ -894,6 +1009,7 @@ pub fn show_workspace(app: &AppHandle) -> Result<(), String> {
   Ok(())
 }
 
+#[cfg(not(feature = "lite"))]
 #[tauri::command(async)]
 pub fn show_workspace_window(app: AppHandle) -> Result<(), String> {
   show_workspace(&app)
@@ -990,34 +1106,8 @@ pub fn show_about_window(app: AppHandle) -> Result<(), String> {
   show_about(&app)
 }
 
-/// Open (or focus) the singleton Keyboard Shortcuts window: system chrome,
-/// resizable so a long shortcut list can be scrolled or the window grown.
-pub fn show_shortcuts(app: &AppHandle) -> Result<(), String> {
-  if let Some(win) = app.get_webview_window("shortcuts") {
-    reveal(&win);
-    return Ok(());
-  }
-  let locale = crate::i18n::current_locale(&crate::settings::app_settings(app).language);
-  let url = WebviewUrl::App("index.html?mode=shortcuts".into());
-  let window = WebviewWindowBuilder::new(app, "shortcuts", url)
-    .title(crate::i18n::tr(locale, crate::i18n::Key::KeyboardShortcuts))
-    .visible(false)
-    .background_color(chrome_background(app))
-    .inner_size(420.0, 560.0)
-    .build()
-    .map_err(|e| e.to_string())?;
-  detach_menu_unless_document(&window);
-  show_after_grace(window);
-  Ok(())
-}
-
-#[tauri::command(async)]
-pub fn show_shortcuts_window(app: AppHandle) -> Result<(), String> {
-  show_shortcuts(&app)
-}
-
 /// Open (or focus) the singleton Acknowledgements window: system chrome,
-/// resizable and wider than the shortcuts window since licence text runs long.
+/// resizable and wide since licence text runs long.
 pub fn show_acknowledgements(app: &AppHandle) -> Result<(), String> {
   if let Some(win) = app.get_webview_window("acknowledgements") {
     reveal(&win);
@@ -1069,6 +1159,33 @@ pub fn show_privacy_window(app: AppHandle) -> Result<(), String> {
   show_privacy(&app)
 }
 
+/// Open (or focus) the singleton "Full Version Features" window, the table of
+/// what the full version adds. Lite only: the full version has no such window.
+pub fn show_edition(app: &AppHandle) -> Result<(), String> {
+  crate::edition::require_lite("the full version features window")?;
+  if let Some(win) = app.get_webview_window("edition") {
+    reveal(&win);
+    return Ok(());
+  }
+  let locale = crate::i18n::current_locale(&crate::settings::app_settings(app).language);
+  let url = WebviewUrl::App("index.html?mode=edition".into());
+  let window = WebviewWindowBuilder::new(app, "edition", url)
+    .title(crate::i18n::tr(locale, crate::i18n::Key::FullFeatures))
+    .visible(false)
+    .background_color(chrome_background(app))
+    .inner_size(620.0, 560.0)
+    .build()
+    .map_err(|e| e.to_string())?;
+  detach_menu_unless_document(&window);
+  show_after_grace(window);
+  Ok(())
+}
+
+#[tauri::command(async)]
+pub fn show_edition_window(app: AppHandle) -> Result<(), String> {
+  show_edition(&app)
+}
+
 /// The fixed-title singleton windows and the i18n key each one's title comes
 /// from. Doc windows (title is the file name) and stickies (no title bar) are
 /// intentionally not part of this table. Extracted from `retitle_fixed_windows`
@@ -1078,9 +1195,9 @@ fn fixed_window_titles() -> [(&'static str, crate::i18n::Key); 6] {
     ("workspace", crate::i18n::Key::Workspace),
     ("settings", crate::i18n::Key::SettingsTitle),
     ("about", crate::i18n::Key::About),
-    ("shortcuts", crate::i18n::Key::KeyboardShortcuts),
     ("acknowledgements", crate::i18n::Key::Acknowledgements),
     ("privacy", crate::i18n::Key::PrivacyPolicy),
+    ("edition", crate::i18n::Key::FullFeatures),
   ]
 }
 
@@ -1149,6 +1266,7 @@ pub fn focus_note_window(
 
 /// Validate a workspace sticky-row action. Only "save" and "close" cross into a
 /// sticky window; any other payload is rejected before the emit.
+#[cfg(not(feature = "lite"))]
 fn validate_sticky_action(action: &str) -> Result<&str, String> {
   match action {
     "save" | "close" => Ok(action),
@@ -1160,6 +1278,7 @@ fn validate_sticky_action(action: &str) -> Result<&str, String> {
 /// reimplementing either. Ensures the sticky window exists (recreating it from
 /// the store when closed) and reveals it so any save dialog or confirm modal is
 /// visible, then emits the action for StickyApp to run.
+#[cfg(not(feature = "lite"))]
 #[tauri::command(async)]
 pub fn sticky_row_action(
   app: AppHandle,
@@ -1285,6 +1404,7 @@ fn filter_live_groups(labels: &[String], groups: &[String]) -> Vec<String> {
 
 /// Ask a document window to close the tab at `tab_index` from the workspace. The
 /// window runs its own `requestCloseTab` flow, so a dirty tab still prompts.
+#[cfg(not(feature = "lite"))]
 #[tauri::command]
 pub fn close_doc_tab(app: AppHandle, group: String, tab_index: i64) -> Result<(), String> {
   let label = format!("doc-{group}");
@@ -1297,9 +1417,10 @@ pub fn close_doc_tab(app: AppHandle, group: String, tab_index: i64) -> Result<()
 
 #[cfg(test)]
 mod tests {
+  #[cfg(not(feature = "lite"))]
+  use super::validate_sticky_action;
   use super::{
-    filter_live_groups, fixed_window_titles, is_sticky_window_label, validate_sticky_action,
-    DocTabInfo, DocWindowTabs,
+    filter_live_groups, fixed_window_titles, is_sticky_window_label, DocTabInfo, DocWindowTabs,
   };
 
   #[test]
@@ -1368,6 +1489,17 @@ mod tests {
     assert_eq!(
       entry.map(|(_, key)| key),
       Some(crate::i18n::Key::Acknowledgements)
+    );
+  }
+
+  #[test]
+  fn the_edition_window_is_retitled_with_the_language() {
+    let entry = fixed_window_titles()
+      .into_iter()
+      .find(|(label, _)| *label == "edition");
+    assert_eq!(
+      entry.map(|(_, key)| key),
+      Some(crate::i18n::Key::FullFeatures)
     );
   }
 
@@ -1448,12 +1580,14 @@ mod tests {
     assert!(stale.active_tab().is_none());
   }
 
+  #[cfg(not(feature = "lite"))]
   #[test]
   fn accepts_known_actions() {
     assert_eq!(validate_sticky_action("save"), Ok("save"));
     assert_eq!(validate_sticky_action("close"), Ok("close"));
   }
 
+  #[cfg(not(feature = "lite"))]
   #[test]
   fn rejects_unknown_actions() {
     assert!(validate_sticky_action("delete").is_err());
@@ -1490,13 +1624,14 @@ mod window_command_threading_tests {
   const MUST_RUN_OFF_THE_MAIN_THREAD: &[&str] = &[
     "new_sticky_note",
     "open_document_window",
+    "launch_window_collapsing",
     "open_document_group",
     "show_workspace_window",
     "show_settings_window",
     "show_about_window",
-    "show_shortcuts_window",
     "show_acknowledgements_window",
     "show_privacy_window",
+    "show_edition_window",
     "focus_note_window",
     "sticky_row_action",
   ];
@@ -1550,5 +1685,22 @@ mod window_command_threading_tests {
     let attribute = SOURCE[..at].trim_end();
     assert!(attribute.ends_with("#[tauri::command]"));
     assert!(!attribute.ends_with("#[tauri::command(async)]"));
+  }
+}
+
+#[cfg(test)]
+mod document_window_query_tests {
+  use super::document_window_query;
+
+  #[test]
+  fn a_blank_window_asks_for_one_blank_tab() {
+    let query = document_window_query("g1", None, None, None, true);
+    assert_eq!(query, "index.html?mode=document&group=g1&blank=1");
+  }
+
+  #[test]
+  fn restored_and_file_windows_never_ask_for_a_blank_tab() {
+    assert!(!document_window_query("g1", None, None, Some(2), false).contains("blank"));
+    assert!(!document_window_query("g1", Some("/a b.txt"), None, None, false).contains("blank"));
   }
 }

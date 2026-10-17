@@ -3,12 +3,18 @@
 
 import { invoke } from '@tauri-apps/api/core';
 import { listen, type UnlistenFn } from '@tauri-apps/api/event';
+import { withAddedFont } from '../util/font';
 import type { LineEnding } from '../util/text';
 import { resolveLocale, type Language, type Locale } from '../i18n/locale';
 import { localeRegistry } from '../i18n/localeRegistry.svelte';
-import { pickDefaultTheme } from '../theme/themes';
+import { pickDefaultTheme, resolveEditorTheme } from '../theme/themes';
+import { isLite } from './edition.svelte';
 import { themeRegistry } from '../theme/themeRegistry.svelte';
-import { isInterfaceMode, type InterfaceMode } from '../theme/chrome';
+import {
+  interfaceIsDark,
+  isInterfaceMode,
+  type InterfaceMode,
+} from '../theme/chrome';
 
 /** How an over-threshold file opens: ask (confirm offering view/edit), or open
  *  straight into the read-only view or in-place edit. */
@@ -43,6 +49,7 @@ interface AppSettings {
   preview_local_resources: boolean;
   open_target: OpenTarget;
   editor_font_family: string;
+  editor_extra_fonts: string[];
   default_line_ending: LineEnding;
   default_encoding: string;
   new_note_shortcut: string;
@@ -61,6 +68,7 @@ interface AppSettings {
 interface LoadedSettings {
   settings: AppSettings;
   repaired_fields: string[];
+  unset_defaults_to_notify?: string[];
   snapshot_dir_unavailable: boolean;
 }
 
@@ -82,6 +90,8 @@ export class SettingsState {
   previewLocalResources = $state(false);
   openTarget = $state<OpenTarget>('tab');
   editorFontFamily = $state('');
+  /** Families the user added through the picker's "choose another font" list. */
+  editorExtraFonts = $state<string[]>([]);
   defaultLineEnding = $state<LineEnding>('LF');
   defaultEncoding = $state('UTF-8');
   newNoteShortcut = $state('CmdOrCtrl+Shift+N');
@@ -129,7 +139,9 @@ export class SettingsState {
    *  default and clobber the selection everywhere. applyTheme falls back
    *  visually until the registry catches up, then resolves the real theme. */
   private apply(s: AppSettings, validate = false): void {
-    if (!validate || themeRegistry.has(s.theme)) {
+    // Lite has no theme choice and must not correct the stored one: that would
+    // overwrite a choice made in the full edition.
+    if (!validate || themeRegistry.has(s.theme) || isLite()) {
       this.themeId = s.theme;
     } else {
       const picked = pickDefaultTheme(this.prefersDark, themeRegistry.themes);
@@ -150,6 +162,7 @@ export class SettingsState {
     this.previewLocalResources = s.preview_local_resources;
     this.openTarget = s.open_target;
     this.editorFontFamily = s.editor_font_family;
+    this.editorExtraFonts = s.editor_extra_fonts;
     this.defaultLineEnding = s.default_line_ending;
     this.defaultEncoding = s.default_encoding;
     this.newNoteShortcut = s.new_note_shortcut;
@@ -204,6 +217,20 @@ export class SettingsState {
    *  used at startup and the default folder is in use instead. Set from
    *  `LoadedSettings.snapshot_dir_unavailable`, alongside `settingsRepaired`. */
   snapshotDirUnavailable = $state(false);
+  /** Rows whose default key is taken and not yet acknowledged, from the last
+   *  load. The Settings window acknowledges them once it has shown the notice. */
+  unsetDefaultsToNotify: string[] = [];
+  /** Tell the Rust core the unset-default notice was shown, so it is not
+   *  repeated on the next launch. A failure only means it is shown again. */
+  async ackUnsetDefaults(): Promise<void> {
+    try {
+      await invoke<void>('ack_unset_defaults', {
+        ids: this.unsetDefaultsToNotify,
+      });
+    } catch {
+      // Reported again on the next load.
+    }
+  }
 
   /** Persist a partial settings patch. On failure the optimistic in-memory
    *  value is re-read from disk, so the control snaps back to what is actually
@@ -219,6 +246,7 @@ export class SettingsState {
         this.apply(loaded.settings);
         this.settingsRepaired = loaded.repaired_fields.length > 0;
         this.snapshotDirUnavailable = loaded.snapshot_dir_unavailable ?? false;
+        this.unsetDefaultsToNotify = loaded.unset_defaults_to_notify ?? [];
       } catch {
         // The stored settings cannot be read back either; the flag is all the
         // signal there is.
@@ -232,6 +260,7 @@ export class SettingsState {
       this.apply(loaded.settings, true);
       this.settingsRepaired = loaded.repaired_fields.length > 0;
       this.snapshotDirUnavailable = loaded.snapshot_dir_unavailable ?? false;
+      this.unsetDefaultsToNotify = loaded.unset_defaults_to_notify ?? [];
     } finally {
       this.#markReady();
     }
@@ -266,7 +295,14 @@ export class SettingsState {
   }
 
   get isDark(): boolean {
-    return themeRegistry.get(this.themeId)?.variant === 'dark';
+    return (
+      resolveEditorTheme(
+        themeRegistry.themes,
+        this.themeId,
+        isLite(),
+        interfaceIsDark(this.interfaceMode, this.prefersDark),
+      )?.variant === 'dark'
+    );
   }
 
   async setLanguage(language: Language): Promise<void> {
@@ -341,6 +377,16 @@ export class SettingsState {
     this.editorFontFamily = trimmed;
     await this.save({ editor_font_family: trimmed });
   }
+  /** Remember `family` in the added-fonts list and select it, in one save. */
+  async addFontFamily(family: string): Promise<void> {
+    const trimmed = family.trim();
+    this.editorFontFamily = trimmed;
+    this.editorExtraFonts = withAddedFont(this.editorExtraFonts, trimmed);
+    await this.save({
+      editor_font_family: trimmed,
+      editor_extra_fonts: this.editorExtraFonts,
+    });
+  }
 
   async setDefaultLineEnding(ending: LineEnding): Promise<void> {
     this.defaultLineEnding = ending;
@@ -387,15 +433,6 @@ export class SettingsState {
     this.snapshotDir = dir;
     await this.refreshResolvedSnapshotDir();
   }
-
-  /** Re-register the global new-note shortcut. Throws (propagated to the caller)
-   *  when the accelerator is invalid or cannot be registered, leaving the old
-   *  one in place; the local field is updated only on success. */
-  async setNewNoteShortcut(accelerator: string): Promise<void> {
-    await invoke<void>('set_new_note_shortcut', { shortcut: accelerator });
-    this.newNoteShortcut = accelerator;
-  }
-
   /** Reset the default sticky size to the built-in 280×230. */
   async resetStickySize(): Promise<void> {
     this.defaultStickyWidth = 280;

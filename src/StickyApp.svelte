@@ -7,7 +7,8 @@
   import { getCurrentWindow } from '@tauri-apps/api/window';
   import { save } from '@tauri-apps/plugin-dialog';
   import EditorShell from './lib/editor/EditorShell.svelte';
-  import ConfirmModal from './lib/ConfirmModal.svelte';
+  import ConfirmModal, { isModalOpen } from './lib/ConfirmModal.svelte';
+  import { popupClosesOnEscape } from './lib/util/popupEscape';
   import {
     stickyNote,
     type PinMode,
@@ -28,7 +29,12 @@
   import { saveDialogOptions } from './lib/util/saveDialog';
   import { READ_ONLY_DESTINATION } from './lib/util/protocol';
   import { fileName } from './lib/util/filePath';
-  import { isEditAction } from './lib/util/menuBar';
+  import {
+    isEditAction,
+    isNativeUndoField,
+    nativeFieldHistory,
+    nativeSelectAll,
+  } from './lib/util/menuBar';
   import {
     editorCopy,
     editorCut,
@@ -93,7 +99,9 @@
       }
     };
     const onKey = (e: KeyboardEvent): void => {
-      if (e.key === 'Escape') {
+      // A dialog on top owns the Esc it acts on; the popup closes on the next
+      // one, or at once on an Esc the dialog ignores.
+      if (popupClosesOnEscape(e, isModalOpen())) {
         close();
       }
     };
@@ -279,6 +287,22 @@
   // to the sticky's save-and-convert flow. New Tab, Open, Find and Find and
   // Replace never reach an enabled sticky menu item, so they are ignored here.
   function runMenuAction(action: string): void {
+    // The find field keeps its own undo history.
+    if (
+      (action === 'undo' || action === 'redo') &&
+      isNativeUndoField(document.activeElement as HTMLElement | null)
+    ) {
+      nativeFieldHistory(action);
+      return;
+    }
+    // Same for Select All: a focused field selects its own text, not the note.
+    if (
+      action === 'select-all' &&
+      isNativeUndoField(document.activeElement as HTMLElement | null)
+    ) {
+      nativeSelectAll();
+      return;
+    }
     if (isEditAction(action) && editorView !== null) {
       const view = editorView;
       switch (action) {
@@ -688,7 +712,9 @@
       primaryLabel={t('common.save')}
       secondaryLabel={t('dialog.dontSave')}
       cancelLabel={t('common.cancel')}
-      onprimary={() => void saveAndConvert()}
+      onprimary={async () => {
+        await saveAndConvert();
+      }}
       onsecondary={discardAndDestroy}
       oncancel={() => (showModal = false)}
     />
@@ -700,8 +726,12 @@
       primaryLabel={t('common.save')}
       secondaryLabel={t('dialog.dontSave')}
       cancelLabel={t('common.cancel')}
-      onprimary={() => void quitGateSave()}
-      onsecondary={() => void quitGateDiscard()}
+      onprimary={async () => {
+        await quitGateSave();
+      }}
+      onsecondary={async () => {
+        await quitGateDiscard();
+      }}
       oncancel={quitGateCancel}
     />
   {/if}

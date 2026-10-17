@@ -3,11 +3,13 @@
   // SPDX-License-Identifier: GPL-3.0-only
 
   import { onMount } from 'svelte';
+  import { getCurrentWindow } from '@tauri-apps/api/window';
   import { settingsState } from './lib/state/settings.svelte';
   import { revealWhenThemed } from './lib/util/reveal';
   import { applyTheme, applyChrome } from './lib/theme/applyTheme';
   import { themeRegistry } from './lib/theme/themeRegistry.svelte';
   import { localeRegistry } from './lib/i18n/localeRegistry.svelte';
+  import { nativeSelectAll } from './lib/util/menuBar';
   import PrivacyDocument from './lib/PrivacyDocument.svelte';
 
   // Reflect the resolved theme onto the document root.
@@ -21,6 +23,16 @@
     const unlistenChanges = settingsState.listenChanges();
     const unlistenThemes = themeRegistry.listen();
     const unlistenLocales = localeRegistry.listen();
+    // Edit > Select All reaches the focused window as a menu action (the macOS
+    // item is no longer native); this page's text is selectable.
+    const unlistenMenuAction = getCurrentWindow().listen<string>(
+      'menu-action',
+      (event) => {
+        if (event.payload === 'select-all') {
+          nativeSelectAll();
+        }
+      },
+    );
     // Reveal the window only after the theme is loaded and applied, so a
     // dark-theme window never flashes its default white background.
     void revealWhenThemed();
@@ -29,6 +41,7 @@
       void unlistenChanges.then((u) => u());
       void unlistenThemes.then((u) => u());
       void unlistenLocales.then((u) => u());
+      void unlistenMenuAction.then((u) => u());
     };
   });
 </script>

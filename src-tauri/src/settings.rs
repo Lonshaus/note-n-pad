@@ -3,6 +3,7 @@
 
 use crate::fs_ops::write_text_atomic;
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 use std::path::Path;
 use std::sync::Mutex;
 use tauri::{AppHandle, Emitter, Manager};
@@ -31,8 +32,18 @@ pub struct AppSettings {
   /// so Rust stores whichever id was chosen verbatim.
   #[serde(default = "default_language")]
   pub language: String,
+  /// Canonical key of the global new-sticky shortcut; empty when cleared.
   #[serde(default = "default_new_note_shortcut")]
   pub new_note_shortcut: String,
+  /// Keys the user changed, by registry id. An empty value means the user
+  /// cleared the key. Only changed rows are stored; see `shortcuts::resolve`.
+  #[serde(default)]
+  pub shortcut_overrides: BTreeMap<String, String>,
+  /// Rows whose default key was already reported as taken, so the Settings
+  /// window does not repeat the notice on every launch. See
+  /// `ack_unset_defaults`.
+  #[serde(default)]
+  pub shortcut_unset_notified: Vec<String>,
   /// Absolute path to the folder the user picked to hold the app's `Note&Pad`
   /// snapshots folder, or `None` for the default (the app data dir). See
   /// `note_store::resolve_snapshot_dir` for how this resolves to the actual
@@ -89,6 +100,11 @@ pub struct AppSettings {
   /// Document editor font family. Empty means the built-in monospace stack.
   #[serde(default)]
   pub editor_font_family: String,
+  /// Font families the user added through the picker's "Choose another font"
+  /// list, listed in the dropdown in this order. Never holds a built-in picker
+  /// face (see `clean_extra_fonts`).
+  #[serde(default)]
+  pub editor_extra_fonts: Vec<String>,
   #[serde(default = "default_line_ending")]
   pub default_line_ending: String,
   #[serde(default = "default_encoding")]
@@ -138,7 +154,10 @@ fn default_language() -> String {
 }
 
 fn default_new_note_shortcut() -> String {
-  "CmdOrCtrl+Shift+N".to_string()
+  crate::shortcuts::default_canonical(
+    crate::shortcuts::GLOBAL_STICKY_ID,
+    crate::shortcuts::Platform::current(),
+  )
 }
 
 fn default_snapshot_dir() -> Option<String> {
@@ -235,6 +254,8 @@ impl Default for AppSettings {
       interface_mode: default_interface_mode(),
       language: default_language(),
       new_note_shortcut: default_new_note_shortcut(),
+      shortcut_overrides: BTreeMap::new(),
+      shortcut_unset_notified: Vec::new(),
       snapshot_dir: default_snapshot_dir(),
       snapshot_dir_bookmark: None,
       default_sticky_width: default_sticky_width(),
@@ -249,6 +270,7 @@ impl Default for AppSettings {
       preview_local_resources: default_preview_local_resources(),
       open_target: default_open_target(),
       editor_font_family: String::new(),
+      editor_extra_fonts: Vec::new(),
       default_line_ending: default_line_ending(),
       default_encoding: default_encoding(),
       workspace_x: None,
@@ -327,6 +349,42 @@ pub fn load_or_default_for_write(path: &Path) -> Result<AppSettings, String> {
     }
   }
 }
+/// Normalize the free-form font family (empty allowed, no allow-list) and the
+/// added-fonts list.
+fn normalize_fonts(settings: &mut AppSettings) {
+  settings.editor_font_family = settings.editor_font_family.trim().to_string();
+  settings.editor_extra_fonts = clean_extra_fonts(&settings.editor_extra_fonts);
+}
+/// The added-fonts list with each name trimmed, blank and duplicate entries
+/// dropped (first occurrence wins) and every built-in picker face removed, since
+/// those already have their own dropdown rows.
+fn clean_extra_fonts(fonts: &[String]) -> Vec<String> {
+  let mut cleaned: Vec<String> = Vec::new();
+  for font in fonts {
+    let name = font.trim();
+    if name.is_empty()
+      || crate::fonts::BUILTIN_FONT_FAMILIES.contains(&name)
+      || cleaned.iter().any(|kept| kept == name)
+    {
+      continue;
+    }
+    cleaned.push(name.to_string());
+  }
+  cleaned
+}
+/// A font typed under the former "Custom…" option is a non-empty family that is
+/// neither a built-in picker face nor in the added-fonts list; append it there
+/// so the dropdown has a row for it.
+fn migrate_custom_font(settings: &mut AppSettings) {
+  normalize_fonts(settings);
+  let family = &settings.editor_font_family;
+  if !family.is_empty() && !crate::fonts::BUILTIN_FONT_FAMILIES.contains(&family.as_str()) {
+    let family = family.clone();
+    if !settings.editor_extra_fonts.contains(&family) {
+      settings.editor_extra_fonts.push(family);
+    }
+  }
+}
 
 /// Reject an empty shortcut. `theme`, `language`, and `snapshot_dir` are not
 /// validated here — `snapshot_dir` is an arbitrary path (or None for the
@@ -344,10 +402,17 @@ pub fn load_or_default_for_write(path: &Path) -> Result<AppSettings, String> {
 /// out-of-range counterpart of the same silent-reset family).
 fn repair(settings: &mut AppSettings) -> Vec<String> {
   let mut repaired = Vec::new();
-  if !crate::shortcut::is_allowed_accelerator(settings.new_note_shortcut.trim()) {
-    settings.new_note_shortcut = default_new_note_shortcut();
-    repaired.push("new_note_shortcut".to_string());
-  }
+  let keys = crate::shortcuts::resolve_current(settings);
+  settings.new_note_shortcut = keys.new_note_shortcut;
+  settings.shortcut_overrides = keys.overrides;
+  repaired.extend(keys.repaired);
+  repaired.extend(
+    keys
+      .unset_defaults
+      .into_iter()
+      .filter(|id| !settings.shortcut_unset_notified.contains(id))
+      .map(|id| format!("shortcut_defaults.{id}")),
+  );
   if !(180.0..=4000.0).contains(&settings.default_sticky_width) {
     settings.default_sticky_width = default_sticky_width();
     repaired.push("default_sticky_width".to_string());
@@ -395,8 +460,12 @@ fn repair(settings: &mut AppSettings) -> Vec<String> {
 }
 
 fn validate(settings: &AppSettings) -> Result<(), String> {
-  if !crate::shortcut::is_allowed_accelerator(settings.new_note_shortcut.trim()) {
-    return Err("new_note_shortcut needs a modifier or must be a bare F1-F24".to_string());
+  let keys = crate::shortcuts::resolve_current(settings);
+  if !keys.repaired.is_empty() {
+    return Err(format!(
+      "invalid shortcut settings: {}",
+      keys.repaired.join(", ")
+    ));
   }
   // Matches the sticky window's min size and a sane upper bound.
   if !(crate::windows::STICKY_MIN_WIDTH..=4000.0).contains(&settings.default_sticky_width)
@@ -552,6 +621,13 @@ fn tolerant_settings(
       default_new_note_shortcut,
       &mut dropped,
     ),
+    shortcut_overrides: field_or_default(obj, "shortcut_overrides", BTreeMap::new, &mut dropped),
+    shortcut_unset_notified: field_or_default(
+      obj,
+      "shortcut_unset_notified",
+      Vec::new,
+      &mut dropped,
+    ),
     snapshot_dir: field_or_default(obj, "snapshot_dir", default_snapshot_dir, &mut dropped),
     snapshot_dir_bookmark: field_or_default(obj, "snapshot_dir_bookmark", || None, &mut dropped),
     default_sticky_width: field_or_default(
@@ -616,6 +692,7 @@ fn tolerant_settings(
     ),
     open_target: field_or_default(obj, "open_target", default_open_target, &mut dropped),
     editor_font_family: field_or_default(obj, "editor_font_family", String::new, &mut dropped),
+    editor_extra_fonts: field_or_default(obj, "editor_extra_fonts", Vec::new, &mut dropped),
     default_line_ending: field_or_default(
       obj,
       "default_line_ending",
@@ -691,6 +768,7 @@ pub fn load_from_with_report(path: &Path) -> Result<(AppSettings, Vec<String>), 
         }
       };
       repaired.extend(repair(&mut settings));
+      migrate_custom_font(&mut settings);
       Ok((settings, repaired))
     }
     Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok((AppSettings::default(), Vec::new())),
@@ -729,6 +807,9 @@ pub fn app_settings(app: &AppHandle) -> AppSettings {
 pub struct LoadedSettings {
   pub settings: AppSettings,
   pub repaired_fields: Vec<String>,
+  /// Rows whose default key is taken and not yet acknowledged; the Settings
+  /// window passes them to `ack_unset_defaults` once it has shown the notice.
+  pub unset_defaults_to_notify: Vec<String>,
   /// The chosen snapshot folder could not be used on this launch and the
   /// default one is in use instead. The setting itself is left alone, so the
   /// chosen folder is used again as soon as it works.
@@ -738,9 +819,15 @@ pub struct LoadedSettings {
 #[tauri::command]
 pub fn load_settings(app: AppHandle) -> Result<LoadedSettings, String> {
   let (settings, repaired_fields) = load_from_with_report(&settings_path(&app)?)?;
+  let unset_defaults_to_notify = repaired_fields
+    .iter()
+    .filter_map(|field| field.strip_prefix("shortcut_defaults."))
+    .map(str::to_string)
+    .collect();
   Ok(LoadedSettings {
     settings,
     repaired_fields,
+    unset_defaults_to_notify,
     snapshot_dir_unavailable: app
       .try_state::<crate::note_store::SnapshotFallback>()
       .is_some_and(|state| state.in_use()),
@@ -765,6 +852,33 @@ pub fn language_changed(old: &str, new: &str) -> bool {
 /// merging both. The lock turns that back into the one-at-a-time sequence the
 /// merge logic already assumes.
 static SETTINGS_WRITE_LOCK: Mutex<()> = Mutex::new(());
+/// Record that the notice for these unset default keys was shown. Keeps only
+/// ids that are still unset, so a row that loses its key again is reported
+/// again. Writes only when the stored list changes.
+fn ack_unset_defaults_at(path: &Path, ids: &[String]) -> Result<(), String> {
+  let _guard = SETTINGS_WRITE_LOCK.lock().unwrap();
+  let mut settings = load_or_default_for_write(path)?;
+  let still_unset = crate::shortcuts::resolve_current(&settings).unset_defaults;
+  let mut next: Vec<String> = settings
+    .shortcut_unset_notified
+    .iter()
+    .chain(ids)
+    .filter(|id| still_unset.contains(id))
+    .cloned()
+    .collect();
+  next.sort();
+  next.dedup();
+  if next == settings.shortcut_unset_notified {
+    return Ok(());
+  }
+  settings.shortcut_unset_notified = next;
+  save_to(path, &settings)
+}
+
+#[tauri::command(async)]
+pub fn ack_unset_defaults(app: AppHandle, ids: Vec<String>) -> Result<(), String> {
+  ack_unset_defaults_at(&settings_path(&app)?, &ids)
+}
 
 /// Off the UI thread: `settings_path` reads the app-data dir and the
 /// load/merge/write below round-trips the whole settings file. The write
@@ -786,8 +900,7 @@ pub fn save_settings(app: AppHandle, settings: serde_json::Value) -> Result<(), 
     // being laundered into defaults that then overwrite the user's real file.
     let current = load_or_default_for_write(&path)?;
     let mut merged = merge_settings(&current, &settings)?;
-    // Normalize the free-form font family (empty allowed, no allow-list).
-    merged.editor_font_family = merged.editor_font_family.trim().to_string();
+    normalize_fonts(&mut merged);
     save_to(&path, &merged)?;
     (current, merged)
   };
@@ -835,6 +948,13 @@ pub fn save_settings(app: AppHandle, settings: serde_json::Value) -> Result<(), 
 mod tests {
   use super::*;
   use tempfile::tempdir;
+  /// A legacy-spelled accelerator in the canonical form for this platform.
+  fn canonical(legacy: &str) -> String {
+    use crate::shortcuts::{normalize, Platform};
+    normalize(legacy, Platform::current())
+      .unwrap()
+      .canonical(Platform::current())
+  }
 
   /// Deserialize a settings JSON string through the same legacy migration path
   /// that `load_from` applies to on-disk files.
@@ -941,7 +1061,11 @@ mod tests {
     for bad in ["Enter", "Shift+N", "NotAKey"] {
       let text = format!(r#"{{"new_note_shortcut": "{bad}"}}"#);
       let (settings, repaired) = load_report(&text);
-      assert_eq!(settings.new_note_shortcut, "CmdOrCtrl+Shift+N", "{bad}");
+      assert_eq!(
+        settings.new_note_shortcut,
+        canonical("CmdOrCtrl+Shift+N"),
+        "{bad}"
+      );
       assert_eq!(repaired, vec!["new_note_shortcut".to_string()], "{bad}");
     }
   }
@@ -951,9 +1075,145 @@ mod tests {
     for good in ["CmdOrCtrl+Shift+N", "CmdOrCtrl+Alt+M"] {
       let text = format!(r#"{{"new_note_shortcut": "{good}"}}"#);
       let (settings, repaired) = load_report(&text);
-      assert_eq!(settings.new_note_shortcut, good);
+      assert_eq!(settings.new_note_shortcut, canonical(good));
       assert!(repaired.is_empty());
     }
+  }
+
+  #[test]
+  fn stored_overrides_are_repaired_on_load_and_reported_by_name() {
+    let (settings, repaired) = load_report(
+      r#"{"shortcut_overrides": {"editor.fold": "CmdOrCtrl+Alt+K", "editor.indent": "nonsense", "menu.save": "Ctrl+Alt+Q", "nope": "Ctrl+Alt+Z"}}"#,
+    );
+    assert_eq!(
+      settings.shortcut_overrides,
+      BTreeMap::from([("editor.fold".to_string(), canonical("CmdOrCtrl+Alt+K"))])
+    );
+    assert_eq!(
+      repaired,
+      vec![
+        "shortcut_overrides.editor.indent".to_string(),
+        "shortcut_overrides.menu.save".to_string(),
+        "shortcut_overrides.nope".to_string(),
+      ]
+    );
+  }
+
+  #[test]
+  fn a_default_blocked_by_an_override_is_reported_as_unset() {
+    let (_, repaired) =
+      load_report(r#"{"shortcut_overrides": {"editor.fold": "CmdOrCtrl+Alt+G"}}"#);
+    assert_eq!(repaired, vec!["shortcut_defaults.goto-line".to_string()]);
+  }
+  /// Write a settings file whose global key is the default of `goto-line`.
+  fn write_with_global_key(path: &Path, key: &str) {
+    let text = serde_json::json!({ "new_note_shortcut": key }).to_string();
+    std::fs::write(path, text).unwrap();
+  }
+
+  fn goto_line_default() -> String {
+    crate::shortcuts::default_canonical("goto-line", crate::shortcuts::Platform::current())
+  }
+
+  #[test]
+  fn an_unset_default_is_reported_until_it_is_acknowledged() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("settings.json");
+    write_with_global_key(&path, &goto_line_default());
+    let ids = vec!["goto-line".to_string()];
+    let reported = vec!["shortcut_defaults.goto-line".to_string()];
+    // Loading never writes, so it keeps reporting.
+    let before = std::fs::read_to_string(&path).unwrap();
+    assert_eq!(load_from_with_report(&path).unwrap().1, reported);
+    assert_eq!(load_from_with_report(&path).unwrap().1, reported);
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), before);
+    ack_unset_defaults_at(&path, &ids).unwrap();
+    let (settings, repaired) = load_from_with_report(&path).unwrap();
+    assert!(repaired.is_empty());
+    assert_eq!(settings.shortcut_unset_notified, ids);
+    // Clearing the global key frees the default; the ack drops the id.
+    write_with_global_key(&path, "");
+    let text = std::fs::read_to_string(&path).unwrap();
+    let mut value: serde_json::Value = serde_json::from_str(&text).unwrap();
+    value["shortcut_unset_notified"] = serde_json::json!(ids);
+    std::fs::write(&path, value.to_string()).unwrap();
+    ack_unset_defaults_at(&path, &[]).unwrap();
+    assert!(load_from(&path).unwrap().shortcut_unset_notified.is_empty());
+    // Taking the key again reports the row again.
+    write_with_global_key(&path, &goto_line_default());
+    assert_eq!(load_from_with_report(&path).unwrap().1, reported);
+  }
+
+  #[test]
+  fn acknowledging_leaves_the_file_alone_when_nothing_changes() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("settings.json");
+    write_with_global_key(&path, "");
+    let before = std::fs::read_to_string(&path).unwrap();
+    ack_unset_defaults_at(&path, &["goto-line".to_string()]).unwrap();
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), before);
+  }
+
+  #[test]
+  fn a_file_without_the_notified_list_loads_with_it_empty() {
+    let (settings, repaired) = load_report(r#"{"theme": "paper"}"#);
+    assert!(settings.shortcut_unset_notified.is_empty());
+    assert!(repaired.is_empty());
+    let (settings, repaired) = load_report(r#"{"theme": "paper", "shortcut_unset_notified": "x"}"#);
+    assert_eq!(settings.theme, "paper");
+    assert!(settings.shortcut_unset_notified.is_empty());
+    assert_eq!(repaired, vec!["shortcut_unset_notified".to_string()]);
+  }
+
+  #[test]
+  fn a_wrongly_typed_override_map_costs_only_that_field() {
+    let (settings, repaired) = load_report(r#"{"theme": "paper", "shortcut_overrides": ["x"]}"#);
+    assert_eq!(settings.theme, "paper");
+    assert!(settings.shortcut_overrides.is_empty());
+    assert_eq!(repaired, vec!["shortcut_overrides".to_string()]);
+  }
+
+  #[test]
+  fn save_rejects_inconsistent_shortcut_settings_and_accepts_a_cleared_global_key() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("settings.json");
+    let conflicting = AppSettings {
+      shortcut_overrides: BTreeMap::from([("editor.fold".to_string(), canonical("CmdOrCtrl+S"))]),
+      ..AppSettings::default()
+    };
+    assert!(save_to(&path, &conflicting).is_err());
+    let unknown = AppSettings {
+      shortcut_overrides: BTreeMap::from([("nope".to_string(), String::new())]),
+      ..AppSettings::default()
+    };
+    assert!(save_to(&path, &unknown).is_err());
+    let cleared = AppSettings {
+      new_note_shortcut: String::new(),
+      ..AppSettings::default()
+    };
+    assert!(save_to(&path, &cleared).is_ok());
+    assert_eq!(load_from(&path).unwrap().new_note_shortcut, "");
+  }
+
+  #[test]
+  fn overrides_merge_as_a_whole_map() {
+    let current = AppSettings {
+      shortcut_overrides: BTreeMap::from([(
+        "editor.fold".to_string(),
+        canonical("CmdOrCtrl+Alt+K"),
+      )]),
+      ..AppSettings::default()
+    };
+    let merged = merge_settings(
+      &current,
+      &serde_json::json!({ "shortcut_overrides": { "editor.indent": canonical("CmdOrCtrl+Alt+J") } }),
+    )
+    .unwrap();
+    assert_eq!(merged.shortcut_overrides.len(), 1);
+    assert!(merged.shortcut_overrides.contains_key("editor.indent"));
+    let emptied =
+      merge_settings(&current, &serde_json::json!({ "shortcut_overrides": {} })).unwrap();
+    assert!(emptied.shortcut_overrides.is_empty());
   }
 
   #[test]
@@ -1032,7 +1292,12 @@ mod tests {
       theme: "voyage".into(),
       interface_mode: "dark".into(),
       language: "ja".into(),
-      new_note_shortcut: "CmdOrCtrl+Alt+M".into(),
+      new_note_shortcut: canonical("CmdOrCtrl+Alt+M"),
+      shortcut_overrides: BTreeMap::from([(
+        "editor.fold".to_string(),
+        canonical("CmdOrCtrl+Alt+K"),
+      )]),
+      shortcut_unset_notified: Vec::new(),
       snapshot_dir: Some("/Volumes/Cloud/Note&Pad".into()),
       snapshot_dir_bookmark: Some("Ym9va21hcms=".into()),
       default_sticky_width: 491.0,
@@ -1047,6 +1312,7 @@ mod tests {
       preview_local_resources: true,
       open_target: "window".into(),
       editor_font_family: "Menlo".into(),
+      editor_extra_fonts: vec!["Zapfino".into()],
       default_line_ending: "CRLF".into(),
       default_encoding: "Big5".into(),
       workspace_x: Some(40.0),
@@ -1219,14 +1485,14 @@ mod tests {
     let path = dir.path().join("does-not-exist.json");
     let loaded = load_from(&path).unwrap();
     assert_eq!(loaded.theme, "ink");
-    assert_eq!(loaded.new_note_shortcut, "CmdOrCtrl+Shift+N");
+    assert_eq!(loaded.new_note_shortcut, canonical("CmdOrCtrl+Shift+N"));
   }
 
   #[test]
   fn legacy_json_without_shortcut_defaults() {
     let legacy = r#"{"theme":"dark"}"#;
     let settings: AppSettings = serde_json::from_str(legacy).unwrap();
-    assert_eq!(settings.new_note_shortcut, "CmdOrCtrl+Shift+N");
+    assert_eq!(settings.new_note_shortcut, canonical("CmdOrCtrl+Shift+N"));
     assert_eq!(settings.snapshot_dir, None);
   }
 
@@ -1493,6 +1759,88 @@ mod tests {
       };
       assert!(save_to(&path, &s).is_ok());
     }
+  }
+
+  fn strings(items: &[&str]) -> Vec<String> {
+    items.iter().map(|s| s.to_string()).collect()
+  }
+
+  #[test]
+  fn extra_fonts_default_to_empty_for_an_older_file() {
+    let settings = load_json(r#"{"editor_font_family": ""}"#);
+    assert!(settings.editor_extra_fonts.is_empty());
+    assert!(AppSettings::default().editor_extra_fonts.is_empty());
+  }
+
+  #[test]
+  fn extra_fonts_of_the_wrong_type_are_reset_and_reported() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("settings.json");
+    std::fs::write(&path, r#"{"editor_extra_fonts": "Arial"}"#).unwrap();
+    let (settings, repaired) = load_from_with_report(&path).unwrap();
+    assert!(settings.editor_extra_fonts.is_empty());
+    assert!(repaired.contains(&"editor_extra_fonts".to_string()));
+  }
+
+  #[test]
+  fn extra_fonts_keep_their_stored_order_through_save_and_load() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("settings.json");
+    let settings = AppSettings {
+      editor_extra_fonts: strings(&["Zapfino", "Arial"]),
+      ..AppSettings::default()
+    };
+    save_to(&path, &settings).unwrap();
+    assert_eq!(
+      load_from(&path).unwrap().editor_extra_fonts,
+      strings(&["Zapfino", "Arial"])
+    );
+  }
+
+  #[test]
+  fn merge_cleans_the_extra_fonts_list() {
+    let merged = merge_settings(
+      &AppSettings::default(),
+      &serde_json::json!({
+        "editor_extra_fonts": [" Zapfino ", "", "  ", "Arial", "Zapfino", "Menlo", "Arial"],
+      }),
+    )
+    .unwrap();
+    let mut merged = merged;
+    normalize_fonts(&mut merged);
+    assert_eq!(merged.editor_extra_fonts, strings(&["Zapfino", "Arial"]));
+  }
+
+  #[test]
+  fn a_previously_typed_custom_font_is_added_to_the_list_on_load() {
+    let settings = load_json(r#"{"editor_font_family": "Zapfino"}"#);
+    assert_eq!(settings.editor_font_family, "Zapfino");
+    assert_eq!(settings.editor_extra_fonts, strings(&["Zapfino"]));
+  }
+
+  #[test]
+  fn the_migration_appends_after_the_fonts_already_added() {
+    let settings =
+      load_json(r#"{"editor_font_family": "Zapfino", "editor_extra_fonts": ["Arial"]}"#);
+    assert_eq!(settings.editor_extra_fonts, strings(&["Arial", "Zapfino"]));
+  }
+
+  #[test]
+  fn the_migration_skips_built_in_empty_and_already_listed_families() {
+    let builtin = load_json(r#"{"editor_font_family": "Menlo"}"#);
+    assert!(builtin.editor_extra_fonts.is_empty());
+    let empty = load_json(r#"{"editor_font_family": ""}"#);
+    assert!(empty.editor_extra_fonts.is_empty());
+    let listed =
+      load_json(r#"{"editor_font_family": "Zapfino", "editor_extra_fonts": ["Zapfino"]}"#);
+    assert_eq!(listed.editor_extra_fonts, strings(&["Zapfino"]));
+  }
+
+  #[test]
+  fn the_migration_trims_the_stored_family() {
+    let settings = load_json(r#"{"editor_font_family": "  Zapfino "}"#);
+    assert_eq!(settings.editor_font_family, "Zapfino");
+    assert_eq!(settings.editor_extra_fonts, strings(&["Zapfino"]));
   }
 
   #[test]

@@ -13,6 +13,7 @@ import {
 } from '../editor/language';
 import { beautifyJson, softWrapLongLines } from '../util/longLine';
 import {
+  KeptRestore,
   UnreadableRestore,
   activePositionAfterRestore,
   restoreOutcome,
@@ -27,7 +28,13 @@ import {
   textEq,
   type LineEnding,
 } from '../util/text';
-import { replacementByteLength } from '../util/rangeEdit';
+import {
+  rangeWriteText,
+  replacementByteLength,
+  sliceEndsWithBreak,
+} from '../util/rangeEdit';
+import { detectBreakStyle } from '../util/windowedEdit';
+import { createOpGate, type OpGate } from '../util/windowedGate';
 import {
   routeOpen,
   orphanCandidates,
@@ -36,13 +43,22 @@ import {
 } from '../util/openRouting';
 import type { CheckpointIndex, NoteSnapshot } from './stickyNote.svelte';
 import { settingsState } from './settings.svelte';
+import { editionState, isLite } from './edition.svelte';
+import {
+  keptTabsToLoad,
+  partitionRestorable,
+  windowBoundsRecord,
+} from '../util/keptTabs';
+import { isOrdinaryTab, pickHeldTab, touchMru } from './heldTab';
+import type { LargeIndexRef } from '../util/largeIndex';
 import {
   snapshotContentPolicy,
   debounceContentPolicy,
   restoredRangeContent,
 } from '../util/snapshotPolicy';
 import { t } from '../i18n';
-import { READ_ONLY_DESTINATION } from '../util/protocol';
+import { rangeLabel } from '../util/rangeLabel';
+import { READ_ONLY_DESTINATION, isLiteRefusal } from '../util/protocol';
 
 /** Rust `splice_file` rejects an out-of-band-edited source with this exact error
  *  string; the write-back keys its conflict flow off it (protocol value). */
@@ -78,6 +94,16 @@ export function windowedRefusalReason(error: string): WindowedRefusalReason {
     return 'tooLarge';
   }
   return 'cannot';
+}
+/** Whether `tab` is a read-only large view, a windowed-editing tab or one about to
+ *  become one: its bytes stay as they are on disk, so its line ending and
+ *  encoding are not changeable. */
+function isLargeKind(tab: DocTab): boolean {
+  return (
+    tab.large !== undefined ||
+    tab.windowed !== undefined ||
+    tab.windowedRestore !== undefined
+  );
 }
 
 /** `windowedRefusalReason` resolved to its `doc.edit.*` translation, the
@@ -218,6 +244,12 @@ export const LARGE_FILE_THRESHOLD = 100 * 1024 * 1024;
  *  offers the read-only view. */
 export const LARGE_EDIT_MAX = 512 * 1024 * 1024;
 
+/** Whether a file of `size` bytes opens in the read-only large-file viewer. The
+ *  Lite edition has no viewer: every size opens in the ordinary editor. */
+export function opensInLargeViewer(size: number, lite: boolean): boolean {
+  return !lite && size > LARGE_FILE_THRESHOLD;
+}
+
 /** One open document tab. The buffer (`content`) is always LF-normalized. It is a
  *  CodeMirror `Text` (rope), not a string, so a keystroke costs O(edit) instead of
  *  copying the whole buffer; string materialization happens only at flush points
@@ -238,6 +270,11 @@ export interface DocTab {
   explicit: boolean;
   lineEnding: LineEnding;
   savedLineEnding: LineEnding;
+  /** Large and windowed tabs only: the separator typed line breaks are written
+   *  with, set together with `lineEnding` once the file's own ending has been
+   *  read. Undefined means not detected yet. Never persisted: a restored tab
+   *  detects again from its first window. */
+  insertLineEnding?: '\r\n' | '\n';
   hadBom: boolean;
   encoding: string;
   /** Transient: set when the last decode produced replacement characters. */
@@ -263,6 +300,10 @@ export interface DocTab {
      *  Null only for a tab restored from an older snapshot that persisted a
      *  formatted label instead of a line number — see `rangeDisplayName`. */
     startLine: number | null;
+    /** Whether the source slice ended with a line break. `splice` adds one to
+     *  what it writes when the buffer ended up without one, so text typed on the
+     *  last line cannot join the next source line. */
+    trailingBreak: boolean;
   };
   /** Present only on a windowed-editing tab: the buffer lives in the Rust core,
    *  streamed a window at a time by the WindowedEditor. `content`/`savedContent`
@@ -312,34 +353,46 @@ export interface DocTab {
 /** The tab-bar/window-title label for a range tab: "{name} (lines X–Y)"
  *  through `t()`, so a language change or a locale edit is reflected the next
  *  time this is called rather than frozen at extraction time. The end line is
- *  derived from the tab's own content line count instead of being stored, so
- *  it stays correct after an edit that changes the line count (`splice`
- *  rebases `endByte` but has nothing else to keep in sync). Returns null for
+ *  derived from the tab's own content line count, so it stays correct after an
+ *  edit that changes the line count (`splice` rebases `endByte` but has
+ *  nothing else to keep in sync); `snapshot()` persists it as `range_end_line`
+ *  for views that do not open the tab. Returns null for
  *  a non-range tab, or for a range tab restored from an older snapshot that
  *  carries no start line (its formatted label wasn't persisted in a form line
  *  numbers can be recovered from) — the caller's own fallback (the file name)
  *  covers that case, matching a fresh range tab's degraded display. */
 export function rangeDisplayName(tab: DocTab): string | null {
   const r = tab.range;
+  const endLine = rangeEndLine(tab);
+  if (r === undefined || r.startLine === null || endLine === null) {
+    return null;
+  }
+  return rangeLabel(r.sourcePath, r.startLine, endLine);
+}
+/** 1-based line number of a range tab's last line, from its live content: the
+ *  start line plus the lines the buffer covers. Null for a non-range tab and
+ *  for a range tab with no start line (restored from an older snapshot). */
+export function rangeEndLine(tab: DocTab): number | null {
+  const r = tab.range;
   if (r === undefined || r.startLine === null) {
     return null;
   }
-  const name = r.sourcePath.split(/[/\\]/).pop() || r.sourcePath;
-  // The extracted slice's end offset is the start of the line *after* the last
-  // selected line (see `LargeFileView.svelte`'s `selectionByteRange`), so the
-  // content almost always ends with the last selected line's trailing
-  // newline. `Text.lines` counts the empty line that trailing newline opens,
-  // so it overcounts by one versus the real number of selected lines — except
-  // for the one case where the extraction reached EOF of a file with no final
-  // newline. Detect that trailing newline directly instead of assuming either
-  // shape, so an empty range (`Text.empty`, no trailing newline) still yields
-  // a single displayed line.
+  return r.startLine + rangeLineCount(tab) - 1;
+}
+/** Number of source lines a range tab's buffer covers (at least 1). The slice's
+ *  end offset is the start of the line *after* the last selected line (see
+ *  `LargeFileView.svelte`'s `selectionByteRange`), so the content almost always
+ *  ends with the last selected line's trailing newline. `Text.lines` counts the
+ *  empty line that trailing newline opens, so it overcounts by one versus the
+ *  real number of selected lines, except for the one case where the extraction
+ *  reached EOF of a file with no final newline. Detect that trailing newline
+ *  directly instead of assuming either shape, so an empty range (`Text.empty`,
+ *  no trailing newline) still yields a single displayed line. */
+function rangeLineCount(tab: DocTab): number {
   const content = tab.content;
   const endsWithNewline =
     content.length > 0 && content.sliceString(content.length - 1) === '\n';
-  const lineCount = content.lines - (endsWithNewline ? 1 : 0);
-  const endLine = r.startLine + lineCount - 1;
-  return t('doc.range.displayName', { name, start: r.startLine, end: endLine });
+  return content.lines - (endsWithNewline ? 1 : 0);
 }
 
 interface Bounds {
@@ -381,8 +434,89 @@ class DocumentWindowState {
   }
 
   set activeIndex(index: number) {
+    this.noteOrdinary(this.activeTab);
     this.#activeIndexState = index;
+    this.noteOrdinary(this.activeTab);
     this.ensureWindowedRestore(this.activeTab);
+  }
+  /** Ids of ordinary tabs, most recently active first: the editor keeps the
+   *  latest one mounted while a windowed or large-file tab is shown. */
+  ordinaryMru = $state<string[]>([]);
+  private noteOrdinary(tab: DocTab | null): void {
+    if (tab !== null && isOrdinaryTab(tab)) {
+      this.ordinaryMru = touchMru(this.ordinaryMru, tab.id);
+    }
+  }
+  /** The ordinary tab the editor holds (see `pickHeldTab`). */
+  get heldTab(): DocTab | null {
+    return pickHeldTab(this.tabs, this.activeIndex, this.ordinaryMru);
+  }
+  /** Where each windowed tab was last looking, by tab id: the viewport's top
+   *  line and the caret (global, 1-based line and column). In memory only and
+   *  not reactive: it is read when an editor remounts, never rendered. */
+  private viewPos = new Map<
+    string,
+    { top?: number; caretLine?: number; caretCol?: number }
+  >();
+  /** The line index each large-file viewer tab keeps alive across tab
+   *  switches, by tab id. Dropped when the tab closes, the window closes, the
+   *  file is rewritten or the tab unlocks. */
+  private largeIndexes = new Map<string, LargeIndexRef>();
+  /** The pending-operation gate of each windowed session, by session id: a
+   *  replace all (or its undo or redo) runs in the Rust core and can outlive
+   *  the editor that started it, since the editor is mounted only for the
+   *  active tab. Not reactive; an editor reads it when it mounts. */
+  private windowedGates = new Map<number, OpGate>();
+  viewTopLine(id: string): number | undefined {
+    return this.viewPos.get(id)?.top;
+  }
+  setViewTopLine(id: string, line: number): void {
+    this.viewPos.set(id, { ...this.viewPos.get(id), top: line });
+  }
+  viewCaret(id: string): { line: number; col: number } | undefined {
+    const pos = this.viewPos.get(id);
+    return pos?.caretLine === undefined || pos.caretCol === undefined
+      ? undefined
+      : { line: pos.caretLine, col: pos.caretCol };
+  }
+  setViewCaret(id: string, line: number, col: number): void {
+    this.viewPos.set(id, {
+      ...this.viewPos.get(id),
+      caretLine: line,
+      caretCol: col,
+    });
+  }
+  largeIndex(id: string): LargeIndexRef | undefined {
+    return this.largeIndexes.get(id);
+  }
+  /** Record (or, with null, forget) a viewer tab's kept line index. An index
+   *  reported for a tab that is gone or no longer a viewer is released. */
+  setLargeIndex(id: string, ref: LargeIndexRef | null): void {
+    if (ref === null) {
+      this.largeIndexes.delete(id);
+      return;
+    }
+    const tab = this.tabs.find((t) => t.id === id);
+    if (tab?.large === undefined) {
+      if (!__LITE__) {
+        void invoke('drop_line_index', { id: ref.id });
+      }
+      return;
+    }
+    this.largeIndexes.set(id, ref);
+  }
+  private dropLargeIndex(id: string): void {
+    const ref = this.largeIndexes.get(id);
+    if (ref !== undefined) {
+      this.largeIndexes.delete(id);
+      if (!__LITE__) {
+        void invoke('drop_line_index', { id: ref.id });
+      }
+    }
+  }
+  private releaseTabView(id: string): void {
+    this.viewPos.delete(id);
+    this.dropLargeIndex(id);
   }
   /** Cursor position of the active tab, mirrored into the status bar. */
   line = $state(1);
@@ -392,6 +526,8 @@ class DocumentWindowState {
   /** Bumped to force the editor to reload the active tab's buffer from state,
    *  e.g. after re-decoding under a new encoding (content changed externally). */
   reloadSeq = $state(0);
+  /** The id of the tab the last `reloadSeq` bump was meant for. */
+  reloadTargetId = '';
   /** Bumped after a splice rewrites a source file whose large-file viewer tab is
    *  in this window, so the keyed view remounts and rebuilds its line index. */
   largeReloadSeq = $state(0);
@@ -421,12 +557,34 @@ class DocumentWindowState {
   /** Paths of restored clean tabs that exist but could not be read. They are
    *  not opened (a blank tab would pass for the file); reported once. */
   restoreUnreadable = $state<string[]>([]);
+  /** How many of this window's stored tabs a lite session left closed: the ones
+   *  that need the large-file viewer, windowed editing or range editing. Their
+   *  records are not touched, and they open once the edition is full. Shown once
+   *  as a notice; zero otherwise. */
+  keptTabs = $state(0);
   /** True when the most recent snapshot write did not reach disk. `upsertTab`
    *  never lets a write's rejection propagate (see its own comment), so this
    *  is the only surviving signal that a save failed; cleared by the next
    *  write that succeeds. No UI reads this yet (see the follow-up issue) —
    *  it exists so a failure is not swallowed into nothing. */
   snapshotFailed = $state(false);
+
+  /** Dismiss the kept-tabs notice. */
+  dismissKeptTabs(): void {
+    this.keptTabs = 0;
+  }
+  /** Dismiss the kept-tabs notice of a window that is about to close. When no
+   *  tab is left the core is told to hold the group back, so it returns when
+   *  the edition is full; resolves `true` then, and the window should be
+   *  destroyed. Nothing else holds a group back. */
+  async dismissKeptTabsAndHoldBack(): Promise<boolean> {
+    this.dismissKeptTabs();
+    if (this.tabs.length > 0) {
+      return false;
+    }
+    await invoke('hold_back_group', { group: this.group });
+    return true;
+  }
 
   /** Dismiss the unreadable-restore report. */
   dismissRestoreUnreadable(): void {
@@ -547,7 +705,7 @@ class DocumentWindowState {
     // degrades to no index rather than throwing; `windowed?.totalBytes` is a
     // last-resort fallback so the tab still restores as *something* large.
     let windowedIndexSnap: WindowedIndexSnapshot | null = null;
-    if (tab.windowed !== undefined) {
+    if (!__LITE__ && tab.windowed !== undefined) {
       try {
         windowedIndexSnap = await invoke<WindowedIndexSnapshot>(
           'windowed_index',
@@ -645,6 +803,8 @@ class DocumentWindowState {
       range_fp_size: tab.range?.fingerprint?.size ?? null,
       range_fp_mtime: tab.range?.fingerprint?.mtime_ms ?? null,
       range_start_line: tab.range?.startLine ?? null,
+      range_end_line: rangeEndLine(tab),
+      range_trailing_break: tab.range?.trailingBreak ?? null,
       // A windowed tab persists what `beginWindowedRestore` needs to rebuild the
       // session with no rescan (see `windowed_reopen`); its presence is what
       // marks the tab as "was unlocked" on restore.
@@ -724,6 +884,9 @@ class DocumentWindowState {
     // conflict baseline either way.
     if (snap !== null && snap.range_source !== null) {
       const source = snap.range_source;
+      if (__LITE__) {
+        throw new KeptRestore();
+      }
       // Shadows the outer `readOnlyFile`: a range tab's write-back target is
       // `source`, not the tab's own (always-empty) `path`.
       const readOnlyFile = await invoke<boolean>('path_writable', {
@@ -745,6 +908,14 @@ class DocumentWindowState {
       } catch (e) {
         diskSlice = null;
         rangeReadError = String(e);
+      }
+      // The edition turned lite while this restore ran and the core refused the
+      // read: that says nothing about the file, and the record needs full.
+      if (
+        rangeReadError !== null &&
+        (isLite() || isLiteRefusal(rangeReadError))
+      ) {
+        throw new KeptRestore();
       }
       if (restoreOutcome(snap.dirty, rangeReadError) === 'unreadable') {
         throw new UnreadableRestore(source);
@@ -785,6 +956,9 @@ class DocumentWindowState {
           endByte,
           fingerprint,
           startLine: snap.range_start_line ?? null,
+          trailingBreak:
+            snap.range_trailing_break ??
+            (diskSlice !== null ? sliceEndsWithBreak(diskSlice) : false),
         },
       };
     }
@@ -848,14 +1022,15 @@ class DocumentWindowState {
     // any reason) must still degrade to the read-only viewer rather than
     // decoding a huge file whole into the WebView — the same ceiling `openTab`
     // enforces before a fresh open ever reaches a full decode.
-    if (path !== '') {
+    // Lite has no viewer to degrade to, so it neither stats nor gates.
+    if (path !== '' && !__LITE__ && !isLite()) {
       let size: number | null = null;
       try {
         size = (await invoke<FileStat>('stat_file', { path })).size;
       } catch {
         size = null;
       }
-      if (size !== null && size > LARGE_FILE_THRESHOLD) {
+      if (size !== null && opensInLargeViewer(size, false)) {
         return {
           id: snap?.id ?? crypto.randomUUID(),
           path,
@@ -974,6 +1149,9 @@ class DocumentWindowState {
     // A fresh window takes its project from the URL; a restored window adopts it
     // from the group's stored notes (set below), ignoring the URL value.
     this.project = project;
+    // The edition decides how a snapshot may be restored, so it is settled
+    // before the first tab is loaded.
+    await editionState.ready();
     const all = await invoke<NoteSnapshot[]>('list_notes');
     const entries = all
       .filter(
@@ -983,11 +1161,22 @@ class DocumentWindowState {
     if (entries.length > 0) {
       // Restore: adopt the project the group's tabs were saved with.
       this.project = entries[0]!.project;
-      const dropped = new Set<number>();
-      for (const entry of entries) {
+      // A lite session does not open a tab that needs a removed feature. It has
+      // no tab object for it, so nothing below can write, rewrite or delete its
+      // record (every snapshot write and delete goes through a tab in `tabs`);
+      // it is counted and noticed instead.
+      const { restorable, kept } = partitionRestorable(entries, isLite());
+      this.keptTabs = kept.length;
+      const dropped = new Set<number>(kept.map((n) => n.tab_index));
+      for (const entry of restorable) {
         try {
           this.tabs.push(await this.loadTab(entry.file_path ?? '', entry));
         } catch (e) {
+          if (e instanceof KeptRestore) {
+            this.keptTabs += 1;
+            dropped.add(entry.tab_index);
+            continue;
+          }
           if (!(e instanceof UnreadableRestore)) {
             throw e;
           }
@@ -999,7 +1188,7 @@ class DocumentWindowState {
           dropped.add(entry.tab_index);
         }
       }
-      const lowest = entries[0]!;
+      const lowest = windowBoundsRecord(entries, isLite());
       this.bounds = {
         x: lowest.x,
         y: lowest.y,
@@ -1023,6 +1212,11 @@ class DocumentWindowState {
       // empty if cancelled — DocumentApp collapses it then).
       this.nextIndex = 0;
       await this.openTab(initialPath);
+      if (this.tabs.length > 0) {
+        // The window now shows a document, so it can no longer be a launch
+        // window that collapses.
+        void invoke('launch_window_loaded', { label: `doc-${group}` });
+      }
       // `switchTo(0)` returns early when the index is already active, so the
       // setter — and the restore it kicks — never fires for a fresh window's
       // first tab, which an adopted orphan can be. Kick it directly: writing
@@ -1031,11 +1225,81 @@ class DocumentWindowState {
       this.ensureWindowedRestore(this.activeTab);
     }
     this.ready = true;
+    // The edition turned full while the tabs above were loading.
+    if (this.keptTabs > 0 && !isLite()) {
+      await this.restoreKeptTabs();
+    }
   }
+
+  /** The edition turned full: open the tabs of this window that lite kept, from
+   *  their stored records exactly as a startup restore would, so a range tab
+   *  comes back with its unsaved edits. Tabs keep their stored order. */
+  restoreKeptTabs(): Promise<void> {
+    // One at a time: two flips in quick succession would otherwise both read
+    // the store before either had opened a tab, and open every one twice.
+    const run = this.keptRestore.then(() => this.restoreKeptTabsNow());
+    this.keptRestore = run.catch(() => {});
+    return run;
+  }
+
+  private keptRestore: Promise<void> = Promise.resolve();
+
+  private async restoreKeptTabsNow(): Promise<void> {
+    if (!this.ready || isLite()) {
+      return;
+    }
+    let all: NoteSnapshot[];
+    try {
+      all = await invoke<NoteSnapshot[]>('list_notes');
+    } catch {
+      return;
+    }
+    const kept = keptTabsToLoad(
+      all,
+      this.group,
+      new Set(this.tabs.map((tab) => tab.id)),
+    );
+    const activeId = this.activeTab?.id ?? null;
+    let stillKept = 0;
+    for (const entry of kept) {
+      try {
+        this.tabs.push(await this.loadTab(entry.file_path ?? '', entry));
+      } catch (e) {
+        if (e instanceof KeptRestore) {
+          // Lite again before this one could be read: it stays kept.
+          stillKept += 1;
+          continue;
+        }
+        if (!(e instanceof UnreadableRestore)) {
+          throw e;
+        }
+        await invoke('delete_note', { id: entry.id }).catch(() => {});
+        this.restoreUnreadable.push(e.path);
+      }
+    }
+    this.keptTabs = stillKept;
+    if (kept.length === 0) {
+      return;
+    }
+    this.tabs.sort((a, b) => a.tabIndex - b.tabIndex);
+    const at = this.tabs.findIndex((tab) => tab.id === activeId);
+    // Written even when unchanged: the setter is what starts the lazy reopen of
+    // a restored windowed tab that is now the active one.
+    this.activeIndex = at === -1 ? 0 : at;
+  }
+  /** Set by the window: ends an IME composition in the active editor and
+   *  resolves once its text is in the tab. A switch waits for it. */
+  endComposition: (() => Promise<void>) | null = null;
 
   /** Switch tabs, flushing the outgoing tab's pending upsert first. */
   async switchTo(index: number): Promise<void> {
     if (index === this.activeIndex || index < 0 || index >= this.tabs.length) {
+      return;
+    }
+    const from = this.activeIndex;
+    await this.endComposition?.();
+    // Another switch or a close may have moved on while waiting.
+    if (this.activeIndex !== from || index >= this.tabs.length) {
       return;
     }
     this.persistActive.flush();
@@ -1082,7 +1346,7 @@ class DocumentWindowState {
    *    tab broken or blank. */
   private async beginWindowedRestore(tab: DocTab): Promise<void> {
     const wr = tab.windowedRestore;
-    if (wr === undefined) {
+    if (__LITE__ || wr === undefined) {
       return;
     }
     this.restoringWindowedIds.add(tab.id);
@@ -1116,11 +1380,14 @@ class DocumentWindowState {
     // just opened rather than leaking it, and don't resurrect the deleted note
     // by upserting a tab no longer in this window.
     if (!this.tabs.includes(tab)) {
-      void invoke('windowed_close', { sessionId: reopened.session_id });
+      if (!__LITE__) {
+        void invoke('windowed_close', { sessionId: reopened.session_id });
+      }
       return;
     }
     delete tab.large;
     delete tab.windowedRestore;
+    this.releaseTabView(tab.id);
     tab.windowed = {
       sessionId: reopened.session_id,
       totalBytes: reopened.total_bytes,
@@ -1236,12 +1503,15 @@ class DocumentWindowState {
       return;
     }
     let size = 0;
-    try {
-      size = (await invoke<FileStat>('stat_file', { path })).size;
-    } catch {
-      size = 0;
+    // Lite has no large-file viewer, so it does not even ask for the size.
+    if (!__LITE__ && !isLite()) {
+      try {
+        size = (await invoke<FileStat>('stat_file', { path })).size;
+      } catch {
+        size = 0;
+      }
     }
-    if (size > LARGE_FILE_THRESHOLD) {
+    if (opensInLargeViewer(size, isLite())) {
       this.pendingLargeOpen = { path, size };
       // 'ask' raises the confirm; 'view'/'edit' skip it and open straight in the
       // chosen mode (edit falls back to the read-only view for a non-UTF-8 or
@@ -1329,7 +1599,9 @@ class DocumentWindowState {
       return { kind: 'fresh' };
     }
     const groups = [
-      ...new Set(orphanCandidates(all, path, this.group).map(documentGroup)),
+      ...new Set(
+        orphanCandidates(all, path, this.group, isLite()).map(documentGroup),
+      ),
     ];
     // Common case: no other group holds this path, so skip the liveness probe.
     if (groups.length === 0) {
@@ -1341,7 +1613,7 @@ class DocumentWindowState {
     } catch {
       live = [];
     }
-    return routeOpen(all, path, this.group, new Set(live));
+    return routeOpen(all, path, this.group, new Set(live), isLite());
   }
 
   /** Re-home an orphaned stored tab (its window group is gone) into this window:
@@ -1355,6 +1627,10 @@ class DocumentWindowState {
     try {
       tab = await this.loadTab(path, note);
     } catch (e) {
+      if (e instanceof KeptRestore) {
+        this.keptTabs += 1;
+        return;
+      }
       if (!(e instanceof UnreadableRestore)) {
         throw e;
       }
@@ -1387,6 +1663,7 @@ class DocumentWindowState {
     tab.content = textFromString(note.content);
     tab.lineEnding = note.line_ending;
     await invoke('delete_note', { id: note.id });
+    this.reloadTargetId = tab.id;
     this.reloadSeq += 1;
     await this.upsertTab(tab);
   }
@@ -1400,6 +1677,11 @@ class DocumentWindowState {
       return;
     }
     this.pendingLargeOpen = null;
+    // The edition turned lite while the question was up: no viewer to open in.
+    if (isLite()) {
+      void this.openNormal(pending.path);
+      return;
+    }
     const tab: DocTab = {
       id: crypto.randomUUID(),
       path: pending.path,
@@ -1453,19 +1735,28 @@ class DocumentWindowState {
     if (tab?.large === undefined) {
       return null;
     }
+    // Lite has no editing session to start. Nothing is asked of the core, and
+    // nothing is recorded on the tab: its lock must be as it was when the
+    // edition is full again.
+    if (__LITE__ || isLite()) {
+      return null;
+    }
     let open: WindowedOpen;
     try {
       open = await invoke<WindowedOpen>('windowed_open', { path: tab.path });
     } catch (e) {
       // Record the refusal on the tab so its lock stays disabled with the reason
       // (the tab may not be active, so the state must live on the tab, not the view).
+      // Not one the edition caused (it turned lite while the open was in
+      // flight): that is not a property of the file and would outlive the edition.
       const reason = windowedRefusalMessage(String(e));
-      if (tab.large !== undefined) {
+      if (tab.large !== undefined && !isLite() && !isLiteRefusal(e)) {
         tab.large.unlockRefused = reason;
       }
       return reason;
     }
     delete tab.large;
+    this.releaseTabView(tab.id);
     const seedLine = Math.max(0, Math.round(topLine));
     tab.windowed = {
       sessionId: open.session_id,
@@ -1494,6 +1785,20 @@ class DocumentWindowState {
     tab.content = content;
     this.persistActive();
   }
+  /** Store the editor's document for the tab with `id`, whichever tab is
+   *  active: a hidden editor must never write into the active tab. */
+  updateContentById(id: string, content: Text): void {
+    const tab = this.tabs.find((t) => t.id === id);
+    if (tab === undefined) {
+      return;
+    }
+    tab.content = content;
+    if (tab === this.activeTab) {
+      this.persistActive();
+    } else {
+      void this.upsertTab(tab);
+    }
+  }
 
   setActiveLanguage(name: string | null): void {
     const tab = this.activeTab;
@@ -1509,7 +1814,9 @@ class DocumentWindowState {
    *  chosen ending. Dirty is tracked against savedLineEnding, so this marks it. */
   setLineEnding(ending: LineEnding): void {
     const tab = this.activeTab;
-    if (tab === null || tab.lineEnding === ending) {
+    // A large tab's ending is the file's own (read by detection) and saving
+    // never rewrites it, so there is nothing to choose.
+    if (tab === null || isLargeKind(tab) || tab.lineEnding === ending) {
       return;
     }
     tab.lineEnding = ending;
@@ -1587,23 +1894,23 @@ class DocumentWindowState {
   /** File > Save As: always prompt for a new path and write the active tab's
    *  buffer there, turning the tab into an ordinary saved document at that path.
    *  A range tab sheds its range identity (like the range save-as conflict path);
-   *  a windowed tab has no separate buffer here, so it falls back to its own save.
+   *  a windowed tab is written by its Rust session and retargeted to the new path.
    *  `pathOverride` skips the dialog (automation/E2E). Returns false on cancel. */
   async saveAs(pathOverride?: string): Promise<boolean> {
     const tab = this.activeTab;
     if (tab === null) {
       return false;
     }
-    // A windowed tab's buffer lives in the Rust core, not this rope; it has no
-    // save-as target, so run its normal save instead.
-    if (tab.windowed !== undefined) {
-      return (await this.saveWindowed(tab, false)) === 'ok';
-    }
     const chosen =
       pathOverride ??
       (await save(saveDialogOptions(tab.language, suggestedName(tab.path))));
     if (chosen === null) {
       return false;
+    }
+    // A windowed tab's buffer lives in the Rust core, not this rope: Rust
+    // writes the chosen path and retargets its session.
+    if (tab.windowed !== undefined) {
+      return this.windowedSaveTo(tab, chosen);
     }
     // Flush point: materialize the rope for the save-as write.
     const out = applyLineEnding(tab.content.toString(), tab.lineEnding);
@@ -1643,11 +1950,16 @@ class DocumentWindowState {
     expected: Fingerprint | null,
   ): Promise<SpliceResult> {
     const r = tab.range;
-    if (r === undefined) {
+    if (__LITE__ || r === undefined) {
       return 'error';
     }
-    // Flush point: materialize the rope for the splice write-back.
-    const out = applyLineEnding(tab.content.toString(), tab.lineEnding);
+    // Flush point: materialize the rope for the splice write-back. A slice that
+    // ended with a line break gets one back if the buffer lost it.
+    const out = rangeWriteText(
+      tab.content.toString(),
+      r.trailingBreak,
+      tab.lineEnding,
+    );
     let fingerprint: Fingerprint;
     try {
       fingerprint = await invoke<Fingerprint>('splice_file', {
@@ -1673,9 +1985,7 @@ class DocumentWindowState {
       this.saveFailed = { path: r.sourcePath, error: String(e) };
       return 'error';
     }
-    r.endByte =
-      r.startByte +
-      replacementByteLength(tab.content.toString(), tab.lineEnding);
+    r.endByte = r.startByte + replacementByteLength(out, tab.lineEnding);
     r.fingerprint = fingerprint;
     tab.savedContent = tab.content;
     tab.savedLineEnding = tab.lineEnding;
@@ -1765,7 +2075,14 @@ class DocumentWindowState {
    *  by remounting its keyed view. Called on the local window and by the
    *  cross-window `range-spliced` listener after a source is rewritten. */
   refreshLargeTabs(path: string): void {
-    if (this.tabs.some((t) => t.large !== undefined && t.path === path)) {
+    const stale = this.tabs.filter(
+      (t) => t.large !== undefined && t.path === path,
+    );
+    if (stale.length > 0) {
+      // The rewritten file's kept index describes bytes that are gone.
+      for (const tab of stale) {
+        this.dropLargeIndex(tab.id);
+      }
       this.largeReloadSeq += 1;
     }
   }
@@ -1792,6 +2109,9 @@ class DocumentWindowState {
       endLine: number;
     },
   ): Promise<string | null> {
+    if (__LITE__) {
+      return null;
+    }
     const read = await invoke<RangeRead>('read_range', {
       path: sourcePath,
       start: info.startByte,
@@ -1835,16 +2155,15 @@ class DocumentWindowState {
       encoding: settingsState.defaultEncoding,
       lossy: false,
       tabIndex: this.nextIndex++,
-      // `startLine` is the only line number persisted (see `rangeDisplayName`
-      // and `snapshot()`); `info.endLine` isn't stored — it's redundant with
-      // the tab's own content line count and would otherwise go stale after
-      // an edit that changes the line count.
+      // `info.endLine` is not kept: the end line is derived from the tab's
+      // content line count and persisted by `snapshot()` as `range_end_line`.
       range: {
         sourcePath,
         startByte: info.startByte,
         endByte: info.endByte,
         fingerprint,
         startLine: info.startLine,
+        trailingBreak: sliceEndsWithBreak(read.text),
       },
     };
     this.tabs.push(tab);
@@ -1865,6 +2184,9 @@ class DocumentWindowState {
     sourcePath: string,
     info: { startByte: number; endByte: number; pathOverride?: string },
   ): Promise<boolean> {
+    if (__LITE__) {
+      return false;
+    }
     // The slice is copied byte-for-byte, so it keeps the source file's type;
     // its name is the natural starting point for the copy.
     const chosen =
@@ -1931,6 +2253,9 @@ class DocumentWindowState {
    *  ponytail: DEV/__auto entry only this segment; the normal open gate keeps
    *  routing oversized files to the read-only viewer until the final step. */
   async openWindowedTab(path: string): Promise<string | null> {
+    if (__LITE__) {
+      return t('doc.unlock.cannot');
+    }
     let open: WindowedOpen;
     try {
       open = await invoke<WindowedOpen>('windowed_open', { path });
@@ -1973,6 +2298,36 @@ class DocumentWindowState {
     await this.upsertTab(tab);
     return null;
   }
+  /** The gate of a windowed session: pending while one of its whole-file
+   *  operations runs, whichever editor started it. */
+  windowedGate(sessionId: number): OpGate {
+    let gate = this.windowedGates.get(sessionId);
+    if (gate === undefined) {
+      gate = createOpGate(null);
+      this.windowedGates.set(sessionId, gate);
+    }
+    return gate;
+  }
+  /** Run a whole-file operation (`run` starts the Rust command) for a windowed
+   *  session. The session's gate is pending until it has finished, including
+   *  this bookkeeping, so an editor mounted meanwhile reads no stale content.
+   *  The tab's totals and dirty flag follow the result even when the editor
+   *  that asked has been unmounted by then. `changed` says whether the result
+   *  changed the content. */
+  runWindowedOp<T extends { total_bytes: number; total_lines: number }>(
+    sessionId: number,
+    run: () => Promise<T>,
+    changed: (result: T) => boolean,
+  ): Promise<T> {
+    const op = run().then((result) => {
+      if (changed(result)) {
+        this.windowedApplied(sessionId, result.total_bytes, result.total_lines);
+      }
+      return result;
+    });
+    this.windowedGate(sessionId).begin(op);
+    return op;
+  }
 
   /** Called by the WindowedEditor after each successful apply: record the fresh
    *  totals and mark the session's tab dirty (the first apply flips dirty). */
@@ -1990,13 +2345,50 @@ class DocumentWindowState {
     tab.windowed.dirty = true;
     this.persistActive();
   }
+  /** Record the line ending read from a large tab's first text. `style` is null
+   *  when the sample had no line break, which falls back to the user's default.
+   *  Returns the separator typed line breaks get. */
+  private setDetectedEnding(
+    tab: DocTab,
+    style: ReturnType<typeof detectBreakStyle>,
+  ): '\r\n' | '\n' {
+    const lineEnding = style?.lineEnding ?? settingsState.defaultLineEnding;
+    tab.lineEnding = lineEnding;
+    tab.savedLineEnding = lineEnding;
+    tab.insertLineEnding = lineEnding === 'CRLF' ? '\r\n' : '\n';
+    return tab.insertLineEnding;
+  }
+  /** A windowed tab's editor read its first window: detect the file's line
+   *  ending now unless the tab already has one. */
+  windowedEndingDetected(
+    sessionId: number,
+    style: ReturnType<typeof detectBreakStyle>,
+  ): '\r\n' | '\n' {
+    const tab = this.tabs.find((t) => t.windowed?.sessionId === sessionId);
+    if (tab === undefined) {
+      return settingsState.defaultLineEnding === 'CRLF' ? '\r\n' : '\n';
+    }
+    return tab.insertLineEnding ?? this.setDetectedEnding(tab, style);
+  }
+  /** The viewer's first chunk arrived. A sample without a line break leaves the
+   *  tab undetected so the editor decides from its own first window. */
+  largeEndingDetected(
+    path: string,
+    style: ReturnType<typeof detectBreakStyle>,
+  ): void {
+    const tab = this.tabs.find((t) => t.large !== undefined && t.path === path);
+    if (tab === undefined || style === null || tab.insertLineEnding) {
+      return;
+    }
+    this.setDetectedEnding(tab, style);
+  }
 
   /** Save a windowed tab back to disk. `force` skips the fingerprint check; a
    *  conflict raises the conflict modal instead of writing. On success the
    *  fingerprint refreshes, totals update, and the tab goes clean. */
   async saveWindowed(tab: DocTab, force: boolean): Promise<WindowedSaveResult> {
     const w = tab.windowed;
-    if (w === undefined) {
+    if (__LITE__ || w === undefined) {
       return 'error';
     }
     let saved: WindowedSaved;
@@ -2036,16 +2428,35 @@ class DocumentWindowState {
    *  (keyed on it), reloading the window from disk. */
   async discardWindowed(tab: DocTab): Promise<void> {
     const w = tab.windowed;
-    if (w === undefined) {
+    if (__LITE__ || w === undefined) {
       return;
     }
-    void invoke('windowed_close', { sessionId: w.sessionId });
-    let open: WindowedOpen;
-    try {
-      open = await invoke<WindowedOpen>('windowed_open', { path: tab.path });
-    } catch {
-      return;
+    // The fresh session is opened before the old one is let go: when the open
+    // is refused (lite) or fails, the tab keeps the session it has.
+    let open: WindowedOpen | null = null;
+    if (!isLite()) {
+      try {
+        open = await invoke<WindowedOpen>('windowed_open', { path: tab.path });
+      } catch {
+        if (!isLite()) {
+          return;
+        }
+      }
     }
+    // Lite cannot start a session, but the tab already has one and the file's
+    // baseline index is all a reopen needs: the quit and close gates' Discard
+    // has to be able to clear the edits there too.
+    if (open === null) {
+      try {
+        open = await this.reopenAtBaseline(tab.path, w.sessionId);
+      } catch {
+        return;
+      }
+    }
+    if (!__LITE__) {
+      void invoke('windowed_close', { sessionId: w.sessionId });
+    }
+    this.windowedGates.delete(w.sessionId);
     tab.windowed = {
       sessionId: open.session_id,
       totalBytes: open.total_bytes,
@@ -2056,6 +2467,33 @@ class DocumentWindowState {
     };
     this.windowedConflict = null;
     await this.upsertTab(tab);
+  }
+
+  /** A fresh session on `path` at its on-disk baseline, made from the index of
+   *  the live session `sessionId` through `windowed_reopen` instead of
+   *  `windowed_open`. */
+  private async reopenAtBaseline(
+    path: string,
+    sessionId: number,
+  ): Promise<WindowedOpen> {
+    if (__LITE__) {
+      throw new Error('windowed editing is not in this build');
+    }
+    const base = await invoke<WindowedIndexSnapshot>('windowed_index', {
+      sessionId,
+    });
+    const r = await invoke<WindowedReopened>('windowed_reopen', {
+      path,
+      index: base.index,
+      fingerprint: base.fingerprint,
+      digest: base.digest,
+    });
+    return {
+      session_id: r.session_id,
+      total_bytes: r.total_bytes,
+      total_lines: r.total_lines,
+      fingerprint: r.fingerprint,
+    };
   }
 
   /** DEV/E2E: save the active windowed tab (fingerprint-checked). */
@@ -2112,7 +2550,7 @@ class DocumentWindowState {
   }
 
   /** Conflict choice: save the current buffer to a chosen path instead. The
-   *  session keeps tracking the original file; only its dirty flag clears. */
+   *  session and the tab both move to the chosen path. */
   async windowedConflictSaveAs(pathOverride?: string): Promise<boolean> {
     const tab = this.windowedConflict;
     if (tab?.windowed === undefined) {
@@ -2124,26 +2562,44 @@ class DocumentWindowState {
     if (chosen === null) {
       return false;
     }
+    return this.windowedSaveTo(tab, chosen);
+  }
+  /** Write a windowed tab's buffer to `chosen` and retarget the tab to it.
+   *  `expected` is null, so Rust checks nothing against the destination: the
+   *  user chose it in the dialog. A failure retargets nothing and is reported
+   *  with `chosen`; it never raises the conflict modal, whose Force button
+   *  writes the old path. */
+  private async windowedSaveTo(tab: DocTab, chosen: string): Promise<boolean> {
+    const w = tab.windowed;
+    if (__LITE__ || w === undefined) {
+      return false;
+    }
     let saved: WindowedSaved;
     try {
       saved = await invoke<WindowedSaved>('windowed_save', {
-        sessionId: tab.windowed.sessionId,
+        sessionId: w.sessionId,
         expected: null,
         pathOverride: chosen,
       });
     } catch (e) {
-      // The conflict modal stays up and nothing is written. The user picked
-      // this path by hand, so every failure here is reported rather than
-      // handing back a dialog that looks like it did nothing. `chosen` is the
-      // target, not `tab.path`, which is still the old file.
+      // The user picked this path by hand, so every failure here is reported
+      // rather than handing back a dialog that looks like it did nothing.
+      // `chosen` is the target, not `tab.path`, which is still the old file.
       this.saveFailed = { path: chosen, error: String(e) };
       return false;
     }
-    tab.windowed.totalBytes = saved.total_bytes;
-    tab.windowed.totalLines = saved.total_lines;
-    tab.windowed.dirty = false;
+    // Rust has already moved the session to `chosen`; mirror that here.
+    tab.path = chosen;
+    if (!tab.explicit) {
+      tab.language = detectByFilename(chosen);
+    }
+    w.fingerprint = saved.fingerprint;
+    w.totalBytes = saved.total_bytes;
+    w.totalLines = saved.total_lines;
+    w.dirty = false;
     this.windowedConflict = null;
     await this.upsertTab(tab);
+    void invoke('add_recent_file', { path: chosen });
     return true;
   }
 
@@ -2157,7 +2613,10 @@ class DocumentWindowState {
    *  its buffer and only changes the encoding used at save time (stays dirty). */
   async setEncoding(label: string): Promise<void> {
     const tab = this.activeTab;
-    if (tab === null || tab.encoding === label) {
+    // A large tab's bytes are never re-decoded (the editor takes UTF-8 only
+    // and the viewer decodes lossily), and the re-decode below would read the
+    // whole file into memory.
+    if (tab === null || isLargeKind(tab) || tab.encoding === label) {
       return;
     }
     if (this.isDirty(tab)) {
@@ -2186,6 +2645,7 @@ class DocumentWindowState {
     tab.encoding = decoded.encoding;
     tab.lossy = decoded.lossy;
     // The editor doc for this tab is already mounted, so push the new buffer in.
+    this.reloadTargetId = tab.id;
     this.reloadSeq += 1;
     this.persistActive();
   }
@@ -2268,6 +2728,7 @@ class DocumentWindowState {
     tab.content = tab.savedContent;
     tab.lineEnding = tab.savedLineEnding;
     if (index === this.activeIndex) {
+      this.reloadTargetId = tab.id;
       this.reloadSeq += 1;
     }
     void this.upsertTab(tab);
@@ -2284,12 +2745,16 @@ class DocumentWindowState {
     }
     // Release the Rust windowed session before dropping the tab.
     if (tab.windowed !== undefined) {
-      void invoke('windowed_close', { sessionId: tab.windowed.sessionId });
+      if (!__LITE__) {
+        void invoke('windowed_close', { sessionId: tab.windowed.sessionId });
+      }
+      this.windowedGates.delete(tab.windowed.sessionId);
     }
     if (tab === this.windowedConflict) {
       this.windowedConflict = null;
     }
     await invoke('delete_note', { id: tab.id });
+    this.releaseTabView(tab.id);
     this.tabs.splice(index, 1);
     // Always write `activeIndex`, even when the computed value equals the
     // current one: closing the active tab can leave the numeric index
@@ -2327,11 +2792,16 @@ class DocumentWindowState {
    *  `CloseRequested` landed (see `should_forget_tabs` in `lib.rs`). */
   async dropClosedTabs(label: string): Promise<void> {
     this.persistActive.cancel();
+    for (const id of [...this.largeIndexes.keys()]) {
+      this.dropLargeIndex(id);
+    }
     const clean = this.tabs.filter((t) => !this.isDirty(t));
     for (const tab of clean) {
       // Release the Rust windowed session too; the record is going away.
       if (tab.windowed !== undefined) {
-        void invoke('windowed_close', { sessionId: tab.windowed.sessionId });
+        if (!__LITE__) {
+          void invoke('windowed_close', { sessionId: tab.windowed.sessionId });
+        }
       }
     }
     await invoke('drop_closed_tabs', { label, ids: clean.map((t) => t.id) });
@@ -2355,6 +2825,7 @@ class DocumentWindowState {
    *  leaving the table view so the CM document reflects table-side edits made
    *  while its (hidden) view was out of sync. */
   forceEditorReload(): void {
+    this.reloadTargetId = this.activeTab?.id ?? '';
     this.reloadSeq += 1;
   }
 }

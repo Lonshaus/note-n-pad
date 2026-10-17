@@ -11,6 +11,7 @@ export const en = {
   'settings.section.sticky': 'Sticky Notes',
   'settings.section.editor': 'Editor',
   'settings.section.language': 'Language',
+  'settings.section.shortcuts': 'Shortcuts',
   // Settings — appearance
   'settings.theme.light': 'Light',
   'settings.theme.dark': 'Dark',
@@ -41,9 +42,9 @@ export const en = {
   'settings.theme.color.danger': 'Danger',
   // Files a data folder held that could not be loaded (snapshots, themes,
   // locales). The reason names the case; `skipReasonKey` maps it.
-  'skipped.heading': '{count} files could not be loaded',
+  'skipped.heading': '{count} file(s) could not be loaded',
   'skipped.snapshotHeading':
-    '{count} sticky or document snapshots could not be loaded',
+    '{count} sticky or document snapshot(s) could not be loaded',
   'skipped.windowHint':
     'These files could not be read when Note&Pad started, so nothing they hold is showing in any window.',
   'skipped.reason.notJson': 'Not a JSON file',
@@ -60,13 +61,33 @@ export const en = {
   'skipped.delete': 'Delete',
   'skipped.deleteConfirm': 'Delete the file "{name}"?',
   // Settings — sticky
-  'settings.sticky.newNoteShortcut': 'New note shortcut',
   'settings.sticky.recording': 'Press a key combination…',
   'settings.sticky.recordCancelHint': 'Press Esc to cancel',
   'settings.sticky.recordHint': 'Click, then press a new key combination',
   'settings.sticky.shortcutError': 'Couldn’t set this shortcut',
   'settings.sticky.defaultSize': 'Default note size',
   'settings.sticky.resetSize': 'Reset',
+  'settings.shortcuts.system': 'System',
+  'settings.shortcuts.otherGroup': 'Other fixed keys',
+  'settings.shortcuts.notSet': 'Not set',
+  'settings.shortcuts.clear': 'Clear',
+  'settings.shortcuts.reset': 'Reset',
+  'settings.shortcuts.resetAll': 'Reset All',
+  'settings.shortcuts.err.conflict': 'Already used by "{name}"',
+  'settings.shortcuts.err.needsModifierMac': 'Needs ⌘, ⌃ or ⌥ (except F keys)',
+  'settings.shortcuts.err.needsModifierWin':
+    'Needs Ctrl, Alt or Win (except F keys)',
+  'settings.shortcuts.err.macOption':
+    'In the editor, ⌥ with a letter types a character. Add ⌘ or ⌃.',
+  'settings.shortcuts.err.unreachable':
+    'This combination doesn’t work in the editor',
+  'settings.shortcuts.err.punctuation': 'Punctuation keys can’t be used',
+  'settings.shortcuts.err.unsupportedKey': 'This key isn’t supported',
+  'settings.shortcuts.err.noLayoutChar':
+    'The current input source has no letter for this key, so ⌥ combinations can’t be recorded',
+  'settings.shortcuts.err.fixed': 'System shortcuts can’t be changed',
+  'settings.shortcuts.err.globalRegister':
+    'Couldn’t register this global shortcut. Another app may be using it.',
   // Settings — editor
   'settings.editor.wordWrap': 'Word wrap',
   'settings.editor.lineNumbers': 'Line numbers',
@@ -75,9 +96,10 @@ export const en = {
   'settings.editor.workerHighlightHint':
     'Large files are processed in the background, so colors appear with a delay. Very complex content may still be slow and use more memory.',
   'settings.editor.font': 'Font',
-  'settings.editor.fontCustom': 'Custom…',
+  'settings.editor.fontCustom': 'Choose another font…',
   'settings.editor.fontDefault': 'System default',
-  'settings.editor.fontNamePlaceholder': 'Font name',
+  'settings.editor.fontPickPlaceholder': 'Choose a font…',
+  'settings.editor.fontNoneFound': 'No other fonts found',
   'settings.editor.fontSize': 'Font size',
   'settings.editor.fontSizeDecrease': 'Decrease',
   'settings.editor.fontSizeIncrease': 'Increase',
@@ -90,11 +112,11 @@ export const en = {
   'settings.general.snapshotReset': 'Reset to default',
   'settings.general.snapshotMoveTitle': 'Move the existing sticky notes over?',
   'settings.general.snapshotMoveBody':
-    "The current folder has {count} sticky notes and unsaved document content. If you don't move them, they won't show up in Note&Pad anymore — they'll stay in the original folder.",
+    "The current folder has {count} sticky note(s) and unsaved document content. If you don't move them, they won't show up in Note&Pad anymore — they'll stay in the original folder.",
   'settings.general.snapshotMoveConfirm': 'Move',
   'settings.general.snapshotMoveSkip': "Don't move",
   'settings.general.snapshotCollisionTitle':
-    'The chosen folder already has {count} matching snapshots',
+    'The chosen folder already has {count} matching snapshot(s)',
   'settings.general.snapshotCollisionSource':
     "Overwrite with this folder's copies",
   'settings.general.snapshotCollisionDest':
@@ -184,7 +206,7 @@ export const en = {
   'large.gutter.title': 'Click a line number to select a range (Shift extends)',
   'large.goto.placeholder': 'Line',
   'large.goto.aria': 'Go to line',
-  'large.range.info': 'Lines {start}–{end} ({count} lines, ~{size})',
+  'large.range.info': 'Lines {start}–{end} ({count} line(s), ~{size})',
   'large.range.edit': 'Edit this range',
   'large.range.saveAs': 'Save range',
   'large.range.tooBig':
@@ -196,7 +218,7 @@ export const en = {
   'large.search.label': 'Search',
   'large.search.case': 'Case',
   'large.search.searching': 'Searching… {count} found',
-  'large.search.results': '{count} results',
+  'large.search.results': '{count} result(s)',
   'large.search.truncatedSuffix': ' (truncated)',
   'large.search.failed':
     'Search failed. The file may have been moved or become unreadable.',
@@ -206,8 +228,8 @@ export const en = {
     'Couldn’t read part of this file. It may have been moved or become unreadable.',
   // Status bar
   'status.view': 'View',
-  'status.indexing': 'Indexing… {count} lines',
-  'status.lines': '{count} lines',
+  'status.indexing': 'Indexing… {count} line(s)',
+  'status.lines': '{count} line(s)',
   'status.lineEnding': 'Line ending',
   'status.encoding': 'Encoding',
   'status.language': 'Language',
@@ -287,7 +309,31 @@ export const en = {
   'doc.openFailed':
     'Couldn’t open “{name}”. The file may have been moved or deleted, or its name may contain characters this app doesn’t support.',
   'doc.restoreUnreadable':
-    'Couldn’t read {names}. Open them again to continue.',
+    'Couldn’t read: {names}. Open the file(s) again to continue.',
+  'doc.keptTabs': 'Not opened: {count} tab(s) not supported in this version.',
+  'edition.col.feature': 'Feature',
+  'edition.col.lite': 'This version',
+  'edition.col.full': 'Full version',
+  'edition.mark.yes': 'Included',
+  'edition.mark.no': 'Not included',
+  'edition.row.largeFiles': 'Large-file viewing and editing',
+  'edition.row.largeFilesNote':
+    'In this version, files over 100 MB open in the ordinary editor.',
+  'edition.row.syntax': 'Syntax highlighting',
+  'edition.row.treeViews': 'JSON and XML tree views',
+  'edition.row.themes': 'Themes (choose, edit, import, export, delete)',
+  'edition.row.languageFiles': 'Deleting, importing and exporting languages',
+  'edition.row.workspace': 'Workspace',
+  'edition.row.stickies': 'Sticky notes',
+  'edition.row.documents': 'Document editing',
+  'edition.row.markdown': 'Markdown preview',
+  'edition.row.table': 'CSV / TSV table mode',
+  'edition.row.interfaceMode': 'Interface mode (follow system, light, dark)',
+  'edition.row.languageEdit': 'Editing languages and restoring defaults',
+  'edition.row.trayIcon': 'Status bar icon',
+  'edition.row.dockMenu': 'Dock menu',
+  'edition.row.jumpList': 'Jump List',
+  'edition.row.globalShortcuts': 'Global shortcuts',
   'doc.revealFailed':
     'Couldn’t show “{name}”. The file may have been moved or deleted.',
   'doc.saveFailed': 'Couldn’t save “{name}”: {error}',
@@ -316,4 +362,33 @@ export const en = {
   // Settings — general, Windows only
   'settings.general.defaultApps': 'Default file types',
   'settings.general.defaultAppsOpen': 'Open Windows settings',
+  // CodeMirror UI text (search panel, go-to-line, folding, announcements)
+  'cm.find': 'Find',
+  'cm.replaceField': 'Replace',
+  'cm.next': 'Next',
+  'cm.previous': 'Previous',
+  'cm.all': 'Select All',
+  'cm.matchCase': 'Match Case',
+  'cm.regexp': 'Regular Expression',
+  'cm.byWord': 'Whole Word',
+  'cm.inSelection': 'In Selection',
+  'cm.replace': 'Replace',
+  'cm.replaceAll': 'Replace All',
+  'cm.close': 'Close',
+  'cm.gotoLine': 'Go to Line',
+  'cm.go': 'Go',
+  'cm.foldedCode': 'Folded code',
+  'cm.unfold': 'Unfold',
+  'cm.foldLine': 'Fold Line',
+  'cm.unfoldLine': 'Unfold Line',
+  'cm.foldedLines': 'Folded lines',
+  'cm.unfoldedLines': 'Unfolded lines',
+  'cm.controlChar': 'Control character',
+  'cm.currentMatch': 'Current match',
+  'cm.onLine': 'on line',
+  'cm.replacedOne': 'Replaced match on line $',
+  'cm.replacedMany': 'Replaced $ matches',
+  'cm.completions': 'Suggestions',
+  'cm.selectionDeleted': 'Selection deleted',
+  'cm.to': 'to',
 } satisfies Record<I18nKey, string>;

@@ -1,10 +1,13 @@
 // Copyright © 2026 Lonshaus
 // SPDX-License-Identifier: GPL-3.0-only
 
+#[cfg(not(feature = "lite"))]
+mod altgr;
 mod app_watch;
 #[cfg(debug_assertions)]
 mod automation;
 mod cmdline;
+#[cfg(not(feature = "lite"))]
 mod ctx_menu;
 mod data_files;
 mod default_apps;
@@ -12,6 +15,7 @@ mod diag;
 #[cfg(target_os = "macos")]
 mod dock;
 mod dock_labels;
+mod edition;
 mod encoding;
 mod file_ops;
 mod flush;
@@ -21,27 +25,41 @@ mod grants;
 mod i18n;
 #[cfg(target_os = "windows")]
 mod jumplist;
+#[cfg(not(feature = "lite"))]
 mod large_file;
+mod launch_windows;
 mod licenses;
 mod linux_clipboard;
 mod linux_desktop_actions;
 mod locale_store;
 mod mac_bookmark;
+#[cfg(target_os = "macos")]
+mod mac_single_instance;
 mod navigation;
 mod note_store;
 mod path_guard;
+mod pending_opens;
+#[cfg(not(feature = "lite"))]
 mod piece_table;
 mod platform;
 mod preview_img;
 mod privacy;
+#[cfg(not(feature = "lite"))]
 mod project;
+#[cfg(not(feature = "lite"))]
 mod range_edit;
+#[cfg(not(feature = "lite"))]
+mod replace_layer;
 mod settings;
 mod shortcut;
+mod shortcuts;
 mod theme_store;
 mod webview2_runtime;
 mod win_menu_gray;
+#[cfg(not(feature = "lite"))]
 mod windowed;
+#[cfg(not(feature = "lite"))]
+mod windowed_scan;
 mod windows;
 
 use flush::{FlushGate, FlushOutcome};
@@ -53,7 +71,7 @@ use std::time::Duration;
 use tauri::menu::{CheckMenuItem, IsMenuItem, Menu, MenuItem, PredefinedMenuItem, Submenu};
 use tauri::tray::TrayIconBuilder;
 use tauri::{Emitter, Manager, Wry};
-use tauri_plugin_global_shortcut::{GlobalShortcutExt, ShortcutState};
+use tauri_plugin_global_shortcut::ShortcutState;
 
 /// The six Undo/Redo/Cut/Copy/Paste/Select-All items built by `build_menu`,
 /// boxed as trait objects so the same tuple type covers both the predefined
@@ -228,6 +246,10 @@ pub(crate) fn flush_then_exit(app: &tauri::AppHandle) {
     log::debug!("quit handshake already in flight; ignoring re-entrant trigger");
     return;
   }
+  // A second start that sees this marker waits for the lock instead of
+  // handing over to an instance that is about to exit.
+  #[cfg(target_os = "macos")]
+  mac_single_instance::mark_quitting();
   // Every sticky and document window flushes its state and acks; the quit is
   // always silent now, and restore brings unsaved documents back afterward.
   let labels: HashSet<String> = app
@@ -258,6 +280,10 @@ pub(crate) fn flush_then_exit(app: &tauri::AppHandle) {
         // quit once the user has saved or discarded the offending tabs.
         // Release the guard so that retried quit can arm a fresh handshake.
         app.state::<FlushGate>().disarm();
+        // Removed before the guard is released, so a retried quit's marker
+        // is never the one removed.
+        #[cfg(target_os = "macos")]
+        mac_single_instance::clear_quitting();
         QUIT_IN_FLIGHT.store(false, Ordering::SeqCst);
         // `flush-request` only means a quit handshake started, not that it
         // will complete: every window that heard it must hear this too, so
@@ -313,6 +339,7 @@ struct MenuLists {
 /// window's active tab (line ending / encoding / syntax / always-on-top) or a
 /// global setting (word wrap / line numbers).
 struct MenuItemRefs {
+  new_sticky: MenuItem<Wry>,
   new_tab: MenuItem<Wry>,
   open: MenuItem<Wry>,
   save: MenuItem<Wry>,
@@ -360,7 +387,13 @@ impl MenuItems {
   /// checks) and the global settings (for word wrap / line numbers).
   fn apply(&self, app: &tauri::AppHandle, kind: FocusKind, focused_label: Option<&str>) {
     let f = menu_flags(kind);
+    let s = settings::app_settings(app);
+    let locale = i18n::current_locale(&s.language);
     let items = self.items.lock().unwrap();
+    let _ = items.new_sticky.set_text(escape_menu_label(i18n::tr(
+      locale,
+      new_label_key(new_target(kind)),
+    )));
     let _ = items.new_tab.set_enabled(f.new_tab);
     let _ = items.open.set_enabled(f.open);
     let _ = items.save.set_enabled(f.save);
@@ -411,7 +444,6 @@ impl MenuItems {
     }
     // Word wrap and line numbers mirror the global settings, so they read right
     // even while the Format/View submenus are disabled (non-document focus).
-    let s = settings::app_settings(app);
     let _ = items.word_wrap.set_checked(s.editor_word_wrap);
     let _ = items.line_numbers.set_checked(s.editor_line_numbers);
     drop(items);
@@ -425,7 +457,6 @@ impl MenuItems {
       if *pin != active_lang {
         *pin = active_lang;
         drop(pin);
-        let locale = i18n::current_locale(&s.language);
         rebuild_app_menu(app, locale);
       }
     }
@@ -490,6 +521,46 @@ fn focus_kind(label: &str) -> FocusKind {
     }
   }
 }
+/// What the File menu's single "new" item does, which follows the focused
+/// window: a document window opens another document window, anything else
+/// (sticky, workspace, settings, no window) makes a sticky.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum NewTarget {
+  Window,
+  Sticky,
+}
+
+fn new_target(kind: FocusKind) -> NewTarget {
+  if kind == FocusKind::Doc {
+    NewTarget::Window
+  } else {
+    NewTarget::Sticky
+  }
+}
+
+fn new_label_key(target: NewTarget) -> i18n::Key {
+  match target {
+    NewTarget::Window => i18n::Key::NewWindow,
+    NewTarget::Sticky => i18n::Key::NewSticky,
+  }
+}
+/// The kind of the window the menu currently treats as focused.
+fn tracked_focus_kind(app: &tauri::AppHandle) -> FocusKind {
+  app
+    .try_state::<MenuItems>()
+    .and_then(|items| items.focused.lock().unwrap().clone())
+    .map_or(FocusKind::None, |label| focus_kind(&label))
+}
+/// Minimize the window the menu treats as focused.
+fn minimize_focused(app: &tauri::AppHandle) {
+  let label = app
+    .try_state::<MenuItems>()
+    .and_then(|items| items.focused.lock().unwrap().clone())
+    .or_else(|| focused_window(app).map(|(label, _)| label));
+  if let Some(window) = label.and_then(|l| app.get_webview_window(&l)) {
+    let _ = window.minimize();
+  }
+}
 
 /// Enabled flags for the eight mode-dependent menu items.
 struct MenuFlags {
@@ -542,10 +613,58 @@ fn emit_to_focused<T: serde::Serialize + Clone>(app: &tauri::AppHandle, event: &
     let _ = app.emit_to(label, event, payload);
   }
 }
+/// Where an Edit-menu command goes.
+#[cfg(any(target_os = "macos", test))]
+#[derive(Debug, PartialEq, Eq)]
+enum EditMenuRoute {
+  /// The focused webview window's frontend, via `menu-action`.
+  Frontend,
+  /// The key window's first responder, for a native panel.
+  FirstResponder,
+}
+/// The macOS Undo, Redo and Select All items are custom, so with no webview
+/// window focused (an open/save panel or another native sheet is the key window)
+/// they would reach nobody. Those three go to the first responder instead, which
+/// is what the predefined items did; everything else always goes to the
+/// frontend.
+#[cfg(any(target_os = "macos", test))]
+fn edit_menu_route(id: &str, any_webview_focused: bool) -> EditMenuRoute {
+  if !any_webview_focused && matches!(id, "undo" | "redo" | "select-all") {
+    EditMenuRoute::FirstResponder
+  } else {
+    EditMenuRoute::Frontend
+  }
+}
+/// Whether one of the app's webview windows is the key window.
+#[cfg(target_os = "macos")]
+fn any_webview_focused(app: &tauri::AppHandle) -> bool {
+  app
+    .webview_windows()
+    .values()
+    .any(|w| w.is_focused().unwrap_or(false))
+}
+/// Send `undo:`, `redo:` or `selectAll:` down the responder chain of the key
+/// window, like the predefined items do. Menu events arrive on the main thread;
+/// off it, nothing is sent.
+#[cfg(target_os = "macos")]
+fn send_to_first_responder(id: &str) {
+  use objc2::runtime::AnyObject;
+  use objc2::{msg_send, sel, MainThreadMarker};
+  let Some(mtm) = MainThreadMarker::new() else {
+    return;
+  };
+  let action = match id {
+    "redo" => sel!(redo:),
+    "select-all" => sel!(selectAll:),
+    _ => sel!(undo:),
+  };
+  let ns_app = objc2_app_kit::NSApplication::sharedApplication(mtm);
+  let none: *const AnyObject = std::ptr::null();
+  // Safety: `sendAction:to:from:` takes a selector and two nullable objects; a
+  // nil target means "the first responder that handles it".
+  let _: bool = unsafe { msg_send![&*ns_app, sendAction: action, to: none, from: none] };
+}
 
-/// Keep the menu's mode-dependent items in sync with the focused window. On
-/// focus-gain the last-focused window wins; on focus-loss or destruction of the
-/// tracked window we fall back to the no-focus (all-disabled) state.
 /// Label of the document window the user was in most recently. Unlike
 /// `MenuItems::focused`, which is cleared the moment focus leaves so the menu
 /// can grey out, this survives focus loss — which is the whole point, since the
@@ -577,7 +696,57 @@ fn last_doc_window(app: &tauri::AppHandle) -> Option<tauri::WebviewWindow> {
   let label = LAST_DOC_WINDOW.lock().unwrap().clone()?;
   app.get_webview_window(&label)
 }
-
+/// The menu focus a window event leads to: the tracked label and the kind to
+/// apply. On loss of the tracked window the window that has focus now takes
+/// over, and only when none has focus does the menu fall back to `None`.
+fn focus_after_loss(
+  tracked: Option<&str>,
+  lost: &str,
+  focused_now: &[String],
+) -> (Option<String>, FocusKind) {
+  if tracked != Some(lost) {
+    return (
+      tracked.map(str::to_string),
+      tracked.map_or(FocusKind::None, focus_kind),
+    );
+  }
+  match focused_now.iter().find(|label| label.as_str() != lost) {
+    Some(label) => (Some(label.clone()), focus_kind(label)),
+    None => (None, FocusKind::None),
+  }
+}
+/// One focus event for the menu. `None` means nothing changes: a loss of a
+/// window that is not the tracked one must not clobber the window that gained
+/// focus.
+fn menu_focus_step(
+  tracked: Option<&str>,
+  label: &str,
+  gained: bool,
+  focused_now: &[String],
+) -> Option<(Option<String>, FocusKind)> {
+  if gained {
+    Some((Some(label.to_string()), focus_kind(label)))
+  } else if tracked == Some(label) {
+    Some(focus_after_loss(tracked, label, focused_now))
+  } else {
+    None
+  }
+}
+/// Labels of the webview windows that report focus, other than `except`, in a
+/// stable order.
+fn focused_labels(app: &tauri::AppHandle, except: &str) -> Vec<String> {
+  let mut labels: Vec<String> = app
+    .webview_windows()
+    .into_iter()
+    .filter(|(label, window)| label != except && window.is_focused().unwrap_or(false))
+    .map(|(label, _)| label)
+    .collect();
+  labels.sort();
+  labels
+}
+/// Keep the menu's mode-dependent items in sync with the focused window. On
+/// focus-gain the last-focused window wins; on loss or destruction of the
+/// tracked window the window that has focus now takes over.
 fn sync_menu_focus(window: &tauri::Window, event: &tauri::WindowEvent) {
   let (label, gained) = match event {
     tauri::WindowEvent::Focused(true) => (window.label().to_string(), true),
@@ -590,19 +759,34 @@ fn sync_menu_focus(window: &tauri::Window, event: &tauri::WindowEvent) {
   let Some(items) = app.try_state::<MenuItems>() else {
     return;
   };
+  // Queried before the lock is taken: asking a window for its state must not
+  // happen while other threads wait on the tracked label.
+  let focused_now = if gained {
+    Vec::new()
+  } else {
+    focused_labels(app, &label)
+  };
   let mut focused = items.focused.lock().unwrap();
-  if gained {
-    *focused = Some(label.clone());
-    drop(focused);
-    items.apply(app, focus_kind(&label), Some(&label));
-  } else if focused.as_deref() == Some(label.as_str()) {
-    // Only the currently tracked window losing focus resets the menu, so a
-    // stale focus-loss from a previously focused window can't clobber the
-    // window that just gained focus.
-    *focused = None;
-    drop(focused);
-    items.apply(app, FocusKind::None, None);
-  }
+  let Some((next, kind)) = menu_focus_step(focused.as_deref(), &label, gained, &focused_now) else {
+    return;
+  };
+  *focused = next.clone();
+  drop(focused);
+  items.apply(app, kind, next.as_deref());
+}
+/// Re-read which window has focus and apply its menu state. Run after a window
+/// is given focus programmatically, where the focus events alone can leave the
+/// menu on the state of a window that lost focus during startup. Does nothing
+/// while no window reports focus; the focus event that follows settles it.
+pub(crate) fn resync_menu_focus(app: &tauri::AppHandle) {
+  let Some(items) = app.try_state::<MenuItems>() else {
+    return;
+  };
+  let Some(label) = focused_labels(app, "").into_iter().next() else {
+    return;
+  };
+  *items.focused.lock().unwrap() = Some(label.clone());
+  items.apply(app, focus_kind(&label), Some(&label));
 }
 
 /// What the same-event-loop-pass batch-close rule decides, given every
@@ -783,6 +967,7 @@ fn handle_window_event(window: &tauri::Window, event: &tauri::WindowEvent) {
     if let Some(items) = window.app_handle().try_state::<MenuItems>() {
       items.on_top.lock().unwrap().remove(window.label());
     }
+    release_pending_opens(window.app_handle(), window.label());
     // A destroyed window has nothing left to flush; ack it on its behalf so
     // a quit whose wait list still names it (it was already let through and
     // is mid-destroy when the quit starts) doesn't stall out the full
@@ -834,7 +1019,7 @@ fn populate_recent(
   let clear = MenuItem::with_id(
     app,
     "recent-clear",
-    i18n::tr(locale, i18n::Key::ClearMenu),
+    escape_menu_label(i18n::tr(locale, i18n::Key::ClearMenu)),
     !recent.is_empty(),
     None::<&str>,
   )?;
@@ -843,214 +1028,31 @@ fn populate_recent(
 }
 
 /// Escape a menu label that may carry a literal `&` (the product name
-/// `Note&Pad`, or any translated label) for the native menu bar. `&` is the
-/// mnemonic-prefix character on Windows and GTK menus, so a bare `&` there is
-/// swallowed and the following letter is underlined instead — the item
-/// renders as "NotePad". Doubling it (`&&`) escapes it to a literal ampersand
-/// on those platforms. macOS menus have no mnemonic syntax, so the label is
-/// returned unchanged there. `build_menu` and `build_tray_menu` apply this to
-/// every `tr`-sourced label via their own `tr` closure, so no call site needs
-/// to remember it individually; the brand literal `"Note&Pad"` still calls it
-/// directly since it doesn't go through `tr`.
+/// `Note&Pad`, or any translated label) for the native menu bar. muda reads a
+/// bare `&` as the mnemonic prefix on every platform (Windows and GTK underline
+/// the next letter, macOS strips it), so the item renders as "NotePad".
+/// Doubling it (`&&`) yields a literal ampersand everywhere. `build_menu` and
+/// `build_tray_menu` apply this to every `tr`-sourced label via their own `tr`
+/// closure, so no call site needs to remember it individually; the brand
+/// literal `"Note&Pad"` still calls it directly since it doesn't go through
+/// `tr`. The Dock menu is built with AppKit directly and must not use it.
 pub(crate) fn escape_menu_label(label: &str) -> String {
-  #[cfg(target_os = "macos")]
-  {
-    label.to_string()
-  }
-  #[cfg(not(target_os = "macos"))]
-  {
-    label.replace('&', "&&")
-  }
+  label.replace('&', "&&")
 }
 
-/// Every menu command that carries a keyboard accelerator: the submenu it
-/// lives in (`None` for the unlocalized "Note&Pad" brand submenu), the
-/// command's own label key, its menu item id, and its accelerator in Tauri's
-/// `CmdOrCtrl+…` syntax. `build_menu` looks up each id and accelerator here
-/// instead of hard-coding the strings inline, the Keyboard Shortcuts window
-/// (`get_shortcuts`) renders this same table, and on Windows
-/// `trigger_menu_accelerator` resolves a keypress through it, so the live
-/// menu, the shortcuts list and the keyboard path can never drift apart.
-const ACCELERATOR_TABLE: &[(Option<i18n::Key>, i18n::Key, &str, &str)] = &[
-  (None, i18n::Key::Quit, "quit", "CmdOrCtrl+Q"),
-  (None, i18n::Key::Settings, "settings", "CmdOrCtrl+,"),
-  (
-    Some(i18n::Key::FileMenu),
-    i18n::Key::NewSticky,
-    "new-sticky",
-    "CmdOrCtrl+N",
-  ),
-  (
-    Some(i18n::Key::FileMenu),
-    i18n::Key::NewTab,
-    "new-tab",
-    "CmdOrCtrl+T",
-  ),
-  (
-    Some(i18n::Key::FileMenu),
-    i18n::Key::Open,
-    "open",
-    "CmdOrCtrl+O",
-  ),
-  (
-    Some(i18n::Key::FileMenu),
-    i18n::Key::Save,
-    "save",
-    "CmdOrCtrl+S",
-  ),
-  (
-    Some(i18n::Key::FileMenu),
-    i18n::Key::SaveAs,
-    "save-as",
-    "CmdOrCtrl+Shift+S",
-  ),
-  (
-    Some(i18n::Key::FileMenu),
-    i18n::Key::Close,
-    "close",
-    "CmdOrCtrl+W",
-  ),
-  (
-    Some(i18n::Key::EditMenu),
-    i18n::Key::Find,
-    "find",
-    "CmdOrCtrl+F",
-  ),
-  (
-    Some(i18n::Key::EditMenu),
-    i18n::Key::FindReplace,
-    "find-replace",
-    "CmdOrCtrl+Alt+F",
-  ),
-  (
-    Some(i18n::Key::EditMenu),
-    i18n::Key::FindNext,
-    "find-next",
-    "CmdOrCtrl+G",
-  ),
-  (
-    Some(i18n::Key::EditMenu),
-    i18n::Key::FindPrev,
-    "find-prev",
-    "CmdOrCtrl+Shift+G",
-  ),
-  (
-    Some(i18n::Key::ViewMenu),
-    i18n::Key::Workspace,
-    "workspace",
-    "CmdOrCtrl+Shift+E",
-  ),
-];
-
-/// Shortcuts that have no menu item, so `ACCELERATOR_TABLE` cannot carry them:
-/// there is no `Option<i18n::Key>` submenu to hang them off of. Each entry
-/// names its own section heading rather than a menu's — `TabsSection` and
-/// `LargeFileSection` are Keyboard Shortcuts window headings, not real menus.
-/// Unlike `ACCELERATOR_TABLE`, this table is hand-maintained: the bindings
-/// themselves live in the frontend (not in this Rust menu code), so the
-/// binding sites each carry a comment pointing back here as the single place
-/// to update when a binding changes.
-const NON_MENU_SHORTCUTS: &[(i18n::Key, i18n::Key, &str)] = &[
-  (i18n::Key::TabsSection, i18n::Key::NextTab, "Ctrl+Tab"),
-  (i18n::Key::TabsSection, i18n::Key::PrevTab, "Ctrl+Shift+Tab"),
-  (
-    i18n::Key::LargeFileSection,
-    i18n::Key::GoToLine,
-    "CmdOrCtrl+L",
-  ),
-];
-
-/// The accelerator `ACCELERATOR_TABLE` records for `item`, or `None` if `item`
-/// carries no keyboard shortcut. Looked up by `build_menu` at each accelerated
-/// item's construction site.
-fn accelerator(item: i18n::Key) -> Option<&'static str> {
-  ACCELERATOR_TABLE
-    .iter()
-    .find(|(_, key, _, _)| *key == item)
-    .map(|(_, _, _, accel)| *accel)
-}
-
-/// The menu item id `ACCELERATOR_TABLE` records for an accelerated `item`.
-/// Panics on a key the table does not carry: every caller is a `build_menu`
-/// construction site for an item that is in the table, so a miss is a
-/// programming error the menu-building tests hit immediately.
-fn menu_id(item: i18n::Key) -> &'static str {
-  ACCELERATOR_TABLE
-    .iter()
-    .find(|(_, key, _, _)| *key == item)
-    .map(|(_, _, id, _)| *id)
-    .expect("menu_id called for a key with no ACCELERATOR_TABLE row")
-}
-
-/// The menu item id whose accelerator is exactly `accelerator` (Tauri's
-/// `CmdOrCtrl+…` syntax, as `ACCELERATOR_TABLE` spells it), or `None`.
-fn menu_id_for_accelerator(accelerator: &str) -> Option<&'static str> {
-  ACCELERATOR_TABLE
-    .iter()
-    .find(|(_, _, _, accel)| *accel == accelerator)
-    .map(|(_, _, id, _)| *id)
-}
-
-#[cfg(test)]
-mod accelerator_table_tests {
-  use super::{accelerator, ACCELERATOR_TABLE};
-  use crate::i18n::Key;
-
-  #[test]
-  fn looks_up_a_representative_spread_of_accelerated_items() {
-    assert_eq!(accelerator(Key::Quit), Some("CmdOrCtrl+Q"));
-    assert_eq!(accelerator(Key::Save), Some("CmdOrCtrl+S"));
-    assert_eq!(accelerator(Key::FindReplace), Some("CmdOrCtrl+Alt+F"));
-    assert_eq!(accelerator(Key::Workspace), Some("CmdOrCtrl+Shift+E"));
+/// The Help menu's items in order, by menu id and label. "Full Version Features"
+/// sits between Report an Issue and Acknowledgements and exists only in lite.
+fn help_menu_entries(lite: bool) -> Vec<(&'static str, i18n::Key)> {
+  let mut entries = vec![
+    ("help-documentation", i18n::Key::Documentation),
+    ("help-report-issue", i18n::Key::ReportIssue),
+  ];
+  if lite {
+    entries.push(("help-full-features", i18n::Key::FullFeatures));
   }
-
-  #[test]
-  fn a_key_with_no_accelerator_returns_none() {
-    // About has a menu item but no keyboard shortcut, unlike its App-menu
-    // sibling Quit — exactly the case `accelerator` must return `None` for
-    // rather than a stale or fabricated accelerator.
-    assert_eq!(accelerator(Key::About), None);
-    assert_eq!(accelerator(Key::HelpMenu), None);
-  }
-
-  #[test]
-  fn no_item_key_appears_twice() {
-    // A duplicate would mean the table (and so both the menu and the
-    // shortcuts window) disagree with themselves about that command's
-    // accelerator — the exact drift this table exists to prevent. `Key` has
-    // no `Hash` impl, so this dedups with a plain (and, at 13 rows, cheap)
-    // O(n²) scan rather than adding one just for this test.
-    let mut seen: Vec<Key> = Vec::new();
-    for (_, item, _, _) in ACCELERATOR_TABLE {
-      assert!(
-        !seen.contains(item),
-        "{item:?} appears more than once in ACCELERATOR_TABLE"
-      );
-      seen.push(*item);
-    }
-  }
-
-  #[test]
-  fn every_accelerator_is_well_formed() {
-    // Every token but the last must be one of the three modifiers this app
-    // actually uses; the last token is the key itself and must be non-empty.
-    for (_, item, _, accel) in ACCELERATOR_TABLE {
-      let tokens: Vec<&str> = accel.split('+').collect();
-      let (key, mods) = tokens
-        .split_last()
-        .expect("accelerator has at least one token");
-      assert!(
-        !key.is_empty(),
-        "{item:?}'s accelerator has an empty key token: {accel:?}"
-      );
-      for token in mods {
-        assert!(
-          matches!(*token, "CmdOrCtrl" | "Alt" | "Shift"),
-          "{item:?}'s accelerator has an unrecognized modifier {token:?}: {accel:?}"
-        );
-      }
-    }
-  }
+  entries.push(("help-acknowledgements", i18n::Key::Acknowledgements));
+  entries.push(("help-privacy", i18n::Key::PrivacyPolicy));
+  entries
 }
 
 /// Build the menu bar in `locale`, returning the built menu (not yet installed;
@@ -1069,26 +1071,23 @@ fn build_menu(
 ) -> Result<(MenuItemRefs, Menu<Wry>), Box<dyn std::error::Error>> {
   let tr = |key| escape_menu_label(i18n::tr(locale, key));
   let s = settings::app_settings(app);
-  let quit = MenuItem::with_id(
-    app,
-    menu_id(i18n::Key::Quit),
-    tr(i18n::Key::Quit),
-    true,
-    accelerator(i18n::Key::Quit),
-  )?;
+  let keys = shortcuts::resolve_current(&s);
+  let accel = |id: &str| keys.menu_accelerator(id);
+  let quit = MenuItem::with_id(app, "quit", tr(i18n::Key::Quit), true, accel("quit"))?;
   // Custom About/Settings items so both route to our own windows.
-  let about = MenuItem::with_id(app, "about", tr(i18n::Key::About), true, None::<&str>)?;
+  let about = MenuItem::with_id(app, "about", tr(i18n::Key::About), true, accel("about"))?;
   let settings_item = MenuItem::with_id(
     app,
-    menu_id(i18n::Key::Settings),
+    "settings",
     tr(i18n::Key::Settings),
     true,
-    accelerator(i18n::Key::Settings),
+    accel("settings"),
   )?;
   // Brand name; not localized (macOS shows the app name as the first submenu).
+  // "Note&Pad Lite" in the Lite build.
   let app_menu = Submenu::with_items(
     app,
-    escape_menu_label("Note&Pad"),
+    escape_menu_label(edition::app_name()),
     true,
     &[
       &about,
@@ -1103,61 +1102,43 @@ fn build_menu(
   // document window closes its active tab (not the whole window).
   let new_sticky = MenuItem::with_id(
     app,
-    menu_id(i18n::Key::NewSticky),
+    "new-sticky",
     tr(i18n::Key::NewSticky),
     true,
-    accelerator(i18n::Key::NewSticky),
+    accel("new-sticky"),
   )?;
   let new_tab = MenuItem::with_id(
     app,
-    menu_id(i18n::Key::NewTab),
+    "new-tab",
     tr(i18n::Key::NewTab),
     false,
-    accelerator(i18n::Key::NewTab),
+    accel("new-tab"),
   )?;
-  let open = MenuItem::with_id(
-    app,
-    menu_id(i18n::Key::Open),
-    tr(i18n::Key::Open),
-    false,
-    accelerator(i18n::Key::Open),
-  )?;
+  let open = MenuItem::with_id(app, "open", tr(i18n::Key::Open), false, accel("open"))?;
   let open_recent = Submenu::with_id(app, "open-recent", tr(i18n::Key::OpenRecent), true)?;
   populate_recent(app, &open_recent, locale, &s.recent_files)?;
-  let save = MenuItem::with_id(
-    app,
-    menu_id(i18n::Key::Save),
-    tr(i18n::Key::Save),
-    false,
-    accelerator(i18n::Key::Save),
-  )?;
+  let save = MenuItem::with_id(app, "save", tr(i18n::Key::Save), false, accel("save"))?;
   let save_as = MenuItem::with_id(
     app,
-    menu_id(i18n::Key::SaveAs),
+    "save-as",
     tr(i18n::Key::SaveAs),
     false,
-    accelerator(i18n::Key::SaveAs),
+    accel("save-as"),
   )?;
-  let close = MenuItem::with_id(
-    app,
-    menu_id(i18n::Key::Close),
-    tr(i18n::Key::Close),
-    false,
-    accelerator(i18n::Key::Close),
-  )?;
+  let close = MenuItem::with_id(app, "close", tr(i18n::Key::Close), false, accel("close"))?;
   let show_in_finder = MenuItem::with_id(
     app,
     "show-in-finder",
     tr(i18n::Key::CtxShowInFinder),
     false,
-    None::<&str>,
+    accel("show-in-finder"),
   )?;
   let copy_path = MenuItem::with_id(
     app,
     "copy-path",
     tr(i18n::Key::CopyFilePath),
     false,
-    None::<&str>,
+    accel("copy-path"),
   )?;
   let file_menu = Submenu::with_items(
     app,
@@ -1181,37 +1162,31 @@ fn build_menu(
   // Edit items: standard roles for native clipboard/undo/select behaviour (which
   // also enables Cmd+C/V in workspace and settings inputs), then our find family
   // which emits `menu-action` to the focused window.
-  let find = MenuItem::with_id(
-    app,
-    menu_id(i18n::Key::Find),
-    tr(i18n::Key::Find),
-    false,
-    accelerator(i18n::Key::Find),
-  )?;
+  let find = MenuItem::with_id(app, "find", tr(i18n::Key::Find), false, accel("find"))?;
   let find_replace = MenuItem::with_id(
     app,
-    menu_id(i18n::Key::FindReplace),
+    "find-replace",
     tr(i18n::Key::FindReplace),
     false,
-    accelerator(i18n::Key::FindReplace),
+    accel("find-replace"),
   )?;
   let find_next = MenuItem::with_id(
     app,
-    menu_id(i18n::Key::FindNext),
+    "find-next",
     tr(i18n::Key::FindNext),
     false,
-    accelerator(i18n::Key::FindNext),
+    accel("find-next"),
   )?;
   let find_prev = MenuItem::with_id(
     app,
-    menu_id(i18n::Key::FindPrev),
+    "find-prev",
     tr(i18n::Key::FindPrev),
     false,
-    accelerator(i18n::Key::FindPrev),
+    accel("find-prev"),
   )?;
   // Undo/Redo/Cut/Copy/Paste/Select All: predefined items on macOS (needed for
-  // the responder chain) and Windows (already dispatched natively via
-  // `execute_edit_command`, see windows/mod.rs). On Linux muda's predefined
+  // the responder chain) and Windows (already dispatched natively through
+  // muda's `EditCommand::run`). On Linux muda's predefined
   // versions are silent no-ops — Cut/Copy/Paste/SelectAll synthesize an X11 key
   // sequence via `libxdo`, a feature this build does not enable, and Undo/Redo
   // have no GTK implementation at all — so Linux gets custom items instead,
@@ -1264,7 +1239,48 @@ fn build_menu(
       Some("CmdOrCtrl+A"),
     )?),
   );
-  #[cfg(not(target_os = "linux"))]
+  // macOS keeps the predefined Cut/Copy/Paste, but Undo, Redo and Select All are
+  // custom items like Linux's: the predefined ones only message the focused
+  // responder, which does nothing for a JSON/XML/Markdown view or a table drawn
+  // over the editor and selects the whole page in a large-file view, so the
+  // frontend picks the target (`menu-action`).
+  #[cfg(target_os = "macos")]
+  let (undo_item, redo_item, cut_item, copy_item, paste_item, select_all_item): EditMenuItems = (
+    Box::new(MenuItem::with_id(
+      app,
+      "undo",
+      tr(i18n::Key::Undo),
+      true,
+      Some("CmdOrCtrl+Z"),
+    )?),
+    Box::new(MenuItem::with_id(
+      app,
+      "redo",
+      tr(i18n::Key::Redo),
+      true,
+      Some("CmdOrCtrl+Shift+Z"),
+    )?),
+    Box::new(PredefinedMenuItem::cut(
+      app,
+      Some(tr(i18n::Key::Cut).as_str()),
+    )?),
+    Box::new(PredefinedMenuItem::copy(
+      app,
+      Some(tr(i18n::Key::Copy).as_str()),
+    )?),
+    Box::new(PredefinedMenuItem::paste(
+      app,
+      Some(tr(i18n::Key::Paste).as_str()),
+    )?),
+    Box::new(MenuItem::with_id(
+      app,
+      "select-all",
+      tr(i18n::Key::SelectAll),
+      true,
+      Some("CmdOrCtrl+A"),
+    )?),
+  );
+  #[cfg(not(any(target_os = "linux", target_os = "macos")))]
   let (undo_item, redo_item, cut_item, copy_item, paste_item, select_all_item): EditMenuItems = (
     Box::new(PredefinedMenuItem::undo(
       app,
@@ -1330,7 +1346,7 @@ fn build_menu(
     let item = CheckMenuItem::with_id(
       app,
       format!("enc:{label}"),
-      label,
+      escape_menu_label(label),
       true,
       false,
       None::<&str>,
@@ -1342,18 +1358,26 @@ fn build_menu(
   let mut language_items = Vec::new();
   let languages = app.state::<MenuLists>().languages.lock().unwrap().clone();
   let current = focused_doc_language(app);
-  let order = syntax_order(&languages, current.as_deref());
+  let order = syntax_entries(&languages, current.as_deref(), edition::is_lite());
   for (index, entry) in order.iter().enumerate() {
     let (id, label) = match entry {
       // Plain Text is never translated, matching program-language names.
       None => ("lang:".to_string(), "Plain Text".to_string()),
       Some(name) => (format!("lang:{name}"), name.clone()),
     };
-    let item = CheckMenuItem::with_id(app, id, label, true, false, None::<&str>)?;
+    let item = CheckMenuItem::with_id(
+      app,
+      id,
+      escape_menu_label(&label),
+      true,
+      false,
+      None::<&str>,
+    )?;
     syntax_menu.append(&item)?;
     language_items.push((entry.clone(), item));
-    // A separator follows the pinned current-syntax entry (index 0).
-    if index == 0 {
+    // A separator follows the pinned current-syntax entry (index 0), when
+    // anything follows it.
+    if index == 0 && order.len() > 1 {
       syntax_menu.append(&PredefinedMenuItem::separator(app)?)?;
     }
   }
@@ -1363,7 +1387,7 @@ fn build_menu(
     tr(i18n::Key::WordWrap),
     true,
     s.editor_word_wrap,
-    None::<&str>,
+    accel("word-wrap"),
   )?;
   let format_menu = Submenu::with_items(
     app,
@@ -1378,12 +1402,13 @@ fn build_menu(
     ],
   )?;
   // View menu: the Workspace (moved here from Window) and the Line Numbers toggle.
+  #[cfg(not(feature = "lite"))]
   let workspace = MenuItem::with_id(
     app,
-    menu_id(i18n::Key::Workspace),
+    "workspace",
     tr(i18n::Key::Workspace),
     true,
-    accelerator(i18n::Key::Workspace),
+    accel("workspace"),
   )?;
   let line_numbers = CheckMenuItem::with_id(
     app,
@@ -1391,14 +1416,14 @@ fn build_menu(
     tr(i18n::Key::LineNumbers),
     true,
     s.editor_line_numbers,
-    None::<&str>,
+    accel("line-numbers"),
   )?;
-  let view_menu = Submenu::with_items(
-    app,
-    tr(i18n::Key::ViewMenu),
-    true,
-    &[&workspace, &line_numbers],
-  )?;
+  let view_menu = Submenu::new(app, tr(i18n::Key::ViewMenu), true)?;
+  #[cfg(not(feature = "lite"))]
+  if edition::workspace_enabled(edition::is_lite()) {
+    view_menu.append(&workspace)?;
+  }
+  view_menu.append(&line_numbers)?;
   // Window menu. Zoom is the predefined Maximize (macOS renders it as "Zoom");
   // always-on-top is per-window (document-focus only); Bring All to Front is the
   // predefined role. On macOS the submenu is registered as the app's Window menu
@@ -1409,14 +1434,30 @@ fn build_menu(
     tr(i18n::Key::AlwaysOnTop),
     false,
     false,
-    None::<&str>,
+    accel("always-on-top"),
   )?;
+  // Minimize is the predefined role on macOS. Elsewhere the role's accelerator
+  // never fires while a webview has focus, so it is a plain item that only
+  // minimizes on click and carries no key.
+  #[cfg(target_os = "macos")]
+  let minimize_item: Box<dyn IsMenuItem<Wry>> = Box::new(PredefinedMenuItem::minimize(
+    app,
+    Some(tr(i18n::Key::Minimize).as_str()),
+  )?);
+  #[cfg(not(target_os = "macos"))]
+  let minimize_item: Box<dyn IsMenuItem<Wry>> = Box::new(MenuItem::with_id(
+    app,
+    "minimize",
+    tr(i18n::Key::Minimize),
+    true,
+    accel("minimize"),
+  )?);
   let window_menu = Submenu::with_items(
     app,
     tr(i18n::Key::WindowMenu),
     true,
     &[
-      &PredefinedMenuItem::minimize(app, Some(tr(i18n::Key::Minimize).as_str()))?,
+      minimize_item.as_ref(),
       &PredefinedMenuItem::maximize(app, Some(tr(i18n::Key::Zoom).as_str()))?,
       &PredefinedMenuItem::separator(app)?,
       &always_on_top,
@@ -1426,55 +1467,12 @@ fn build_menu(
   #[cfg(target_os = "macos")]
   let _ = window_menu.set_as_windows_menu_for_nsapp();
   // Help menu: Documentation and Report an Issue open the browser (routed to
-  // `tauri_plugin_opener` in the menu-event handler); Keyboard Shortcuts,
-  // Acknowledgements, and Privacy Policy each open our own window.
-  let documentation = MenuItem::with_id(
-    app,
-    "help-documentation",
-    tr(i18n::Key::Documentation),
-    true,
-    None::<&str>,
-  )?;
-  let report_issue = MenuItem::with_id(
-    app,
-    "help-report-issue",
-    tr(i18n::Key::ReportIssue),
-    true,
-    None::<&str>,
-  )?;
-  let keyboard_shortcuts = MenuItem::with_id(
-    app,
-    "help-keyboard-shortcuts",
-    tr(i18n::Key::KeyboardShortcuts),
-    true,
-    None::<&str>,
-  )?;
-  let acknowledgements = MenuItem::with_id(
-    app,
-    "help-acknowledgements",
-    tr(i18n::Key::Acknowledgements),
-    true,
-    None::<&str>,
-  )?;
-  let privacy = MenuItem::with_id(
-    app,
-    "help-privacy",
-    tr(i18n::Key::PrivacyPolicy),
-    true,
-    None::<&str>,
-  )?;
-  let help_menu = Submenu::with_items(
-    app,
-    tr(i18n::Key::HelpMenu),
-    true,
-    &[
-      &documentation,
-      &report_issue,
-      &keyboard_shortcuts,
-      &acknowledgements,
-      &privacy,
-    ],
-  )?;
+  // `tauri_plugin_opener` in the menu-event handler); Full Version Features
+  // (Lite only), Acknowledgements and Privacy Policy each open our own window.
+  let help_menu = Submenu::new(app, tr(i18n::Key::HelpMenu), true)?;
+  for (id, key) in help_menu_entries(edition::is_lite()) {
+    help_menu.append(&MenuItem::with_id(app, id, tr(key), true, accel(id))?)?;
+  }
   // On macOS this also gets the system-inserted menu search field; Windows and
   // Linux have no equivalent, so the menu there is just the menu.
   #[cfg(target_os = "macos")]
@@ -1493,6 +1491,7 @@ fn build_menu(
   )?;
   Ok((
     MenuItemRefs {
+      new_sticky,
       new_tab,
       open,
       save,
@@ -1584,13 +1583,24 @@ fn build_app_menu(
 fn handle_menu_id(app: &tauri::AppHandle, id: &str) {
   match id {
     "quit" => flush_then_exit(app),
-    "new-sticky" => {
-      let store = app.state::<NoteStore>();
-      let _ = windows::new_sticky(app, &store);
-    }
+    "new-sticky" => match new_target(tracked_focus_kind(app)) {
+      NewTarget::Window => {
+        let _ = windows::new_blank_document(app);
+      }
+      NewTarget::Sticky => {
+        let store = app.state::<NoteStore>();
+        let _ = windows::new_sticky(app, &store);
+      }
+    },
+    "minimize" => minimize_focused(app),
     "new-tab" | "open" | "save" | "save-as" | "show-in-finder" | "copy-path" | "find"
     | "find-replace" | "find-next" | "find-prev" | "undo" | "redo" | "cut" | "copy" | "paste"
     | "select-all" => {
+      #[cfg(target_os = "macos")]
+      if edit_menu_route(id, any_webview_focused(app)) == EditMenuRoute::FirstResponder {
+        send_to_first_responder(id);
+        return;
+      }
       emit_to_focused(app, "menu-action", id.to_string());
     }
     "line-ending-lf" => emit_to_focused(app, "menu-action", "set-line-ending:LF".to_string()),
@@ -1599,6 +1609,7 @@ fn handle_menu_id(app: &tauri::AppHandle, id: &str) {
     "line-numbers" => toggle_line_numbers(app),
     "always-on-top" => toggle_always_on_top(app),
     "recent-clear" => clear_recent(app),
+    #[cfg(not(feature = "lite"))]
     "workspace" => {
       let _ = windows::show_workspace(app);
     }
@@ -1614,11 +1625,11 @@ fn handle_menu_id(app: &tauri::AppHandle, id: &str) {
     "help-report-issue" => {
       navigation::open_externally("https://github.com/Lonshaus/note-n-pad/issues");
     }
-    "help-keyboard-shortcuts" => {
-      let _ = windows::show_shortcuts(app);
-    }
     "help-acknowledgements" => {
       let _ = windows::show_acknowledgements(app);
+    }
+    "help-full-features" => {
+      let _ = windows::show_edition(app);
     }
     "help-privacy" => {
       let _ = windows::show_privacy(app);
@@ -1634,12 +1645,12 @@ fn handle_menu_id(app: &tauri::AppHandle, id: &str) {
       emit_to_focused(app, "menu-action", format!("set-language:{}", &id[5..]));
     }
     _ if id.starts_with("recent:") => open_recent(app, id),
+    #[cfg(not(feature = "lite"))]
     _ if id.starts_with("ctx:") => ctx_menu::route_ctx_event(app, id),
     _ => {}
   }
 }
-
-/// Whether menu item `id` (an `ACCELERATOR_TABLE` id) is enabled for a
+/// Whether menu item `id` (a registry menu id) is enabled for a
 /// `kind`-focused window — the same rule `MenuItems::apply` uses to
 /// enable/disable the live item, recomputed here rather than read off the
 /// built menu, since `Menu::get` does not recurse into submenus. Keeps
@@ -1658,8 +1669,22 @@ fn accelerator_enabled(id: &str, kind: FocusKind) -> bool {
     "find-prev" => f.find_prev,
     // Document-only, mirroring `save_as.set_enabled(is_doc)` in `MenuItems::apply`.
     "save-as" => kind == FocusKind::Doc,
+    // The Format and Window items and the file-path items are document-only,
+    // like their submenus in `MenuItems::apply`.
+    "word-wrap" | "always-on-top" | "show-in-finder" | "copy-path" => kind == FocusKind::Doc,
     // Never toggled by focus kind.
-    "quit" | "settings" | "new-sticky" | "workspace" => true,
+    "quit"
+    | "settings"
+    | "new-sticky"
+    | "workspace"
+    | "line-numbers"
+    | "about"
+    | "minimize"
+    | "help-documentation"
+    | "help-report-issue"
+    | "help-acknowledgements"
+    | "help-full-features"
+    | "help-privacy" => true,
     _ => false,
   }
 }
@@ -1680,31 +1705,44 @@ fn trigger_menu_accelerator(
   window: tauri::Window,
   accelerator: String,
 ) -> bool {
-  let Some(id) = menu_id_for_accelerator(&accelerator) else {
+  let keys = shortcuts::resolve_current(&settings::app_settings(&app));
+  let Some(id) = keys.menu_id_for_accelerator(&accelerator) else {
     return false;
   };
+  // The workspace has no menu item in lite, so its key is not ours to take.
+  if id == "workspace" && !edition::workspace_enabled(edition::is_lite()) {
+    return false;
+  }
   if !accelerator_enabled(id, focus_kind(window.label())) {
     return false;
   }
   handle_menu_id(&app, id);
   true
 }
-
-/// Every accelerator in `ACCELERATOR_TABLE`, for the Windows frontend keydown
-/// listener to match against. Deliberately narrower than `get_shortcuts`,
-/// which also carries `NON_MENU_SHORTCUTS` (frontend-only bindings such as
-/// Ctrl+L) that must never be intercepted by `trigger_menu_accelerator`.
+/// Every canonical accelerator a native menu item currently carries, for the
+/// Windows frontend keydown listener to match against. Shortcuts that are not
+/// menu items (tab switching, go to line) are never in this list, so
+/// `trigger_menu_accelerator` can never intercept them.
 #[tauri::command]
-fn get_menu_accelerators() -> Vec<String> {
-  ACCELERATOR_TABLE
-    .iter()
-    .map(|(_, _, _, accel)| (*accel).to_string())
-    .collect()
+fn get_menu_accelerators(app: tauri::AppHandle) -> Vec<String> {
+  shortcuts::resolve_current(&settings::app_settings(&app))
+    .menu_accelerators_for(edition::workspace_enabled(edition::is_lite()))
 }
 
 #[cfg(test)]
 mod menu_accelerator_command_tests {
-  use super::{accelerator_enabled, menu_id_for_accelerator, FocusKind, ACCELERATOR_TABLE};
+  use super::{accelerator_enabled, new_label_key, new_target, shortcuts, FocusKind, NewTarget};
+  use crate::i18n::Key;
+  use crate::shortcuts::{Platform, ROWS};
+  use std::collections::BTreeMap;
+
+  fn defaults(platform: Platform) -> shortcuts::Resolved {
+    shortcuts::resolve(
+      &shortcuts::default_canonical(shortcuts::GLOBAL_STICKY_ID, platform),
+      &BTreeMap::new(),
+      platform,
+    )
+  }
 
   // Reads the source because the failure mode is a deadlock, with nothing to
   // assert at runtime. Same style as `window_command_threading_tests` in
@@ -1742,30 +1780,64 @@ mod menu_accelerator_command_tests {
   }
 
   #[test]
-  fn every_table_id_round_trips_through_lookup() {
-    for (_, _, id, accel) in ACCELERATOR_TABLE {
-      assert_eq!(menu_id_for_accelerator(accel), Some(*id));
+  fn every_menu_row_round_trips_through_lookup() {
+    for platform in [Platform::MacOS, Platform::Other] {
+      let keys = defaults(platform);
+      for row in ROWS {
+        let (Some(menu_id), Some(accel)) = (row.menu_id, keys.accel(row.id)) else {
+          continue;
+        };
+        assert_eq!(
+          keys.menu_id_for_accelerator(&accel.canonical(platform)),
+          Some(menu_id),
+          "{}",
+          row.id
+        );
+      }
     }
   }
 
   #[test]
   fn save_resolves_via_lookup() {
-    assert_eq!(menu_id_for_accelerator("CmdOrCtrl+S"), Some("save"));
+    assert_eq!(
+      defaults(Platform::MacOS).menu_id_for_accelerator("Cmd+S"),
+      Some("save")
+    );
+    assert_eq!(
+      defaults(Platform::Other).menu_id_for_accelerator("Ctrl+S"),
+      Some("save")
+    );
+    assert_eq!(
+      defaults(Platform::Other).menu_id_for_accelerator("CmdOrCtrl+S"),
+      Some("save")
+    );
   }
 
   #[test]
-  fn non_table_combos_resolve_to_none() {
-    assert_eq!(menu_id_for_accelerator("CmdOrCtrl+Z"), None);
-    assert_eq!(menu_id_for_accelerator("CmdOrCtrl+L"), None);
+  fn non_menu_combos_resolve_to_none() {
+    let keys = defaults(Platform::Other);
+    assert_eq!(keys.menu_id_for_accelerator("Ctrl+Z"), None);
+    assert_eq!(keys.menu_id_for_accelerator("Ctrl+Alt+G"), None);
+    assert_eq!(keys.menu_id_for_accelerator("Ctrl+Tab"), None);
   }
 
   #[test]
-  fn ids_are_unique() {
+  fn menu_ids_are_unique() {
     let mut seen: Vec<&str> = Vec::new();
-    for (_, _, id, _) in ACCELERATOR_TABLE {
-      assert!(!seen.contains(id), "{id} appears more than once");
+    for id in ROWS.iter().filter_map(|row| row.menu_id) {
+      assert!(!seen.contains(&id), "{id} appears more than once");
       seen.push(id);
     }
+  }
+
+  #[test]
+  fn new_item_follows_the_focused_window_kind() {
+    assert_eq!(new_target(FocusKind::Doc), NewTarget::Window);
+    for kind in NON_DOC_KINDS {
+      assert_eq!(new_target(*kind), NewTarget::Sticky, "{kind:?}");
+    }
+    assert_eq!(new_label_key(NewTarget::Window), Key::NewWindow);
+    assert_eq!(new_label_key(NewTarget::Sticky), Key::NewSticky);
   }
 
   #[test]
@@ -1806,7 +1878,7 @@ mod menu_accelerator_command_tests {
 
   #[test]
   fn always_on_items_are_enabled_for_every_kind() {
-    for id in ["quit", "settings", "new-sticky", "workspace"] {
+    for id in ["quit", "settings", "new-sticky", "workspace", "minimize"] {
       for kind in ALL_KINDS {
         assert!(accelerator_enabled(id, *kind));
       }
@@ -1945,9 +2017,98 @@ fn syntax_order(languages: &[String], current: Option<&str>) -> Vec<Option<Strin
   order
 }
 
+/// The entries of the Format > Syntax submenu: `syntax_order`, except that the
+/// Lite edition has no syntax highlighting and so lists Plain Text alone.
+fn syntax_entries(languages: &[String], current: Option<&str>, lite: bool) -> Vec<Option<String>> {
+  if lite {
+    vec![None]
+  } else {
+    syntax_order(languages, current)
+  }
+}
+
+#[cfg(test)]
+mod help_menu_tests {
+  use super::{accelerator_enabled, help_menu_entries, FocusKind};
+  use crate::i18n::Key;
+
+  fn ids(lite: bool) -> Vec<&'static str> {
+    help_menu_entries(lite)
+      .into_iter()
+      .map(|(id, _)| id)
+      .collect()
+  }
+
+  #[test]
+  fn lite_has_full_version_features_between_report_an_issue_and_acknowledgements() {
+    assert_eq!(
+      ids(true),
+      vec![
+        "help-documentation",
+        "help-report-issue",
+        "help-full-features",
+        "help-acknowledgements",
+        "help-privacy",
+      ]
+    );
+    assert!(help_menu_entries(true).contains(&("help-full-features", Key::FullFeatures)));
+  }
+
+  #[test]
+  fn full_never_has_it() {
+    assert_eq!(
+      ids(false),
+      vec![
+        "help-documentation",
+        "help-report-issue",
+        "help-acknowledgements",
+        "help-privacy",
+      ]
+    );
+  }
+
+  #[test]
+  fn the_item_works_from_every_window() {
+    for kind in [
+      FocusKind::Doc,
+      FocusKind::Sticky,
+      FocusKind::Workspace,
+      FocusKind::Settings,
+      FocusKind::About,
+      FocusKind::None,
+    ] {
+      assert!(accelerator_enabled("help-full-features", kind));
+    }
+  }
+
+  #[test]
+  fn the_menu_is_built_from_the_entries() {
+    let source = include_str!("lib.rs");
+    let at = source.find("fn build_menu(").unwrap();
+    let body = &source[at..];
+    assert!(body[..body.find("\n}\n").unwrap()].contains("help_menu_entries(edition::is_lite())"));
+  }
+}
+
 #[cfg(test)]
 mod syntax_order_tests {
-  use super::syntax_order;
+  use super::{syntax_entries, syntax_order};
+
+  #[test]
+  fn lite_lists_plain_text_only_whatever_the_tab_had() {
+    for current in [None, Some("Rust"), Some("Cobol")] {
+      assert_eq!(syntax_entries(&langs(), current, true), vec![None]);
+    }
+  }
+
+  #[test]
+  fn full_lists_every_language() {
+    assert_eq!(
+      syntax_entries(&langs(), Some("Rust"), false),
+      syntax_order(&langs(), Some("Rust"))
+    );
+    assert_eq!(syntax_entries(&langs(), None, false).len(), 4);
+  }
 
   fn langs() -> Vec<String> {
     vec!["HTML".into(), "Rust".into(), "JSON".into()]
@@ -2031,179 +2192,6 @@ fn set_menu_lists(app: tauri::AppHandle, encodings: Vec<String>, languages: Vec<
   }
 }
 
-/// One row of the Keyboard Shortcuts window: the current-locale section
-/// heading, the command's label, and its accelerator in Tauri's
-/// `CmdOrCtrl+…` syntax (the window converts that into a platform-correct
-/// display on its own side).
-#[derive(serde::Serialize)]
-struct ShortcutRow {
-  section: String,
-  label: String,
-  accelerator: String,
-}
-
-/// Every accelerated command in `ACCELERATOR_TABLE`, translated into `locale`,
-/// for the Keyboard Shortcuts window. `None` sections (the "Note&Pad" brand
-/// submenu) render with the same unlocalized brand name `build_menu` uses for
-/// that submenu's title. Pulled out of the `#[tauri::command]` wrapper below
-/// so the translation and section-mapping logic is testable without an
-/// `AppHandle`.
-fn shortcut_rows(locale: i18n::Locale) -> Vec<ShortcutRow> {
-  let menu_rows = ACCELERATOR_TABLE
-    .iter()
-    .map(|(section, item, _, accel)| ShortcutRow {
-      section: section.map_or_else(
-        || "Note&Pad".to_string(),
-        |key| i18n::tr(locale, key).to_string(),
-      ),
-      label: i18n::tr(locale, *item).to_string(),
-      accelerator: (*accel).to_string(),
-    });
-  // Appended after the menu rows so the window groups menu sections first,
-  // then the non-menu sections (Tabs, Large File Viewer), by first appearance.
-  let non_menu_rows = NON_MENU_SHORTCUTS
-    .iter()
-    .map(|(section, item, accel)| ShortcutRow {
-      section: i18n::tr(locale, *section).to_string(),
-      label: i18n::tr(locale, *item).to_string(),
-      accelerator: (*accel).to_string(),
-    });
-  menu_rows.chain(non_menu_rows).collect()
-}
-
-#[tauri::command]
-fn get_shortcuts(app: tauri::AppHandle) -> Vec<ShortcutRow> {
-  let locale = i18n::current_locale(&settings::app_settings(&app).language);
-  shortcut_rows(locale)
-}
-
-#[cfg(test)]
-mod shortcut_rows_tests {
-  use super::{shortcut_rows, NON_MENU_SHORTCUTS};
-  use crate::i18n::Locale;
-
-  #[test]
-  fn row_count_matches_both_tables() {
-    assert_eq!(
-      shortcut_rows(Locale::En).len(),
-      super::ACCELERATOR_TABLE.len() + NON_MENU_SHORTCUTS.len()
-    );
-  }
-
-  #[test]
-  fn a_none_section_maps_to_the_unlocalized_brand_name() {
-    let rows = shortcut_rows(Locale::En);
-    let quit = rows.iter().find(|r| r.label == "Quit Note&Pad").unwrap();
-    assert_eq!(quit.section, "Note&Pad");
-  }
-
-  #[test]
-  fn a_some_section_translates_to_its_menu_heading() {
-    let rows = shortcut_rows(Locale::ZhTw);
-    let save = rows.iter().find(|r| r.label == "儲存").unwrap();
-    assert_eq!(save.section, "檔案");
-    assert_eq!(save.accelerator, "CmdOrCtrl+S");
-  }
-
-  #[test]
-  fn non_menu_rows_are_present_with_their_own_section() {
-    let rows = shortcut_rows(Locale::En);
-    let next_tab = rows.iter().find(|r| r.label == "Next Tab").unwrap();
-    assert_eq!(next_tab.section, "Tabs");
-    assert_eq!(next_tab.accelerator, "Ctrl+Tab");
-    let prev_tab = rows.iter().find(|r| r.label == "Previous Tab").unwrap();
-    assert_eq!(prev_tab.section, "Tabs");
-    assert_eq!(prev_tab.accelerator, "Ctrl+Shift+Tab");
-    let goto = rows.iter().find(|r| r.label == "Go to Line").unwrap();
-    assert_eq!(goto.section, "Large File Viewer");
-    assert_eq!(goto.accelerator, "CmdOrCtrl+L");
-  }
-
-  #[test]
-  fn no_accelerator_is_claimed_by_both_tables() {
-    // A shared accelerator string would mean a menu command and a non-menu
-    // command both claim the same chord.
-    for (_, _, _, menu_accel) in super::ACCELERATOR_TABLE {
-      for (_, _, non_menu_accel) in NON_MENU_SHORTCUTS {
-        assert_ne!(
-          menu_accel, non_menu_accel,
-          "{menu_accel} appears in both ACCELERATOR_TABLE and NON_MENU_SHORTCUTS"
-        );
-      }
-    }
-  }
-
-  #[test]
-  fn every_locale_has_distinct_sections_and_labels_within_each_section() {
-    use crate::i18n::{tr, Key};
-    let locales = [
-      Locale::ZhTw,
-      Locale::ZhCn,
-      Locale::Ja,
-      Locale::En,
-      Locale::Ru,
-      Locale::Es,
-      Locale::PtBr,
-      Locale::De,
-      Locale::Fr,
-      Locale::Ko,
-      Locale::Pl,
-      Locale::Tr,
-      Locale::It,
-      Locale::Th,
-      Locale::Vi,
-    ];
-    // Distinct section keys: `ACCELERATOR_TABLE`'s `Option<Key>` column
-    // (`None` is the unlocalized "Note&Pad" brand submenu) plus
-    // `NON_MENU_SHORTCUTS`'s section-key column.
-    let mut section_keys: Vec<Option<Key>> = Vec::new();
-    for (section, _, _, _) in super::ACCELERATOR_TABLE {
-      if !section_keys.contains(section) {
-        section_keys.push(*section);
-      }
-    }
-    for (section, _, _) in NON_MENU_SHORTCUTS {
-      let section = Some(*section);
-      if !section_keys.contains(&section) {
-        section_keys.push(section);
-      }
-    }
-    for locale in locales {
-      // Two different section keys must never translate to the same string,
-      // or `ShortcutsApp.svelte`'s `{#each sections as group (group.section)}`
-      // would merge two unrelated groups under one heading in that locale.
-      let mut seen: Vec<(Option<Key>, String)> = Vec::new();
-      for key in &section_keys {
-        let text = key.map_or_else(|| "Note&Pad".to_string(), |k| tr(locale, k).to_string());
-        if let Some((other_key, _)) = seen.iter().find(|(_, t)| *t == text) {
-          panic!("{locale:?} sections {other_key:?} and {key:?} both translate to {text:?}");
-        }
-        seen.push((*key, text));
-      }
-      // Within each section, labels must be distinct (Svelte's keyed each
-      // uses `row.label` as the key inside a section).
-      let rows = shortcut_rows(locale);
-      let mut sections: Vec<&str> = Vec::new();
-      for row in &rows {
-        if !sections.contains(&row.section.as_str()) {
-          sections.push(&row.section);
-        }
-      }
-      for section in &sections {
-        let mut seen_labels: Vec<&str> = Vec::new();
-        for row in rows.iter().filter(|r| r.section == *section) {
-          assert!(
-            !seen_labels.contains(&row.label.as_str()),
-            "{locale:?} section {section} has a duplicate label: {}",
-            row.label
-          );
-          seen_labels.push(&row.label);
-        }
-      }
-    }
-  }
-}
-
 /// Stable id for the single tray icon, so a language change can look it up and
 /// swap its menu.
 const TRAY_ID: &str = "main";
@@ -2278,6 +2266,7 @@ mod rebuild_app_menu_guard_tests {
 static TRAY_MENU_LABELS: std::sync::OnceLock<std::sync::Mutex<Vec<String>>> =
   std::sync::OnceLock::new();
 
+#[cfg_attr(not(debug_assertions), allow(dead_code))]
 pub(crate) fn tray_menu_labels() -> Vec<String> {
   TRAY_MENU_LABELS
     .get_or_init(Default::default)
@@ -2351,6 +2340,7 @@ fn build_tray_menu(
     true,
     None::<&str>,
   )?;
+  #[cfg(not(feature = "lite"))]
   let workspace_item = MenuItem::with_id(
     app,
     "workspace",
@@ -2369,17 +2359,16 @@ fn build_tray_menu(
     true,
     None::<&str>,
   )?;
-  Menu::with_items(
-    app,
-    &[
-      &new_item,
-      &show_item,
-      &workspace_item,
-      &settings_item,
-      &quit_item,
-    ],
-  )
-  .map_err(Into::into)
+  let menu = Menu::new(app)?;
+  menu.append(&new_item)?;
+  menu.append(&show_item)?;
+  #[cfg(not(feature = "lite"))]
+  if edition::workspace_enabled(edition::is_lite()) {
+    menu.append(&workspace_item)?;
+  }
+  menu.append(&settings_item)?;
+  menu.append(&quit_item)?;
+  Ok(menu)
 }
 
 fn build_tray(
@@ -2413,6 +2402,7 @@ fn build_tray(
         let _ = windows::new_sticky(app, &store);
       }
       "show_all" => show_all_notes(app),
+      #[cfg(not(feature = "lite"))]
       "workspace" => {
         let _ = windows::show_workspace(app);
       }
@@ -2478,6 +2468,7 @@ fn activate_existing(app: &tauri::AppHandle) {
 /// The workspace holds no document of its own, so Open there is the same
 /// situation as a file arriving from Finder: it honours the tab-or-window
 /// setting and reuses the last document window when that setting says tabs.
+#[cfg(not(feature = "lite"))]
 #[tauri::command]
 fn open_picked_files(app: tauri::AppHandle, paths: Vec<String>) {
   open_shell_paths(&app, paths);
@@ -2491,18 +2482,39 @@ where
   for path in paths {
     if as_tabs {
       if let Some(window) = last_doc_window(app) {
-        if window
-          .emit_to(window.label(), "open-file-here", &path)
-          .is_ok()
-        {
-          windows::reveal(&window);
+        if pending_opens::open_in_window(&window, &path) {
+          launch_windows::record_routed_if_starting(window.label());
           continue;
         }
       }
     }
-    if let Err(err) = windows::open_document(app, &path, None) {
-      log::warn!("could not open {path} handed over by the shell: {err}");
+    open_in_new_window(app, &path);
+  }
+}
+/// A document window went away: files queued for it and never delivered open in
+/// windows of their own, so a launch's file is not lost with it.
+fn release_pending_opens(app: &tauri::AppHandle, label: &str) {
+  let Some(pending) = app.try_state::<pending_opens::PendingOpens>() else {
+    return;
+  };
+  let paths = pending.forget(label);
+  if paths.is_empty() {
+    return;
+  }
+  // Off the event loop: building a window from a window-event handler can
+  // deadlock on Windows.
+  let app = app.clone();
+  std::thread::spawn(move || {
+    for path in paths {
+      open_in_new_window(&app, &path);
     }
+  });
+}
+/// Open `path` in a document window of its own.
+fn open_in_new_window(app: &tauri::AppHandle, path: &str) {
+  match windows::open_document_labeled(app, path, None) {
+    Ok(label) => launch_windows::record_if_starting(&label),
+    Err(err) => log::warn!("could not open {path} handed over by the shell: {err}"),
   }
 }
 
@@ -2515,9 +2527,12 @@ fn apply_launch_action(app: &tauri::AppHandle, action: cmdline::Action) {
       let store = app.state::<NoteStore>();
       let _ = windows::new_sticky(app, &store);
     }
+    #[cfg(not(feature = "lite"))]
     cmdline::Action::Workspace => {
       let _ = windows::show_workspace(app);
     }
+    #[cfg(feature = "lite")]
+    cmdline::Action::Workspace => {}
     cmdline::Action::Note(id) => {
       let store = app.state::<NoteStore>();
       let _ = windows::focus_note_window(app.clone(), store, id);
@@ -2536,7 +2551,7 @@ fn apply_launch_action(app: &tauri::AppHandle, action: cmdline::Action) {
 /// double-launch with no flags at all.
 #[cfg(any(target_os = "windows", target_os = "linux"))]
 fn handle_second_launch(app: &tauri::AppHandle, argv: Vec<String>) {
-  match cmdline::parse_args(&argv) {
+  match cmdline::for_edition(cmdline::parse_args(&argv), edition::is_lite()) {
     cmdline::Action::None => activate_existing(app),
     action => apply_launch_action(app, action),
   }
@@ -2551,7 +2566,23 @@ fn handle_second_launch(app: &tauri::AppHandle, argv: Vec<String>) {
 #[cfg(any(target_os = "windows", target_os = "linux"))]
 fn handle_first_launch(app: &tauri::AppHandle) {
   let argv: Vec<String> = std::env::args().collect();
-  apply_launch_action(app, cmdline::parse_args(&argv));
+  apply_launch_action(
+    app,
+    cmdline::for_edition(cmdline::parse_args(&argv), edition::is_lite()),
+  );
+}
+/// Whether the launch hands the app files to open. Windows and Linux read them
+/// off the command line; macOS has already received them as `RunEvent::Opened`
+/// by the time `setup` runs, and that handler has opened their windows.
+#[cfg(any(target_os = "windows", target_os = "linux"))]
+fn launch_carries_files_at_startup() -> bool {
+  let argv: Vec<String> = std::env::args().collect();
+  launch_windows::launch_carries_files_in_argv(&argv)
+}
+
+#[cfg(target_os = "macos")]
+fn launch_carries_files_at_startup() -> bool {
+  launch_windows::opened_any()
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -2560,14 +2591,20 @@ pub fn run() {
   // `log`; it replaces the debug-only `tauri-plugin-log` registration that
   // used to leave every release build with no logging at all.
   diag::init();
+  // A second start of the same app exits here, before it reads settings or
+  // snapshots.
+  #[cfg(target_os = "macos")]
+  mac_single_instance::ensure();
   // Must run before any window (and so any taskbar association) exists.
   #[cfg(target_os = "windows")]
   jumplist::set_app_id();
   #[allow(unused_mut)]
   let mut builder = tauri::Builder::default();
   // The single-instance plugin must be registered first so it can intercept a
-  // second launch before any window is created. macOS is excluded: it handles
-  // reactivation through the Reopen event below, so its behavior is unchanged.
+  // second launch before any window is created. macOS uses
+  // `mac_single_instance::ensure` above instead: Launch Services reuses a
+  // running instance for ordinary opens, but `open -n` or running the
+  // executable directly starts a second process.
   #[cfg(any(target_os = "windows", target_os = "linux"))]
   {
     builder = builder.plugin(tauri_plugin_single_instance::init(|app, argv, _cwd| {
@@ -2639,15 +2676,17 @@ pub fn run() {
       }
       // Before any window exists, so restored windows paint the right title bar.
       apply_app_theme(handle, &settings::app_settings(handle).interface_mode);
-      // Seed the 10 bundled default themes into app data on first run only;
-      // a themes dir that already exists (even emptied by the user) is left
-      // untouched so deleted defaults never come back.
+      // Seed the bundled default themes into app data on first run, then copy
+      // themes that later releases added to the bundle. A themes dir that
+      // already exists is otherwise left untouched, so deleted defaults never
+      // come back.
       if let Err(e) = theme_store::seed_on_startup(handle) {
         log::warn!("failed to seed default themes: {e}");
       }
-      // Seed the bundled data locales on first run only, same policy as themes;
-      // the three compiled locales (en/ja/zh-TW) are never files, so they are
-      // unaffected and always available even after every data locale is deleted.
+      // Seed the bundled data locales on first run only, same policy as themes,
+      // then add keys that later releases put in a seed to the existing files
+      // (a deleted locale stays deleted). The three compiled locales
+      // (en/ja/zh-TW) are never files, so they are always available.
       if let Err(e) = locale_store::seed_on_startup(handle) {
         log::warn!("failed to seed default locales: {e}");
       }
@@ -2677,6 +2716,7 @@ pub fn run() {
       // held here until the report window asks for it.
       let had_snapshot_skips = !snapshot_skips.is_empty();
       app.manage(note_store::StartupSkips::holding(snapshot_skips));
+      app.manage(note_store::HeldBackGroups::default());
       // Grants must be live before any window reads a restored path.
       match handle.path().app_data_dir() {
         Ok(app_data) => {
@@ -2690,37 +2730,36 @@ pub fn run() {
             &notes,
           );
           grants::restore_all(&app_data, keep.as_ref());
+          // Change lists of replace-alls from an earlier run are of no use.
+          #[cfg(not(feature = "lite"))]
+          replace_layer::cleanup_tmp(&app_data.join(replace_layer::TMP_DIR));
         }
         Err(e) => log::warn!("grants: no app data dir: {e}"),
       }
       app.manage(FlushGate::default());
-      app.manage(ctx_menu::CtxPending::default());
-      app.manage(large_file::LargeFileState::default());
-      app.manage(windowed::WindowedState::default());
+      #[cfg(not(feature = "lite"))]
+      {
+        app.manage(ctx_menu::CtxPending::default());
+        app.manage(large_file::LargeFileState::default());
+        app.manage(windowed::WindowedState::default());
+      }
       app.manage(windows::OpenDocTabs::default());
+      app.manage(pending_opens::PendingOpens::default());
       app.manage(MenuLists::default());
       app.manage(preview_img::PreviewBases::default());
       let store = app.state::<NoteStore>();
-      // Migrate any group-less document to its own solo group (keyed by its id)
-      // so future restores keep it grouped. A store that cannot be written to
-      // (read-only dir, full disk) only loses the migration, never the launch.
-      for note in &notes {
-        if note.kind == "document" && note.window_group.is_none() {
-          let mut migrated = note.clone();
-          migrated.window_group = Some(note.id.clone());
-          if let Err(e) = store.upsert(migrated) {
-            log::warn!(
-              "failed to migrate document {} to a solo group: {e}",
-              note.id
-            );
-          }
-        }
-      }
+      // The edition decides which features exist, so it is settled before the
+      // first window, menu or Jump List is built (and a window's first
+      // `edition_info` can never read the lite initial value), and before the
+      // snapshot migration below, which must leave a lite-kept tab alone.
+      edition::init(handle);
+      note_store::migrate_group_less_documents(&store, &notes, edition::is_lite());
       // Restore windows: one per sticky, one per document group. Nothing in here
       // may propagate: this runs inside `setup`, whose error is unwrapped by the
       // `.expect` on `build()` below, so one window that refuses to build would
       // panic the whole launch and leave no way back in.
       let mut opened = 0usize;
+      let launch_has_files = launch_carries_files_at_startup();
       for note in &notes {
         if note.kind != "document" {
           match windows::create_sticky_window(handle, note) {
@@ -2729,15 +2768,26 @@ pub fn run() {
           }
         }
       }
-      for plan in note_store::plan_document_windows(&notes) {
+      let mut restored_docs: Vec<String> = Vec::new();
+      for plan in note_store::plan_document_windows(&notes, edition::is_lite()) {
         match windows::create_document_window(handle, &plan, None) {
-          Ok(()) => opened += 1,
+          Ok(()) => {
+            opened += 1;
+            restored_docs.push(format!("doc-{}", plan.group));
+          }
           Err(e) => log::warn!("failed to restore document window {}: {e}", plan.group),
         }
       }
+      // A file passed at launch joins a restored window as a tab when the open
+      // target is "tab", and no window has been focused yet to name one.
+      {
+        let mut last = LAST_DOC_WINDOW.lock().unwrap();
+        *last = pending_opens::choose_tab_target(last.as_deref(), &restored_docs);
+      }
       // A fresh install has nothing to restore, and so does a store whose every
       // window failed above. Either way the app must not sit there windowless.
-      if opened == 0 {
+      // A launch that carries files gets its window from those files instead.
+      if launch_windows::fallback_needed_at_setup(opened, launch_has_files) {
         if let Err(e) = windows::new_sticky(handle, &store) {
           log::warn!("failed to open the fallback sticky: {e}");
         }
@@ -2781,10 +2831,7 @@ pub fn run() {
       // Follow the frontmost app so "pin to app" stickies float only over it.
       app_watch::start(handle.clone());
       // Register the global new-note accelerator from settings.
-      let accel = startup.new_note_shortcut.clone();
-      if let Err(e) = handle.global_shortcut().register(accel.as_str()) {
-        log::warn!("failed to register global shortcut '{accel}': {e}");
-      }
+      shortcuts::register_startup_global(handle);
       // A snapshot that could not be read is reported in its own window, opened
       // last so it lands on top of everything the restore just built.
       if had_snapshot_skips {
@@ -2796,13 +2843,24 @@ pub fn run() {
       // and document window is restored, so the workspace opens on top of them
       // rather than being buried; as the explicitly requested window it does
       // take focus, which is the expected behavior for this opt-in.
-      if startup.open_workspace_on_startup {
+      #[cfg(not(feature = "lite"))]
+      if startup.open_workspace_on_startup && edition::workspace_enabled(edition::is_lite()) {
+        if launch_has_files {
+          launch_windows::focus_launch_window_after_workspace();
+        }
         let _ = windows::show_workspace(handle);
       }
       // Whatever the app was launched with, applied after the restore above so
       // a requested window opens on top rather than behind the restored ones.
       #[cfg(any(target_os = "windows", target_os = "linux"))]
       handle_first_launch(handle);
+      // The files' windows could not be built: do not leave the app windowless.
+      if opened == 0 && launch_has_files && !launch_windows::opened_any() {
+        if let Err(e) = windows::new_sticky(handle, &store) {
+          log::warn!("failed to open the fallback sticky: {e}");
+        }
+      }
+      launch_windows::finish_startup();
       // Main thread: the only place GTK/AppKit may be read.
       platform::prime_dark_preference();
       // Debug-only E2E automation socket; inert unless NOTE_N_PAD_AUTOMATION=1.
@@ -2819,6 +2877,7 @@ pub fn run() {
       encoding::write_file_encoded,
       note_store::list_notes,
       note_store::take_startup_skips,
+      note_store::hold_back_group,
       windows::show_load_problems_window,
       data_files::delete_data_file,
       data_files::reveal_data_file,
@@ -2831,79 +2890,140 @@ pub fn run() {
       note_store::get_snapshot_dir,
       settings::load_settings,
       settings::save_settings,
+      settings::ack_unset_defaults,
       theme_store::list_themes,
+      #[cfg(not(feature = "lite"))]
       theme_store::save_theme,
+      #[cfg(not(feature = "lite"))]
       theme_store::delete_theme,
+      #[cfg(not(feature = "lite"))]
       theme_store::import_theme,
+      #[cfg(not(feature = "lite"))]
       theme_store::export_theme,
+      #[cfg(not(feature = "lite"))]
       theme_store::restore_default_theme,
       locale_store::list_locales,
       locale_store::save_locale,
       locale_store::delete_locale,
+      #[cfg(not(feature = "lite"))]
       locale_store::import_locale,
+      #[cfg(not(feature = "lite"))]
       locale_store::read_locale_file,
+      #[cfg(not(feature = "lite"))]
       locale_store::export_locale,
       locale_store::restore_default_locale,
       licenses::list_acknowledgements,
       privacy::read_privacy_policy,
       windows::new_sticky_note,
       windows::open_document_window,
+      windows::launch_window_collapsing,
+      launch_windows::launch_window_loaded,
       windows::open_document_group,
       set_menu_lists,
       add_recent_file,
       windows::set_window_opacity,
       windows::reveal_self,
+      pending_opens::doc_window_ready,
+      #[cfg(not(feature = "lite"))]
       windows::show_workspace_window,
       windows::show_settings_window,
       windows::show_about_window,
-      windows::show_shortcuts_window,
       windows::show_acknowledgements_window,
       windows::show_privacy_window,
-      get_shortcuts,
+      windows::show_edition_window,
+      shortcuts::get_shortcuts,
+      shortcuts::set_shortcut,
+      shortcuts::reset_shortcut,
+      shortcuts::reset_all_shortcuts,
+      shortcuts::layout_char_for_code,
       get_menu_accelerators,
       trigger_menu_accelerator,
-      shortcut::set_new_note_shortcut,
       windows::focus_note_window,
       windows::focus_doc_tab,
       windows::report_doc_tabs,
+      #[cfg(not(feature = "lite"))]
       windows::close_doc_tab,
       windows::live_doc_groups,
+      #[cfg(not(feature = "lite"))]
       windows::sticky_row_action,
+      #[cfg(not(feature = "lite"))]
       ctx_menu::popup_row_menu,
+      #[cfg(not(feature = "lite"))]
       large_file::stat_file,
+      #[cfg(not(feature = "lite"))]
       large_file::read_chunk,
+      #[cfg(not(feature = "lite"))]
       large_file::start_line_index,
+      #[cfg(not(feature = "lite"))]
       large_file::line_to_offset,
+      #[cfg(not(feature = "lite"))]
       large_file::index_line_count,
+      #[cfg(not(feature = "lite"))]
       large_file::drop_line_index,
+      #[cfg(not(feature = "lite"))]
       large_file::stream_search,
+      #[cfg(not(feature = "lite"))]
       large_file::cancel_search,
+      #[cfg(not(feature = "lite"))]
       range_edit::file_fingerprint,
+      #[cfg(not(feature = "lite"))]
       range_edit::splice_file,
+      #[cfg(not(feature = "lite"))]
       range_edit::read_range,
+      #[cfg(not(feature = "lite"))]
       range_edit::copy_range,
+      #[cfg(not(feature = "lite"))]
       windowed::windowed_open,
+      #[cfg(not(feature = "lite"))]
       windowed::windowed_reopen,
+      #[cfg(not(feature = "lite"))]
       windowed::windowed_index,
+      #[cfg(not(feature = "lite"))]
       windowed::windowed_read,
+      #[cfg(not(feature = "lite"))]
       windowed::windowed_apply,
+      #[cfg(not(feature = "lite"))]
       windowed::windowed_undo,
+      #[cfg(not(feature = "lite"))]
       windowed::windowed_redo,
+      #[cfg(not(feature = "lite"))]
       windowed::windowed_save,
+      #[cfg(not(feature = "lite"))]
       windowed::windowed_close,
+      #[cfg(not(feature = "lite"))]
+      windowed::windowed_find,
+      #[cfg(not(feature = "lite"))]
+      windowed::windowed_search,
+      #[cfg(not(feature = "lite"))]
+      windowed::windowed_search_cancel,
+      #[cfg(not(feature = "lite"))]
+      windowed::windowed_replace_all,
+      #[cfg(not(feature = "lite"))]
       file_ops::create_file,
+      #[cfg(not(feature = "lite"))]
       file_ops::create_folder,
+      #[cfg(not(feature = "lite"))]
       file_ops::rename_path,
+      #[cfg(not(feature = "lite"))]
       file_ops::trash_path,
       file_ops::reveal_in_finder,
+      #[cfg(not(feature = "lite"))]
       project::list_project_tree,
+      #[cfg(not(feature = "lite"))]
       project::open_project_file,
+      #[cfg(not(feature = "lite"))]
       open_picked_files,
       app_watch::list_running_apps,
       platform::platform_info,
+      edition::edition_info,
+      #[cfg(debug_assertions)]
+      edition::debug_set_edition,
+      #[cfg(not(feature = "lite"))]
+      altgr::altgr_table,
       default_apps::default_apps_page_supported,
       default_apps::open_default_apps_page,
       fonts::installed_font_families,
+      fonts::list_font_families,
       linux_clipboard::read_clipboard_text,
       preview_img::set_preview_base,
       navigation::open_external_link,
@@ -3073,21 +3193,10 @@ mod tests {
   }
 
   #[test]
-  fn escapes_menu_label_for_current_target() {
-    // Behavior is cfg-dependent: doubled on non-macOS (mnemonic escape),
-    // unchanged on macOS (no mnemonic syntax there).
-    #[cfg(target_os = "macos")]
-    {
-      assert_eq!(escape_menu_label("Note&Pad"), "Note&Pad");
-      assert_eq!(escape_menu_label("no ampersand"), "no ampersand");
-      assert_eq!(escape_menu_label(""), "");
-    }
-    #[cfg(not(target_os = "macos"))]
-    {
-      assert_eq!(escape_menu_label("Note&Pad"), "Note&&Pad");
-      assert_eq!(escape_menu_label("no ampersand"), "no ampersand");
-      assert_eq!(escape_menu_label(""), "");
-    }
+  fn escapes_menu_label_on_every_platform() {
+    assert_eq!(escape_menu_label("Note&Pad"), "Note&&Pad");
+    assert_eq!(escape_menu_label("no ampersand"), "no ampersand");
+    assert_eq!(escape_menu_label(""), "");
   }
 
   #[test]
@@ -3295,6 +3404,33 @@ mod tests {
   }
 }
 
+#[cfg(test)]
+mod edit_menu_route_tests {
+  use super::{edit_menu_route, EditMenuRoute};
+
+  #[test]
+  fn undo_redo_and_select_all_go_to_the_first_responder_when_no_webview_is_key() {
+    for id in ["undo", "redo", "select-all"] {
+      assert_eq!(edit_menu_route(id, false), EditMenuRoute::FirstResponder);
+    }
+  }
+
+  #[test]
+  fn undo_redo_and_select_all_go_to_the_frontend_when_a_webview_is_key() {
+    for id in ["undo", "redo", "select-all"] {
+      assert_eq!(edit_menu_route(id, true), EditMenuRoute::Frontend);
+    }
+  }
+
+  #[test]
+  fn other_commands_always_go_to_the_frontend() {
+    for id in ["cut", "copy", "paste", "find", "save"] {
+      assert_eq!(edit_menu_route(id, false), EditMenuRoute::Frontend);
+      assert_eq!(edit_menu_route(id, true), EditMenuRoute::Frontend);
+    }
+  }
+}
+
 /// Regression guard for the Content-Security-Policy declared in the committed
 /// `tauri.conf.json`. Nothing at runtime would report a mistake here: if the IPC
 /// origins fall out of `connect-src`, Tauri catches the blocked fetch, logs a
@@ -3412,5 +3548,104 @@ mod windows_crt_config_tests {
          redistributable"
       );
     }
+  }
+}
+#[cfg(test)]
+mod menu_focus_tests {
+  use super::{focus_after_loss, menu_focus_step, FocusKind};
+
+  fn labels(items: &[&str]) -> Vec<String> {
+    items.iter().map(|s| s.to_string()).collect()
+  }
+
+  #[test]
+  fn a_lost_document_window_hands_over_to_the_focused_sibling() {
+    assert_eq!(
+      focus_after_loss(Some("doc-a"), "doc-a", &labels(&["doc-b"])),
+      (Some("doc-b".to_string()), FocusKind::Doc)
+    );
+  }
+
+  #[test]
+  fn a_lost_window_with_nothing_focused_clears_the_menu() {
+    assert_eq!(
+      focus_after_loss(Some("doc-a"), "doc-a", &[]),
+      (None, FocusKind::None)
+    );
+  }
+
+  #[test]
+  fn the_lost_window_never_takes_over_from_itself() {
+    assert_eq!(
+      focus_after_loss(Some("doc-a"), "doc-a", &labels(&["doc-a"])),
+      (None, FocusKind::None)
+    );
+  }
+
+  #[test]
+  fn the_loss_of_an_untracked_window_changes_nothing() {
+    assert_eq!(
+      focus_after_loss(Some("doc-b"), "doc-a", &labels(&["workspace"])),
+      (Some("doc-b".to_string()), FocusKind::Doc)
+    );
+    assert_eq!(
+      focus_after_loss(None, "doc-a", &[]),
+      (None, FocusKind::None)
+    );
+  }
+
+  #[test]
+  fn a_destroyed_tracked_window_hands_over_to_the_workspace() {
+    assert_eq!(
+      focus_after_loss(Some("doc-a"), "doc-a", &labels(&["workspace"])),
+      (Some("workspace".to_string()), FocusKind::Workspace)
+    );
+  }
+  /// Feed `events` (label, gained) through the step function. `focused` is the
+  /// labels the windows report as focused when each loss is handled.
+  fn replay(events: &[(&str, bool)], focused: &[&str]) -> (Option<String>, FocusKind) {
+    let focused_now = labels(focused);
+    let mut tracked: Option<String> = None;
+    let mut kind = FocusKind::None;
+    for (label, gained) in events {
+      if let Some((next, next_kind)) =
+        menu_focus_step(tracked.as_deref(), label, *gained, &focused_now)
+      {
+        tracked = next;
+        kind = next_kind;
+      }
+    }
+    (tracked, kind)
+  }
+
+  #[test]
+  fn a_spurious_focus_pair_on_a_hidden_window_leaves_the_focused_window_menu() {
+    // B gains focus, hidden A gains and loses it again while B stays focused.
+    assert_eq!(
+      replay(
+        &[("doc-b", true), ("doc-a", true), ("doc-a", false)],
+        &["doc-b"]
+      ),
+      (Some("doc-b".to_string()), FocusKind::Doc)
+    );
+  }
+
+  #[test]
+  fn a_loss_with_no_window_focused_ends_on_the_none_state() {
+    assert_eq!(
+      replay(&[("doc-a", true), ("doc-a", false)], &[]),
+      (None, FocusKind::None)
+    );
+  }
+
+  #[test]
+  fn a_stale_loss_does_not_clobber_the_window_that_gained_focus() {
+    assert_eq!(
+      replay(
+        &[("doc-a", true), ("workspace", true), ("doc-a", false)],
+        &["workspace"]
+      ),
+      (Some("workspace".to_string()), FocusKind::Workspace)
+    );
   }
 }

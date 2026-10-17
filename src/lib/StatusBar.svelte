@@ -7,6 +7,7 @@
   import { formatFileSize } from './util/format';
   import { syntaxOrder } from './util/syntaxOrder';
   import { t } from './i18n';
+  import { isLite } from './state/edition.svelte';
 
   /** One entry of the view-mode switcher. `disabledReason` is the tooltip
    *  explaining why a mode cannot be picked right now — null when it can. */
@@ -28,6 +29,9 @@
 
   interface Props {
     lineEnding: LineEnding;
+    // The file's own line ending and encoding are shown but not changeable (a
+    // windowed-editing tab never rewrites them).
+    fixedFormat: boolean;
     hadBom: boolean;
     encoding: string;
     encodings: readonly string[];
@@ -53,6 +57,7 @@
 
   let {
     lineEnding,
+    fixedFormat,
     hadBom,
     encoding,
     encodings,
@@ -156,15 +161,21 @@
 {:else}
   <footer class="statusbar">
     <div class="left">
-      <select
-        class="item lang"
-        value={lineEnding}
-        title={t('status.lineEnding')}
-        onchange={onEndingChange}
-      >
-        <option value="LF">LF</option>
-        <option value="CRLF">CRLF</option>
-      </select>
+      {#if fixedFormat}
+        <span class="item fixed" title={t('status.lineEnding')}
+          >{lineEnding}</span
+        >
+      {:else}
+        <select
+          class="item lang"
+          value={lineEnding}
+          title={t('status.lineEnding')}
+          onchange={onEndingChange}
+        >
+          <option value="LF">LF</option>
+          <option value="CRLF">CRLF</option>
+        </select>
+      {/if}
       {#if lossy}
         <span class="item warn" title={t('status.lossy')}>
           <svg
@@ -183,35 +194,42 @@
           </svg>
         </span>
       {/if}
-      <select
-        class="item lang"
-        value={encoding}
-        title={t('status.encoding')}
-        onchange={onEncodingChange}
-      >
-        {#each encodings as name (name)}
-          <option value={name}>{name}</option>
-        {/each}
-      </select>
+      {#if fixedFormat}
+        <span class="item fixed" title={t('status.encoding')}>{encoding}</span>
+      {:else}
+        <select
+          class="item lang"
+          value={encoding}
+          title={t('status.encoding')}
+          onchange={onEncodingChange}
+        >
+          {#each encodings as name (name)}
+            <option value={name}>{name}</option>
+          {/each}
+        </select>
+      {/if}
       {#if hadBom}
         <span class="item bom">+BOM</span>
       {/if}
-      <select
-        class="item lang"
-        value={language ?? ''}
-        title={t('status.language')}
-        onchange={onLangChange}
-      >
-        <!-- Language names stay untranslated; Plain Text follows the same
-             rule. The current language is pinned first, then a separator,
-             matching the Format > Syntax menu. -->
-        {#each langOrder as name, index (name ?? '')}
-          <option value={name ?? ''}>{name ?? 'Plain Text'}</option>
-          {#if index === 0}
-            <hr />
-          {/if}
-        {/each}
-      </select>
+      <!-- Lite has no syntax to pick (also the Windows trial), so no dropdown. -->
+      {#if !isLite()}
+        <select
+          class="item lang"
+          value={language ?? ''}
+          title={t('status.language')}
+          onchange={onLangChange}
+        >
+          <!-- Language names stay untranslated; Plain Text follows the same
+               rule. The current language is pinned first, then a separator,
+               matching the Format > Syntax menu. -->
+          {#each langOrder as name, index (name ?? '')}
+            <option value={name ?? ''}>{name ?? 'Plain Text'}</option>
+            {#if index === 0 && langOrder.length > 1}
+              <hr />
+            {/if}
+          {/each}
+        </select>
+      {/if}
       {#if longLine !== null}
         <span class="item longline" title={t('status.longLine.reason')}>
           {longLine.workerColoring
@@ -266,6 +284,9 @@
   .item {
     opacity: 0.8;
     white-space: nowrap;
+  }
+  .fixed {
+    padding: 0 0.25rem;
   }
   .lang {
     appearance: none;

@@ -10,19 +10,20 @@
     drawSelection,
     highlightSpecialChars,
   } from '@codemirror/view';
-  import { defaultKeymap, history, historyKeymap } from '@codemirror/commands';
+  import { history } from '@codemirror/commands';
   import {
     syntaxHighlighting,
     defaultHighlightStyle,
   } from '@codemirror/language';
-  import {
-    gotoLine,
-    selectNextOccurrence,
-    selectSelectionMatches,
-  } from '@codemirror/search';
   import { basicSetup } from 'codemirror';
   import { oneDark } from '@codemirror/theme-one-dark';
   import { readCspNonce } from '../util/cspNonce';
+  import { keymapExtension } from './keymap';
+  import { compositionCancel } from './composition';
+  import { isUndoKey } from './imeShortcuts';
+  import { cmPhraseExtension, cmPhraseSignature } from './cmPhrases';
+  import { shortcutsState } from '../state/shortcuts.svelte';
+  import { platform } from '../state/platform.svelte';
 
   interface Props {
     value: string;
@@ -50,16 +51,12 @@
   // Keeps the language + theme compartments so highlighting still works.
   const minimalSetup: Extension = [
     history(),
+    EditorState.allowMultipleSelections.of(true),
     drawSelection(),
     highlightSpecialChars(),
     syntaxHighlighting(defaultHighlightStyle, { fallback: true }),
     EditorView.lineWrapping,
     keymap.of([
-      ...defaultKeymap,
-      ...historyKeymap,
-      { key: 'Mod-Alt-g', run: gotoLine },
-      { key: 'Mod-d', run: selectNextOccurrence, preventDefault: true },
-      { key: 'Mod-Shift-l', run: selectSelectionMatches },
       { key: 'Mod-f', run: stickyNoSearch },
       {
         key: 'F3',
@@ -76,6 +73,19 @@
   const languageCompartment = new Compartment();
   // Swappable slot for the dark theme, reconfigured without rebuilding the view.
   const themeCompartment = new Compartment();
+  // The rebindable commands' keys (minimal editors only; the full setup ships
+  // its own keymaps).
+  const keymapCompartment = new Compartment();
+  // CodeMirror's own UI text in the active UI language.
+  const phraseCompartment = new Compartment();
+  // Phrases baked into the state so far; a reconfigure is skipped when equal.
+  let appliedPhrases = cmPhraseSignature();
+
+  function currentKeymap(): Extension {
+    return keymapExtension('sticky', platform.os, (id) =>
+      shortcutsState.accel(id),
+    );
+  }
 
   // Create the view exactly once; a reactive $effect here would rebuild the
   // editor (and drop focus) on every keystroke since it reads `value`.
@@ -92,7 +102,16 @@
           // attribute, which does not re-run the CSP check, so a missing nonce
           // here breaks styling for the whole window. Do not deduplicate.
           EditorView.cspNonce.of(readCspNonce()),
-          minimal ? minimalSetup : basicSetup,
+          minimal
+            ? [minimalSetup, keymapCompartment.of(currentKeymap())]
+            : basicSetup,
+          // Undo while composing cancels the composition, as TextEdit does.
+          platform.isMacOS
+            ? compositionCancel(isUndoKey, (v) =>
+                onchange(v.state.doc.toString()),
+              )
+            : [],
+          phraseCompartment.of(cmPhraseExtension()),
           languageCompartment.of([]),
           themeCompartment.of([]),
           EditorView.updateListener.of((update) => {
@@ -127,6 +146,34 @@
     if (view !== undefined && next !== view.state.doc.toString()) {
       view.dispatch({
         changes: { from: 0, to: view.state.doc.length, insert: next },
+      });
+    }
+  });
+  // Rebind the customizable commands when the effective shortcuts change.
+  $effect(() => {
+    const accels = shortcutsState.accelerators;
+    const os = platform.os;
+    if (view !== undefined && minimal) {
+      view.dispatch({
+        effects: keymapCompartment.reconfigure(
+          keymapExtension('sticky', os, (id) => accels[id] ?? null),
+        ),
+      });
+    }
+  });
+  // Swap the CodeMirror phrases when the UI language changes.
+  $effect(() => {
+    const ext = cmPhraseExtension();
+    const sig = cmPhraseSignature();
+    if (view !== undefined && sig !== appliedPhrases) {
+      appliedPhrases = sig;
+      // The phrase change rebuilds the view, so put the scroll position back.
+      const top = view.scrollDOM.scrollTop;
+      view.dispatch({ effects: phraseCompartment.reconfigure(ext) });
+      const restoring = view;
+      // Runs after CodeMirror's own measure pass, which moves the scroll.
+      requestAnimationFrame(() => {
+        restoring.scrollDOM.scrollTop = top;
       });
     }
   });

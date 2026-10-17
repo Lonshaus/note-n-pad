@@ -8,6 +8,8 @@ import {
   tabReportEntry,
   isEditAction,
   editActionSurface,
+  isNativeUndoField,
+  type FieldLike,
 } from './menuBar';
 
 describe('splitMenuAction', () => {
@@ -136,5 +138,167 @@ describe('editActionSurface', () => {
     expect(editActionSurface('copy', editor)).toBe('editor');
     expect(editActionSurface('paste', editor)).toBe('editor');
     expect(editActionSurface('select-all', editor)).toBe('editor');
+  });
+});
+
+describe('editActionSurface for the JSON, XML and Markdown views', () => {
+  const overlay = {
+    isTable: false,
+    isWindowed: false,
+    hasEditorView: true,
+    isOverlay: true,
+  };
+
+  it('replays undo/redo on the source editor behind the view', () => {
+    expect(editActionSurface('undo', overlay)).toBe('overlay');
+    expect(editActionSurface('redo', overlay)).toBe('overlay');
+  });
+
+  it('owns select-all and copy, and never reaches the hidden editor for the rest', () => {
+    expect(editActionSurface('select-all', overlay)).toBe('overlay');
+    expect(editActionSurface('copy', overlay)).toBe('overlay');
+    expect(editActionSurface('cut', overlay)).toBe('none');
+    expect(editActionSurface('paste', overlay)).toBe('none');
+  });
+
+  it('has nothing to undo without a mounted editor view', () => {
+    expect(
+      editActionSurface('undo', { ...overlay, hasEditorView: false }),
+    ).toBe('none');
+  });
+});
+
+describe('editActionSurface with focus in a text field', () => {
+  it('hands undo/redo to the field in every view', () => {
+    const base = { isWindowed: false, hasEditorView: true, fieldFocused: true };
+    expect(editActionSurface('undo', { ...base, isTable: false })).toBe(
+      'field',
+    );
+    expect(editActionSurface('redo', { ...base, isTable: true })).toBe('field');
+    expect(
+      editActionSurface('undo', { ...base, isTable: false, isOverlay: true }),
+    ).toBe('field');
+    expect(
+      editActionSurface('redo', {
+        ...base,
+        isTable: false,
+        isWindowed: true,
+      }),
+    ).toBe('field');
+  });
+
+  it('leaves the other commands to their usual surface', () => {
+    const ctx = {
+      isTable: false,
+      isWindowed: false,
+      hasEditorView: true,
+      fieldFocused: true,
+    };
+    expect(editActionSurface('copy', ctx)).toBe('editor');
+  });
+});
+
+describe('isNativeUndoField', () => {
+  function el(
+    tagName: string,
+    extra: Partial<FieldLike> = {},
+    inCm = false,
+  ): FieldLike {
+    return {
+      tagName,
+      closest: (selector) => (inCm && selector === '.cm-content' ? {} : null),
+      ...extra,
+    };
+  }
+
+  it('accepts text inputs and textareas', () => {
+    expect(isNativeUndoField(el('INPUT', { type: 'text' }))).toBe(true);
+    expect(isNativeUndoField(el('INPUT', { type: 'search' }))).toBe(true);
+    expect(isNativeUndoField(el('TEXTAREA'))).toBe(true);
+  });
+
+  it('rejects inputs that take no text', () => {
+    expect(isNativeUndoField(el('INPUT', { type: 'checkbox' }))).toBe(false);
+    expect(isNativeUndoField(el('SELECT'))).toBe(false);
+  });
+
+  it('accepts a contenteditable outside CodeMirror, rejects CodeMirror content', () => {
+    expect(isNativeUndoField(el('DIV', { isContentEditable: true }))).toBe(
+      true,
+    );
+    expect(
+      isNativeUndoField(el('DIV', { isContentEditable: true }, true)),
+    ).toBe(false);
+  });
+
+  it('rejects nothing-focused and plain elements', () => {
+    expect(isNativeUndoField(null)).toBe(false);
+    expect(isNativeUndoField(el('DIV', { isContentEditable: false }))).toBe(
+      false,
+    );
+    expect(isNativeUndoField(el('BODY'))).toBe(false);
+  });
+});
+
+describe('editActionSurface for select-all', () => {
+  const source = { isTable: false, isWindowed: false, hasEditorView: true };
+  const windowed = { isTable: false, isWindowed: true, hasEditorView: false };
+  const viewer = {
+    isTable: false,
+    isWindowed: false,
+    hasEditorView: false,
+    isViewer: true,
+  };
+  const table = { isTable: true, isWindowed: false, hasEditorView: true };
+  const overlay = {
+    isTable: false,
+    isWindowed: false,
+    hasEditorView: true,
+    isOverlay: true,
+  };
+
+  it('selects the on-screen span in a windowed tab, with or without a view', () => {
+    expect(editActionSurface('select-all', windowed)).toBe('windowed');
+    expect(
+      editActionSurface('select-all', { ...windowed, hasEditorView: true }),
+    ).toBe('windowed');
+  });
+
+  it('selects the fully visible rows in a large-file viewer tab', () => {
+    expect(editActionSurface('select-all', viewer)).toBe('viewer');
+  });
+
+  it('keeps the viewer and windowed routes to select-all alone', () => {
+    expect(editActionSurface('copy', viewer)).toBe('none');
+    expect(editActionSurface('copy', windowed)).toBe('none');
+    expect(editActionSurface('paste', viewer)).toBe('none');
+  });
+
+  it('keeps the table, view and source routes', () => {
+    expect(editActionSurface('select-all', table)).toBe('table');
+    expect(editActionSurface('select-all', overlay)).toBe('overlay');
+    expect(editActionSurface('select-all', source)).toBe('editor');
+  });
+
+  it('hands select-all to a focused text field in every context', () => {
+    for (const ctx of [source, windowed, viewer, table, overlay]) {
+      expect(
+        editActionSurface('select-all', { ...ctx, fieldFocused: true }),
+      ).toBe('field');
+    }
+  });
+
+  it('keeps select-all native while a dialog is open', () => {
+    for (const ctx of [source, windowed, viewer, table, overlay]) {
+      expect(editActionSurface('select-all', { ...ctx, modalOpen: true })).toBe(
+        'field',
+      );
+    }
+  });
+
+  it('leaves copy to its usual surface when a field is focused', () => {
+    expect(editActionSurface('copy', { ...table, fieldFocused: true })).toBe(
+      'table',
+    );
   });
 });

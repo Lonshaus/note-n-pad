@@ -1,8 +1,8 @@
 // Copyright © 2026 Lonshaus
 // SPDX-License-Identifier: GPL-3.0-only
 
-import { languages } from '@codemirror/language-data';
-import { fileExtension } from '../editor/language';
+import { fileExtension, languageInfos } from '../editor/language';
+import type { LanguageInfo } from '../editor/liteLanguages';
 
 /** Extensions the CodeMirror registry does not give us correctly.
  *  CSV/TSV are display-only pseudo-languages with no CM mode of their own
@@ -20,7 +20,10 @@ const EXTENSION_OVERRIDES: Record<string, string> = {
 /** Extension (no dot) a language name should save as, derived from the same
  *  CodeMirror registry `detectByFilename` reads (single source of truth).
  *  No language (a plain sticky, or an unrecognized name) falls back to txt. */
-export function extensionForLanguage(language: string | null): string {
+export function extensionForLanguage(
+  language: string | null,
+  infos: readonly LanguageInfo[] = languageInfos,
+): string {
   if (language === null) {
     return 'txt';
   }
@@ -28,7 +31,7 @@ export function extensionForLanguage(language: string | null): string {
   if (override !== undefined) {
     return override;
   }
-  const desc = languages.find((l) => l.name === language);
+  const desc = infos.find((l) => l.name === language);
   return desc?.extensions[0] ?? 'txt';
 }
 

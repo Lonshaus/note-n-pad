@@ -2,25 +2,40 @@
   // Copyright © 2026 Lonshaus
   // SPDX-License-Identifier: GPL-3.0-only
 
-  import { onDestroy, onMount } from 'svelte';
+  import { onDestroy, onMount, tick } from 'svelte';
   import { invoke } from '@tauri-apps/api/core';
   import { listen, type UnlistenFn } from '@tauri-apps/api/event';
   import { cssFontFamily } from '../util/font';
   import { Lru } from '../util/lru';
   import {
     computeVisibleWindow,
+    fullyVisibleSpan,
+    joinSelectedRows,
     lineToScrollTop,
+    type SelectedRow,
     scrollAxisHeight,
   } from '../util/largeView';
   import { moveResultCursor, parseGotoRange } from '../util/largeSearch';
-  import { matchSegments } from '../util/matchSegments';
+  import { detectBreakStyle } from '../util/windowedEdit';
+  import { readPageLines } from '../util/largePage';
   import {
     RANGE_EDIT_MAX,
     rangeWithinLimit,
     resolveByteRange,
   } from '../util/rangeEdit';
   import { formatFileSize } from '../util/format';
+  import {
+    canReuseIndex,
+    type IndexScanState,
+    type LargeIndexRef,
+  } from '../util/largeIndex';
   import { t } from '../i18n';
+  import FindPanels, { type FindResult } from './FindPanels.svelte';
+  import { platform } from '../state/platform.svelte';
+  import { isLite } from '../state/edition.svelte';
+  import { editionUi } from '../util/editionUi';
+  import { shortcutsState } from '../state/shortcuts.svelte';
+  import { matchWindowShortcut } from '../util/windowShortcut';
 
   /** Byte span + line labels of a range selection, handed to the app to extract. */
   export interface RangeExtract {
@@ -38,11 +53,16 @@
   }
 
   interface Props {
+    // The tab this view shows; the kept index is reported against it.
+    tabId: string;
     path: string;
     size: number;
     fontSize: number;
     fontFamily: string;
     onstatus: (s: LargeStatus) => void;
+    // The first chunk's line-ending style (null: no line break in it), so the
+    // tab shows the file's own ending instead of the user's default.
+    ondetectending: (style: ReturnType<typeof detectBreakStyle>) => void;
     // Resolves null when the range opened as an edit tab, or a message to show in
     // the range toolbar when it was refused (e.g. a lossy, non-UTF-8 slice).
     // Rejects on a genuine read failure.
@@ -54,6 +74,16 @@
     // mid-scan I/O error), so the app can surface it via its existing
     // openFailed/revealFailed-style notice.
     onindexerror: () => void;
+    // The 0-based line to open scrolled to (the line the tab was left at).
+    initialTopLine?: number;
+    // The line index this tab kept from an earlier mount, if any. It is reused
+    // when the file is unchanged, so coming back to the tab does not rescan.
+    indexRef?: LargeIndexRef | undefined;
+    // Fired with the index this view started (to keep), or null once a kept
+    // one was found stale and dropped.
+    onindexchange?: (tabId: string, ref: LargeIndexRef | null) => void;
+    // Fired with the first visible line as the view scrolls.
+    ontopline?: (line: number) => void;
   }
 
   export interface LargeStatus {
@@ -68,14 +98,20 @@
   }
 
   let {
+    tabId,
     path,
     size,
     fontSize,
     fontFamily,
     onstatus,
+    ondetectending,
     onextract,
     onsaverange,
     onindexerror,
+    initialTopLine = 0,
+    indexRef,
+    onindexchange,
+    ontopline,
   }: Props = $props();
 
   /** Boundary-aligned text slice returned by the Rust `read_chunk` command. */
@@ -83,6 +119,16 @@
     text: string;
     start: number;
     end: number;
+  }
+  /** What the Rust `index_line_count` answers. */
+  type IndexStatus =
+    | { state: 'running' }
+    | { state: 'done'; lines: number }
+    | { state: 'failed' };
+  /** The Rust `file_fingerprint` answer. */
+  interface Fingerprint {
+    size: number;
+    mtime_ms: number;
   }
 
   interface IndexProgress {
@@ -110,10 +156,7 @@
   }
 
   /** One result row: `line` is 1-based (as displayed and returned to DEV hooks). */
-  interface SearchResult {
-    line: number;
-    preview: string;
-  }
+  type SearchResult = FindResult;
 
   // Bytes read per backend request; also the LRU key grid is line-page based.
   const READ_LEN = 1024 * 1024;
@@ -133,6 +176,11 @@
   const lineHeight = $derived(Math.round(fontSize * 1.5));
 
   let indexId: string | null = null;
+  // The kept index being checked for reuse: its progress is heard before it is adopted.
+  let candidateId: string | null = null;
+  // Set once the app tab owns the index, so a destroy leaves it alive.
+  let indexKept = false;
+  let destroyed = false;
   let unlisten: UnlistenFn | null = null;
   let unlistenHit: UnlistenFn | null = null;
   let unlistenDone: UnlistenFn | null = null;
@@ -143,6 +191,7 @@
   let avgBytes = 80;
   const pageCache = new Lru<number, string[]>(PAGE_CACHE_MAX);
 
+  let wrap = $state<HTMLDivElement | null>(null);
   let container = $state<HTMLDivElement | null>(null);
   let scrollTop = $state(0);
   let viewportHeight = $state(0);
@@ -157,13 +206,12 @@
   // Goto/search overlays are mutually exclusive: only one is ever open.
   let panel = $state<'none' | 'goto' | 'search'>('none');
   let gotoValue = $state('');
-  let gotoInput = $state<HTMLInputElement | null>(null);
+  let panels = $state<ReturnType<typeof FindPanels> | null>(null);
   let searchQuery = $state('');
   let searchCase = $state(false);
   // The query and case the shown results were searched with, for highlighting.
   let resultQuery = $state('');
   let resultCase = $state(false);
-  let queryInput = $state<HTMLInputElement | null>(null);
   let results = $state<SearchResult[]>([]);
   let cursor = $state(-1);
   let searching = $state(false);
@@ -238,46 +286,46 @@
       readFailed,
     });
   }
-
   /** Byte offset where `line` begins. Line 0 is trivially 0; otherwise the Rust
-   *  index resolves it (scanning from the nearest checkpoint). Returns null when
-   *  the line lies past the file's end. */
-  async function lineToOffset(line: number): Promise<number | null> {
+   *  index resolves it (scanning from the nearest checkpoint). Resolves null when
+   *  the line lies past the file's end; rejects on a real failure. */
+  async function lineOffset(line: number): Promise<number | null> {
     if (line <= 0) {
       return 0;
     }
     if (indexId === null) {
-      return null;
+      throw new Error('no line index');
     }
+    return await invoke<number | null>('line_to_offset', { id: indexId, line });
+  }
+  /** Like `lineOffset`, but null for a failure too: callers that treat both the
+   *  same (a range selection) read it this way. */
+  async function lineToOffset(line: number): Promise<number | null> {
     try {
-      return await invoke<number>('line_to_offset', { id: indexId, line });
+      return await lineOffset(line);
     } catch {
       return null;
     }
   }
-
   /** Read one page's lines, anchored at its first line's byte offset. The offset
    *  is a line start, so the chunk begins exactly on that line and the first
-   *  `LOAD_PAGE` split pieces are whole lines. */
-  async function readPage(page: number): Promise<string[] | null> {
-    const offset = await lineToOffset(page * LOAD_PAGE);
-    if (offset === null) {
-      return null;
-    }
-    // ponytail: one bounded read per page; a page whose lines exceed the read
-    // under-fills and shows blanks until scrolled — fine for a viewer. Bump the
-    // multiplier only if very long lines ever leave visible gaps.
-    const len = Math.min(
-      2 * 1024 * 1024,
-      Math.max(READ_LEN, avgBytes * LOAD_PAGE * 2),
-    );
-    let chunk: Chunk;
-    try {
-      chunk = await invoke<Chunk>('read_chunk', { path, offset, len });
-    } catch {
-      return null;
-    }
-    return chunk.text.split('\n').slice(0, LOAD_PAGE);
+   *  `LOAD_PAGE` split pieces are whole lines. A page past the end of the file
+   *  is empty; null means a read really failed. */
+  function readPage(page: number): Promise<string[] | null> {
+    return readPageLines(page, LOAD_PAGE, {
+      lineToOffset: lineOffset,
+      // ponytail: one bounded read per page; a page whose lines exceed the read
+      // under-fills and shows blanks until scrolled — fine for a viewer. Bump the
+      // multiplier only if very long lines ever leave visible gaps.
+      readText: async (offset) => {
+        const len = Math.min(
+          2 * 1024 * 1024,
+          Math.max(READ_LEN, avgBytes * LOAD_PAGE * 2),
+        );
+        const chunk = await invoke<Chunk>('read_chunk', { path, offset, len });
+        return chunk.text;
+      },
+    });
   }
 
   async function getPage(page: number): Promise<string[] | null> {
@@ -333,6 +381,7 @@
     }
     scrollTop = container.scrollTop;
     publishStatus();
+    ontopline?.(visible.firstVisible);
     void syncLoad();
   }
 
@@ -414,7 +463,7 @@
   /** Extract the selection into an editable tab, refusing (with a hint) when the
    *  span exceeds RANGE_EDIT_MAX. */
   async function triggerRangeEdit(): Promise<void> {
-    if (sel === null) {
+    if (sel === null || !editionUi(isLite()).rangeEdit) {
       return;
     }
     const { start, end } = sel;
@@ -575,7 +624,7 @@
     resetSearch();
     panel = 'goto';
     gotoValue = '';
-    requestAnimationFrame(() => gotoInput?.focus());
+    requestAnimationFrame(() => panels?.focusGoto());
   }
 
   function closeGoto(): void {
@@ -600,7 +649,7 @@
 
   function openSearch(): void {
     panel = 'search';
-    requestAnimationFrame(() => queryInput?.focus());
+    requestAnimationFrame(() => panels?.focusQuery());
   }
 
   function closeSearch(): void {
@@ -632,20 +681,129 @@
       stepResult(-1);
     } else if (e.key === 'Enter') {
       e.preventDefault();
-      if (document.activeElement === queryInput) {
+      if (panels?.isQueryFocused() === true) {
         searchOrNext();
       } else {
         stepResult(1);
       }
     }
   }
-
-  // Cmd/Ctrl+L opens goto. Cmd/Ctrl+F is a native menu accelerator (it never
-  // reaches this listener), so DocumentApp routes it to `openSearch` instead.
-  // Listed in the Keyboard Shortcuts window via `NON_MENU_SHORTCUTS` in
-  // src-tauri/src/lib.rs — changing this binding means updating that table too.
+  // The rendered rows' text elements, in order.
+  function rowTexts(): HTMLElement[] {
+    return wrap === null
+      ? []
+      : Array.from(wrap.querySelectorAll<HTMLElement>('.row .text'));
+  }
+  // Characters between the start of `el` and a boundary point inside it.
+  function offsetIn(el: HTMLElement, node: Node, offset: number): number {
+    const r = document.createRange();
+    r.selectNodeContents(el);
+    r.setEnd(node, offset);
+    return r.toString().length;
+  }
+  // The rendered rows fully on screen become the selection.
+  function selectVisibleRows(): void {
+    const sel = document.getSelection();
+    if (wrap === null || container === null || sel === null) {
+      return;
+    }
+    const texts = rowTexts();
+    // clientHeight leaves out a horizontal scrollbar covering the last row.
+    const viewTop = container.getBoundingClientRect().top + container.clientTop;
+    // The find panel floats over the bottom rows, full width.
+    const panelTop = wrap
+      .querySelector('.search-panel')
+      ?.getBoundingClientRect().top;
+    const span = fullyVisibleSpan(
+      texts.map((el) => {
+        const r = el.closest('.row')?.getBoundingClientRect();
+        return { top: r?.top ?? 0, bottom: r?.bottom ?? 0 };
+      }),
+      viewTop,
+      Math.min(viewTop + container.clientHeight, panelTop ?? Infinity),
+    );
+    const a = span === null ? undefined : texts[span.first];
+    const b = span === null ? undefined : texts[span.last];
+    if (a === undefined || b === undefined) {
+      return;
+    }
+    const next = document.createRange();
+    next.setStart(a, 0);
+    next.setEnd(b, b.childNodes.length);
+    sel.removeAllRanges();
+    sel.addRange(next);
+  }
+  // A native select-all (keyboard) starts before the viewer and ends at or
+  // after the last rendered row; narrow it to the rows fully on screen.
+  function onSelectionChange(): void {
+    const sel = document.getSelection();
+    if (wrap === null || container === null || sel === null) {
+      return;
+    }
+    if (sel.rangeCount === 0 || sel.isCollapsed) {
+      return;
+    }
+    const range = sel.getRangeAt(0);
+    const texts = rowTexts();
+    const lastText = texts[texts.length - 1];
+    if (lastText === undefined) {
+      return;
+    }
+    const root = document.createRange();
+    root.selectNode(wrap);
+    // Chromium ends a select-all inside the last text node, WebKit after it.
+    const endNode = lastText.lastChild ?? lastText;
+    const endOffset =
+      endNode.nodeType === Node.TEXT_NODE
+        ? (endNode.textContent ?? '').length
+        : endNode.childNodes.length;
+    if (
+      range.compareBoundaryPoints(Range.START_TO_START, root) >= 0 ||
+      range.comparePoint(endNode, endOffset) !== 0
+    ) {
+      return;
+    }
+    selectVisibleRows();
+  }
+  // Copies the selected rows' text only: a multi-row selection otherwise
+  // carries the gutter numbers in WebKit.
+  function onCopy(e: ClipboardEvent): void {
+    const sel = document.getSelection();
+    if (sel === null || sel.rangeCount === 0 || sel.isCollapsed) {
+      return;
+    }
+    const range = sel.getRangeAt(0);
+    const rows: SelectedRow[] = [];
+    for (const el of rowTexts()) {
+      if (!range.intersectsNode(el)) {
+        continue;
+      }
+      const len = el.textContent?.length ?? 0;
+      const row: SelectedRow = { text: el.textContent ?? '' };
+      if (el.contains(range.startContainer)) {
+        row.from = offsetIn(el, range.startContainer, range.startOffset);
+      }
+      if (el.contains(range.endContainer)) {
+        row.to = offsetIn(el, range.endContainer, range.endOffset);
+      }
+      // A boundary touching a non-empty row without selecting from it.
+      if (len > 0 && ((row.from ?? 0) >= len || row.to === 0)) {
+        continue;
+      }
+      rows.push(row);
+    }
+    if (rows.length === 0 || e.clipboardData === null) {
+      return;
+    }
+    e.preventDefault();
+    e.clipboardData.setData('text/plain', joinSelectedRows(rows));
+  }
+  // The shortcut registry's `goto-line` key opens goto. Cmd/Ctrl+F is a native
+  // menu accelerator (it never reaches this listener), so DocumentApp routes it
+  // to `openSearch` instead.
   function onWindowKeydown(e: KeyboardEvent): void {
-    if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === 'l') {
+    const accel = shortcutsState.accel('goto-line');
+    if (accel !== null && matchWindowShortcut(e, accel, platform.os)) {
       e.preventDefault();
       openGoto();
     }
@@ -660,6 +818,11 @@
   }
   export function largeGoto(line: number): void {
     void scrollToLine(Math.max(0, Math.round(line) - 1));
+  }
+  // Edit > Select All (the macOS item is custom): the rows fully on screen, the
+  // same rows the narrowing above picks.
+  export function selectAllVisible(): void {
+    selectVisibleRows();
   }
   export function largeSearchOpen(): void {
     openSearch();
@@ -706,13 +869,117 @@
   export function largeRangeSaveAs(targetPath: string): Promise<boolean> {
     return triggerRangeSaveAs(targetPath);
   }
+  /** The scan ended without a line count: stop the "indexing" status and tell
+   *  the app once. */
+  function failIndex(): void {
+    if (indexFailed) {
+      return;
+    }
+    indexFailed = true;
+    onindexerror();
+  }
+  /** The scan ended with `lines` lines. A finish heard while the view is open
+   *  rescales the axis from the estimate to the precise count, so the scroll is
+   *  re-anchored to keep the line at the top of the viewport where it is. */
+  function finishIndex(lines: number, reanchor: boolean): void {
+    indexedLines = lines;
+    const anchorLine = visible.firstVisible;
+    totalLines = lines;
+    if (reanchor && container !== null) {
+      const height = scrollAxisHeight(lines, lineHeight);
+      container.scrollTop = lineToScrollTop(
+        anchorLine,
+        lines,
+        lineHeight,
+        height,
+        viewportHeight,
+      );
+      scrollTop = container.scrollTop;
+    }
+  }
+
+  async function readStatus(id: string): Promise<IndexStatus | null> {
+    try {
+      return await invoke<IndexStatus>('index_line_count', { id });
+    } catch {
+      // The id is gone on the Rust side.
+      return null;
+    }
+  }
+
+  function scanState(status: IndexStatus | null): IndexScanState {
+    return status === null ? 'unknown' : status.state;
+  }
+  /** Reuse the index this tab kept when the file is unchanged, otherwise
+   *  (re)build it. The index id and the file's size and mtime from before the
+   *  scan go back to the tab, which keeps them across unmounts. */
+  async function resolveIndex(
+    id: string,
+    kept: LargeIndexRef | undefined,
+  ): Promise<void> {
+    let current: { size: number; mtimeMs: number } | null = null;
+    try {
+      const f = await invoke<Fingerprint>('file_fingerprint', { path });
+      current = { size: f.size, mtimeMs: f.mtime_ms };
+    } catch {
+      current = null;
+    }
+    if (destroyed) {
+      return;
+    }
+    if (kept !== undefined) {
+      candidateId = kept.id;
+      const status = await readStatus(kept.id);
+      candidateId = null;
+      if (canReuseIndex(kept, current, scanState(status))) {
+        indexId = kept.id;
+        indexKept = true;
+        if (status?.state === 'done') {
+          finishIndex(status.lines, false);
+        }
+        return;
+      }
+      void invoke('drop_line_index', { id: kept.id });
+      onindexchange?.(id, null);
+    }
+    try {
+      indexId = await invoke<string>('start_line_index', {
+        path,
+        intervalLines: INTERVAL_LINES,
+      });
+    } catch {
+      indexId = null;
+    }
+    if (indexId === null) {
+      return;
+    }
+    if (current !== null) {
+      indexKept = true;
+      onindexchange?.(id, { id: indexId, ...current });
+    } else if (destroyed) {
+      void invoke('drop_line_index', { id: indexId });
+    }
+    // The progress events may have gone by before the id was known.
+    const status = await readStatus(indexId);
+    if (status?.state === 'done') {
+      finishIndex(status.lines, true);
+    } else if (status?.state === 'failed') {
+      failIndex();
+    }
+  }
 
   onMount(() => {
     let disposed = false;
+    // The tab at mount time: the prop moves on when the view is reused.
+    const mountedTabId = tabId;
+    const startLine = initialTopLine;
+    const kept = indexRef;
     let observer: ResizeObserver | null = null;
     // Only mounted while a large tab is active, so this shortcut never fires in
     // the normal editor (which has no LargeFileView).
     window.addEventListener('keydown', onWindowKeydown);
+    document.addEventListener('selectionchange', onSelectionChange);
+    document.addEventListener('copy', onCopy);
     if (container !== null) {
       // Keep the visible-line math and status in step with the pane height.
       observer = new ResizeObserver(() => {
@@ -727,47 +994,28 @@
       if (container !== null) {
         viewportHeight = container.clientHeight;
       }
-      try {
-        indexId = await invoke<string>('start_line_index', {
-          path,
-          intervalLines: INTERVAL_LINES,
-        });
-      } catch {
-        indexId = null;
-      }
-      if (disposed) {
-        return;
-      }
+      // Subscribe before looking at the index, so a scan that ends while it is
+      // being resolved is still heard (and one that ended earlier is read back
+      // from its status).
       unlisten = await listen<IndexProgress>('large-index-progress', (e) => {
-        if (e.payload.id !== indexId) {
+        if (e.payload.id !== indexId && e.payload.id !== candidateId) {
           return;
         }
         indexedLines = e.payload.lines;
         if (e.payload.done && e.payload.error) {
-          // No total line count was ever produced; publishStatus reads
-          // indexFailed to stop treating this as still-indexing.
-          indexFailed = true;
-          onindexerror();
+          failIndex();
         } else if (e.payload.done) {
-          // Switching from the estimate to the precise count rescales the
-          // proportional axis; re-anchor the scroll so the line currently at the
-          // top of the viewport stays put instead of jumping.
-          const anchorLine = visible.firstVisible;
-          totalLines = e.payload.lines;
-          if (container !== null) {
-            const height = scrollAxisHeight(e.payload.lines, lineHeight);
-            container.scrollTop = lineToScrollTop(
-              anchorLine,
-              e.payload.lines,
-              lineHeight,
-              height,
-              viewportHeight,
-            );
-            scrollTop = container.scrollTop;
-          }
+          finishIndex(e.payload.lines, true);
         }
         publishStatus();
       });
+      if (disposed) {
+        return;
+      }
+      await resolveIndex(mountedTabId, kept);
+      if (disposed) {
+        return;
+      }
       unlistenHit = await listen<SearchHitPayload>('large-search-hit', (e) => {
         if (e.payload.search_id !== currentSearchId) {
           return;
@@ -805,6 +1053,9 @@
         );
         estTotalLines = Math.max(1, Math.round(size / avgBytes));
         pageCache.set(0, lines.slice(0, LOAD_PAGE));
+        if (!disposed) {
+          ondetectending(detectBreakStyle(first.text));
+        }
       } catch {
         // Leave the defaults; a failed read just yields an empty view.
       }
@@ -812,13 +1063,23 @@
         return;
       }
       lastPage = -1;
-      await syncLoad();
+      if (startLine > 0) {
+        // The axis height follows the line count, which only reaches the DOM
+        // after a tick; scrolling before it would be clamped to the old height.
+        await tick();
+        await scrollToLine(startLine);
+      } else {
+        await syncLoad();
+      }
       publishStatus();
     })();
     return () => {
       disposed = true;
+      destroyed = true;
       observer?.disconnect();
       window.removeEventListener('keydown', onWindowKeydown);
+      document.removeEventListener('selectionchange', onSelectionChange);
+      document.removeEventListener('copy', onCopy);
     };
   });
 
@@ -832,14 +1093,16 @@
     if (currentSearchId !== null) {
       void invoke('cancel_search', { searchId: currentSearchId });
     }
-    if (indexId !== null) {
-      // The Rust index is not garbage-collected; release it explicitly.
+    if (indexId !== null && !indexKept) {
+      // The Rust index is not garbage-collected; release it explicitly. One the
+      // tab keeps is released by the tab when it closes.
       void invoke('drop_line_index', { id: indexId });
     }
   });
 </script>
 
 <div
+  bind:this={wrap}
   class="large-wrap"
   style="--doc-font-size: {fontSize}px; --doc-font-family: {cssFontFamily(
     fontFamily,
@@ -871,21 +1134,6 @@
     </div>
   </div>
 
-  {#if panel === 'goto'}
-    <div class="goto-panel cm-panel">
-      <input
-        bind:this={gotoInput}
-        class="cm-textfield"
-        type="text"
-        inputmode="numeric"
-        placeholder={t('large.goto.placeholder')}
-        aria-label={t('large.goto.aria')}
-        bind:value={gotoValue}
-        onkeydown={onGotoKeydown}
-      />
-    </div>
-  {/if}
-
   {#if sel !== null}
     <div class="range-bar cm-panel">
       <span class="range-info"
@@ -896,9 +1144,11 @@
           size: formatFileSize(selEstBytes),
         })}</span
       >
-      <button class="cm-button" onclick={() => void triggerRangeEdit()}
-        >{t('large.range.edit')}</button
-      >
+      {#if editionUi(isLite()).rangeEdit}
+        <button class="cm-button" onclick={() => void triggerRangeEdit()}
+          >{t('large.range.edit')}</button
+        >
+      {/if}
       <button class="cm-button" onclick={() => void triggerRangeSaveAs()}
         >{t('large.range.saveAs')}</button
       >
@@ -911,57 +1161,23 @@
     </div>
   {/if}
 
-  {#if panel === 'search'}
-    <div class="cm-panel cm-search search-panel">
-      <div class="cm-search-row">
-        <input
-          bind:this={queryInput}
-          class="cm-textfield"
-          type="text"
-          placeholder={t('large.search.label')}
-          aria-label={t('large.search.label')}
-          bind:value={searchQuery}
-          onkeydown={onSearchKeydown}
-        />
-        <button class="cm-button" onclick={searchOrNext}
-          >{t('large.search.label')}</button
-        >
-        <label>
-          <input type="checkbox" bind:checked={searchCase} />
-          {t('large.search.case')}
-        </label>
-      </div>
-      {#if searchStatus !== ''}
-        <div class="search-status">{searchStatus}</div>
-      {/if}
-      {#if results.length > 0}
-        <div class="search-results">
-          {#each results as r, i (i)}
-            <button
-              type="button"
-              class="search-result"
-              class:active={i === cursor}
-              onclick={() => jumpToResult(i)}
-              onkeydown={onSearchKeydown}
-            >
-              <span class="rline">{r.line}</span>
-              <span class="rprev"
-                >{#each matchSegments(r.preview, resultQuery, resultCase) as seg, j (j)}{#if seg.hit}<mark
-                      class="rhit">{seg.text}</mark
-                    >{:else}{seg.text}{/if}{/each}</span
-              >
-            </button>
-          {/each}
-        </div>
-      {/if}
-      <button
-        name="close"
-        title={t('common.close')}
-        aria-label={t('common.close')}
-        onclick={closeSearch}>×</button
-      >
-    </div>
-  {/if}
+  <FindPanels
+    bind:this={panels}
+    {panel}
+    bind:gotoValue
+    ongotokeydown={onGotoKeydown}
+    bind:query={searchQuery}
+    bind:caseSensitive={searchCase}
+    status={searchStatus}
+    {results}
+    {cursor}
+    {resultQuery}
+    {resultCase}
+    onsearch={searchOrNext}
+    onjump={jumpToResult}
+    onclose={closeSearch}
+    onsearchkeydown={onSearchKeydown}
+  />
 </div>
 
 <style>
@@ -1028,34 +1244,6 @@
     flex: 1 1 auto;
     padding: 0 0.6rem;
   }
-  /* Floating goto box, top-right, reusing the flat control look of the search
-     panel (which app.css styles globally via .cm-panel.cm-search). */
-  .goto-panel {
-    position: absolute;
-    top: 8px;
-    right: 8px;
-    z-index: 5;
-    padding: 8px 10px;
-    background: var(--bg);
-    color: var(--fg);
-    border: 1px solid var(--topbar-border);
-    border-radius: 6px;
-    box-shadow: 0 4px 16px rgba(0, 0, 0, 0.25);
-  }
-  .goto-panel .cm-textfield {
-    width: 8rem;
-    background: var(--bg);
-    color: var(--fg);
-    border: 1px solid var(--topbar-border);
-    border-radius: 5px;
-    padding: 5px 9px;
-    font-size: 0.85rem;
-  }
-  .goto-panel .cm-textfield:focus {
-    outline: none;
-    border-color: var(--accent);
-    box-shadow: 0 0 0 2px var(--accent);
-  }
   /* Floating range toolbar, top-left (mirroring the top-right goto box), shown
      while a line range is selected. */
   .range-bar {
@@ -1083,71 +1271,5 @@
     flex-basis: 100%;
     font-size: 0.78rem;
     color: var(--danger);
-  }
-  /* The search shell picks up .cm-panel.cm-search from app.css; only its docking
-     position and the read-only results list are component-local. */
-  .search-panel {
-    position: absolute;
-    bottom: 0;
-    left: 0;
-    right: 0;
-    z-index: 5;
-  }
-  .search-panel [name='close'] {
-    border: none;
-    background: none;
-    cursor: default;
-  }
-  .search-status {
-    font-size: 0.78rem;
-    opacity: 0.7;
-  }
-  .search-results {
-    display: flex;
-    flex-direction: column;
-    max-height: 40vh;
-    overflow-y: auto;
-    border: 1px solid var(--topbar-border);
-    border-radius: 5px;
-  }
-  .search-result {
-    /* overflow: hidden drops a flex item's minimum height to 0, so a long
-       result list would shrink every row to a sliver instead of scrolling. */
-    flex: 0 0 auto;
-    display: flex;
-    gap: 0.6rem;
-    align-items: baseline;
-    padding: 3px 8px;
-    border: none;
-    background: none;
-    color: var(--fg);
-    font-family: var(--doc-font-family);
-    font-size: 0.8rem;
-    text-align: left;
-    white-space: pre;
-    overflow: hidden;
-    cursor: default;
-  }
-  .search-result:hover {
-    background: rgba(127, 127, 127, 0.15);
-  }
-  .search-result.active {
-    background: color-mix(in srgb, var(--accent) 25%, transparent);
-  }
-  .rhit {
-    background: color-mix(in srgb, var(--accent) 40%, transparent);
-    color: inherit;
-    border-radius: 2px;
-  }
-  .rline {
-    flex: 0 0 auto;
-    min-width: 4rem;
-    text-align: right;
-    opacity: 0.6;
-  }
-  .rprev {
-    flex: 1 1 auto;
-    overflow: hidden;
-    text-overflow: ellipsis;
   }
 </style>

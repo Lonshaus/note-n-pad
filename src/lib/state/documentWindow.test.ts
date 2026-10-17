@@ -4,6 +4,7 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { Text } from '@codemirror/state';
 import { invoke } from '@tauri-apps/api/core';
+import { save } from '@tauri-apps/plugin-dialog';
 import {
   snapshotContentPolicy,
   SNAPSHOT_CONTENT_MAX,
@@ -11,6 +12,7 @@ import {
 import type { NoteSnapshot } from './stickyNote.svelte';
 import { t } from '../i18n';
 import { settingsState } from './settings.svelte';
+import { editionState } from './edition.svelte';
 import {
   documentWindow,
   windowedRefusalReason,
@@ -21,6 +23,7 @@ import {
   type DocTab,
 } from './documentWindow.svelte';
 import { READ_ONLY_DESTINATION } from '../util/protocol';
+import { detectByFilename } from '../editor/language';
 
 // Mocked so the tests below drive `documentWindow`'s real
 // `setBounds`/`switchTo` against a fake Tauri backend instead of
@@ -28,10 +31,11 @@ import { READ_ONLY_DESTINATION } from '../util/protocol';
 // import in this file by Vitest's transform, so `documentWindow.svelte.ts`'s
 // own top-level `import { invoke } from '@tauri-apps/api/core'` binds to it.
 vi.mock('@tauri-apps/api/core', () => ({ invoke: vi.fn() }));
-vi.mock('@tauri-apps/api/event', () => ({ emit: vi.fn() }));
+vi.mock('@tauri-apps/api/event', () => ({ emit: vi.fn(), listen: vi.fn() }));
 vi.mock('@tauri-apps/plugin-dialog', () => ({ save: vi.fn() }));
 
 const mockInvoke = vi.mocked(invoke);
+const mockSave = vi.mocked(save);
 
 // `beginWindowedRestore`'s grace-period timer uses `window.setTimeout`/
 // `clearTimeout`; this file runs under Vitest's default node environment (no
@@ -93,6 +97,8 @@ function baseNote(overrides: Partial<NoteSnapshot>): NoteSnapshot {
     range_fp_size: null,
     range_fp_mtime: null,
     range_start_line: null,
+    range_end_line: null,
+    range_trailing_break: null,
     windowed_index: null,
     windowed_fp_size: null,
     windowed_fp_mtime: null,
@@ -197,6 +203,7 @@ describe('rangeDisplayName (derived, not frozen at extraction)', () => {
         endByte: 10,
         fingerprint: null,
         startLine: null,
+        trailingBreak: false,
       },
     });
     expect(rangeDisplayName(tab)).toBe(null);
@@ -211,6 +218,7 @@ describe('rangeDisplayName (derived, not frozen at extraction)', () => {
         endByte: 10,
         fingerprint: null,
         startLine: 5,
+        trailingBreak: false,
       },
     });
     // Lines 5,6,7 for a 3-line buffer starting at line 5.
@@ -228,6 +236,7 @@ describe('rangeDisplayName (derived, not frozen at extraction)', () => {
         endByte: 10,
         fingerprint: null,
         startLine: 5,
+        trailingBreak: false,
       },
     });
     expect(rangeDisplayName(tab)).toBe(
@@ -248,6 +257,7 @@ describe('rangeDisplayName (derived, not frozen at extraction)', () => {
         endByte: 10,
         fingerprint: null,
         startLine: 5,
+        trailingBreak: false,
       },
     });
     expect(rangeDisplayName(tab)).toBe(
@@ -264,6 +274,7 @@ describe('rangeDisplayName (derived, not frozen at extraction)', () => {
         endByte: 10,
         fingerprint: null,
         startLine: 5,
+        trailingBreak: false,
       },
     });
     expect(rangeDisplayName(tab)).toBe(
@@ -280,6 +291,7 @@ describe('rangeDisplayName (derived, not frozen at extraction)', () => {
         endByte: 0,
         fingerprint: null,
         startLine: 5,
+        trailingBreak: false,
       },
     });
     expect(rangeDisplayName(tab)).toBe(
@@ -379,6 +391,8 @@ describe('loadTab size gate on the restore fallback path (F2 regression)', () =>
               range_fp_size: null,
               range_fp_mtime: null,
               range_start_line: null,
+              range_end_line: null,
+              range_trailing_break: null,
               windowed_index: null,
               windowed_fp_size: null,
               windowed_fp_mtime: null,
@@ -412,6 +426,27 @@ describe('loadTab size gate on the restore fallback path (F2 regression)', () =>
   });
 });
 
+describe('init waits for the edition', () => {
+  it('does not read the snapshots until the edition is settled', async () => {
+    let settle: () => void = () => {};
+    const gate = vi.spyOn(editionState, 'ready').mockReturnValue(
+      new Promise<void>((resolve) => {
+        settle = resolve;
+      }),
+    );
+    mockInvoke.mockReset();
+    mockInvoke.mockImplementation((() => Promise.resolve([])) as typeof invoke);
+    const done = documentWindow.init('g-edition', null, null);
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(mockInvoke).not.toHaveBeenCalledWith('list_notes');
+    settle();
+    await done;
+    expect(mockInvoke).toHaveBeenCalledWith('list_notes');
+    gate.mockRestore();
+  });
+});
+
 describe('switchTo flush ordering (F4 regression: upsertTab must not become async)', () => {
   it('awaits exactly the write flush() just triggered, not a stale previous one', async () => {
     let writeCompleted = false;
@@ -440,6 +475,36 @@ describe('switchTo flush ordering (F4 regression: upsertTab must not become asyn
     await documentWindow.switchTo(1);
 
     expect(writeCompleted).toBe(true);
+  });
+});
+
+describe('switchTo and an IME composition', () => {
+  afterEach(() => {
+    documentWindow.endComposition = null;
+  });
+
+  it('changes the active tab only after the composition has ended', async () => {
+    mockInvoke.mockImplementation((() =>
+      Promise.resolve(undefined)) as typeof invoke);
+    documentWindow.tabs.length = 0;
+    documentWindow.tabs.push(
+      baseTab({ id: 'a', tabIndex: 0 }),
+      baseTab({ id: 'b', tabIndex: 1, path: '' }),
+    );
+    documentWindow.activeIndex = 0;
+    let finish: () => void = () => {};
+    documentWindow.endComposition = () =>
+      new Promise<void>((resolve) => {
+        finish = resolve;
+      });
+
+    const switching = documentWindow.switchTo(1);
+    await Promise.resolve();
+    expect(documentWindow.activeIndex).toBe(0);
+
+    finish();
+    await switching;
+    expect(documentWindow.activeIndex).toBe(1);
   });
 });
 
@@ -536,6 +601,54 @@ describe('ensureWindowedRestore kicks off the reopen for the active restored tab
       fingerprint: { size: 150 * 1024 * 1024, mtime_ms: 1_700_000_000_000 },
       digest: '999',
     });
+  });
+});
+
+describe('a slow-path windowed restore lets go of the kept viewer index', () => {
+  it('drops the kept line index when the reopen completes', async () => {
+    documentWindow.tabs.length = 0;
+    let finishReopen: (v: object) => void = () => {};
+    mockInvoke.mockReset();
+    mockInvoke.mockImplementation(((cmd: string) => {
+      switch (cmd) {
+        case 'list_notes':
+          return Promise.resolve([
+            baseNote({
+              id: 'pending-slow',
+              large: 150 * 1024 * 1024,
+              windowed_index: { checkpoints: [[0, 0]], total_newlines: 10 },
+              windowed_fp_size: 150 * 1024 * 1024,
+              windowed_fp_mtime: 1_700_000_000_000,
+              windowed_digest: '999',
+              windowed_top_line: 3,
+            }),
+          ]);
+        case 'windowed_reopen':
+          return new Promise((resolve) => {
+            finishReopen = resolve as (v: object) => void;
+          });
+        default:
+          return Promise.resolve(null);
+      }
+    }) as typeof invoke);
+    await documentWindow.init('g1', null, null);
+    const tab = documentWindow.tabs[0]!;
+    // The grace timer fired: the viewer is up and keeps an index.
+    tab.large = { size: 150 * 1024 * 1024 };
+    documentWindow.setLargeIndex(tab.id, { id: 'kept', size: 1, mtimeMs: 2 });
+    expect(documentWindow.largeIndex(tab.id)).toBeDefined();
+    finishReopen({
+      session_id: 7,
+      total_bytes: 10,
+      total_lines: 5000,
+      fingerprint: null,
+      rescanned: true,
+    });
+    await vi.waitFor(() => {
+      expect(tab.windowed).toBeDefined();
+    });
+    expect(documentWindow.largeIndex(tab.id)).toBeUndefined();
+    expect(mockInvoke).toHaveBeenCalledWith('drop_line_index', { id: 'kept' });
   });
 });
 
@@ -718,6 +831,7 @@ describe('splice on a read-only-destination refusal', () => {
         endByte: 10,
         fingerprint: null,
         startLine: 1,
+        trailingBreak: false,
       },
     });
     documentWindow.tabs.push(tab);
@@ -843,6 +957,7 @@ describe('splice reports a failure that is not a refusal', () => {
         endByte: 10,
         fingerprint: null,
         startLine: 1,
+        trailingBreak: false,
       },
     });
     documentWindow.tabs.push(tab);
@@ -938,6 +1053,129 @@ describe('windowedConflictSaveAs reports a failure that is not a refusal', () =>
       error: 'No space left on device (os error 28)',
     });
     expect(documentWindow.windowedConflict).toBe(tab);
+  });
+});
+/** A windowed tab on `/tmp/original.log`, pushed as the only (active) tab. */
+function pushWindowedTab(): DocTab {
+  documentWindow.tabs.length = 0;
+  documentWindow.saveFailed = null;
+  documentWindow.windowedConflict = null;
+  const tab = baseTab({
+    id: 'windowed-tab',
+    path: '/tmp/original.log',
+    windowed: {
+      sessionId: 9,
+      totalBytes: 1000,
+      totalLines: 10,
+      fingerprint: { size: 1000, mtime_ms: 1 },
+      dirty: true,
+      topLine: 0,
+    },
+  });
+  documentWindow.tabs.push(tab);
+  documentWindow.activeIndex = 0;
+  return tab;
+}
+
+const SAVED_AS = {
+  fingerprint: { size: 1234, mtime_ms: 99 },
+  total_bytes: 1234,
+  total_lines: 12,
+};
+
+describe('saveAs on a windowed tab', () => {
+  it('asks the dialog and writes the chosen path with no expected fingerprint', async () => {
+    const tab = pushWindowedTab();
+    mockSave.mockResolvedValue('/tmp/copy.txt');
+    mockInvoke.mockImplementation(((cmd: string) =>
+      Promise.resolve(
+        cmd === 'windowed_save' ? SAVED_AS : null,
+      )) as typeof invoke);
+
+    expect(await documentWindow.saveAs()).toBe(true);
+
+    expect(mockSave).toHaveBeenCalled();
+    expect(mockInvoke).toHaveBeenCalledWith('windowed_save', {
+      sessionId: 9,
+      expected: null,
+      pathOverride: '/tmp/copy.txt',
+    });
+    expect(tab.path).toBe('/tmp/copy.txt');
+    expect(tab.language).toBe(detectByFilename('/tmp/copy.txt'));
+    expect(tab.windowed?.fingerprint).toEqual(SAVED_AS.fingerprint);
+    expect(tab.windowed?.totalBytes).toBe(1234);
+    expect(tab.windowed?.totalLines).toBe(12);
+    expect(tab.windowed?.dirty).toBe(false);
+    expect(mockInvoke).toHaveBeenCalledWith('upsert_note', expect.anything());
+    expect(mockInvoke).toHaveBeenCalledWith('add_recent_file', {
+      path: '/tmp/copy.txt',
+    });
+  });
+
+  it('writes nothing when the dialog is cancelled', async () => {
+    const tab = pushWindowedTab();
+    mockSave.mockResolvedValue(null);
+    mockInvoke.mockReset();
+
+    expect(await documentWindow.saveAs()).toBe(false);
+
+    expect(mockInvoke).not.toHaveBeenCalled();
+    expect(tab.path).toBe('/tmp/original.log');
+  });
+
+  it('reports a failure with the chosen path, retargets nothing and never raises the conflict modal', async () => {
+    const tab = pushWindowedTab();
+    mockInvoke.mockImplementation(((cmd: string) =>
+      cmd === 'windowed_save'
+        ? Promise.reject('fingerprint-mismatch')
+        : Promise.resolve(null)) as typeof invoke);
+
+    expect(await documentWindow.saveAs('/tmp/copy.txt')).toBe(false);
+
+    expect(documentWindow.windowedConflictVisible()).toBe(false);
+    expect(tab.path).toBe('/tmp/original.log');
+    expect(tab.windowed?.fingerprint).toEqual({ size: 1000, mtime_ms: 1 });
+    expect(documentWindow.saveFailed).toEqual({
+      path: '/tmp/copy.txt',
+      error: 'fingerprint-mismatch',
+    });
+  });
+});
+
+describe('windowedConflictSaveAs success', () => {
+  it('retargets the tab: path, fingerprint, sizes, language and conflict state', async () => {
+    const tab = pushWindowedTab();
+    documentWindow.windowedConflict = tab;
+    mockInvoke.mockImplementation(((cmd: string) =>
+      Promise.resolve(
+        cmd === 'windowed_save' ? SAVED_AS : null,
+      )) as typeof invoke);
+
+    expect(
+      await documentWindow.windowedConflictSaveAs('/tmp/picked.json'),
+    ).toBe(true);
+
+    expect(tab.path).toBe('/tmp/picked.json');
+    expect(tab.language).toBe('JSON');
+    expect(tab.windowed?.fingerprint).toEqual(SAVED_AS.fingerprint);
+    expect(tab.windowed?.dirty).toBe(false);
+    expect(documentWindow.windowedConflictVisible()).toBe(false);
+    expect(mockInvoke).toHaveBeenCalledWith('upsert_note', expect.anything());
+  });
+
+  it('keeps an explicitly chosen language', async () => {
+    const tab = pushWindowedTab();
+    tab.explicit = true;
+    tab.language = 'markdown';
+    documentWindow.windowedConflict = tab;
+    mockInvoke.mockImplementation(((cmd: string) =>
+      Promise.resolve(
+        cmd === 'windowed_save' ? SAVED_AS : null,
+      )) as typeof invoke);
+
+    await documentWindow.windowedConflictSaveAs('/tmp/picked.json');
+
+    expect(tab.language).toBe('markdown');
   });
 });
 
@@ -1521,5 +1759,315 @@ describe('init still selects the stored tab when restoring a window group', () =
 
     expect(documentWindow.tabs.length).toBe(2);
     expect(documentWindow.activeIndex).toBe(1);
+  });
+});
+// A large tab's bytes are never rewritten or re-decoded, so the line ending is
+// the file's own (detected) and the encoding stays what it was.
+describe('large and windowed tabs: line ending and encoding', () => {
+  const largeTab = (): DocTab =>
+    baseTab({ id: 'big', large: { size: 200 * 1024 * 1024 } });
+  const windowedTab = (): DocTab =>
+    baseTab({
+      id: 'win',
+      windowed: {
+        sessionId: 7,
+        totalBytes: 1,
+        totalLines: 1,
+        fingerprint: null,
+        dirty: false,
+        topLine: 0,
+      },
+    });
+  const crlf = { lineEnding: 'CRLF', insert: '\r\n' } as const;
+
+  beforeEach(() => {
+    mockInvoke.mockReset();
+    mockInvoke.mockResolvedValue(null);
+    settingsState.defaultLineEnding = 'LF';
+  });
+
+  function select(tab: DocTab): void {
+    documentWindow.tabs.length = 0;
+    documentWindow.tabs.push(tab);
+    documentWindow.activeIndex = 0;
+  }
+
+  it('a windowed tab takes the detected ending, not the setting', () => {
+    settingsState.defaultLineEnding = 'LF';
+    const tab = windowedTab();
+    select(tab);
+    expect(documentWindow.windowedEndingDetected(7, crlf)).toBe('\r\n');
+    expect(tab.lineEnding).toBe('CRLF');
+    expect(tab.savedLineEnding).toBe('CRLF');
+    expect(tab.insertLineEnding).toBe('\r\n');
+  });
+
+  it('a sample without a line break falls back to the setting', () => {
+    settingsState.defaultLineEnding = 'CRLF';
+    const tab = windowedTab();
+    select(tab);
+    expect(documentWindow.windowedEndingDetected(7, null)).toBe('\r\n');
+    expect(tab.lineEnding).toBe('CRLF');
+    settingsState.defaultLineEnding = 'LF';
+  });
+
+  it('an already detected windowed tab keeps its value', () => {
+    const tab = windowedTab();
+    tab.insertLineEnding = '\n';
+    select(tab);
+    expect(documentWindow.windowedEndingDetected(7, crlf)).toBe('\n');
+    expect(tab.lineEnding).toBe('LF');
+  });
+
+  it('a viewer tab takes the detected ending from its first chunk', () => {
+    const tab = largeTab();
+    select(tab);
+    documentWindow.largeEndingDetected('/tmp/huge.log', crlf);
+    expect(tab.lineEnding).toBe('CRLF');
+    expect(tab.insertLineEnding).toBe('\r\n');
+  });
+
+  it('a viewer chunk without a line break leaves the tab undetected', () => {
+    const tab = largeTab();
+    select(tab);
+    documentWindow.largeEndingDetected('/tmp/huge.log', null);
+    expect(tab.insertLineEnding).toBeUndefined();
+    expect(tab.lineEnding).toBe('LF');
+  });
+
+  it.each([
+    ['large', largeTab],
+    ['windowed', windowedTab],
+  ] as const)(
+    'setLineEnding and toggleLineEnding do nothing on a %s tab',
+    (_name, make) => {
+      const tab = make();
+      tab.insertLineEnding = '\n';
+      select(tab);
+      documentWindow.setLineEnding('CRLF');
+      expect(tab.lineEnding).toBe('LF');
+      documentWindow.toggleLineEnding();
+      expect(tab.lineEnding).toBe('LF');
+      expect(tab.savedLineEnding).toBe('LF');
+      expect(tab.insertLineEnding).toBe('\n');
+    },
+  );
+
+  it.each([
+    ['large', largeTab],
+    ['windowed', windowedTab],
+  ] as const)(
+    'setEncoding does not read or change a %s tab',
+    async (_name, make) => {
+      const tab = make();
+      select(tab);
+      const seq = documentWindow.reloadSeq;
+      await documentWindow.setEncoding('Windows-1252');
+      expect(mockInvoke).not.toHaveBeenCalled();
+      expect(tab.encoding).toBe('UTF-8');
+      expect(tab.content.toString()).toBe('');
+      expect(documentWindow.reloadSeq).toBe(seq);
+    },
+  );
+
+  it('a normal tab still changes its line ending', () => {
+    const tab = baseTab({ id: 'plain' });
+    select(tab);
+    documentWindow.setLineEnding('CRLF');
+    expect(tab.lineEnding).toBe('CRLF');
+  });
+});
+
+describe('the ordinary editor holds a tab while a large or windowed tab is active', () => {
+  function setup(): void {
+    documentWindow.tabs.length = 0;
+    documentWindow.ordinaryMru = [];
+    mockInvoke.mockReset();
+    mockInvoke.mockResolvedValue(undefined);
+    documentWindow.tabs.push(
+      baseTab({ id: 'a', tabIndex: 0, path: '/tmp/a.txt' }),
+      baseTab({ id: 'L', tabIndex: 1, path: '/tmp/l.log', large: { size: 1 } }),
+      baseTab({ id: 'b', tabIndex: 2, path: '/tmp/b.txt' }),
+    );
+    documentWindow.activeIndex = 0;
+  }
+
+  it('holds the last active ordinary tab behind a large tab', () => {
+    setup();
+    documentWindow.activeIndex = 2;
+    documentWindow.activeIndex = 1;
+    expect(documentWindow.heldTab?.id).toBe('b');
+    documentWindow.activeIndex = 0;
+    documentWindow.activeIndex = 1;
+    expect(documentWindow.heldTab?.id).toBe('a');
+  });
+
+  it('re-points the held tab when it closes, and ends with none', async () => {
+    setup();
+    documentWindow.activeIndex = 2;
+    documentWindow.activeIndex = 0;
+    await documentWindow.deleteTab(0);
+    // tab L is now active; b is the surviving ordinary tab
+    expect(documentWindow.activeTab?.id).toBe('L');
+    expect(documentWindow.heldTab?.id).toBe('b');
+    // closing the last ordinary tab leaves nothing to hold
+    await documentWindow.deleteTab(1);
+    expect(documentWindow.heldTab).toBeNull();
+  });
+
+  it('writes an editor document to the tab it names, not the active one', () => {
+    setup();
+    documentWindow.activeIndex = 1;
+    documentWindow.updateContentById('a', Text.of(['held text']));
+    expect(documentWindow.tabs[0]?.content.toString()).toBe('held text');
+    expect(documentWindow.tabs[1]?.content.toString()).toBe('');
+  });
+
+  it('records which tab a reload was meant for', () => {
+    setup();
+    documentWindow.activeIndex = 1;
+    documentWindow.forceEditorReload();
+    expect(documentWindow.reloadTargetId).toBe('L');
+  });
+});
+
+describe('a large-file viewer tab keeps its line index', () => {
+  function setup(): void {
+    documentWindow.tabs.length = 0;
+    mockInvoke.mockReset();
+    mockInvoke.mockResolvedValue(undefined);
+    documentWindow.tabs.push(
+      baseTab({ id: 'L', tabIndex: 0, path: '/tmp/l.log', large: { size: 1 } }),
+      baseTab({ id: 'a', tabIndex: 1, path: '/tmp/a.txt' }),
+    );
+    documentWindow.activeIndex = 0;
+  }
+  const ref = { id: 'idx', size: 1, mtimeMs: 2 };
+
+  it('stores the index and releases it when the tab closes', async () => {
+    setup();
+    documentWindow.setLargeIndex('L', ref);
+    expect(documentWindow.largeIndex('L')).toEqual(ref);
+    documentWindow.setViewTopLine('L', 709);
+    await documentWindow.deleteTab(0);
+    expect(mockInvoke).toHaveBeenCalledWith('drop_line_index', { id: 'idx' });
+    expect(documentWindow.largeIndex('L')).toBeUndefined();
+    expect(documentWindow.viewTopLine('L')).toBeUndefined();
+  });
+
+  it('releases an index reported for a tab that is gone or not a viewer', () => {
+    setup();
+    documentWindow.setLargeIndex('gone', ref);
+    documentWindow.setLargeIndex('a', { ...ref, id: 'idx2' });
+    expect(mockInvoke).toHaveBeenCalledWith('drop_line_index', { id: 'idx' });
+    expect(mockInvoke).toHaveBeenCalledWith('drop_line_index', { id: 'idx2' });
+    expect(documentWindow.largeIndex('gone')).toBeUndefined();
+    expect(documentWindow.largeIndex('a')).toBeUndefined();
+  });
+
+  it('drops the index when the file is rewritten but keeps the position', () => {
+    setup();
+    documentWindow.setLargeIndex('L', ref);
+    documentWindow.setViewTopLine('L', 5);
+    documentWindow.refreshLargeTabs('/tmp/l.log');
+    expect(mockInvoke).toHaveBeenCalledWith('drop_line_index', { id: 'idx' });
+    expect(documentWindow.largeIndex('L')).toBeUndefined();
+    expect(documentWindow.viewTopLine('L')).toBe(5);
+  });
+
+  it('drops every kept index when the window closes', async () => {
+    setup();
+    documentWindow.setLargeIndex('L', ref);
+    await documentWindow.dropClosedTabs('main');
+    expect(mockInvoke).toHaveBeenCalledWith('drop_line_index', { id: 'idx' });
+  });
+});
+
+describe('where a windowed tab was looking is remembered per tab', () => {
+  it('keeps the top line and the caret apart', () => {
+    documentWindow.setViewTopLine('w', 165);
+    documentWindow.setViewCaret('w', 170, 5);
+    expect(documentWindow.viewTopLine('w')).toBe(165);
+    expect(documentWindow.viewCaret('w')).toEqual({ line: 170, col: 5 });
+    expect(documentWindow.viewCaret('other')).toBeUndefined();
+  });
+});
+
+describe('runWindowedOp (a whole-file operation outliving its editor)', () => {
+  function windowedTab(sessionId: number): DocTab {
+    return baseTab({
+      id: `op-tab-${sessionId}`,
+      path: '/tmp/huge.log',
+      windowed: {
+        sessionId,
+        totalBytes: 1000,
+        totalLines: 10,
+        fingerprint: null,
+        dirty: false,
+        topLine: 0,
+      },
+    });
+  }
+
+  it('keeps the session gate pending until the totals and dirty flag are recorded', async () => {
+    documentWindow.tabs.length = 0;
+    const tab = windowedTab(31);
+    documentWindow.tabs.push(tab);
+    documentWindow.activeIndex = 0;
+    let finish: (r: {
+      total_bytes: number;
+      total_lines: number;
+    }) => void = () => {};
+    const run = (): Promise<{ total_bytes: number; total_lines: number }> =>
+      new Promise((resolve) => {
+        finish = resolve;
+      });
+    const op = documentWindow.runWindowedOp(31, run, () => true);
+    const gate = documentWindow.windowedGate(31);
+    expect(gate.pending()).toBe(true);
+    expect(gate.canApply()).toBe(false);
+    // An editor mounted now (a tab switched away and back) waits to read.
+    const read = vi.fn(() => Promise.resolve(tab.windowed?.totalBytes));
+    const mounted = gate.whenIdle(read);
+    await Promise.resolve();
+    expect(read).not.toHaveBeenCalled();
+    finish({ total_bytes: 5000, total_lines: 77 });
+    await op;
+    // The read happens only after the tab learned the replaced totals.
+    await expect(mounted).resolves.toBe(5000);
+    expect(tab.windowed?.totalLines).toBe(77);
+    expect(tab.windowed?.dirty).toBe(true);
+    expect(gate.pending()).toBe(false);
+  });
+
+  it('leaves the tab clean when the operation changed nothing', async () => {
+    documentWindow.tabs.length = 0;
+    const tab = windowedTab(32);
+    documentWindow.tabs.push(tab);
+    documentWindow.activeIndex = 0;
+    await documentWindow.runWindowedOp(
+      32,
+      () => Promise.resolve({ count: 0, total_bytes: 1000, total_lines: 10 }),
+      (r) => r.count > 0,
+    );
+    expect(tab.windowed?.dirty).toBe(false);
+    expect(documentWindow.windowedGate(32).pending()).toBe(false);
+  });
+
+  it('opens the gate again when the operation fails', async () => {
+    documentWindow.tabs.length = 0;
+    const tab = windowedTab(33);
+    documentWindow.tabs.push(tab);
+    documentWindow.activeIndex = 0;
+    await expect(
+      documentWindow.runWindowedOp(
+        33,
+        () => Promise.reject(new Error('disk full')),
+        () => true,
+      ),
+    ).rejects.toThrow('disk full');
+    await documentWindow.windowedGate(33).whenIdle(() => Promise.resolve());
+    expect(documentWindow.windowedGate(33).canApply()).toBe(true);
+    expect(tab.windowed?.dirty).toBe(false);
   });
 });
