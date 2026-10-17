@@ -2,9 +2,21 @@
 // SPDX-License-Identifier: GPL-3.0-only
 
 import type { Extension, Text } from '@codemirror/state';
-import { LanguageDescription } from '@codemirror/language';
+import type { LanguageDescription } from '@codemirror/language';
 import { languages } from '@codemirror/language-data';
 import { isLite } from '../state/edition.svelte';
+import { LITE_LANGUAGES, type LanguageInfo } from './liteLanguages';
+
+/** The metadata detection and the save dialog read. The Lite build reads the
+ *  static table, so `@codemirror/language-data` and its parsers stay out of it. */
+export const languageInfos: readonly LanguageInfo[] = __LITE__
+  ? LITE_LANGUAGES
+  : languages;
+
+/** The languages that can be loaded for highlighting; none in the Lite build. */
+const loadableLanguages: readonly LanguageDescription[] = __LITE__
+  ? []
+  : languages;
 
 /**
  * Above this content size highlighting is forced off. Compares
@@ -69,7 +81,7 @@ const TABULAR_LABELS: Record<string, string> = { csv: 'CSV', tsv: 'TSV' };
 
 /** Sorted list of language names for the picker. */
 export const languageNames: string[] = [
-  ...languages.map((l) => l.name),
+  ...languageInfos.map((l) => l.name),
   ...Object.values(TABULAR_LABELS),
 ].sort((a, b) => a.localeCompare(b));
 
@@ -77,7 +89,7 @@ export const languageNames: string[] = [
  *  there is no syntax highlighting and Plain Text is the only choice (the
  *  pickers always add Plain Text themselves). */
 export function availableLanguageNames(lite: boolean = isLite()): string[] {
-  return lite ? [] : languageNames;
+  return __LITE__ || lite ? [] : languageNames;
 }
 
 /** The language a tab is shown and colored with. Lite has none: a tab keeps the
@@ -100,12 +112,37 @@ export function fileExtension(path: string): string | null {
   return base.slice(dot + 1).toLowerCase();
 }
 
+/** The first language whose filename pattern, else whose extension, matches
+ *  `path`. Same rule as CodeMirror's `LanguageDescription.matchFilename`. */
+function matchFilename(
+  infos: readonly LanguageInfo[],
+  path: string,
+): LanguageInfo | null {
+  for (const info of infos) {
+    if (info.filename?.test(path) === true) {
+      return info;
+    }
+  }
+  const ext = /\.([^.]+)$/.exec(path);
+  if (ext !== null) {
+    for (const info of infos) {
+      if (info.extensions.includes(ext[1] ?? '')) {
+        return info;
+      }
+    }
+  }
+  return null;
+}
+
 /** Match a path to a language name via CM's registry, or null. Not edition-
  *  dependent: a tab stores its real language even in lite (where it is only
  *  shown as plain text, see `effectiveLanguage`), so it is right when the
  *  edition is full. */
-export function detectByFilename(path: string): string | null {
-  const match = LanguageDescription.matchFilename(languages, path);
+export function detectByFilename(
+  path: string,
+  infos: readonly LanguageInfo[] = languageInfos,
+): string | null {
+  const match = matchFilename(infos, path);
   if (match !== null) {
     return match.name;
   }
@@ -115,7 +152,7 @@ export function detectByFilename(path: string): string | null {
   if (ext === null) {
     return null;
   }
-  const byExt = languages.find((l) => l.extensions.includes(ext));
+  const byExt = infos.find((l) => l.extensions.includes(ext));
   if (byExt !== undefined) {
     return byExt.name;
   }
@@ -234,10 +271,10 @@ export async function loadLanguage(
   name: string,
   lite: boolean = isLite(),
 ): Promise<Extension | null> {
-  if (lite) {
+  if (__LITE__ || lite) {
     return null;
   }
-  const desc = languages.find((l) => l.name === name);
+  const desc = loadableLanguages.find((l) => l.name === name);
   if (desc === undefined) {
     return null;
   }

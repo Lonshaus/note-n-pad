@@ -60,11 +60,11 @@ export class EditionState {
 
 export const editionState = new EditionState();
 
-/** Whether the Lite edition's cuts apply right now. `__LITE__` is constant in a
- *  Lite build, so gated code is folded away there; elsewhere it follows the
- *  runtime value, which a license change can flip without a restart. Reactive
- *  through `editionState.lite` when read inside `$derived`, `$effect` or a
- *  template. */
+/** Whether the Lite edition's cuts apply right now: always in the Lite build,
+ *  elsewhere the runtime value, which a license change can flip without a
+ *  restart. Reactive through `editionState.lite` when read inside `$derived`,
+ *  `$effect` or a template. Calling this never removes code from the Lite
+ *  build; code that build must not ship is guarded by `__LITE__` itself. */
 export function isLite(): boolean {
   return __LITE__ || editionState.lite;
 }

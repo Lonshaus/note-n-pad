@@ -90,6 +90,7 @@ mod tests {
       expected_names(Key::NewSticky),
       "NewSticky action names in note-n-pad.desktop.hbs are out of sync with i18n::tr(Key::NewSticky)"
     );
+    #[cfg(not(feature = "lite"))]
     assert_eq!(
       parse_group_names(&text, "[Desktop Action OpenWorkspace]"),
       expected_names(Key::DockOpenWorkspace),

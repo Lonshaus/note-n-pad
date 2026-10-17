@@ -334,7 +334,7 @@
   // Reconfiguring to the same empty value on every call is cheap and keeps the
   // enable/disable logic in one place.
   function applyWorkerHighlight(name: string | null, longLine: boolean): void {
-    if (view === undefined) {
+    if (__LITE__ || view === undefined) {
       return;
     }
     const id = name === null ? null : resolveLanguageId(name);

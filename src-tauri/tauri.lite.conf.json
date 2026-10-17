@@ -39,7 +39,10 @@
     ],
     "resources": {
       "resources/privacy/*": null,
-      "resources/privacy-lite/*": "privacy-lite/"
+      "resources/privacy-lite/*": "privacy-lite/",
+      "resources/themes/*": null,
+      "resources/themes/ink.json": "themes/ink.json",
+      "resources/themes/paper.json": "themes/paper.json"
     },
     "icon": [
       "icons-lite/32x32.png",

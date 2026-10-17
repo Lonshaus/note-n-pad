@@ -102,6 +102,7 @@ pub fn finish_startup() {
 }
 /// The startup workspace must not end up above the window of a file the app
 /// was launched with: the workspace's reveal hands focus back to it once.
+#[cfg(not(feature = "lite"))]
 pub fn focus_launch_window_after_workspace() {
   RECORD.lock().unwrap().focus_after_workspace = true;
 }
