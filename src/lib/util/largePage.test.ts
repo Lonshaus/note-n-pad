@@ -1,0 +1,66 @@
+// Copyright © 2026 Lonshaus
+// SPDX-License-Identifier: GPL-3.0-only
+
+import { describe, expect, it } from 'vitest';
+import { readPageLines, type PageSource } from './largePage';
+
+const LOAD_PAGE = 400;
+/** A file of `total` short lines, "L<n>\n" each, read through the same two
+ *  calls the viewer makes. */
+function fileOf(total: number, over: Partial<PageSource> = {}): PageSource {
+  const lines = Array.from({ length: total }, (_, i) => `L${i}`);
+  return {
+    lineToOffset: async (line) => {
+      return line >= total ? null : line;
+    },
+    readText: async (offset) =>
+      lines.slice(offset, offset + LOAD_PAGE).join('\n'),
+    ...over,
+  };
+}
+
+describe('readPageLines', () => {
+  it('returns the page lines', async () => {
+    const got = await readPageLines(1, LOAD_PAGE, fileOf(1000));
+    expect(got).toHaveLength(LOAD_PAGE);
+    expect(got![0]).toBe('L400');
+  });
+
+  it('answers an empty page, not a failure, for a page past the end', async () => {
+    const source = fileOf(350);
+    expect(await readPageLines(1, LOAD_PAGE, source)).toEqual([]);
+    expect(await readPageLines(2, LOAD_PAGE, source)).toEqual([]);
+  });
+
+  it('ends without a failure when the line estimate exceeds the true total', async () => {
+    // The viewer sizes itself from an estimate of 30,000 lines; the file has 350.
+    const source = fileOf(350);
+    const pages = Math.ceil(30000 / LOAD_PAGE);
+    const results = await Promise.all(
+      Array.from({ length: pages }, (_, p) =>
+        readPageLines(p, LOAD_PAGE, source),
+      ),
+    );
+    expect(results.some((r) => r === null)).toBe(false);
+    expect(results[0]).toHaveLength(350);
+    expect(results.slice(1).every((r) => r!.length === 0)).toBe(true);
+  });
+
+  it('fails when the line lookup rejects', async () => {
+    const source = fileOf(1000, {
+      lineToOffset: async () => {
+        throw new Error('io');
+      },
+    });
+    expect(await readPageLines(0, LOAD_PAGE, source)).toBeNull();
+  });
+
+  it('fails when the chunk read rejects', async () => {
+    const source = fileOf(1000, {
+      readText: async () => {
+        throw new Error('permission-denied');
+      },
+    });
+    expect(await readPageLines(1, LOAD_PAGE, source)).toBeNull();
+  });
+});

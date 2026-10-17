@@ -6,7 +6,10 @@ import {
   availableFonts,
   cssFontFamily,
   DEFAULT_FONT_STACK,
+  dropdownFontFamilies,
   filterInstalledFonts,
+  pickableFontFamilies,
+  withAddedFont,
 } from './font';
 
 describe('availableFonts', () => {
@@ -95,5 +98,103 @@ describe('cssFontFamily', () => {
 
   it('leaves a single-token family unquoted', () => {
     expect(cssFontFamily('Consolas')).toBe(`Consolas, ${DEFAULT_FONT_STACK}`);
+  });
+});
+
+describe('dropdownFontFamilies', () => {
+  it('lists detected faces first, then added families in stored order', () => {
+    expect(
+      dropdownFontFamilies(['Menlo', 'Monaco'], ['Zapfino', 'Arial'], ''),
+    ).toEqual(['Menlo', 'Monaco', 'Zapfino', 'Arial']);
+  });
+
+  it('does not repeat an added family that is also a detected face', () => {
+    expect(dropdownFontFamilies(['Menlo'], ['Menlo', 'Zapfino'], '')).toEqual([
+      'Menlo',
+      'Zapfino',
+    ]);
+  });
+
+  it('does not repeat a family added twice', () => {
+    expect(dropdownFontFamilies([], ['Zapfino', 'Zapfino'], '')).toEqual([
+      'Zapfino',
+    ]);
+  });
+
+  it('adds a stored font this host did not detect after the other rows', () => {
+    const rows = dropdownFontFamilies(['Menlo'], ['Zapfino'], 'Consolas');
+    expect(rows).toEqual(['Menlo', 'Zapfino', 'Consolas']);
+    expect(rows).toContain('Consolas');
+  });
+
+  it('does not repeat a current font that is already a row', () => {
+    expect(dropdownFontFamilies(['Menlo'], ['Zapfino'], 'Menlo')).toEqual([
+      'Menlo',
+      'Zapfino',
+    ]);
+    expect(dropdownFontFamilies(['Menlo'], ['Zapfino'], 'Zapfino')).toEqual([
+      'Menlo',
+      'Zapfino',
+    ]);
+  });
+
+  it('adds no row for the built-in default (empty current font)', () => {
+    expect(dropdownFontFamilies(['Menlo'], [], '')).toEqual(['Menlo']);
+  });
+
+  it('is empty when nothing is detected or added', () => {
+    expect(dropdownFontFamilies([], [], '')).toEqual([]);
+  });
+});
+
+describe('pickableFontFamilies', () => {
+  it('keeps the host order', () => {
+    expect(
+      pickableFontFamilies(['Arial', 'Apple Symbols', 'Zapfino'], []),
+    ).toEqual(['Arial', 'Apple Symbols', 'Zapfino']);
+  });
+
+  it('leaves out the current font row an undetected face gets', () => {
+    const rows = dropdownFontFamilies([], [], 'Consolas');
+    expect(pickableFontFamilies(['Consolas', 'Arial'], rows)).toEqual([
+      'Arial',
+    ]);
+  });
+
+  it('leaves out families the dropdown already lists', () => {
+    expect(
+      pickableFontFamilies(['Arial', 'Menlo', 'Zapfino'], ['Menlo', 'Zapfino']),
+    ).toEqual(['Arial']);
+  });
+
+  it('compares case-insensitively', () => {
+    expect(pickableFontFamilies(['menlo', 'Arial'], ['Menlo'])).toEqual([
+      'Arial',
+    ]);
+  });
+
+  it('lists each family once', () => {
+    expect(pickableFontFamilies(['Arial', 'Arial', 'arial'], [])).toEqual([
+      'Arial',
+    ]);
+  });
+
+  it('is empty when the host list is empty', () => {
+    expect(pickableFontFamilies([], ['Menlo'])).toEqual([]);
+  });
+});
+
+describe('withAddedFont', () => {
+  it('appends a new family after the existing ones', () => {
+    expect(withAddedFont(['Arial'], 'Zapfino')).toEqual(['Arial', 'Zapfino']);
+  });
+
+  it('does not repeat a family already added', () => {
+    expect(withAddedFont(['Arial'], 'Arial')).toEqual(['Arial']);
+  });
+
+  it('ignores an empty family and trims the name', () => {
+    expect(withAddedFont(['Arial'], '  ')).toEqual(['Arial']);
+    expect(withAddedFont([], ' Zapfino ')).toEqual(['Zapfino']);
   });
 });

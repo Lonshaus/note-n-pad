@@ -52,11 +52,19 @@ export interface NoteSnapshot {
   range_fp_size: number | null;
   range_fp_mtime: number | null;
   /** 1-based line number of the range's first line, fixed at extraction time;
-   *  the tab-bar label's end line is derived from the tab's own content line
-   *  count instead (see `rangeDisplayName`). null for a non-range tab, and
-   *  for a range tab restored from an older snapshot (its old `range_label`
-   *  isn't read back). */
+   *  the end line is `range_end_line` (see `rangeDisplayName`). null for a
+   *  non-range tab, and for a range tab restored from an older snapshot (its
+   *  old `range_label` isn't read back). */
   range_start_line: number | null;
+  /** 1-based line number of the range's last line, kept in step with the live
+   *  content on every write so a view that never opens the tab can label it.
+   *  null for a non-range tab and for a record written before this field. */
+  range_end_line: number | null;
+  /** Whether the source slice ended with a line break. The buffer keeps that
+   *  break; on write-back one is added only if the slice ended with one and the
+   *  non-empty buffer no longer does. null for a non-range tab and for a record
+   *  written before this field; restore derives it then. */
+  range_trailing_break: boolean | null;
   /** Sparse line-checkpoint index of a windowed-editing tab. Its presence is
    *  what marks the tab as "was unlocked" on restore — there is deliberately
    *  no separate boolean for that fact. null for every non-windowed tab. */

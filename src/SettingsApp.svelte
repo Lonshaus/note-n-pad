@@ -37,8 +37,10 @@
   import {
     FONT_CANDIDATES,
     availableFonts,
+    dropdownFontFamilies,
     filterInstalledFonts,
     makeCanvasMeasurer,
+    pickableFontFamilies,
   } from './lib/util/font';
   import { invoke } from '@tauri-apps/api/core';
   import { getCurrentWindow } from '@tauri-apps/api/window';
@@ -301,45 +303,77 @@
   function stepFontSize(delta: number): void {
     commitFontSize(String(settingsState.editorFontSize + delta));
   }
-
-  // Font picker rows. '' is the built-in stack whose label is translated
-  // (labelKey); the concrete faces are detected per host in onMount (only the
-  // ones actually installed are listed), so brand face names stay verbatim.
-  let fontFamilies = $state<{ value: string; labelKey?: I18nKey }[]>([
-    { value: '', labelKey: 'settings.editor.fontDefault' },
-  ]);
-  const CUSTOM_FONT = '__custom__';
-
-  // Sticky flag set once the user picks the custom option, so the text input stays visible
-  // even while its value is empty or matches a listed face.
-  let fontCustom = $state(false);
-  // A stored value not in the list is inherently custom (e.g. loaded from disk).
-  const fontValueIsCustom = $derived(
-    settingsState.editorFontFamily !== '' &&
-      !fontFamilies.some((f) => f.value === settingsState.editorFontFamily),
+  // Font picker rows. '' is the built-in stack whose label is translated; the
+  // built-in faces are detected per host in onMount (only the ones actually
+  // installed are listed), then come the families the user added, so brand face
+  // names stay verbatim.
+  let installedFonts = $state<string[]>([]);
+  const fontFamilies = $derived(
+    dropdownFontFamilies(
+      installedFonts,
+      settingsState.editorExtraFonts,
+      settingsState.editorFontFamily,
+    ),
   );
-  const showFontInput = $derived(fontCustom || fontValueIsCustom);
+  const PICK_FONT = '__pick__';
+  // Whether the second list of every installed family is open. It is filled on
+  // opening; null while the host is being asked.
+  let pickingFont = $state(false);
+  let hostFonts = $state<string[] | null>(null);
+  const pickableFonts = $derived(
+    pickableFontFamilies(hostFonts ?? [], fontFamilies),
+  );
   const fontSelectValue = $derived(
-    showFontInput ? CUSTOM_FONT : settingsState.editorFontFamily,
+    pickingFont ? PICK_FONT : settingsState.editorFontFamily,
   );
 
   function onFontSelect(value: string): void {
-    if (value === CUSTOM_FONT) {
-      fontCustom = true;
+    if (value === PICK_FONT) {
+      pickingFont = true;
+      hostFonts = null;
+      // A failed call reads as an empty list: the second list then says so.
+      void invoke<string[]>('list_font_families')
+        .catch(() => [] as string[])
+        .then((families) => {
+          hostFonts = families;
+        });
     } else {
-      fontCustom = false;
+      pickingFont = false;
       void settingsState.setFontFamily(value);
     }
   }
 
-  function commitFontFamily(raw: string): void {
-    const value = raw.trim();
-    // A typed value matching a listed face collapses back to the dropdown.
-    if (fontFamilies.some((f) => f.value === value)) {
-      fontCustom = false;
+  function onPickFont(value: string): void {
+    pickingFont = false;
+    if (value !== '') {
+      void settingsState.addFontFamily(value);
     }
-    void settingsState.setFontFamily(value);
   }
+
+  let mainFontSelect = $state<HTMLSelectElement | null>(null);
+  let pickFontSelect = $state<HTMLSelectElement | null>(null);
+  // Clicking a label or an empty part of the pane never blurs the select, so
+  // while the second list is open any press outside both font selects closes it.
+  // The main select closes it through its own change path.
+  $effect(() => {
+    if (!pickingFont) {
+      return;
+    }
+    const closeOnOutsidePress = (e: PointerEvent): void => {
+      const target = e.target;
+      if (
+        target instanceof Node &&
+        !mainFontSelect?.contains(target) &&
+        !pickFontSelect?.contains(target)
+      ) {
+        pickingFont = false;
+      }
+    };
+    document.addEventListener('pointerdown', closeOnOutsidePress, true);
+    return () => {
+      document.removeEventListener('pointerdown', closeOnOutsidePress, true);
+    };
+  });
 
   // Reflect the resolved theme onto the document root.
   $effect(() => {
@@ -381,11 +415,10 @@
     void invoke<string[] | null>('installed_font_families')
       .catch(() => null)
       .then((installed) => {
-        const filtered =
+        installedFonts =
           installed === null
             ? availableFonts(FONT_CANDIDATES, makeCanvasMeasurer())
             : filterInstalledFonts(FONT_CANDIDATES, installed);
-        fontFamilies.push(...filtered.map((value) => ({ value })));
       });
     // Reveal the window only after the theme is loaded and applied, so a
     // dark-theme window never flashes its default white background. The
@@ -472,9 +505,8 @@
       cancelSaveAs();
     }
   }
-
-  // Focus the modal's input as soon as it mounts.
-  function autofocus(node: HTMLInputElement): void {
+  // Focus the element as soon as it mounts.
+  function autofocus(node: HTMLElement): void {
     node.focus();
   }
 
@@ -1104,29 +1136,59 @@
         <span class="field-label">{t('settings.editor.font')}</span>
         <select
           class="select"
+          bind:this={mainFontSelect}
           value={fontSelectValue}
           onchange={(e) => onFontSelect(e.currentTarget.value)}
         >
-          {#each fontFamilies as f (f.value)}
-            <option value={f.value}
-              >{f.labelKey ? t(f.labelKey) : f.value}</option
-            >
+          <option value="">{t('settings.editor.fontDefault')}</option>
+          {#each fontFamilies as family (family)}
+            <option value={family}>{family}</option>
           {/each}
-          <option value={CUSTOM_FONT}>{t('settings.editor.fontCustom')}</option>
+          <option value={PICK_FONT}>{t('settings.editor.fontCustom')}</option>
         </select>
-        {#if showFontInput}
-          <input
-            class="text-input"
-            type="text"
-            placeholder={t('settings.editor.fontNamePlaceholder')}
-            value={settingsState.editorFontFamily}
+        {#if pickingFont}
+          <select
+            class="select"
+            bind:this={pickFontSelect}
+            value=""
+            onchange={(e) => onPickFont(e.currentTarget.value)}
             onkeydown={(e) => {
-              if (e.key === 'Enter') {
-                e.currentTarget.blur();
+              if (e.key === 'Escape') {
+                pickingFont = false;
               }
             }}
-            onblur={(e) => commitFontFamily(e.currentTarget.value)}
-          />
+            onblur={(e) => {
+              const select = e.currentTarget;
+              // Opening the native popup or switching apps also blurs the select
+              // while the window itself loses focus, and WebKit may not have
+              // updated document.hasFocus() yet. Decide one task later: close
+              // only when the window kept focus, the select is no longer the
+              // active element and no family was chosen (onchange handles that).
+              setTimeout(() => {
+                if (
+                  document.hasFocus() &&
+                  document.activeElement !== select &&
+                  select.value === ''
+                ) {
+                  pickingFont = false;
+                }
+              }, 0);
+            }}
+            use:autofocus
+          >
+            {#if hostFonts !== null && pickableFonts.length === 0}
+              <option value="" disabled
+                >{t('settings.editor.fontNoneFound')}</option
+              >
+            {:else}
+              <option value=""
+                >{t('settings.editor.fontPickPlaceholder')}</option
+              >
+              {#each pickableFonts as family (family)}
+                <option value={family}>{family}</option>
+              {/each}
+            {/if}
+          </select>
         {/if}
       </div>
 

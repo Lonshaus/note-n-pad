@@ -28,7 +28,11 @@ import {
   textEq,
   type LineEnding,
 } from '../util/text';
-import { replacementByteLength } from '../util/rangeEdit';
+import {
+  rangeWriteText,
+  replacementByteLength,
+  sliceEndsWithBreak,
+} from '../util/rangeEdit';
 import { detectBreakStyle } from '../util/windowedEdit';
 import { createOpGate, type OpGate } from '../util/windowedGate';
 import {
@@ -40,7 +44,11 @@ import {
 import type { CheckpointIndex, NoteSnapshot } from './stickyNote.svelte';
 import { settingsState } from './settings.svelte';
 import { editionState, isLite } from './edition.svelte';
-import { keptTabsToLoad, partitionRestorable } from '../util/keptTabs';
+import {
+  keptTabsToLoad,
+  partitionRestorable,
+  windowBoundsRecord,
+} from '../util/keptTabs';
 import { isOrdinaryTab, pickHeldTab, touchMru } from './heldTab';
 import type { LargeIndexRef } from '../util/largeIndex';
 import {
@@ -49,6 +57,7 @@ import {
   restoredRangeContent,
 } from '../util/snapshotPolicy';
 import { t } from '../i18n';
+import { rangeLabel } from '../util/rangeLabel';
 import { READ_ONLY_DESTINATION, isLiteRefusal } from '../util/protocol';
 
 /** Rust `splice_file` rejects an out-of-band-edited source with this exact error
@@ -291,6 +300,10 @@ export interface DocTab {
      *  Null only for a tab restored from an older snapshot that persisted a
      *  formatted label instead of a line number — see `rangeDisplayName`. */
     startLine: number | null;
+    /** Whether the source slice ended with a line break. `splice` adds one to
+     *  what it writes when the buffer ended up without one, so text typed on the
+     *  last line cannot join the next source line. */
+    trailingBreak: boolean;
   };
   /** Present only on a windowed-editing tab: the buffer lives in the Rust core,
    *  streamed a window at a time by the WindowedEditor. `content`/`savedContent`
@@ -340,34 +353,46 @@ export interface DocTab {
 /** The tab-bar/window-title label for a range tab: "{name} (lines X–Y)"
  *  through `t()`, so a language change or a locale edit is reflected the next
  *  time this is called rather than frozen at extraction time. The end line is
- *  derived from the tab's own content line count instead of being stored, so
- *  it stays correct after an edit that changes the line count (`splice`
- *  rebases `endByte` but has nothing else to keep in sync). Returns null for
+ *  derived from the tab's own content line count, so it stays correct after an
+ *  edit that changes the line count (`splice` rebases `endByte` but has
+ *  nothing else to keep in sync); `snapshot()` persists it as `range_end_line`
+ *  for views that do not open the tab. Returns null for
  *  a non-range tab, or for a range tab restored from an older snapshot that
  *  carries no start line (its formatted label wasn't persisted in a form line
  *  numbers can be recovered from) — the caller's own fallback (the file name)
  *  covers that case, matching a fresh range tab's degraded display. */
 export function rangeDisplayName(tab: DocTab): string | null {
   const r = tab.range;
+  const endLine = rangeEndLine(tab);
+  if (r === undefined || r.startLine === null || endLine === null) {
+    return null;
+  }
+  return rangeLabel(r.sourcePath, r.startLine, endLine);
+}
+/** 1-based line number of a range tab's last line, from its live content: the
+ *  start line plus the lines the buffer covers. Null for a non-range tab and
+ *  for a range tab with no start line (restored from an older snapshot). */
+export function rangeEndLine(tab: DocTab): number | null {
+  const r = tab.range;
   if (r === undefined || r.startLine === null) {
     return null;
   }
-  const name = r.sourcePath.split(/[/\\]/).pop() || r.sourcePath;
-  // The extracted slice's end offset is the start of the line *after* the last
-  // selected line (see `LargeFileView.svelte`'s `selectionByteRange`), so the
-  // content almost always ends with the last selected line's trailing
-  // newline. `Text.lines` counts the empty line that trailing newline opens,
-  // so it overcounts by one versus the real number of selected lines — except
-  // for the one case where the extraction reached EOF of a file with no final
-  // newline. Detect that trailing newline directly instead of assuming either
-  // shape, so an empty range (`Text.empty`, no trailing newline) still yields
-  // a single displayed line.
+  return r.startLine + rangeLineCount(tab) - 1;
+}
+/** Number of source lines a range tab's buffer covers (at least 1). The slice's
+ *  end offset is the start of the line *after* the last selected line (see
+ *  `LargeFileView.svelte`'s `selectionByteRange`), so the content almost always
+ *  ends with the last selected line's trailing newline. `Text.lines` counts the
+ *  empty line that trailing newline opens, so it overcounts by one versus the
+ *  real number of selected lines, except for the one case where the extraction
+ *  reached EOF of a file with no final newline. Detect that trailing newline
+ *  directly instead of assuming either shape, so an empty range (`Text.empty`,
+ *  no trailing newline) still yields a single displayed line. */
+function rangeLineCount(tab: DocTab): number {
   const content = tab.content;
   const endsWithNewline =
     content.length > 0 && content.sliceString(content.length - 1) === '\n';
-  const lineCount = content.lines - (endsWithNewline ? 1 : 0);
-  const endLine = r.startLine + lineCount - 1;
-  return t('doc.range.displayName', { name, start: r.startLine, end: endLine });
+  return content.lines - (endsWithNewline ? 1 : 0);
 }
 
 interface Bounds {
@@ -547,6 +572,18 @@ class DocumentWindowState {
   /** Dismiss the kept-tabs notice. */
   dismissKeptTabs(): void {
     this.keptTabs = 0;
+  }
+  /** Dismiss the kept-tabs notice of a window that is about to close. When no
+   *  tab is left the core is told to hold the group back, so it returns when
+   *  the edition is full; resolves `true` then, and the window should be
+   *  destroyed. Nothing else holds a group back. */
+  async dismissKeptTabsAndHoldBack(): Promise<boolean> {
+    this.dismissKeptTabs();
+    if (this.tabs.length > 0) {
+      return false;
+    }
+    await invoke('hold_back_group', { group: this.group });
+    return true;
   }
 
   /** Dismiss the unreadable-restore report. */
@@ -766,6 +803,8 @@ class DocumentWindowState {
       range_fp_size: tab.range?.fingerprint?.size ?? null,
       range_fp_mtime: tab.range?.fingerprint?.mtime_ms ?? null,
       range_start_line: tab.range?.startLine ?? null,
+      range_end_line: rangeEndLine(tab),
+      range_trailing_break: tab.range?.trailingBreak ?? null,
       // A windowed tab persists what `beginWindowedRestore` needs to rebuild the
       // session with no rescan (see `windowed_reopen`); its presence is what
       // marks the tab as "was unlocked" on restore.
@@ -917,6 +956,9 @@ class DocumentWindowState {
           endByte,
           fingerprint,
           startLine: snap.range_start_line ?? null,
+          trailingBreak:
+            snap.range_trailing_break ??
+            (diskSlice !== null ? sliceEndsWithBreak(diskSlice) : false),
         },
       };
     }
@@ -1146,7 +1188,7 @@ class DocumentWindowState {
           dropped.add(entry.tab_index);
         }
       }
-      const lowest = entries[0]!;
+      const lowest = windowBoundsRecord(entries, isLite());
       this.bounds = {
         x: lowest.x,
         y: lowest.y,
@@ -1911,8 +1953,13 @@ class DocumentWindowState {
     if (__LITE__ || r === undefined) {
       return 'error';
     }
-    // Flush point: materialize the rope for the splice write-back.
-    const out = applyLineEnding(tab.content.toString(), tab.lineEnding);
+    // Flush point: materialize the rope for the splice write-back. A slice that
+    // ended with a line break gets one back if the buffer lost it.
+    const out = rangeWriteText(
+      tab.content.toString(),
+      r.trailingBreak,
+      tab.lineEnding,
+    );
     let fingerprint: Fingerprint;
     try {
       fingerprint = await invoke<Fingerprint>('splice_file', {
@@ -1938,9 +1985,7 @@ class DocumentWindowState {
       this.saveFailed = { path: r.sourcePath, error: String(e) };
       return 'error';
     }
-    r.endByte =
-      r.startByte +
-      replacementByteLength(tab.content.toString(), tab.lineEnding);
+    r.endByte = r.startByte + replacementByteLength(out, tab.lineEnding);
     r.fingerprint = fingerprint;
     tab.savedContent = tab.content;
     tab.savedLineEnding = tab.lineEnding;
@@ -2110,16 +2155,15 @@ class DocumentWindowState {
       encoding: settingsState.defaultEncoding,
       lossy: false,
       tabIndex: this.nextIndex++,
-      // `startLine` is the only line number persisted (see `rangeDisplayName`
-      // and `snapshot()`); `info.endLine` isn't stored — it's redundant with
-      // the tab's own content line count and would otherwise go stale after
-      // an edit that changes the line count.
+      // `info.endLine` is not kept: the end line is derived from the tab's
+      // content line count and persisted by `snapshot()` as `range_end_line`.
       range: {
         sourcePath,
         startByte: info.startByte,
         endByte: info.endByte,
         fingerprint,
         startLine: info.startLine,
+        trailingBreak: sliceEndsWithBreak(read.text),
       },
     };
     this.tabs.push(tab);
