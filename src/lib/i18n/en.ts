@@ -96,9 +96,10 @@ export const en = {
   'settings.editor.workerHighlightHint':
     'Large files are processed in the background, so colors appear with a delay. Very complex content may still be slow and use more memory.',
   'settings.editor.font': 'Font',
-  'settings.editor.fontCustom': 'Custom…',
+  'settings.editor.fontCustom': 'Choose another font…',
   'settings.editor.fontDefault': 'System default',
-  'settings.editor.fontNamePlaceholder': 'Font name',
+  'settings.editor.fontPickPlaceholder': 'Choose a font…',
+  'settings.editor.fontNoneFound': 'No other fonts found',
   'settings.editor.fontSize': 'Font size',
   'settings.editor.fontSizeDecrease': 'Decrease',
   'settings.editor.fontSizeIncrease': 'Increase',

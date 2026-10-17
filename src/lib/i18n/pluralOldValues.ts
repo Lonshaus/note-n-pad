@@ -17,6 +17,7 @@ export const OLD_SHIPPED: Record<string, Record<string, string>> = {
     'status.lines': '{count} lines',
     'doc.restoreUnreadable':
       'Couldn’t read {names}. Open them again to continue.',
+    'settings.editor.fontCustom': 'Custom…',
   },
   de: {
     'skipped.heading': '{count} Dateien konnten nicht geladen werden',
@@ -30,6 +31,7 @@ export const OLD_SHIPPED: Record<string, Record<string, string>> = {
     'status.lines': '{count} Zeilen',
     'doc.restoreUnreadable':
       '{names} konnte nicht gelesen werden. Öffne die Dateien erneut, um fortzufahren.',
+    'settings.editor.fontCustom': 'Benutzerdefiniert…',
   },
   fr: {
     'skipped.heading': '{count} fichiers n’ont pas pu être chargés',
@@ -45,6 +47,7 @@ export const OLD_SHIPPED: Record<string, Record<string, string>> = {
     'status.lines': '{count} lignes',
     'doc.restoreUnreadable':
       'Impossible de lire {names}. Rouvrez les fichiers pour continuer.',
+    'settings.editor.fontCustom': 'Personnalisée…',
   },
   es: {
     'skipped.heading': 'No se pudieron cargar {count} archivos',
@@ -61,6 +64,7 @@ export const OLD_SHIPPED: Record<string, Record<string, string>> = {
     'status.lines': '{count} líneas',
     'doc.restoreUnreadable':
       'No se pudo leer {names}. Ábrelos de nuevo para continuar.',
+    'settings.editor.fontCustom': 'Personalizada…',
   },
   it: {
     'skipped.snapshotHeading':
@@ -74,6 +78,7 @@ export const OLD_SHIPPED: Record<string, Record<string, string>> = {
     'status.lines': '{count} righe',
     'doc.restoreUnreadable':
       'Impossibile leggere {names}. Riaprili per continuare.',
+    'settings.editor.fontCustom': 'Personalizzato…',
   },
   'pt-BR': {
     'skipped.heading': 'Não foi possível carregar {count} arquivos',
@@ -90,6 +95,7 @@ export const OLD_SHIPPED: Record<string, Record<string, string>> = {
     'status.lines': '{count} linhas',
     'doc.restoreUnreadable':
       'Não foi possível ler {names}. Abra os arquivos novamente para continuar.',
+    'settings.editor.fontCustom': 'Personalizada…',
   },
   ru: {
     'settings.general.snapshotMoveBody':
@@ -100,6 +106,7 @@ export const OLD_SHIPPED: Record<string, Record<string, string>> = {
     'status.indexing': 'Индексирование… {count} строк',
     'doc.restoreUnreadable':
       'Не удалось прочитать: {names}. Откройте файлы снова, чтобы продолжить.',
+    'settings.editor.fontCustom': 'Другой…',
   },
   pl: {
     'settings.general.snapshotMoveBody':
@@ -111,13 +118,31 @@ export const OLD_SHIPPED: Record<string, Record<string, string>> = {
     'status.lines': '{count} wierszy',
     'doc.restoreUnreadable':
       'Nie można odczytać: {names}. Otwórz pliki ponownie, aby kontynuować.',
+    'settings.editor.fontCustom': 'Niestandardowa…',
   },
   tr: {
     'doc.restoreUnreadable':
       '{names} okunamadı. Devam etmek için dosyaları yeniden açın.',
+    'settings.editor.fontCustom': 'Özel…',
   },
   vi: {
     'doc.restoreUnreadable':
       'Không đọc được {names}. Hãy mở lại các tệp để tiếp tục.',
+    'settings.editor.fontCustom': 'Tùy chỉnh…',
+  },
+  ko: {
+    'settings.editor.fontCustom': '사용자 지정…',
+  },
+  th: {
+    'settings.editor.fontCustom': 'กำหนดเอง…',
+  },
+  'zh-CN': {
+    'settings.editor.fontCustom': '自定义…',
+  },
+  'zh-TW': {
+    'settings.editor.fontCustom': '自訂…',
+  },
+  ja: {
+    'settings.editor.fontCustom': 'カスタム…',
   },
 };

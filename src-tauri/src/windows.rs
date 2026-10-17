@@ -251,6 +251,11 @@ fn show_after_grace(window: tauri::WebviewWindow) {
       let _ = window.set_focus();
       detach_menu_unless_document(&window);
       focus_launch_window_after(&window, false);
+      // Menu items are only ever touched on the main thread.
+      let app = window.app_handle().clone();
+      let _ = app.clone().run_on_main_thread(move || {
+        crate::resync_menu_focus(&app);
+      });
     }
   });
 }
@@ -436,6 +441,7 @@ fn clip_sticky_corners(window: &tauri::WebviewWindow) -> Result<(), String> {
 /// lives on the window, not in CSS — so a test that a sticky really is as
 /// translucent as the setting says has no other source. Returns -1.0 where the
 /// platform has no reader wired up.
+#[cfg_attr(not(debug_assertions), allow(dead_code))]
 pub fn window_alpha(window: &tauri::WebviewWindow) -> f64 {
   #[cfg(target_os = "macos")]
   {
@@ -815,6 +821,8 @@ fn blank_sticky(id: String, width: f64, height: f64, paper: String) -> NoteSnaps
     range_fp_size: None,
     range_fp_mtime: None,
     range_start_line: None,
+    range_end_line: None,
+    range_trailing_break: None,
     windowed_index: None,
     windowed_fp_size: None,
     windowed_fp_mtime: None,
@@ -889,19 +897,20 @@ pub fn open_document_group(
   tab: Option<i64>,
 ) -> Result<(), String> {
   let notes = store.list();
-  let plan = crate::note_store::plan_document_windows(&notes)
+  let plan = crate::note_store::plan_document_windows(&notes, crate::edition::is_lite())
     .into_iter()
     .find(|p| p.group == group)
     .ok_or_else(|| format!("no stored document group: {group}"))?;
   create_document_window(&app, &plan, tab)
 }
-
-/// The edition just turned full: open a window for every group that lite kept
-/// tabs of and whose window is not open, so those tabs return as at a startup
-/// restore. Windows still open reload their own kept tabs.
+/// The edition just turned full: open a window for every group the app closed
+/// for the trial (`HeldBackGroups`) that lite kept tabs of and whose window is
+/// not open, so those tabs return as at a startup restore. Windows still open
+/// reload their own kept tabs; groups the user closed wait for the next launch.
 pub fn reopen_kept_groups(app: &AppHandle) {
   let notes = app.state::<NoteStore>().list();
-  let plans = crate::note_store::groups_to_reopen(&notes, |group| {
+  let held = app.state::<crate::note_store::HeldBackGroups>().take_all();
+  let plans = crate::note_store::groups_to_reopen(&notes, &held, |group| {
     app.get_webview_window(&format!("doc-{group}")).is_some()
   });
   for plan in plans {
@@ -927,6 +936,7 @@ pub fn reveal_self(window: tauri::WebviewWindow) -> Result<(), String> {
   window.set_focus().map_err(|e| e.to_string())?;
   detach_menu_unless_document(&window);
   focus_launch_window_after(&window, true);
+  crate::resync_menu_focus(window.app_handle());
   Ok(())
 }
 /// After the startup workspace is revealed, give focus back to the window of a

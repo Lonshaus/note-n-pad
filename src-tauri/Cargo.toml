@@ -60,6 +60,7 @@ objc2-app-kit = { version = "0.3.2", features = [
   "NSMenu",
   "NSMenuItem",
   "NSResponder",
+  "NSFontManager",
 ] }
 objc2-foundation = { version = "0.3.2", features = [
   "NSArray",
@@ -82,6 +83,7 @@ windows-sys = { version = "0.60", features = [
   "Win32_Storage_FileSystem",
   "Win32_Security",
   "Win32_Security_Authorization",
+  "Win32_Graphics_Gdi",
 ] }
 # Only windows-sys (raw FFI, no COM) was a dependency before; the Jump List
 # needs COM interfaces (ICustomDestinationList, IShellLinkW), which windows-sys

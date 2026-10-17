@@ -348,10 +348,10 @@
   }
   // Lite kept some of this window's stored tabs closed (see `keptTabs`); a
   // window that has nothing else to show has nothing left once the notice is
-  // closed. The tabs come back through `reopen_kept_groups` in the core.
-  function onKeptTabsClose(): void {
-    documentWindow.dismissKeptTabs();
-    if (documentWindow.tabs.length === 0) {
+  // closed. The core brings the group back through `reopen_kept_groups`
+  // when the edition is full again.
+  async function onKeptTabsClose(): Promise<void> {
+    if (await documentWindow.dismissKeptTabsAndHoldBack()) {
       void win.destroy();
     }
   }
@@ -1319,30 +1319,63 @@
     // dark-theme window never flashes its default white background. File
     // content is loaded separately below and paints onto the themed surface.
     void revealWhenThemed();
-    void (async (): Promise<void> => {
-      await documentWindow.init(group, initialPath, initialProject, initialTab);
-      if (startBlank && documentWindow.tabs.length === 0) {
-        // The new tab's line ending and encoding come from the settings.
-        await settingsState.ready;
-        await documentWindow.newTab();
+    // Settles once the `open-file-here` listener below is registered.
+    let openFileListening: Promise<unknown> = Promise.resolve();
+    // Announce the window to the core and open the files it queued meanwhile.
+    // Each path opens on its own, so one failure leaves the rest.
+    const announceReady = async (): Promise<void> => {
+      const queued = await invoke<string[]>('doc_window_ready', {
+        label: win.label,
+      });
+      for (const path of queued) {
+        await documentWindow.openTab(path).catch((err: unknown) => {
+          console.error('opening a queued file failed', err);
+        });
       }
-      // A fresh window opened for a single file whose open routed elsewhere (it
-      // was already showing in another live window) has no tab and no pending
-      // prompt; close the empty shell rather than leave it hanging. A pending
-      // open-mode confirm (large-file OR long-line) must keep the window alive
-      // so the user can answer it — omitting the long-line flag flash-closed the
-      // window mid-dialog when a long-line file opened into a fresh window.
-      if (
-        shouldCollapseEmptyWindow(
-          initialPath !== null,
-          documentWindow.tabs.length,
-          documentWindow.pendingLargeOpen !== null,
-          documentWindow.pendingLongLineOpen !== null,
-          documentWindow.openFailed !== null ||
-            documentWindow.restoreUnreadable.length > 0,
-        )
-      ) {
-        void collapseWindow();
+    };
+    void (async (): Promise<void> => {
+      let collapsing = false;
+      try {
+        await documentWindow.init(
+          group,
+          initialPath,
+          initialProject,
+          initialTab,
+        );
+        if (startBlank && documentWindow.tabs.length === 0) {
+          // The new tab's line ending and encoding come from the settings.
+          await settingsState.ready;
+          await documentWindow.newTab();
+        }
+        // A fresh window opened for a single file whose open routed elsewhere (it
+        // was already showing in another live window) has no tab and no pending
+        // prompt; close the empty shell rather than leave it hanging. A pending
+        // open-mode confirm (large-file OR long-line) must keep the window alive
+        // so the user can answer it — omitting the long-line flag flash-closed the
+        // window mid-dialog when a long-line file opened into a fresh window.
+        if (
+          shouldCollapseEmptyWindow(
+            initialPath !== null,
+            documentWindow.tabs.length,
+            documentWindow.pendingLargeOpen !== null,
+            documentWindow.pendingLongLineOpen !== null,
+            documentWindow.openFailed !== null ||
+              documentWindow.restoreUnreadable.length > 0,
+          )
+        ) {
+          collapsing = true;
+          void collapseWindow();
+          return;
+        }
+      } finally {
+        // Files routed here while the window was loading were queued by the
+        // core, which keeps queueing until this call: opening them any earlier
+        // would hand a launched tab an index that collides with a restored one.
+        // Also reached when init throws, so later files are not queued forever.
+        if (!collapsing) {
+          await openFileListening;
+          await announceReady();
+        }
       }
     })();
 
@@ -1469,6 +1502,7 @@
     const unlistenOpenFile = win.listen<string>('open-file-here', (event) => {
       void documentWindow.openTab(event.payload);
     });
+    openFileListening = unlistenOpenFile;
 
     // A splice rewrote a source file (this window or another): if a large-file
     // viewer of that path is open here, rebuild its stale line index.

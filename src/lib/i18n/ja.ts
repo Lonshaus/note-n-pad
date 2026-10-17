@@ -97,9 +97,10 @@ export const ja = {
   'settings.editor.workerHighlightHint':
     'しきい値を超えるファイルはバックグラウンドで処理するため、色付けは遅れて表示されます。非常に複雑な内容では動作が遅くなり、メモリ使用量が増える場合があります。',
   'settings.editor.font': 'フォント',
-  'settings.editor.fontCustom': 'カスタム…',
+  'settings.editor.fontCustom': 'その他のフォントを選択…',
   'settings.editor.fontDefault': 'システム標準',
-  'settings.editor.fontNamePlaceholder': 'フォント名',
+  'settings.editor.fontPickPlaceholder': 'フォントを選択…',
+  'settings.editor.fontNoneFound': 'ほかのフォントが見つかりません',
   'settings.editor.fontSize': '文字サイズ',
   'settings.editor.fontSizeDecrease': '小さく',
   'settings.editor.fontSizeIncrease': '大きく',
