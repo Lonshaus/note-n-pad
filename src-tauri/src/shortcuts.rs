@@ -1517,9 +1517,20 @@ pub fn resolve_in(
       continue;
     };
     if !workspace && row.id == WORKSPACE_ID {
-      kept.insert(row.id.to_string(), stored.clone());
-      hidden_workspace = normalize(stored, platform).ok();
-      hidden_stored = true;
+      // Held for full, by the same rules full applies. A key full would repair
+      // is dropped instead, silently: lite shows no workspace row to point at,
+      // and the default it falls back to below is a key that can give way.
+      if stored.is_empty() {
+        kept.insert(row.id.to_string(), String::new());
+        hidden_stored = true;
+      } else if let Some(accel) = normalize(stored, platform)
+        .ok()
+        .filter(|a| rule_violation(row, a, platform).is_none() && !occupied.contains_key(a))
+      {
+        kept.insert(row.id.to_string(), stored.clone());
+        hidden_workspace = Some(accel);
+        hidden_stored = true;
+      }
       settled[i] = true;
       continue;
     }
@@ -2447,8 +2458,10 @@ mod tests {
       OTHER,
       false,
     );
+    // The global key holds it first, so lite drops the workspace's copy.
+    assert!(!lite.overrides.contains_key("menu.workspace"));
     let next = plan_set(&lite, GLOBAL_STICKY_ID, Some("Ctrl+Alt+K"), OTHER).unwrap();
-    assert_eq!(next.overrides["menu.workspace"], "");
+    assert!(!next.overrides.contains_key("menu.workspace"));
     let full = back_in_full(&next);
     assert!(full.repaired.is_empty());
     assert_eq!(full.new_note_shortcut, "Ctrl+Alt+K");
@@ -2472,10 +2485,11 @@ mod tests {
     assert_eq!(next.overrides["menu.workspace"], "");
     let next = plan_set(&cleared, "menu.word-wrap", Some("Ctrl+Alt+J"), OTHER).unwrap();
     assert_eq!(next.overrides["menu.workspace"], "");
-    // A stored value that is not a key holds none either.
-    assert!(lite_with(&[("menu.workspace", "nonsense")])
-      .hidden_workspace
-      .is_none());
+    // A stored value that is not a key is dropped, and the default holds.
+    assert_eq!(
+      lite_with(&[("menu.workspace", "nonsense")]).hidden_workspace,
+      Some(normalize(&default, OTHER).unwrap())
+    );
   }
 
   #[test]
@@ -2534,8 +2548,9 @@ mod tests {
 
   #[test]
   fn lite_resolution_neither_claims_nor_repairs_the_workspace_row() {
-    // A stored override that would collide, and one that is not even a key.
-    for stored in ["Ctrl+N", "nonsense"] {
+    // A later row's default is not taken yet when the workspace row resolves,
+    // so this override is held; one that is not a key is dropped silently.
+    for (stored, held) in [("Ctrl+N", true), ("nonsense", false)] {
       let lite = resolve_in(
         &default_canonical(GLOBAL_STICKY_ID, OTHER),
         &map(&[("menu.workspace", stored)]),
@@ -2543,7 +2558,11 @@ mod tests {
         false,
       );
       assert!(lite.repaired.is_empty(), "{stored}");
-      assert_eq!(lite.overrides["menu.workspace"], stored);
+      assert_eq!(
+        lite.overrides.get("menu.workspace").map(String::as_str),
+        held.then_some(stored),
+        "{stored}"
+      );
       assert!(lite.accel("menu.workspace").is_none());
     }
     // Nor does its default key, when nothing is stored for it.
@@ -2554,6 +2573,28 @@ mod tests {
       false,
     );
     assert!(bare.accel("menu.workspace").is_none());
+  }
+
+  #[test]
+  fn lite_drops_an_invalid_workspace_override_for_its_default_silently() {
+    let global = default_canonical(GLOBAL_STICKY_ID, OTHER);
+    let default = normalize(&default_canonical("menu.workspace", OTHER), OTHER).unwrap();
+    // Not a key; a key without a modifier; a key the global row holds first.
+    for stored in ["nonsense", "K", global.as_str()] {
+      let lite = resolve_in(&global, &map(&[("menu.workspace", stored)]), OTHER, false);
+      assert!(!lite.overrides.contains_key("menu.workspace"), "{stored}");
+      assert_eq!(lite.hidden_workspace.as_ref(), Some(&default), "{stored}");
+      assert!(lite.repaired.is_empty(), "{stored}");
+      let next = plan_set(
+        &lite,
+        "menu.line-numbers",
+        Some(&default.canonical(OTHER)),
+        OTHER,
+      )
+      .unwrap_or_else(|e| panic!("{stored}: refused {}", e.code()));
+      assert_eq!(next.overrides["menu.workspace"], "", "{stored}");
+      assert!(back_in_full(&next).repaired.is_empty(), "{stored}");
+    }
   }
 
   #[test]
