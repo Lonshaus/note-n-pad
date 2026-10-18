@@ -969,6 +969,393 @@ describe('windowedConflictSaveAs success', () => {
     expect(tab.language).toBe('markdown');
   });
 });
+/** A promise the test settles by hand, to hold an invoke open. */
+function deferred<T>(): {
+  promise: Promise<T>;
+  resolve: (value: T) => void;
+  reject: (reason: unknown) => void;
+} {
+  let resolve: (value: T) => void = () => {};
+  let reject: (reason: unknown) => void = () => {};
+  const promise = new Promise<T>((res, rej) => {
+    resolve = res;
+    reject = rej;
+  });
+  return { promise, resolve, reject };
+}
+/** Let every already-resolved promise chain run. */
+function settle(): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, 0));
+}
+/** A viewer tab on `/tmp/big.log` (1000 bytes at open), the only active tab. */
+function pushViewerTab(id: string): DocTab {
+  documentWindow.tabs.length = 0;
+  documentWindow.saveFailed = null;
+  documentWindow.windowedConflict = null;
+  const tab = baseTab({ id, path: '/tmp/big.log', large: { size: 1000 } });
+  documentWindow.tabs.push(tab);
+  documentWindow.activeIndex = 0;
+  return tab;
+}
+const RESTORE: NonNullable<DocTab['windowedRestore']> = {
+  index: { checkpoints: [[0, 0]], total_newlines: 10 },
+  fingerprint: { size: 1000, mtime_ms: 1 },
+  digest: '1',
+  topLine: 0,
+  size: 1000,
+};
+// A large-file viewer has no buffer of its own: the generic save used to write
+// its empty `content` over the original file.
+describe('a large-file viewer never writes its empty buffer over the file', () => {
+  beforeEach(() => {
+    mockInvoke.mockReset();
+    mockInvoke.mockImplementation((() =>
+      Promise.resolve(null)) as typeof invoke);
+  });
+
+  it('saveActive on a viewer tab writes nothing and returns false', async () => {
+    documentWindow.tabs.length = 0;
+    documentWindow.saveFailed = null;
+    documentWindow.tabs.push(
+      baseTab({ id: 'h1-viewer-save', large: { size: 1000 } }),
+    );
+    documentWindow.activeIndex = 0;
+
+    expect(await documentWindow.saveActive()).toBe(false);
+
+    expect(mockInvoke).not.toHaveBeenCalledWith(
+      'write_file_encoded',
+      expect.anything(),
+    );
+    expect(documentWindow.saveFailed).toBeNull();
+  });
+
+  it('saveActive on a tab that only has windowedRestore writes nothing and returns false', async () => {
+    const reopen = deferred<object>();
+    mockInvoke.mockImplementation(((cmd: string) =>
+      cmd === 'windowed_reopen'
+        ? reopen.promise
+        : Promise.resolve(null)) as typeof invoke);
+    documentWindow.tabs.length = 0;
+    const tab = baseTab({ id: 'h1-restore-save', windowedRestore: RESTORE });
+    documentWindow.tabs.push(tab);
+    documentWindow.activeIndex = 0;
+
+    expect(await documentWindow.saveActive()).toBe(false);
+
+    expect(mockInvoke).not.toHaveBeenCalledWith(
+      'write_file_encoded',
+      expect.anything(),
+    );
+    reopen.reject('boom');
+    await vi.waitFor(() => {
+      expect(tab.windowedRestore).toBeUndefined();
+    });
+  });
+});
+
+describe('saveAs on a large-file viewer tab copies the original bytes', () => {
+  beforeEach(() => {
+    mockInvoke.mockReset();
+    mockInvoke.mockImplementation(((cmd: string) =>
+      Promise.resolve(
+        cmd === 'stat_file' ? { size: 1500 } : null,
+      )) as typeof invoke);
+  });
+
+  it('copies up to the size on disk now, not the size at open, and retargets the tab', async () => {
+    const tab = pushViewerTab('h1-copy');
+
+    expect(await documentWindow.saveAs('/tmp/copy.json')).toBe(true);
+
+    expect(mockInvoke).toHaveBeenCalledWith('stat_file', {
+      path: '/tmp/big.log',
+    });
+    expect(mockInvoke).toHaveBeenCalledWith('copy_range', {
+      path: '/tmp/big.log',
+      start: 0,
+      end: 1500,
+      dest: '/tmp/copy.json',
+    });
+    expect(mockInvoke).not.toHaveBeenCalledWith(
+      'write_file_encoded',
+      expect.anything(),
+    );
+    expect(tab.path).toBe('/tmp/copy.json');
+    expect(tab.language).toBe(detectByFilename('/tmp/copy.json'));
+    expect(tab.large?.size).toBe(1500);
+    expect(mockInvoke).toHaveBeenCalledWith(
+      'upsert_note',
+      expect.objectContaining({
+        note: expect.objectContaining({ file_path: '/tmp/copy.json' }),
+      }),
+    );
+    expect(mockInvoke).toHaveBeenCalledWith('add_recent_file', {
+      path: '/tmp/copy.json',
+    });
+  });
+
+  it('keeps an explicitly chosen language', async () => {
+    const tab = pushViewerTab('h1-copy-explicit');
+    tab.explicit = true;
+    tab.language = 'markdown';
+
+    await documentWindow.saveAs('/tmp/copy.json');
+
+    expect(tab.language).toBe('markdown');
+  });
+
+  it('reports a failed copy with the chosen path and keeps the tab on the original', async () => {
+    const tab = pushViewerTab('h1-copy-fail');
+    mockInvoke.mockImplementation(((cmd: string) => {
+      if (cmd === 'copy_range') {
+        return Promise.reject('No space left on device (os error 28)');
+      }
+      return Promise.resolve(cmd === 'stat_file' ? { size: 1500 } : null);
+    }) as typeof invoke);
+
+    expect(await documentWindow.saveAs('/tmp/copy.log')).toBe(false);
+
+    expect(documentWindow.saveFailed).toEqual({
+      path: '/tmp/copy.log',
+      error: 'No space left on device (os error 28)',
+    });
+    expect(tab.path).toBe('/tmp/big.log');
+    expect(tab.large?.size).toBe(1000);
+    expect(mockInvoke).not.toHaveBeenCalledWith(
+      'upsert_note',
+      expect.anything(),
+    );
+  });
+
+  it('succeeds without copying when the chosen path is the file itself', async () => {
+    const tab = pushViewerTab('h1-copy-same');
+
+    expect(await documentWindow.saveAs('/tmp/big.log')).toBe(true);
+
+    expect(mockInvoke).not.toHaveBeenCalledWith(
+      'copy_range',
+      expect.anything(),
+    );
+    expect(tab.path).toBe('/tmp/big.log');
+  });
+});
+
+describe('a large tab does one thing at a time (switching modes vs Save As)', () => {
+  const OPENED = {
+    session_id: 5,
+    total_bytes: 1000,
+    total_lines: 10,
+    fingerprint: { size: 1000, mtime_ms: 1 },
+  };
+
+  beforeEach(() => {
+    mockInvoke.mockReset();
+  });
+
+  it('Save As waits for an unlock in flight, then saves the edit session to the new path', async () => {
+    const open = deferred<object>();
+    mockInvoke.mockImplementation(((cmd: string) => {
+      switch (cmd) {
+        case 'windowed_open':
+          return open.promise;
+        case 'windowed_save':
+          return Promise.resolve(SAVED_AS);
+        case 'stat_file':
+          return Promise.resolve({ size: 1500 });
+        default:
+          return Promise.resolve(null);
+      }
+    }) as typeof invoke);
+    const tab = pushViewerTab('h1-unlock-then-saveas');
+
+    const unlocking = documentWindow.unlockLargeTab(0);
+    const saving = documentWindow.saveAs('/tmp/new.log');
+    await settle();
+
+    expect(mockInvoke).not.toHaveBeenCalledWith(
+      'copy_range',
+      expect.anything(),
+    );
+    expect(mockInvoke).not.toHaveBeenCalledWith(
+      'windowed_save',
+      expect.anything(),
+    );
+
+    open.resolve(OPENED);
+    expect(await unlocking).toBeNull();
+    expect(await saving).toBe(true);
+
+    expect(mockInvoke).toHaveBeenCalledWith('windowed_save', {
+      sessionId: 5,
+      expected: null,
+      pathOverride: '/tmp/new.log',
+    });
+    expect(mockInvoke).not.toHaveBeenCalledWith(
+      'copy_range',
+      expect.anything(),
+    );
+    expect(tab.path).toBe('/tmp/new.log');
+    expect(tab.windowed?.sessionId).toBe(5);
+  });
+
+  it('an unlock waits for a view-mode copy in flight, then opens the new path', async () => {
+    const copy = deferred<null>();
+    mockInvoke.mockImplementation(((cmd: string) => {
+      switch (cmd) {
+        case 'copy_range':
+          return copy.promise;
+        case 'windowed_open':
+          return Promise.resolve(OPENED);
+        case 'stat_file':
+          return Promise.resolve({ size: 1500 });
+        default:
+          return Promise.resolve(null);
+      }
+    }) as typeof invoke);
+    const tab = pushViewerTab('h1-saveas-then-unlock');
+
+    const saving = documentWindow.saveAs('/tmp/new.log');
+    await vi.waitFor(() => {
+      expect(mockInvoke).toHaveBeenCalledWith('copy_range', expect.anything());
+    });
+    const unlocking = documentWindow.unlockLargeTab(0);
+    await settle();
+
+    expect(mockInvoke).not.toHaveBeenCalledWith(
+      'windowed_open',
+      expect.anything(),
+    );
+
+    copy.resolve(null);
+    expect(await saving).toBe(true);
+    expect(await unlocking).toBeNull();
+
+    expect(mockInvoke).toHaveBeenCalledWith('windowed_open', {
+      path: '/tmp/new.log',
+    });
+    expect(tab.path).toBe('/tmp/new.log');
+    expect(tab.windowed?.sessionId).toBe(5);
+  });
+
+  it('a Save As queued behind an unlock does nothing once its tab is closed', async () => {
+    const open = deferred<object>();
+    mockInvoke.mockImplementation(((cmd: string) => {
+      switch (cmd) {
+        case 'windowed_open':
+          return open.promise;
+        case 'stat_file':
+          return Promise.resolve({ size: 1500 });
+        default:
+          return Promise.resolve(null);
+      }
+    }) as typeof invoke);
+    pushViewerTab('h1-unlock-then-close');
+    const unlocking = documentWindow.unlockLargeTab(0);
+    const saving = documentWindow.saveAs('/tmp/new.log');
+    await settle();
+    documentWindow.tabs.length = 0;
+    open.resolve(OPENED);
+    expect(await unlocking).toBeNull();
+    expect(await saving).toBe(false);
+    expect(mockInvoke).toHaveBeenCalledWith('windowed_close', {
+      sessionId: 5,
+    });
+    for (const cmd of [
+      'copy_range',
+      'windowed_save',
+      'upsert_note',
+      'add_recent_file',
+    ]) {
+      expect(mockInvoke).not.toHaveBeenCalledWith(cmd, expect.anything());
+    }
+  });
+
+  it('a viewer copy that finishes after its tab closed writes no record and starts no unlock', async () => {
+    const copy = deferred<null>();
+    mockInvoke.mockImplementation(((cmd: string) => {
+      switch (cmd) {
+        case 'copy_range':
+          return copy.promise;
+        case 'stat_file':
+          return Promise.resolve({ size: 1500 });
+        default:
+          return Promise.resolve(null);
+      }
+    }) as typeof invoke);
+    const tab = pushViewerTab('h1-copy-then-close');
+    const saving = documentWindow.saveAs('/tmp/new.log');
+    await vi.waitFor(() => {
+      expect(mockInvoke).toHaveBeenCalledWith('copy_range', expect.anything());
+    });
+    const unlocking = documentWindow.unlockLargeTab(0);
+    documentWindow.tabs.length = 0;
+    copy.resolve(null);
+    expect(await saving).toBe(true);
+    expect(await unlocking).toBeNull();
+    expect(tab.path).toBe('/tmp/big.log');
+    for (const cmd of ['upsert_note', 'add_recent_file', 'windowed_open']) {
+      expect(mockInvoke).not.toHaveBeenCalledWith(cmd, expect.anything());
+    }
+  });
+
+  it('Save As waits for a restore in flight, then saves the edit session to the new path', async () => {
+    const reopen = deferred<object>();
+    mockInvoke.mockImplementation(((cmd: string) => {
+      switch (cmd) {
+        case 'windowed_reopen':
+          return reopen.promise;
+        case 'windowed_save':
+          return Promise.resolve(SAVED_AS);
+        case 'stat_file':
+          return Promise.resolve({ size: 1500 });
+        default:
+          return Promise.resolve(null);
+      }
+    }) as typeof invoke);
+    documentWindow.tabs.length = 0;
+    documentWindow.saveFailed = null;
+    const tab = baseTab({
+      id: 'h1-restore-then-saveas',
+      windowedRestore: RESTORE,
+    });
+    documentWindow.tabs.push(tab);
+    // Becoming active starts the restore.
+    documentWindow.activeIndex = 0;
+    await vi.waitFor(() => {
+      expect(mockInvoke).toHaveBeenCalledWith(
+        'windowed_reopen',
+        expect.anything(),
+      );
+    });
+    // What the grace timer does when the reopen is slow: the viewer shows.
+    tab.large = { size: RESTORE.size };
+
+    const saving = documentWindow.saveAs('/tmp/new.log');
+    await settle();
+
+    expect(mockInvoke).not.toHaveBeenCalledWith(
+      'copy_range',
+      expect.anything(),
+    );
+
+    reopen.resolve({ ...OPENED, rescanned: false });
+    expect(await saving).toBe(true);
+
+    expect(mockInvoke).toHaveBeenCalledWith('windowed_save', {
+      sessionId: 5,
+      expected: null,
+      pathOverride: '/tmp/new.log',
+    });
+    expect(mockInvoke).not.toHaveBeenCalledWith(
+      'copy_range',
+      expect.anything(),
+    );
+    expect(tab.path).toBe('/tmp/new.log');
+    expect(tab.windowed?.sessionId).toBe(5);
+  });
+});
+
 // A failed `read_range`/`copy_range` used to be indistinguishable from a
 // successful extraction or a cancelled save (both were swallowed to the same
 // `null`/`false` the success/cancel paths already returned). These confirm
