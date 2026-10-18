@@ -50,6 +50,11 @@ export function keptTabsToLoad(
     )
     .sort((a, b) => a.tab_index - b.tab_index);
 }
+/** The first tab index above every stored tab of the group, kept ones included,
+ *  so a tab opened later never reuses a stored index. */
+export function nextTabIndex(entries: NoteSnapshot[]): number {
+  return entries.reduce((max, n) => Math.max(max, n.tab_index + 1), 0);
+}
 /** The stored tab a window takes its position and size from: the lowest-index
  *  one that is shown. A kept tab in lite is never written, so its bounds go
  *  stale; only a group of kept tabs alone falls back to the lowest overall.
