@@ -22,6 +22,7 @@
   } from './lib/util/viewModes';
   import LargeFileView from './lib/large/LargeFileView.svelte';
   import type { LargeStatus } from './lib/large/LargeFileView.svelte';
+  import RangeEditBox from './lib/large/RangeEditBox.svelte';
   import WindowedEditor from './lib/windowed/WindowedEditor.svelte';
   import StatusBar from './lib/StatusBar.svelte';
   import ConfirmModal from './lib/ConfirmModal.svelte';
@@ -81,9 +82,9 @@
     documentWindow,
     LARGE_EDIT_MAX,
     RANGE_SPLICED_EVENT,
-    rangeDisplayName,
     type DocTab,
   } from './lib/state/documentWindow.svelte';
+  import { CloseGate } from './lib/state/closeGate.svelte';
   import { READ_ONLY_DESTINATION } from './lib/util/protocol';
   import { fileName } from './lib/util/filePath';
   import { formatFileSize } from './lib/util/format';
@@ -124,26 +125,15 @@
   const startBlank = params.get('blank') === '1';
 
   let showModal = $state(false);
-  // The oversized gate is up: a dirty tab too large to snapshot must be saved or
-  // discarded first. Set by the quit or the window-close handshake.
-  let oversizedVisible = $state(false);
-  // What the oversized gate resumes once every offending tab is resolved: a quit
-  // (request_exit) or just closing this window (confirm_close). Non-reactive: it
-  // is only read inside the async handshake handlers right after being set.
-  let oversizedContinuation: 'quit' | 'close' = 'quit';
-  // Which condition is currently raising the gate: known-in-advance size
-  // ('oversized', `firstOversizedDirtyIndex`) or a snapshot write that was
-  // actually attempted and failed ('unwritable', `firstUnwritableDirtyIndex`).
-  // Drives the gate's message and its save action (see `promptOversized`).
-  let oversizedReason = $state<'oversized' | 'unwritable'>('oversized');
-  // Set once the app-level quit handshake starts (`flush-request`), cleared
-  // again if this or another window vetoes the quit (`flush-cancelled`). Not
-  // a one-way latch: `flush-request` only means the handshake *started*.
-  // While true, `close-flush-request` (a same-window OS close caught up in
-  // the same batch close) is ignored so the quit handshake — not this
-  // window's own self-destroy via `confirm_close` — owns the shutdown; a
-  // window racing both would never send `flush_ack`, stalling the quit.
-  let quitting = false;
+  // The gate before a quit, a window close or a tab close that would lose what no
+  // snapshot can carry; see CloseGate. Its host callbacks are function
+  // declarations below, so they are ready by the time a handshake runs.
+  const gate = new CloseGate(documentWindow, {
+    label: win.label,
+    finishWindowClose: () => finishWindowClose(),
+    finishTabClose: () => finishTabClose(),
+    focusWindow: () => win.setFocus(),
+  });
   // Set when a windowed apply/read fails: the editor has locked itself and the
   // message is shown so the divergence is visible rather than silent.
   let windowedError = $state<string | null>(null);
@@ -153,11 +143,7 @@
   let longLineActive = $state(false);
 
   const active = $derived(documentWindow.activeTab);
-  const title = $derived(
-    active
-      ? (rangeDisplayName(active) ?? tabName(active.path))
-      : t('doc.untitled'),
-  );
+  const title = $derived(active ? tabName(active.path) : t('doc.untitled'));
   const openIds = $derived(documentWindow.tabs.map((t) => t.id));
   // Whether the active tab renders through the ordinary editor.
   const activeOrdinary = $derived(
@@ -204,7 +190,7 @@
     const tabs = documentWindow.tabs.map((tb) =>
       tabReportEntry({
         tabIndex: tb.tabIndex,
-        name: rangeDisplayName(tb) ?? tabName(tb.path),
+        name: tabName(tb.path),
         path: tb.path,
         lineEnding: tb.lineEnding,
         encoding: tb.encoding,
@@ -346,16 +332,6 @@
       void win.destroy();
     }
   }
-  // Lite kept some of this window's stored tabs closed (see `keptTabs`); a
-  // window that has nothing else to show has nothing left once the notice is
-  // closed. The core brings the group back through `reopen_kept_groups`
-  // when the edition is full again.
-  async function onKeptTabsClose(): Promise<void> {
-    if (await documentWindow.dismissKeptTabsAndHoldBack()) {
-      void win.destroy();
-    }
-  }
-
   // Unlike the failed-open report above, the tab whose encoding change failed
   // stays open with its previous content — there is nothing to collapse.
   function onEncodingFailedClose(): void {
@@ -487,13 +463,10 @@
   const overlayShown = $derived(
     activeOrdinary && (showTable || showJson || showXml || showMarkdown),
   );
-  // The folder the Markdown preview may load images from: the document's own,
-  // and a range tab's real file is its source, not its (empty) `path`. Null
-  // for an unsaved tab, which gets no images at all.
+  // The folder the Markdown preview may load images from: the document's own.
+  // Null for an unsaved tab, which gets no images at all.
   const previewBaseDir = $derived(
-    showMarkdown && active !== null
-      ? dirOf(active.range?.sourcePath ?? active.path)
-      : null,
+    showMarkdown && active !== null ? dirOf(active.path) : null,
   );
   // The folder the core has confirmed for this webview. The preview waits for
   // it: an image requested before the registration lands is refused, and the
@@ -760,6 +733,9 @@
   function liveView(): EditorView | null {
     return activeOrdinary ? heldView : null;
   }
+  // The range edit box's CodeMirror view, supplied by RangeEditBox while it is
+  // open. The box is modal, so it takes the menu's edit, find and save actions.
+  let boxView: EditorView | null = null;
   // Path of a reveal that could not be carried out, awaiting the user's
   // acknowledgement. A tab outlives the file it was opened from, and a reveal
   // that quietly does nothing (or, on Windows, opens some unrelated folder) is
@@ -775,15 +751,14 @@
   // while one is open so a gate/confirm keeps the keyboard.
   const anyModalOpen = $derived(
     showModal ||
-      oversizedVisible ||
+      gate.visible ||
       pendingLarge !== null ||
       pendingLongLine !== null ||
       windowedError !== null ||
       documentWindow.openFailed !== null ||
       documentWindow.restoreUnreadable.length > 0 ||
-      documentWindow.keptTabs > 0 ||
       documentWindow.saveFailed !== null ||
-      documentWindow.rangeConflict !== null ||
+      documentWindow.rangeBox !== null ||
       documentWindow.windowedConflict !== null ||
       documentWindow.encodingFailed !== null ||
       revealFailed !== null ||
@@ -794,7 +769,9 @@
   // programmatically opened or restored window types without a click. Large
   // read-only viewer tabs have no editor to focus, so they are skipped.
   function focusActiveEditor(): void {
-    if (documentWindow.activeTab?.windowed !== undefined) {
+    if (documentWindow.rangeBox !== null) {
+      focusEditorIfIdle(boxView, false);
+    } else if (documentWindow.activeTab?.windowed !== undefined) {
       windowedRef?.focus();
     } else if (overlayShown) {
       focusEditorIfIdle({ focus: focusOverlay }, anyModalOpen);
@@ -1039,11 +1016,42 @@
       });
     }
   }
+  // The menu actions the open range edit box takes besides the edits: save
+  // writes it back, find drives its own editor. Everything else waits.
+  function runBoxAction(action: string): void {
+    const view = boxView;
+    switch (action) {
+      case 'save':
+        void documentWindow.rangeBoxSave();
+        break;
+      case 'find':
+      case 'find-replace':
+        if (view !== null) {
+          openSearchPanel(view);
+        }
+        break;
+      case 'find-next':
+        if (view !== null) {
+          findNext(view);
+        }
+        break;
+      case 'find-prev':
+        if (view !== null) {
+          findPrevious(view);
+        }
+        break;
+    }
+  }
 
   // Route a menu accelerator (emitted from the Rust menu to the focused window)
   // to its handler. Parameterized Format actions (set-line-ending / set-encoding
   // / set-language) carry their argument after a colon. Unknown actions ignored.
   function runMenuAction(action: string): void {
+    // The range edit box is modal: only the actions below act while it is open.
+    if (documentWindow.rangeBox !== null && !isEditAction(action)) {
+      runBoxAction(action);
+      return;
+    }
     const parsed = splitMenuAction(action);
     if (parsed !== null) {
       switch (parsed.command) {
@@ -1060,13 +1068,19 @@
       return;
     }
     if (isEditAction(action)) {
-      const view = liveView();
+      // Under the box the tab's own surface is out of reach; its edits go to
+      // the box's editor.
+      const boxOpen = documentWindow.rangeBox !== null;
+      const view = boxOpen ? boxView : liveView();
       const surface = editActionSurface(action, {
-        isTable: showTable,
-        isWindowed: active?.windowed !== undefined,
+        isTable: showTable && !boxOpen,
+        isWindowed: active?.windowed !== undefined && !boxOpen,
         hasEditorView: view !== null,
-        isOverlay: showJson || showXml || showMarkdown,
-        isViewer: active?.large !== undefined && active.windowed === undefined,
+        isOverlay: (showJson || showXml || showMarkdown) && !boxOpen,
+        isViewer:
+          active?.large !== undefined &&
+          active.windowed === undefined &&
+          !boxOpen,
         fieldFocused: isNativeUndoField(document.activeElement),
         modalOpen: isModalOpen(),
       });
@@ -1192,7 +1206,13 @@
     if (tab === null) {
       return;
     }
-    if (documentWindow.isDirty(tab)) {
+    // An edit box with changes must be dealt with before its tab goes.
+    if (
+      documentWindow.rangeBox?.tabId === tab.id &&
+      documentWindow.rangeBoxDirty()
+    ) {
+      void gate.promptTabClose();
+    } else if (documentWindow.isDirty(tab)) {
       showModal = true;
     } else {
       void finishTabClose();
@@ -1231,65 +1251,6 @@
     await documentWindow.dropClosedTabs(win.label);
     await invoke('confirm_close', { label: win.label });
   }
-  // Oversized gate. A dirty tab too large to snapshot cannot be restored after
-  // the window goes away, so the quit and window-close handshakes raise this
-  // gate instead of silently dropping the edits. Save/discard walk the offending
-  // tabs one at a time; once none remain the pending action resumes — a quit via
-  // `request_exit`, or just closing this window via `confirm_close`. Cancel
-  // leaves everything as-is (a quit is already vetoed; a close was prevented).
-  async function promptOversized(): Promise<void> {
-    const blocking = documentWindow.firstBlockingDirty();
-    if (blocking === null) {
-      oversizedVisible = false;
-      if (oversizedContinuation === 'close') {
-        await finishWindowClose();
-      } else {
-        await invoke('request_exit');
-      }
-      return;
-    }
-    await documentWindow.switchTo(blocking.index);
-    oversizedReason = blocking.oversized ? 'oversized' : 'unwritable';
-    oversizedVisible = true;
-    // The gate may belong to a background window (quit asks every window at
-    // once); raise it or the user sees no reaction to their quit at all.
-    await win.setFocus();
-  }
-
-  async function oversizedSave(): Promise<void> {
-    // The oversized gate resaves in place (a dialog only for an untitled tab).
-    // A write-failure gate always prompts Save As: the failure is in the
-    // snapshot folder, a different location from the tab's own file, but
-    // forcing an explicit new target is the safer default when a location was
-    // just proven unwritable.
-    const saved =
-      oversizedReason === 'unwritable'
-        ? await documentWindow.saveAs()
-        : await documentWindow.saveActive();
-    // A cancelled or failed save leaves the tab unsaved; dismiss the gate (the
-    // quit is already vetoed, so the app simply stays open).
-    if (!saved) {
-      oversizedVisible = false;
-      return;
-    }
-    await promptOversized();
-  }
-
-  async function oversizedDiscard(): Promise<void> {
-    // A windowed tab's dirtiness lives in its Rust session, so a plain buffer
-    // reset would not clear it (leaving the quit gate stuck); reopen the session
-    // at the on-disk baseline instead.
-    if (documentWindow.activeTab?.windowed !== undefined) {
-      await documentWindow.discardWindowedActive();
-    } else {
-      documentWindow.discardChanges(documentWindow.activeIndex);
-    }
-    await promptOversized();
-  }
-
-  function oversizedCancel(): void {
-    oversizedVisible = false;
-  }
 
   onMount(() => {
     const unlistenTheme = settingsState.listen();
@@ -1308,13 +1269,7 @@
       });
     };
     void editionState.ready().then(pushMenuLists);
-    const offEdition = editionState.onChanged((lite) => {
-      pushMenuLists();
-      // The edition turned full: tabs this window kept in lite come back.
-      if (!lite) {
-        void documentWindow.restoreKeptTabs();
-      }
-    });
+    const offEdition = editionState.onChanged(pushMenuLists);
     // Reveal the window only after the theme is loaded and applied, so a
     // dark-theme window never flashes its default white background. File
     // content is loaded separately below and paints onto the themed surface.
@@ -1387,6 +1342,13 @@
       // macOS: the menu does not fire while an IME composes; save anyway and
       // leave the composition running, as TextEdit does.
       if (platform.isMacOS && isSaveKey(e)) {
+        if (documentWindow.rangeBox !== null) {
+          if (boxView?.composing === true) {
+            e.preventDefault();
+            void documentWindow.rangeBoxSave();
+          }
+          return;
+        }
         if (liveView()?.composing === true) {
           e.preventDefault();
           void documentWindow.saveActive();
@@ -1399,6 +1361,10 @@
           void windowed.applied().then(() => documentWindow.saveActive());
           return;
         }
+      }
+      // The box covers the tab bar: the tabs stay as they are until it closes.
+      if (documentWindow.rangeBox !== null) {
+        return;
       }
       const next = shortcutsState.accel('window.next-tab');
       const prev = shortcutsState.accel('window.prev-tab');
@@ -1427,28 +1393,9 @@
     // them), then the backend destroys the window. A dirty tab too large to
     // snapshot cannot ride along, so it raises the same gate quit uses; here the
     // gate resumes by closing the window instead of quitting.
-    const unlistenCloseFlush = win.listen('close-flush-request', async () => {
-      if (quitting) {
-        // A quit handshake already owns this window's shutdown (see
-        // `quitting`'s comment); let it finish instead of racing it through
-        // `confirm_close`.
-        return;
-      }
-      if (documentWindow.firstOversizedDirtyIndex() !== -1) {
-        oversizedContinuation = 'close';
-        await promptOversized();
-        return;
-      }
-      await documentWindow.flushAll();
-      // A snapshot write failure is only discovered by attempting it; check
-      // right after the attempt, same gate as the oversized case above.
-      if (documentWindow.firstUnwritableDirtyIndex() !== -1) {
-        oversizedContinuation = 'close';
-        await promptOversized();
-        return;
-      }
-      await finishWindowClose();
-    });
+    const unlistenCloseFlush = win.listen('close-flush-request', () =>
+      gate.onCloseFlushRequest(),
+    );
     const unlistenMoved = win.onMoved(() => captureBounds());
     const unlistenResized = win.onResized(() => captureBounds());
 
@@ -1512,35 +1459,15 @@
 
     // Quit handshake: flush every dirty tab, then ack. Quit stays silent;
     // restore reopens unsaved tabs afterward.
-    const unlistenFlush = win.listen('flush-request', async () => {
-      quitting = true;
-      // A dirty tab too large to snapshot cannot be silently restored after
-      // quit; veto this quit right away (before the handshake times out and
-      // exits anyway) and make the user save or discard it first.
-      if (documentWindow.firstOversizedDirtyIndex() !== -1) {
-        oversizedContinuation = 'quit';
-        await invoke('flush_cancel');
-        await promptOversized();
-        return;
-      }
-      await documentWindow.flushAll();
-      // A snapshot write failure is only discovered by attempting it, so this
-      // check can only happen after the flush above — a dirty tab whose write
-      // just failed cannot be silently restored after quit either.
-      if (documentWindow.firstUnwritableDirtyIndex() !== -1) {
-        oversizedContinuation = 'quit';
-        await invoke('flush_cancel');
-        await promptOversized();
-        return;
-      }
-      await invoke('flush_ack', { label: win.label });
-    });
+    const unlistenFlush = win.listen('flush-request', () =>
+      gate.onFlushRequest(),
+    );
     // Companion to `flush-request`: emitted when any window (this one or
     // another) vetoes the quit. The handshake never completes, so undo the
     // latch — `close-flush-request` must work normally again afterward.
-    const unlistenFlushCancelled = win.listen('flush-cancelled', () => {
-      quitting = false;
-    });
+    const unlistenFlushCancelled = win.listen('flush-cancelled', () =>
+      gate.onFlushCancelled(),
+    );
 
     window.addEventListener('keydown', onKeydown);
     // A tab switch waits for the active editor's IME composition to end.
@@ -1692,22 +1619,22 @@
           largeRangeEdit: () => largeRef?.largeRangeEdit(),
           largeRangeSaveAs: (path: string) =>
             largeRef?.largeRangeSaveAs(path) ?? Promise.resolve(false),
-          isRangeTab: () => documentWindow.isRangeTab(),
-          rangeInfo: () => documentWindow.rangeInfo(),
-          rangeSave: () => documentWindow.rangeSave(),
+          rangeBoxVisible: () => documentWindow.rangeBox !== null,
+          rangeBoxInfo: () => documentWindow.rangeBoxInfo(),
+          rangeBoxDirty: () => documentWindow.rangeBoxDirty(),
+          rangeBoxSave: () => documentWindow.rangeBoxSave(),
+          rangeBoxCancel: () => documentWindow.rangeBoxCancel(),
           rangeConflictVisible: () => documentWindow.rangeConflictVisible(),
           rangeConflictForce: () => documentWindow.rangeConflictForce(),
           rangeConflictSaveAs: (path: string) =>
             documentWindow.rangeConflictSaveAs(path),
+          rangeConflictCancel: () => documentWindow.rangeConflictCancel(),
           windowedConflictSaveAs: (path: string) =>
             documentWindow.windowedConflictSaveAs(path),
-          rangeConflictCancel: () => documentWindow.rangeConflictCancel(),
-          rangeSaveAsBytes: (path: string) =>
-            documentWindow.saveRangeBytes(path),
-          oversizedGateVisible: () => oversizedVisible,
-          oversizedGateSave: () => oversizedSave(),
-          oversizedGateDiscard: () => oversizedDiscard(),
-          oversizedGateCancel: () => oversizedCancel(),
+          oversizedGateVisible: () => gate.visible,
+          oversizedGateSave: () => gate.save(),
+          oversizedGateDiscard: () => gate.discard(),
+          oversizedGateCancel: () => gate.cancel(),
           windowedOpen: (path: string) => documentWindow.openWindowedTab(path),
           isWindowedTab: () => documentWindow.isWindowedTab(),
           windowedRestoreRescanned: () =>
@@ -1816,9 +1743,7 @@
             </svg>
           </span>
         {/if}
-        <span class="tab-name"
-          >{rangeDisplayName(tab) ?? tabName(tab.path)}</span
-        >
+        <span class="tab-name">{tabName(tab.path)}</span>
         {#if documentWindow.isDirty(tab)}
           <span class="tab-dirty" title={t('doc.tab.unsaved')}>•</span>
         {/if}
@@ -1980,7 +1905,7 @@
           onextract={(info) => {
             const active = documentWindow.activeTab;
             return active !== null
-              ? documentWindow.createRangeTab(active.path, info)
+              ? documentWindow.openRangeBox(active, info)
               : Promise.resolve(null);
           }}
           onsaverange={(info) => {
@@ -2115,6 +2040,23 @@
     />
   {/if}
 
+  {#if documentWindow.rangeBox !== null}
+    <RangeEditBox
+      box={documentWindow.rangeBox}
+      dark={settingsState.isDark}
+      fontSize={settingsState.editorFontSize}
+      fontFamily={settingsState.editorFontFamily}
+      wordWrap={settingsState.editorWordWrap}
+      lineNumbers={settingsState.editorLineNumbers}
+      onchange={(content) => documentWindow.rangeBoxEdited(content)}
+      onsave={async () => {
+        await documentWindow.rangeBoxSave();
+      }}
+      oncancel={() => documentWindow.rangeBoxCancel()}
+      onview={(v) => (boxView = v)}
+    />
+  {/if}
+
   {#if showModal}
     <ConfirmModal
       message={t('dialog.saveBeforeClose')}
@@ -2148,16 +2090,6 @@
       })}
       cancelLabel={t('common.close')}
       oncancel={onRestoreUnreadableClose}
-    />
-  {/if}
-
-  {#if documentWindow.keptTabs > 0}
-    <!-- Report only: nothing was lost, the tabs are simply not opened by this
-         edition. Their stored copies, unsaved edits included, are untouched. -->
-    <ConfirmModal
-      message={t('doc.keptTabs', { count: documentWindow.keptTabs })}
-      cancelLabel={t('common.close')}
-      oncancel={onKeptTabsClose}
     />
   {/if}
 
@@ -2230,7 +2162,7 @@
     />
   {/if}
 
-  {#if documentWindow.rangeConflict !== null}
+  {#if documentWindow.rangeBox?.conflict === true}
     <ConfirmModal
       message={t('doc.rangeConflict.message')}
       primaryLabel={t('doc.conflict.writeAnyway')}
@@ -2274,23 +2206,25 @@
     </div>
   {/if}
 
-  {#if oversizedVisible}
+  {#if gate.visible}
     <ConfirmModal
       message={t(
-        oversizedReason === 'unwritable'
-          ? 'doc.snapshotFailed.message'
-          : 'doc.oversized.message',
+        gate.reason === 'rangeBox'
+          ? 'doc.rangeBox.unsaved'
+          : gate.reason === 'unwritable'
+            ? 'doc.snapshotFailed.message'
+            : 'doc.oversized.message',
       )}
       primaryLabel={t('common.save')}
       secondaryLabel={t('doc.oversized.discard')}
       cancelLabel={t('common.cancel')}
       onprimary={async () => {
-        await oversizedSave();
+        await gate.save();
       }}
       onsecondary={async () => {
-        await oversizedDiscard();
+        await gate.discard();
       }}
-      oncancel={oversizedCancel}
+      oncancel={() => gate.cancel()}
     />
   {/if}
 

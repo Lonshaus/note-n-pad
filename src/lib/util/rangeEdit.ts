@@ -1,23 +1,10 @@
 // Copyright © 2026 Lonshaus
 // SPDX-License-Identifier: GPL-3.0-only
-/** Pure helpers for pulling a line range out of the large-file viewer into an
- *  editable tab: byte-range assembly and the size ceiling. Kept free of
+/** Pure helpers for pulling a line range out of the large-file viewer into the
+ *  range edit box: byte-range assembly and the size ceiling. Kept free of
  *  Svelte/Tauri so they are unit-testable in isolation. */
 import { applyLineEnding, type LineEnding } from './text';
-
-/** UTF-8 byte length of a range tab's buffer once its line ending is re-applied.
- *  This is exactly what `splice_file` writes back (the replacement is UTF-8), so
- *  `startByte + this` is the slice's new exclusive end after a successful splice.
- *  The line ending must be restored first: a CRLF source needs its `\r` bytes
- *  counted, or the rebased end would be short by one byte per line. */
-export function replacementByteLength(
-  content: string,
-  ending: LineEnding,
-): number {
-  return new TextEncoder().encode(applyLineEnding(content, ending)).length;
-}
-
-/** Largest range (in bytes) that may be pulled into an editable tab. A slice this
+/** Largest range (in bytes) that may be pulled into the edit box. A slice this
  *  big is loaded whole into the editor, so allowing more would blow the WebView's
  *  memory and defeat the streaming viewer; extraction above it is refused. */
 export const RANGE_EDIT_MAX = 32 * 1024 * 1024;
@@ -35,7 +22,7 @@ export function resolveByteRange(
   return { startByte: startOffset, endByte: endOffset ?? fileSize };
 }
 
-/** Whether a byte range is small enough to extract into an editable tab. */
+/** Whether a byte range is small enough to extract into the edit box. */
 export function rangeWithinLimit(
   startByte: number,
   endByte: number,
@@ -47,7 +34,7 @@ export function rangeWithinLimit(
 export function sliceEndsWithBreak(slice: string): boolean {
   return slice.endsWith('\n');
 }
-/** The text a range tab writes back into its source. A slice that ended with a
+/** The text the range edit box writes back into its source. A slice that ended with a
  *  line break (`trailingBreak`) gets one in the file's line ending when the
  *  buffer is not empty and does not already end with one, so text typed on the
  *  buffer's last line cannot join the next source line. An empty buffer writes

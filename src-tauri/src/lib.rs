@@ -2710,13 +2710,14 @@ pub fn run() {
           (NoteStore::empty(dir), Vec::new(), false)
         }
       };
+      // A clean range tab of an earlier version has nothing to restore.
+      note_store::drop_clean_range_records(&store);
       let notes = store.list();
       app.manage(store);
       // Snapshots are loaded before any window exists, so anything skipped is
       // held here until the report window asks for it.
       let had_snapshot_skips = !snapshot_skips.is_empty();
       app.manage(note_store::StartupSkips::holding(snapshot_skips));
-      app.manage(note_store::HeldBackGroups::default());
       // Grants must be live before any window reads a restored path.
       match handle.path().app_data_dir() {
         Ok(app_data) => {
@@ -2750,10 +2751,9 @@ pub fn run() {
       let store = app.state::<NoteStore>();
       // The edition decides which features exist, so it is settled before the
       // first window, menu or Jump List is built (and a window's first
-      // `edition_info` can never read the lite initial value), and before the
-      // snapshot migration below, which must leave a lite-kept tab alone.
+      // `edition_info` can never read the lite initial value).
       edition::init(handle);
-      note_store::migrate_group_less_documents(&store, &notes, edition::is_lite());
+      note_store::migrate_group_less_documents(&store, &notes);
       // Restore windows: one per sticky, one per document group. Nothing in here
       // may propagate: this runs inside `setup`, whose error is unwrapped by the
       // `.expect` on `build()` below, so one window that refuses to build would
@@ -2769,7 +2769,7 @@ pub fn run() {
         }
       }
       let mut restored_docs: Vec<String> = Vec::new();
-      for plan in note_store::plan_document_windows(&notes, edition::is_lite()) {
+      for plan in note_store::plan_document_windows(&notes) {
         match windows::create_document_window(handle, &plan, None) {
           Ok(()) => {
             opened += 1;
@@ -2877,7 +2877,6 @@ pub fn run() {
       encoding::write_file_encoded,
       note_store::list_notes,
       note_store::take_startup_skips,
-      note_store::hold_back_group,
       windows::show_load_problems_window,
       data_files::delete_data_file,
       data_files::reveal_data_file,

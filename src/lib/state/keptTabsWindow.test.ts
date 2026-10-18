@@ -1,9 +1,11 @@
 // Copyright © 2026 Lonshaus
 // SPDX-License-Identifier: GPL-3.0-only
-// The Lite edition's tab rules, driven through the real window state against a
-// fake backend: a tab that needs a removed feature is kept (not opened, its
-// record never written, rewritten or deleted), a file over 100 MB opens in the
-// ordinary editor, and everything returns once the edition is full.
+// How a window restores its stored tabs in each edition, driven through the
+// real window state against a fake backend: the trial has no large-file viewer
+// or windowed editing, so those records restore as ordinary tabs of their file
+// and are written again as such; a range tab of an earlier version restores as
+// an untitled tab (or is dropped when it holds nothing); a file over 100 MB
+// opens in the ordinary editor in the trial.
 
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { Text } from '@codemirror/state';
@@ -98,7 +100,6 @@ const stored = [
     range_trailing_break: null,
   }),
 ];
-const KEPT_IDS = ['large', 'windowed', 'range'];
 
 /** Commands that touch a stored record. */
 const WRITES = ['upsert_note', 'delete_note', 'drop_closed_tabs'];
@@ -191,7 +192,6 @@ beforeEach(() => {
   readySpy = vi.spyOn(editionState, 'ready').mockResolvedValue();
   documentWindow.tabs.length = 0;
   documentWindow.ready = false;
-  documentWindow.keptTabs = 0;
   documentWindow.restoreUnreadable = [];
   documentWindow.activeIndex = 0;
 });
@@ -210,230 +210,220 @@ describe('opensInLargeViewer', () => {
   });
 });
 
-describe('a lite window restoring a group that holds kept tabs', () => {
-  it('opens only the ordinary tab and counts the rest', async () => {
+/** The record each `upsert_note` wrote for `id`, in order. */
+function upsertsOf(id: string): NoteSnapshot[] {
+  return mockInvoke.mock.calls
+    .filter(([cmd]) => cmd === 'upsert_note')
+    .map(([, args]) => (args as { note: NoteSnapshot }).note)
+    .filter((n) => n.id === id);
+}
+
+function attempted(): string[] {
+  return mockInvoke.mock.calls.map(([cmd]) => cmd);
+}
+
+describe('restoring large-file records in the trial', () => {
+  const tab = (id: string): DocTab | undefined =>
+    documentWindow.tabs.find((t) => t.id === id);
+
+  it('opens a large-viewer and a windowed record as ordinary tabs of their file', async () => {
     editionState.lite = true;
     backend();
     await documentWindow.init('g', null, null);
 
-    expect(documentWindow.tabs.map((t) => t.id)).toEqual(['plain']);
-    expect(documentWindow.keptTabs).toBe(3);
+    for (const [id, path] of [
+      ['large', '/tmp/big.log'],
+      ['windowed', '/tmp/win.log'],
+    ] as const) {
+      const restored = tab(id)!;
+      expect(restored.path).toBe(path);
+      expect(restored.large).toBeUndefined();
+      expect(restored.windowed).toBeUndefined();
+      expect(restored.windowedRestore).toBeUndefined();
+      expect(restored.content.toString()).toBe('disk text');
+      expect(documentWindow.isDirty(restored)).toBe(false);
+    }
     // Nothing for a removed feature was even attempted.
-    const attempted = mockInvoke.mock.calls.map(([cmd]) => cmd);
-    for (const cmd of ['read_range', 'windowed_reopen', 'stat_file']) {
-      expect(attempted).not.toContain(cmd);
+    for (const cmd of ['stat_file', 'windowed_reopen', 'read_range']) {
+      expect(attempted()).not.toContain(cmd);
     }
   });
 
-  it('never writes, rewrites or deletes a kept record, whatever the window does', async () => {
+  it('writes each record again at once, as an ordinary one', async () => {
     editionState.lite = true;
     backend();
     await documentWindow.init('g', null, null);
-    documentWindow.updateActiveContent(Text.of(['edited']));
 
-    await documentWindow.flushAll();
-    documentWindow.setBounds(1, 2, 300, 200);
-    await documentWindow.dropClosedTabs('doc-g');
-    await documentWindow.deleteTab(0);
-    await documentWindow.dropClosedTabs('doc-g');
-    // The ordinary tab was written and deleted as always, so this is not vacuous.
-    expect(writesTo(['plain']).length).toBeGreaterThan(0);
-    expect(writesTo(KEPT_IDS)).toEqual([]);
+    for (const id of ['large', 'windowed']) {
+      const written = upsertsOf(id);
+      expect(written).toHaveLength(1);
+      expect(written[0]).toMatchObject({
+        large: null,
+        windowed_index: null,
+        windowed_fp_size: null,
+        windowed_fp_mtime: null,
+        windowed_digest: null,
+        windowed_top_line: null,
+        file_path: id === 'large' ? '/tmp/big.log' : '/tmp/win.log',
+      });
+    }
+    // A record that was already ordinary is not touched.
+    expect(upsertsOf('plain')).toEqual([]);
   });
 
-  it('keeps counting from the highest stored index so a new tab cannot collide', async () => {
-    editionState.lite = true;
-    backend();
-    await documentWindow.init('g', null, null);
-    await documentWindow.newTab();
-    expect(documentWindow.tabs.at(-1)?.tabIndex).toBe(4);
-  });
-
-  it('opens every tab in full', async () => {
+  it('leaves them as they were in full: the viewer, and a windowed tab still to reopen', async () => {
     editionState.lite = false;
     backend();
     await documentWindow.init('g', null, null);
-    expect(documentWindow.tabs.map((t) => t.id)).toEqual([
-      'plain',
-      'large',
-      'windowed',
-      'range',
-    ]);
-    expect(documentWindow.keptTabs).toBe(0);
+
+    expect(tab('large')?.large).toEqual({ size: SIZE });
+    expect(tab('windowed')?.windowedRestore).toBeDefined();
+    expect(writesTo(['large', 'windowed'])).toEqual([]);
   });
 
-  it('shows no active tab but still counts when every tab is kept', async () => {
+  it('adopts an orphaned large record as an ordinary tab, and writes it again', async () => {
     editionState.lite = true;
     backend({
-      list_notes: stored.filter((n) => KEPT_IDS.includes(n.id)),
+      list_notes: [
+        note({
+          id: 'orphan',
+          window_group: 'dead',
+          file_path: '/tmp/big.log',
+          large: SIZE,
+        }),
+      ],
     });
+    await settingsState.init();
     await documentWindow.init('g', null, null);
-    expect(documentWindow.tabs).toEqual([]);
-    expect(documentWindow.keptTabs).toBe(3);
-    expect(writesTo(KEPT_IDS)).toEqual([]);
+    await documentWindow.openTab('/tmp/big.log');
+
+    expect(documentWindow.tabs.map((t) => t.id)).toEqual(['orphan']);
+    expect(tab('orphan')?.large).toBeUndefined();
+    expect(upsertsOf('orphan').at(-1)).toMatchObject({
+      large: null,
+      window_group: 'g',
+    });
+    expect(attempted()).not.toContain('stat_file');
   });
 });
 
-describe('the edition turning full', () => {
-  it('opens the kept tabs in stored order, the range tab with its unsaved edits', async () => {
-    editionState.lite = true;
-    backend();
+// A range is an edit box over its viewer tab now. A range tab an earlier
+// version stored restores as an untitled tab holding the edited slice, or is
+// dropped when it held nothing.
+describe.each([
+  ['full', false],
+  ['the trial', true],
+])('restoring an old range record in %s', (_name, lite) => {
+  const dirtyRange = note({
+    id: 'range',
+    tab_index: 1,
+    file_path: '',
+    dirty: true,
+    content: 'edited\nslice',
+    line_ending: 'CRLF',
+    range_source: '/tmp/big.log',
+    range_start: 0,
+    range_end: 10,
+    range_fp_size: SIZE,
+    range_fp_mtime: 1,
+    range_start_line: 1,
+    range_end_line: 2,
+    range_trailing_break: true,
+  });
+  const cleanRange = { ...dirtyRange, id: 'clean', tab_index: 2, dirty: false };
+
+  it('with edits opens an untitled dirty tab holding the stored text', async () => {
+    editionState.lite = lite;
+    backend({ list_notes: [note({ id: 'plain' }), dirtyRange] });
     await documentWindow.init('g', null, null);
-    expect(documentWindow.tabs).toHaveLength(1);
 
-    editionState.lite = false;
-    await documentWindow.restoreKeptTabs();
+    const restored = documentWindow.tabs.find((t) => t.id === 'range')!;
+    expect(restored.path).toBe('');
+    expect(restored.content.toString()).toBe('edited\nslice');
+    expect(restored.lineEnding).toBe('CRLF');
+    expect(documentWindow.isDirty(restored)).toBe(true);
+    expect(restored.readOnlyFile).toBe(false);
+    // The source is not read, nor is anything written back to it.
+    expect(attempted()).not.toContain('read_range');
+    expect(attempted()).not.toContain('splice_file');
+  });
 
-    expect(documentWindow.tabs.map((t) => t.id)).toEqual([
-      'plain',
-      'large',
-      'windowed',
-      'range',
-    ]);
-    expect(documentWindow.keptTabs).toBe(0);
-    const range = documentWindow.tabs.find((t) => t.id === 'range')!;
-    expect(range.content.toString()).toBe('unsaved edit');
-    expect(range.range?.sourcePath).toBe('/tmp/big.log');
-    expect(documentWindow.tabs.find((t) => t.id === 'large')?.large).toEqual({
-      size: SIZE,
+  it('with edits is written again with no range in it', async () => {
+    editionState.lite = lite;
+    backend({ list_notes: [note({ id: 'plain' }), dirtyRange] });
+    await documentWindow.init('g', null, null);
+
+    const written = upsertsOf('range');
+    expect(written).toHaveLength(1);
+    expect(written[0]).toMatchObject({
+      file_path: '',
+      content: 'edited\nslice',
+      dirty: true,
+      line_ending: 'CRLF',
+      range_source: null,
+      range_start: null,
+      range_end: null,
+      range_fp_size: null,
+      range_fp_mtime: null,
+      range_start_line: null,
+      range_end_line: null,
+      range_trailing_break: null,
     });
-    expect(
-      documentWindow.tabs.find((t) => t.id === 'windowed')?.windowedRestore,
-    ).toBeDefined();
-    // Reading a record back is all it took.
-    expect(writesTo(KEPT_IDS)).toEqual([]);
   });
 
-  it('does nothing while still lite, and a second call opens nothing twice', async () => {
-    editionState.lite = true;
-    backend();
+  it('with nothing unsaved is deleted and opens no tab', async () => {
+    editionState.lite = lite;
+    backend({ list_notes: [note({ id: 'plain' }), cleanRange] });
     await documentWindow.init('g', null, null);
-    await documentWindow.restoreKeptTabs();
-    expect(documentWindow.tabs).toHaveLength(1);
-    expect(documentWindow.keptTabs).toBe(3);
 
-    editionState.lite = false;
-    await documentWindow.restoreKeptTabs();
-    await documentWindow.restoreKeptTabs();
-    expect(documentWindow.tabs).toHaveLength(4);
+    expect(documentWindow.tabs.map((t) => t.id)).toEqual(['plain']);
+    expect(mockInvoke).toHaveBeenCalledWith('delete_note', { id: 'clean' });
+    expect(upsertsOf('clean')).toEqual([]);
+    expect(documentWindow.restoreUnreadable).toEqual([]);
   });
 
-  it('keeps the tab the user was on', async () => {
-    editionState.lite = true;
-    backend();
+  it('with nothing unsaved leaves a window of such records without tabs', async () => {
+    editionState.lite = lite;
+    backend({ list_notes: [cleanRange] });
     await documentWindow.init('g', null, null);
-    editionState.lite = false;
-    await documentWindow.restoreKeptTabs();
-    expect(documentWindow.activeTab?.id).toBe('plain');
-  });
 
-  it('opens a window that held only kept tabs', async () => {
-    editionState.lite = true;
-    const onlyKept = stored.filter((n) => KEPT_IDS.includes(n.id));
-    backend({ list_notes: onlyKept });
-    await documentWindow.init('g', null, null);
     expect(documentWindow.tabs).toEqual([]);
+    expect(mockInvoke).toHaveBeenCalledWith('delete_note', { id: 'clean' });
+    expect(documentWindow.ready).toBe(true);
+  });
 
-    editionState.lite = false;
-    await documentWindow.restoreKeptTabs();
-    expect(documentWindow.tabs.map((t) => t.id)).toEqual([
-      'large',
-      'windowed',
-      'range',
-    ]);
-    expect(documentWindow.activeTab?.id).toBe('large');
+  it('keeps the tab the user was on, whatever tabs were dropped before it', async () => {
+    editionState.lite = lite;
+    backend({
+      list_notes: [
+        { ...cleanRange, tab_index: 0 },
+        note({ id: 'a', tab_index: 1, file_path: '/tmp/a.txt' }),
+        note({ id: 'b', tab_index: 2, file_path: '/tmp/b.txt' }),
+      ],
+    });
+    await documentWindow.init('g', null, null, 2);
+    expect(documentWindow.activeTab?.id).toBe('b');
   });
 });
 
-describe('a lite window taking its bounds', () => {
+describe('a window taking its bounds', () => {
   const bounds = (): { x: number | null } =>
     (documentWindow as unknown as { bounds: { x: number | null } }).bounds;
 
-  it('from the lowest shown tab, not a kept record before it', async () => {
-    editionState.lite = true;
-    backend({
-      list_notes: [
-        note({ id: 'kept', tab_index: 0, x: 10, large: SIZE }),
-        note({ id: 'shown', tab_index: 1, x: 900 }),
-      ],
-    });
-    await documentWindow.init('g', null, null);
-    expect(bounds().x).toBe(900);
-  });
-
-  it('from the lowest record when every tab is kept', async () => {
-    editionState.lite = true;
-    backend({
-      list_notes: [
-        note({ id: 'kept2', tab_index: 3, x: 500, large: SIZE }),
-        note({ id: 'kept', tab_index: 0, x: 10, large: SIZE }),
-      ],
-    });
-    await documentWindow.init('g', null, null);
-    expect(bounds().x).toBe(10);
-  });
-
-  it('from the lowest record in full', async () => {
-    editionState.lite = false;
-    backend({
-      list_notes: [
-        note({ id: 'kept', tab_index: 0, x: 10, large: SIZE }),
-        note({ id: 'shown', tab_index: 1, x: 900 }),
-      ],
-    });
-    await documentWindow.init('g', null, null);
-    expect(bounds().x).toBe(10);
-  });
-});
-// A group is held back for the trial from one place only: dismissing the
-// kept-tabs notice of a window that has nothing else to show.
-describe('holding a group back for the trial', () => {
-  const heldBack = (): unknown[][] =>
-    mockInvoke.mock.calls.filter(([cmd]) => cmd === 'hold_back_group');
-
-  it('invokes hold_back_group before resolving true when only kept tabs were there', async () => {
-    editionState.lite = true;
-    backend({
-      list_notes: stored.filter((n) => KEPT_IDS.includes(n.id)),
-    });
-    await documentWindow.init('g', null, null);
-    expect(documentWindow.keptTabs).toBe(3);
-
-    expect(await documentWindow.dismissKeptTabsAndHoldBack()).toBe(true);
-    expect(heldBack()).toEqual([['hold_back_group', { group: 'g' }]]);
-    expect(documentWindow.keptTabs).toBe(0);
-  });
-
-  it('does not invoke it and resolves false when tabs remain', async () => {
-    editionState.lite = true;
-    backend();
-    await documentWindow.init('g', null, null);
-
-    expect(await documentWindow.dismissKeptTabsAndHoldBack()).toBe(false);
-    expect(heldBack()).toEqual([]);
-    expect(documentWindow.keptTabs).toBe(0);
-  });
-
-  it('is never invoked by closing the last tab or the window', async () => {
-    editionState.lite = false;
-    backend({ list_notes: [stored[0]] });
-    await documentWindow.init('g', null, null);
-    expect(documentWindow.tabs).toHaveLength(1);
-
-    await documentWindow.deleteTab(0);
-    expect(documentWindow.tabs).toHaveLength(0);
-    await documentWindow.dropClosedTabs('doc-g');
-    expect(heldBack()).toEqual([]);
-  });
-
-  it('is never invoked by closing a window in the trial either', async () => {
-    editionState.lite = true;
-    backend();
-    await documentWindow.init('g', null, null);
-    await documentWindow.deleteTab(0);
-    await documentWindow.dropClosedTabs('doc-g');
-    expect(heldBack()).toEqual([]);
-  });
+  it.each([false, true])(
+    'from the lowest stored tab, a large one included (lite %s)',
+    async (lite) => {
+      editionState.lite = lite;
+      backend({
+        list_notes: [
+          note({ id: 'first', tab_index: 0, x: 10, large: SIZE }),
+          note({ id: 'second', tab_index: 1, x: 900 }),
+        ],
+      });
+      await documentWindow.init('g', null, null);
+      expect(bounds().x).toBe(10);
+    },
+  );
 });
 
 describe('opening a file over 100 MB', () => {
@@ -478,32 +468,9 @@ describe('opening a file over 100 MB', () => {
   });
 });
 
-describe('opening a path whose only stored tab is a kept one', () => {
-  it('opens a fresh tab in lite and leaves the stored record alone', async () => {
-    editionState.lite = true;
-    backend({
-      list_notes: [
-        note({
-          id: 'orphan',
-          window_group: 'dead',
-          file_path: '/tmp/big.log',
-          large: SIZE,
-        }),
-      ],
-    });
-    await settingsState.init();
-    await documentWindow.init('g', null, null);
-    await documentWindow.openTab('/tmp/big.log');
-
-    expect(documentWindow.tabs).toHaveLength(1);
-    expect(documentWindow.tabs[0]?.id).not.toBe('orphan');
-    expect(documentWindow.tabs[0]?.large).toBeUndefined();
-    expect(writesTo(['orphan'])).toEqual([]);
-  });
-});
-// A lite session can hold a large viewer, windowed session or range tab only if
-// it was opened while full. The window state does not react to `edition-changed`
-// for them: nothing closes, and every operation on them keeps going to the core.
+// A lite session can hold a large viewer or windowed session only if it was
+// opened while full. The window state does not react to `edition-changed` for
+// them: nothing closes, and every operation on them keeps going to the core.
 describe('tabs opened while full, after the edition turns lite', () => {
   function windowedTab(): DocTab {
     return {
@@ -534,7 +501,6 @@ describe('tabs opened while full, after the edition turns lite', () => {
   async function openFullThenTurnLite(over: Record<string, unknown> = {}) {
     editionState.lite = false;
     backend({
-      splice_file: { size: 5, mtime_ms: 2 },
       windowed_save: {
         fingerprint: { size: 10, mtime_ms: 2 },
         total_bytes: 10,
@@ -546,13 +512,14 @@ describe('tabs opened while full, after the edition turns lite', () => {
     editionState.lite = true;
   }
 
-  it('stay open, and nothing is counted as kept', async () => {
+  it('stay open as they were', async () => {
     await openFullThenTurnLite();
-    const ids = documentWindow.tabs.map((t) => t.id);
-    await documentWindow.restoreKeptTabs();
-    expect(documentWindow.tabs.map((t) => t.id)).toEqual(ids);
-    expect(ids).toEqual(['plain', 'large', 'windowed', 'range']);
-    expect(documentWindow.keptTabs).toBe(0);
+    expect(documentWindow.tabs.map((t) => t.id)).toEqual([
+      'plain',
+      'large',
+      'windowed',
+      'range',
+    ]);
     expect(documentWindow.tabs.find((t) => t.id === 'large')?.large).toEqual({
       size: SIZE,
     });
@@ -560,17 +527,9 @@ describe('tabs opened while full, after the edition turns lite', () => {
 
   it('keep writing their snapshot records', async () => {
     await openFullThenTurnLite();
+    mockInvoke.mockClear();
     await documentWindow.flushAll();
     expect(writesTo(['range']).length).toBeGreaterThan(0);
-  });
-
-  it('let a range tab save back to its source', async () => {
-    await openFullThenTurnLite();
-    documentWindow.activeIndex = documentWindow.tabs.findIndex(
-      (t) => t.id === 'range',
-    );
-    expect(await documentWindow.rangeSave()).toBe('ok');
-    expect(mockInvoke.mock.calls.map(([cmd]) => cmd)).toContain('splice_file');
   });
 
   it('let a windowed tab save', async () => {
@@ -725,93 +684,6 @@ describe('the language of a tab opened in lite', () => {
   });
 });
 
-describe('a restore that the edition interrupts', () => {
-  const cleanRange = note({
-    id: 'crange',
-    tab_index: 0,
-    file_path: '',
-    range_source: '/tmp/big.log',
-    range_start: 0,
-    range_end: 10,
-    range_fp_size: SIZE,
-    range_fp_mtime: 1,
-    range_start_line: 1,
-    range_end_line: null,
-    range_trailing_break: null,
-  });
-  const refused = (): Promise<never> => {
-    editionState.lite = true;
-    return Promise.reject('range editing is not available in the Lite edition');
-  };
-
-  it('keeps a range record when the edition turns lite mid-restore', async () => {
-    editionState.lite = false;
-    backend({ list_notes: [cleanRange], read_range: refused });
-    await documentWindow.init('g', null, null);
-    expect(writesTo(['crange'])).toEqual([]);
-    expect(documentWindow.restoreUnreadable).toEqual([]);
-    expect(documentWindow.tabs).toEqual([]);
-    expect(documentWindow.keptTabs).toBe(1);
-  });
-
-  it('keeps it too when the flip lands during the return to full', async () => {
-    editionState.lite = true;
-    backend({ list_notes: [cleanRange], read_range: refused });
-    await documentWindow.init('g', null, null);
-    expect(documentWindow.keptTabs).toBe(1);
-    editionState.lite = false;
-    await documentWindow.restoreKeptTabs();
-    expect(writesTo(['crange'])).toEqual([]);
-    expect(documentWindow.restoreUnreadable).toEqual([]);
-    expect(documentWindow.keptTabs).toBe(1);
-  });
-
-  it('keeps a range record whose read fails for another reason once the edition is lite', async () => {
-    editionState.lite = false;
-    backend({
-      list_notes: [cleanRange],
-      read_range: () => {
-        editionState.lite = true;
-        return Promise.reject('permission-denied');
-      },
-    });
-    await documentWindow.init('g', null, null);
-    expect(writesTo(['crange'])).toEqual([]);
-    expect(documentWindow.restoreUnreadable).toEqual([]);
-    expect(documentWindow.tabs).toEqual([]);
-    expect(documentWindow.keptTabs).toBe(1);
-  });
-
-  it('still reports and drops a record that is really unreadable in full', async () => {
-    editionState.lite = false;
-    backend({
-      list_notes: [cleanRange],
-      read_range: () => Promise.reject('permission-denied'),
-    });
-    await documentWindow.init('g', null, null);
-    expect(writesTo(['crange']).length).toBe(1);
-    expect(documentWindow.restoreUnreadable).toEqual(['/tmp/big.log']);
-  });
-});
-
-describe('returning to full with the ordinary tab between kept ones', () => {
-  it('puts every tab back at its stored position and keeps the active one', async () => {
-    const group = [
-      note({ id: 'k0', tab_index: 0, file_path: '/tmp/big.log', large: SIZE }),
-      note({ id: 'mid', tab_index: 1, file_path: '/tmp/mid.txt' }),
-      note({ id: 'k2', tab_index: 2, file_path: '/tmp/big2.log', large: SIZE }),
-    ];
-    editionState.lite = true;
-    backend({ list_notes: group });
-    await documentWindow.init('g', null, null);
-    expect(documentWindow.tabs.map((t) => t.id)).toEqual(['mid']);
-    editionState.lite = false;
-    await documentWindow.restoreKeptTabs();
-    expect(documentWindow.tabs.map((t) => t.id)).toEqual(['k0', 'mid', 'k2']);
-    expect(documentWindow.activeTab?.id).toBe('mid');
-  });
-});
-
 describe('discarding a dirty windowed tab after the edition turned lite', () => {
   it('clears the edits through windowed_reopen, since windowed_open is refused', async () => {
     editionState.lite = false;
@@ -871,33 +743,6 @@ describe('discarding a dirty windowed tab after the edition turned lite', () => 
 });
 
 describe('a refusal that arrives before the edition-changed event', () => {
-  const refusal = 'range editing is not available in the Lite edition';
-  const cleanRange = note({
-    id: 'crange',
-    tab_index: 0,
-    file_path: '',
-    range_source: '/tmp/big.log',
-    range_start: 0,
-    range_end: 10,
-    range_fp_size: SIZE,
-    range_fp_mtime: 1,
-    range_start_line: 1,
-    range_end_line: null,
-    range_trailing_break: null,
-  });
-
-  it('keeps a range record while isLite() still says full', async () => {
-    editionState.lite = false;
-    backend({
-      list_notes: [cleanRange],
-      read_range: () => Promise.reject(refusal),
-    });
-    await documentWindow.init('g', null, null);
-    expect(writesTo(['crange'])).toEqual([]);
-    expect(documentWindow.restoreUnreadable).toEqual([]);
-    expect(documentWindow.keptTabs).toBe(1);
-  });
-
   it('is not stored as the reason a large tab cannot be edited', async () => {
     editionState.lite = false;
     backend({
@@ -912,49 +757,6 @@ describe('a refusal that arrives before the edition-changed event', () => {
     );
     await documentWindow.unlockLargeTab(0);
     expect(documentWindow.activeTab?.large?.unlockRefused).toBeUndefined();
-  });
-});
-
-describe('returning to full', () => {
-  it('twice in quick succession opens every kept tab once', async () => {
-    editionState.lite = true;
-    backend();
-    await documentWindow.init('g', null, null);
-    editionState.lite = false;
-    await Promise.all([
-      documentWindow.restoreKeptTabs(),
-      documentWindow.restoreKeptTabs(),
-    ]);
-    expect(documentWindow.tabs.map((t) => t.id)).toEqual([
-      'plain',
-      'large',
-      'windowed',
-      'range',
-    ]);
-  });
-
-  it('catches up when it happens while the restore is still loading', async () => {
-    editionState.lite = true;
-    backend({
-      // Loading the one ordinary tab is where the edition turns full.
-      read_file_as: () => {
-        editionState.lite = false;
-        return Promise.resolve({
-          content: 'disk text',
-          encoding: 'UTF-8',
-          had_bom: false,
-          lossy: false,
-        });
-      },
-    });
-    await documentWindow.init('g', null, null);
-    expect(documentWindow.tabs.map((t) => t.id)).toEqual([
-      'plain',
-      'large',
-      'windowed',
-      'range',
-    ]);
-    expect(documentWindow.keptTabs).toBe(0);
   });
 });
 

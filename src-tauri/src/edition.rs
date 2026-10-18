@@ -157,14 +157,6 @@ pub(crate) fn set_lite(app: &AppHandle, lite: bool) -> bool {
     return false;
   }
   let _ = app.emit("edition-changed", lite);
-  if !lite {
-    // Document windows that were not opened (or were closed) in lite because
-    // every tab they held was kept come back; the windows still open reload
-    // their kept tabs themselves on `edition-changed`. Off this thread: a
-    // window cannot be built from the event loop on Windows.
-    let reopen_app = app.clone();
-    std::thread::spawn(move || crate::windows::reopen_kept_groups(&reopen_app));
-  }
   let app_for_main = app.clone();
   if let Err(e) = app.run_on_main_thread(move || {
     if lite {

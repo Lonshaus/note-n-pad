@@ -138,18 +138,21 @@ export interface DocumentHooks {
   largeGetRange: () => { startLine: number; endLine: number } | null;
   largeRangeEdit: () => void;
   largeRangeSaveAs: (path: string) => Promise<boolean>;
-  isRangeTab: () => boolean;
-  rangeInfo: () => {
+  /** The range edit box over the large-file tab: opened by `largeRangeEdit`,
+   *  typed into with `typeText`, then saved or cancelled. */
+  rangeBoxVisible: () => boolean;
+  rangeBoxInfo: () => {
     sourcePath: string;
     startByte: number;
     endByte: number;
   } | null;
-  rangeSave: () => Promise<'ok' | 'mismatch' | 'error'>;
+  rangeBoxDirty: () => boolean;
+  rangeBoxSave: () => Promise<'ok' | 'mismatch' | 'error'>;
+  rangeBoxCancel: () => void;
   rangeConflictVisible: () => boolean;
   rangeConflictForce: () => Promise<'ok' | 'mismatch' | 'error'>;
   rangeConflictSaveAs: (path: string) => Promise<boolean>;
   rangeConflictCancel: () => void;
-  rangeSaveAsBytes: (path: string) => Promise<boolean>;
   oversizedGateVisible: () => boolean;
   oversizedGateSave: () => Promise<void>;
   oversizedGateDiscard: () => Promise<void>;

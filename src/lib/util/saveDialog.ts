@@ -36,8 +36,8 @@ export function extensionForLanguage(
 }
 
 /** The filename a save dialog should start from, given the path a tab already
- *  has. Empty (an untitled tab, or a range tab with no path of its own) falls
- *  back to a neutral name that `saveDialogOptions` then extends. */
+ *  has. Empty (an untitled tab) falls back to a neutral name that
+ *  `saveDialogOptions` then extends. */
 export function suggestedName(path: string): string {
   const base = path.split(/[/\\]/).pop() ?? '';
   return base === '' ? 'Untitled' : base;
