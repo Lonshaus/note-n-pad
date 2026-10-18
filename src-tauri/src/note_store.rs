@@ -384,7 +384,7 @@ pub struct DocWindowPlan {
 
 /// A document note's effective group id: its window_group, or its own id when
 /// None (a legacy/solo document becomes its own single-tab window).
-fn resolved_group(note: &NoteSnapshot) -> &str {
+pub(crate) fn resolved_group(note: &NoteSnapshot) -> &str {
   note.window_group.as_deref().unwrap_or(&note.id)
 }
 
@@ -500,6 +500,25 @@ struct Inner {
   notes: Vec<NoteSnapshot>,
   dir: PathBuf,
   seqs: std::collections::HashMap<String, u64>,
+  /// Project rebinds made during this run (`from -> to`, one edge per rebind). A
+  /// snapshot write still tagged with a `from` project is re-tagged on arrival,
+  /// following the edges until a project with none.
+  rebinds: std::collections::HashMap<String, String>,
+}
+/// The project a write tagged `project` ends up with once this run's rebinds
+/// are applied. The step cap only guards against a cyclic map.
+fn rebound_project(
+  rebinds: &std::collections::HashMap<String, String>,
+  project: Option<String>,
+) -> Option<String> {
+  let mut current = project?;
+  for _ in 0..=rebinds.len() {
+    match rebinds.get(&current) {
+      Some(next) => current = next.clone(),
+      None => break,
+    }
+  }
+  Some(current)
 }
 
 /// The single owner of note snapshots: an in-memory Vec guarded by a Mutex,
@@ -528,6 +547,7 @@ impl NoteStore {
           notes: loaded.items,
           dir,
           seqs: std::collections::HashMap::new(),
+          rebinds: std::collections::HashMap::new(),
         }),
       },
       loaded.skipped,
@@ -544,6 +564,7 @@ impl NoteStore {
         notes: Vec::new(),
         dir,
         seqs: std::collections::HashMap::new(),
+        rebinds: std::collections::HashMap::new(),
       }),
     }
   }
@@ -563,8 +584,9 @@ impl NoteStore {
       .cloned()
   }
 
-  pub fn upsert(&self, note: NoteSnapshot) -> Result<(), String> {
+  pub fn upsert(&self, mut note: NoteSnapshot) -> Result<(), String> {
     let mut inner = self.inner.lock().unwrap();
+    note.project = rebound_project(&inner.rebinds, note.project.take());
     save_note(&inner.dir, &note)?;
     upsert(&mut inner.notes, note);
     Ok(())
@@ -578,18 +600,51 @@ impl NoteStore {
   /// though `upsert_note` runs `(async)` and worker-pool scheduling gives no
   /// such guarantee on its own. Returns whether the write was applied, so the
   /// caller can skip broadcasting `store-changed` for a dropped write.
-  pub fn upsert_ordered(&self, note: NoteSnapshot, seq: u64) -> Result<bool, String> {
+  pub fn upsert_ordered(&self, mut note: NoteSnapshot, seq: u64) -> Result<bool, String> {
     let mut inner = self.inner.lock().unwrap();
     if let Some(&last) = inner.seqs.get(&note.id) {
       if seq < last {
         return Ok(false);
       }
     }
+    note.project = rebound_project(&inner.rebinds, note.project.take());
     let id = note.id.clone();
     save_note(&inner.dir, &note)?;
     inner.seqs.insert(id, seq);
     upsert(&mut inner.notes, note);
     Ok(true)
+  }
+  /// Move every stored note tagged `from` (closed window groups included) to
+  /// project `to`, and remember the rebind so a write still tagged `from` that
+  /// arrives later is re-tagged too. Returns how many notes were rewritten.
+  #[cfg(not(feature = "lite"))]
+  pub fn rebind_project(&self, from: &str, to: &str) -> Result<usize, String> {
+    let mut inner = self.inner.lock().unwrap();
+    let edge = to;
+    let to = rebound_project(&inner.rebinds, Some(to.to_string())).unwrap_or_default();
+    if from == to {
+      return Ok(0);
+    }
+    inner.rebinds.insert(from.to_string(), edge.to_string());
+    let mut rewritten = 0;
+    for index in 0..inner.notes.len() {
+      if inner.notes[index].project.as_deref() != Some(from) {
+        continue;
+      }
+      let mut note = inner.notes[index].clone();
+      note.project = Some(to.clone());
+      save_note(&inner.dir, &note)?;
+      inner.notes[index] = note;
+      rewritten += 1;
+    }
+    Ok(rewritten)
+  }
+  /// `root` is a project of its own again: drop the rebind that folded it into
+  /// another project, so a later write tagged `root` stays on it. A chain that
+  /// runs through `root` stops there.
+  #[cfg(not(feature = "lite"))]
+  pub fn forget_rebind(&self, root: &str) {
+    self.inner.lock().unwrap().rebinds.remove(root);
   }
 
   pub fn delete(&self, id: &str) -> Result<(), String> {
@@ -2314,6 +2369,134 @@ mod tests {
     store.upsert(d.clone()).unwrap();
     let reloaded = NoteStore::load(dir.path().to_path_buf()).unwrap().list();
     assert_eq!(reloaded, vec![d]);
+  }
+
+  #[cfg(not(feature = "lite"))]
+  fn doc_in(id: &str, group: &str, project: Option<&str>) -> NoteSnapshot {
+    NoteSnapshot {
+      project: project.map(str::to_string),
+      ..doc(id, Some(group), 0)
+    }
+  }
+
+  #[cfg(not(feature = "lite"))]
+  #[test]
+  fn rebind_project_rewrites_only_the_matching_project() {
+    let dir = tempdir().unwrap();
+    let store = NoteStore::load(dir.path().to_path_buf()).unwrap();
+    store.upsert(doc_in("a", "g1", Some("/x/y"))).unwrap();
+    // A group whose window is closed is still a stored record.
+    store.upsert(doc_in("b", "g2", Some("/x/y"))).unwrap();
+    store.upsert(doc_in("c", "g3", Some("/x/other"))).unwrap();
+    store.upsert(doc_in("d", "g4", None)).unwrap();
+    store.upsert(note("s")).unwrap();
+    assert_eq!(store.rebind_project("/x/y", "/x").unwrap(), 2);
+    let project_of = |id: &str| store.get(id).unwrap().project;
+    assert_eq!(project_of("a").as_deref(), Some("/x"));
+    assert_eq!(project_of("b").as_deref(), Some("/x"));
+    assert_eq!(project_of("c").as_deref(), Some("/x/other"));
+    assert_eq!(project_of("d"), None);
+    assert_eq!(project_of("s"), None);
+    // The rewrite reached the disk, not just the in-memory list.
+    let reloaded = NoteStore::load(dir.path().to_path_buf()).unwrap();
+    assert_eq!(reloaded.get("b").unwrap().project.as_deref(), Some("/x"));
+  }
+
+  #[cfg(not(feature = "lite"))]
+  #[test]
+  fn ordered_write_that_arrives_after_a_rebind_keeps_the_new_project() {
+    let dir = tempdir().unwrap();
+    let store = NoteStore::load(dir.path().to_path_buf()).unwrap();
+    store
+      .upsert_ordered(doc_in("a", "g1", Some("/x/y")), 4)
+      .unwrap();
+    store.rebind_project("/x/y", "/x").unwrap();
+    // Sent before the rebind with the same seq, delivered after it.
+    assert!(store
+      .upsert_ordered(doc_in("a", "g1", Some("/x/y")), 4)
+      .unwrap());
+    assert_eq!(store.get("a").unwrap().project.as_deref(), Some("/x"));
+    let reloaded = NoteStore::load(dir.path().to_path_buf()).unwrap();
+    assert_eq!(reloaded.get("a").unwrap().project.as_deref(), Some("/x"));
+    // The plain upsert path is covered too, and a first write is re-tagged.
+    store.upsert(doc_in("a", "g1", Some("/x/y"))).unwrap();
+    assert_eq!(store.get("a").unwrap().project.as_deref(), Some("/x"));
+    store
+      .upsert_ordered(doc_in("new", "g1", Some("/x/y")), 1)
+      .unwrap();
+    assert_eq!(store.get("new").unwrap().project.as_deref(), Some("/x"));
+    // Other projects are left alone.
+    store
+      .upsert_ordered(doc_in("c", "g3", Some("/x/other")), 1)
+      .unwrap();
+    assert_eq!(store.get("c").unwrap().project.as_deref(), Some("/x/other"));
+  }
+
+  #[cfg(not(feature = "lite"))]
+  #[test]
+  fn chained_rebinds_resolve_to_the_last_project() {
+    let dir = tempdir().unwrap();
+    let store = NoteStore::load(dir.path().to_path_buf()).unwrap();
+    store.upsert(doc_in("a", "g1", Some("/x/y/z"))).unwrap();
+    store.upsert(doc_in("b", "g2", Some("/x/y"))).unwrap();
+    store.rebind_project("/x/y/z", "/x/y").unwrap();
+    store.rebind_project("/x/y", "/x").unwrap();
+    assert_eq!(store.get("a").unwrap().project.as_deref(), Some("/x"));
+    assert_eq!(store.get("b").unwrap().project.as_deref(), Some("/x"));
+    // A write still tagged with the first or the second project lands on the last.
+    store.upsert(doc_in("a", "g1", Some("/x/y/z"))).unwrap();
+    assert_eq!(store.get("a").unwrap().project.as_deref(), Some("/x"));
+    store.upsert(doc_in("b", "g2", Some("/x/y"))).unwrap();
+    assert_eq!(store.get("b").unwrap().project.as_deref(), Some("/x"));
+  }
+
+  #[cfg(not(feature = "lite"))]
+  #[test]
+  fn a_forgotten_rebind_leaves_later_writes_on_their_project() {
+    let dir = tempdir().unwrap();
+    let store = NoteStore::load(dir.path().to_path_buf()).unwrap();
+    store.upsert(doc_in("a", "g1", Some("/x/y"))).unwrap();
+    store.rebind_project("/x/y", "/x").unwrap();
+    // The folded project is added again as a project of its own.
+    store.forget_rebind("/x/y");
+    store.upsert(doc_in("a", "g1", Some("/x/y"))).unwrap();
+    assert_eq!(store.get("a").unwrap().project.as_deref(), Some("/x/y"));
+    store
+      .upsert_ordered(doc_in("b", "g2", Some("/x/y")), 1)
+      .unwrap();
+    assert_eq!(store.get("b").unwrap().project.as_deref(), Some("/x/y"));
+    // Forgetting a project that was never folded changes nothing.
+    store.forget_rebind("/never");
+  }
+
+  #[cfg(not(feature = "lite"))]
+  #[test]
+  fn a_chain_stops_at_the_project_that_was_forgotten() {
+    let dir = tempdir().unwrap();
+    let store = NoteStore::load(dir.path().to_path_buf()).unwrap();
+    store.rebind_project("/x/y/z", "/x/y").unwrap();
+    store.rebind_project("/x/y", "/x").unwrap();
+    store.forget_rebind("/x/y");
+    // `/x/y` is its own project again; `/x/y/z` still folds into it.
+    store.upsert(doc_in("a", "g1", Some("/x/y"))).unwrap();
+    assert_eq!(store.get("a").unwrap().project.as_deref(), Some("/x/y"));
+    store.upsert(doc_in("b", "g2", Some("/x/y/z"))).unwrap();
+    assert_eq!(store.get("b").unwrap().project.as_deref(), Some("/x/y"));
+    // The rebind further up is untouched for any other project.
+    store.rebind_project("/q", "/x").unwrap();
+    store.upsert(doc_in("c", "g3", Some("/q"))).unwrap();
+    assert_eq!(store.get("c").unwrap().project.as_deref(), Some("/x"));
+  }
+
+  #[cfg(not(feature = "lite"))]
+  #[test]
+  fn rebinding_a_project_to_itself_changes_nothing() {
+    let dir = tempdir().unwrap();
+    let store = NoteStore::load(dir.path().to_path_buf()).unwrap();
+    store.upsert(doc_in("a", "g1", Some("/x"))).unwrap();
+    assert_eq!(store.rebind_project("/x", "/x").unwrap(), 0);
+    store.upsert(doc_in("a", "g1", Some("/x"))).unwrap();
+    assert_eq!(store.get("a").unwrap().project.as_deref(), Some("/x"));
   }
 
   #[test]
