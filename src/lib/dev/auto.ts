@@ -1,6 +1,7 @@
 // Copyright © 2026 Lonshaus
 // SPDX-License-Identifier: GPL-3.0-only
 
+import { gotoLine as gotoLineCommand } from '@codemirror/search';
 import { activeView } from './editorRegistry';
 import { settingsState, type LargeOpenMode } from '../state/settings.svelte';
 import type { LineEnding } from '../util/text';
@@ -215,6 +216,73 @@ function getEditorState(): {
     lineNumbers: view.dom.querySelector('.cm-lineNumbers') !== null,
   };
 }
+/** Runs the go-to-line command and submits its panel like a user would. */
+function gotoLine(n: number): boolean {
+  const view = activeView();
+  if (view === null) {
+    return false;
+  }
+  gotoLineCommand(view);
+  const input = view.dom.querySelector<HTMLInputElement>(
+    '.cm-panel input[name="line"]',
+  );
+  const form = input?.form;
+  if (input === null || input === undefined || !form) {
+    return false;
+  }
+  input.value = String(n);
+  form.requestSubmit();
+  return true;
+}
+/** Distance of the cursor row's middle from the scroller's middle, plus the
+ *  numbers needed to judge it. */
+function lineCenterOffset(n: number): {
+  offset: number;
+  lineHeight: number;
+  defaultLineHeight: number;
+  scrollTop: number;
+  maxScrollTop: number;
+  inView: boolean;
+} | null {
+  const view = activeView();
+  if (view === null || n < 1 || n > view.state.doc.lines) {
+    return null;
+  }
+  const line = view.state.doc.line(n);
+  const top = view.coordsAtPos(line.from);
+  const bottom = view.coordsAtPos(line.to, -1);
+  if (top === null || bottom === null) {
+    return null;
+  }
+  const scroller = view.scrollDOM;
+  const rect = scroller.getBoundingClientRect();
+  return {
+    offset: (top.top + top.bottom) / 2 - (rect.top + scroller.clientHeight / 2),
+    lineHeight: bottom.bottom - top.top,
+    defaultLineHeight: view.defaultLineHeight,
+    scrollTop: scroller.scrollTop,
+    maxScrollTop: scroller.scrollHeight - scroller.clientHeight,
+    inView:
+      top.top >= rect.top && top.bottom <= rect.top + scroller.clientHeight,
+  };
+}
+
+let warnings: string[] | null = null;
+/** Messages passed to console.warn since the previous call; the first call
+ *  starts collecting. */
+function consoleWarnings(): string[] {
+  if (warnings === null) {
+    const collected: string[] = [];
+    warnings = collected;
+    const original = console.warn.bind(console);
+    console.warn = (...args: unknown[]): void => {
+      collected.push(args.map(String).join(' '));
+      original(...args);
+    };
+    return [];
+  }
+  return warnings.splice(0);
+}
 
 export function installDocumentAuto(hooks: DocumentHooks): void {
   (window as unknown as { __auto: unknown }).__auto = {
@@ -222,6 +290,10 @@ export function installDocumentAuto(hooks: DocumentHooks): void {
     getContent,
     getEditorState,
     editorFocused,
+    gotoLine,
+    lineCenterOffset,
+    consoleWarnings,
+    setWordWrap: (on: boolean) => settingsState.setWordWrap(on),
     getLanguage: () => settingsState.language,
     setLanguage: (l: Language) => settingsState.setLanguage(l),
     ...hooks,
