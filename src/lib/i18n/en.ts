@@ -182,6 +182,10 @@ export const en = {
   'doc.oversized.message':
     'This tab’s unsaved content is too large to snapshot and must be handled before closing.',
   'doc.oversized.discard': 'Discard Changes',
+  'doc.missing.message':
+    'Couldn’t find “{name}”. The file may have been moved or deleted. Unsaved changes are still in the tab.',
+  'doc.missing.saveAs': 'Save As New',
+  'doc.missing.discard': 'Discard Changes',
   'doc.rangeBox.unsaved':
     'The range edit box has unsaved changes and must be handled before closing.',
   'doc.snapshotFailed.message':

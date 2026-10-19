@@ -18,6 +18,7 @@ import {
   restoreOutcome,
 } from '../util/restoreOutcome';
 import { saveDialogOptions, suggestedName } from '../util/saveDialog';
+import { retargetPath, type PathRules } from '../util/filePath';
 import { Text } from '@codemirror/state';
 import {
   detectLineEnding,
@@ -44,6 +45,7 @@ import {
 } from '../util/openRouting';
 import type { CheckpointIndex, NoteSnapshot } from './stickyNote.svelte';
 import { settingsState } from './settings.svelte';
+import { platform } from './platform.svelte';
 import { editionState, isLite } from './edition.svelte';
 import { nextTabIndex } from '../util/keptTabs';
 import { isCleanOldRange, needsRewrite } from '../util/restoreRecords';
@@ -360,6 +362,17 @@ export interface DocTab {
    *  the snapshot folder missing/unwritable, the disk full, made read-only.
    *  Cleared by the next write that succeeds. See `firstUnwritableDirtyIndex`. */
   writeFailed?: boolean;
+  /** Set when the file behind a tab holding unsaved changes was found deleted or
+   *  moved away. In memory only, never persisted. Such a tab is never written
+   *  back to `path`: saving asks for a new path instead. */
+  missing?: boolean;
+}
+/** How the host compares paths, for following a rename. */
+function pathRules(): PathRules {
+  return {
+    caseInsensitive: platform.isMacOS || platform.isWindows,
+    backslash: platform.isWindows,
+  };
 }
 
 interface Bounds {
@@ -490,6 +503,8 @@ export class DocumentWindowState {
   col = $state(1);
   /** Gate rendering the editor until the initial tabs have loaded. */
   ready = $state(false);
+  /** Called once `init` has restored the window's tabs and set `ready`. */
+  onRestored: (() => void) | null = null;
   /** Bumped to force the editor to reload the active tab's buffer from state,
    *  e.g. after re-decoding under a new encoding (content changed externally). */
   reloadSeq = $state(0);
@@ -501,10 +516,33 @@ export class DocumentWindowState {
   /** The range edit box over the active large-file tab, or null. While its
    *  `conflict` is set the box's write-back found the source changed and
    *  DocumentApp renders the conflict modal. It is never persisted. */
-  rangeBox = $state.raw<RangeBox | null>(null);
+  #rangeBox = $state.raw<RangeBox | null>(null);
+  get rangeBox(): RangeBox | null {
+    return this.#rangeBox;
+  }
+  set rangeBox(box: RangeBox | null) {
+    const hadConflict = this.#rangeBox?.conflict === true;
+    this.#rangeBox = box;
+    if (hadConflict && box?.conflict !== true) {
+      this.onConflictClosed?.();
+    }
+  }
   /** The windowed tab whose save hit a fingerprint conflict, awaiting the user's
    *  choice (force-write / save-as / cancel). Null when none is pending. */
-  windowedConflict = $state<DocTab | null>(null);
+  #windowedConflict = $state<DocTab | null>(null);
+  get windowedConflict(): DocTab | null {
+    return this.#windowedConflict;
+  }
+  set windowedConflict(tab: DocTab | null) {
+    const hadConflict = this.#windowedConflict !== null;
+    this.#windowedConflict = tab;
+    if (hadConflict && tab === null) {
+      this.onConflictClosed?.();
+    }
+  }
+  /** Called when a write-back conflict dialog (the box's or a windowed tab's)
+   *  has gone, however it was answered. */
+  onConflictClosed: (() => void) | null = null;
   /** Set while an over-threshold file awaits the open-mode confirm. The window
    *  shows the confirm modal; resolving it opens the view, the editor, or
    *  nothing (cancel). */
@@ -1128,6 +1166,7 @@ export class DocumentWindowState {
       this.ensureWindowedRestore(this.activeTab);
     }
     this.ready = true;
+    this.onRestored?.();
   }
 
   /** Set by the window: ends an IME composition in the active editor and
@@ -1737,6 +1776,11 @@ export class DocumentWindowState {
     if (tab === null) {
       return false;
     }
+    // The file is gone: a write to the old path would quietly make a new file
+    // there, so the user picks where it goes instead.
+    if (tab.missing === true) {
+      return this.saveAs(pathOverride);
+    }
     // A windowed tab saves its Rust-side buffer through windowed_save; only a
     // clean write counts as saved (a conflict raises the modal).
     if (tab.windowed !== undefined) {
@@ -1839,6 +1883,7 @@ export class DocumentWindowState {
       return false;
     }
     tab.path = chosen;
+    tab.missing = false;
     if (!tab.explicit) {
       tab.language = detectByFilename(chosen);
     }
@@ -1887,6 +1932,44 @@ export class DocumentWindowState {
     await this.upsertTab(tab);
     void invoke('add_recent_file', { path: chosen });
     return true;
+  }
+  /** The file or folder `from` was renamed to `to`: every tab at or below it, and
+   *  the range box over such a file, follow it. Each moved tab is written to the
+   *  store again at once, with a newer sequence than anything sent before the
+   *  rename, so a snapshot still carrying the old path cannot win. */
+  retargetPaths(
+    from: string,
+    to: string,
+    rules: PathRules = pathRules(),
+  ): void {
+    const moved: DocTab[] = [];
+    for (const tab of this.tabs) {
+      const next = retargetPath(tab.path, from, to, rules);
+      if (next === tab.path) {
+        continue;
+      }
+      tab.path = next;
+      if (!tab.explicit) {
+        tab.language = detectByFilename(next);
+      }
+      if (!__LITE__ && tab.windowed !== undefined) {
+        void invoke('windowed_set_path', {
+          sessionId: tab.windowed.sessionId,
+          path: next,
+        });
+      }
+      moved.push(tab);
+    }
+    const box = this.rangeBox;
+    if (box !== null) {
+      const source = retargetPath(box.sourcePath, from, to, rules);
+      if (source !== box.sourcePath) {
+        this.rangeBox = { ...box, sourcePath: source };
+      }
+    }
+    for (const tab of moved) {
+      void this.upsertTab(tab);
+    }
   }
   /** Open the range edit box over `tab`, a large-file viewer tab, on the byte
    *  slice `info` of its file. The byte offsets are resolved by the caller (the
@@ -2455,6 +2538,7 @@ export class DocumentWindowState {
     }
     // Rust has already moved the session to `chosen`; mirror that here.
     tab.path = chosen;
+    tab.missing = false;
     if (!tab.explicit) {
       tab.language = detectByFilename(chosen);
     }

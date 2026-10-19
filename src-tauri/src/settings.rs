@@ -310,16 +310,58 @@ pub fn push_recent(current: &[String], path: &str) -> Vec<String> {
 /// A missing file falls back to defaults (first run); a genuine read failure on
 /// an existing file aborts instead of writing defaults back over it.
 pub fn push_recent_file(app: &AppHandle, path: &str) -> Result<Vec<String>, String> {
-  let file = settings_path(app)?;
-  let mut settings = load_or_default_for_write(&file)?;
+  push_recent_in(&settings_path(app)?, path)
+}
+
+fn push_recent_in(file: &Path, path: &str) -> Result<Vec<String>, String> {
+  let _guard = SETTINGS_WRITE_LOCK.lock().unwrap();
+  let mut settings = load_or_default_for_write(file)?;
   settings.recent_files = push_recent(&settings.recent_files, path);
-  save_to(&file, &settings)?;
+  save_to(file, &settings)?;
   Ok(settings.recent_files)
+}
+/// `recent` with every path at or below `from` moved to `to`. A path that ends up
+/// listed twice keeps its first place.
+#[cfg(not(feature = "lite"))]
+pub fn retarget_recent(recent: &[String], from: &str, to: &str) -> Vec<String> {
+  let mut out: Vec<String> = Vec::with_capacity(recent.len());
+  for path in recent {
+    let moved = crate::file_ops::retarget_path(path, from, to);
+    if !out.contains(&moved) {
+      out.push(moved);
+    }
+  }
+  out
+}
+/// Move the recent files at or below `from` to `to` on disk. Returns the new
+/// list, or `None` when nothing in it changed. See `push_recent_file` for the
+/// read-failure handling.
+#[cfg(not(feature = "lite"))]
+pub fn retarget_recent_files(
+  app: &AppHandle,
+  from: &str,
+  to: &str,
+) -> Result<Option<Vec<String>>, String> {
+  retarget_recent_in(&settings_path(app)?, from, to)
+}
+
+#[cfg(not(feature = "lite"))]
+fn retarget_recent_in(file: &Path, from: &str, to: &str) -> Result<Option<Vec<String>>, String> {
+  let _guard = SETTINGS_WRITE_LOCK.lock().unwrap();
+  let mut settings = load_or_default_for_write(file)?;
+  let moved = retarget_recent(&settings.recent_files, from, to);
+  if moved == settings.recent_files {
+    return Ok(None);
+  }
+  settings.recent_files = moved.clone();
+  save_to(file, &settings)?;
+  Ok(Some(moved))
 }
 
 /// Clear the on-disk recent list. See `push_recent_file` for the read-failure
 /// handling.
 pub fn clear_recent_files(app: &AppHandle) -> Result<(), String> {
+  let _guard = SETTINGS_WRITE_LOCK.lock().unwrap();
   let file = settings_path(app)?;
   let mut settings = load_or_default_for_write(&file)?;
   settings.recent_files.clear();
@@ -2010,6 +2052,84 @@ mod tests {
     // Newest is at the front, and the oldest entries fell off.
     assert_eq!(list[0], format!("/f{}", RECENT_FILES_MAX + 4));
     assert!(!list.contains(&"/f0".to_string()));
+  }
+
+  #[cfg(not(feature = "lite"))]
+  #[test]
+  fn retarget_recent_moves_the_file_and_what_is_below_a_folder() {
+    let list: Vec<String> = ["/x/f.txt", "/x/y/a.txt", "/x/y/b/c.txt", "/x/y2/d.txt"]
+      .iter()
+      .map(|p| p.to_string())
+      .collect();
+    assert_eq!(
+      retarget_recent(&list, "/x/f.txt", "/x/g.txt"),
+      vec!["/x/g.txt", "/x/y/a.txt", "/x/y/b/c.txt", "/x/y2/d.txt"]
+    );
+    assert_eq!(
+      retarget_recent(&list, "/x/y", "/x/z"),
+      vec!["/x/f.txt", "/x/z/a.txt", "/x/z/b/c.txt", "/x/y2/d.txt"]
+    );
+    assert_eq!(retarget_recent(&list, "/q", "/r"), list);
+  }
+
+  #[cfg(not(feature = "lite"))]
+  #[test]
+  fn retarget_recent_writes_the_new_list_to_the_settings_file() {
+    let dir = tempdir().unwrap();
+    let file = dir.path().join("settings.json");
+    let settings = AppSettings {
+      recent_files: vec!["/x/f.txt".into(), "/x/h.txt".into()],
+      ..AppSettings::default()
+    };
+    save_to(&file, &settings).unwrap();
+    let moved = retarget_recent_in(&file, "/x/f.txt", "/x/g.txt").unwrap();
+    assert_eq!(moved, Some(vec!["/x/g.txt".into(), "/x/h.txt".into()]));
+    assert_eq!(
+      load_from(&file).unwrap().recent_files,
+      vec!["/x/g.txt", "/x/h.txt"]
+    );
+    // Nothing to move: the file is left alone and no new list is reported.
+    assert_eq!(retarget_recent_in(&file, "/q", "/r").unwrap(), None);
+  }
+  /// Whether `work` finishes while the settings write lock is held elsewhere.
+  fn finishes_under_the_write_lock<T: Send + 'static>(
+    work: impl FnOnce() -> T + Send + 'static,
+  ) -> bool {
+    let guard = SETTINGS_WRITE_LOCK.lock().unwrap();
+    let (tx, rx) = std::sync::mpsc::channel();
+    let worker = std::thread::spawn(move || {
+      work();
+      tx.send(()).unwrap();
+    });
+    let waited = rx.recv_timeout(std::time::Duration::from_millis(200));
+    let finished_under_lock = waited.is_ok();
+    drop(guard);
+    worker.join().unwrap();
+    finished_under_lock
+  }
+
+  #[cfg(not(feature = "lite"))]
+  #[test]
+  fn following_a_rename_waits_for_the_settings_write_lock() {
+    let dir = tempdir().unwrap();
+    let file = dir.path().join("settings.json");
+    let target = file.clone();
+    assert!(!finishes_under_the_write_lock(move || {
+      retarget_recent_in(&target, "/x/f.txt", "/x/g.txt").unwrap();
+    }));
+    // The same work goes through once nobody holds the lock.
+    retarget_recent_in(&file, "/x/f.txt", "/x/g.txt").unwrap();
+  }
+
+  #[test]
+  fn recording_a_recent_file_waits_for_the_settings_write_lock() {
+    let dir = tempdir().unwrap();
+    let file = dir.path().join("settings.json");
+    let target = file.clone();
+    assert!(!finishes_under_the_write_lock(move || {
+      push_recent_in(&target, "/x/f.txt").unwrap();
+    }));
+    assert_eq!(push_recent_in(&file, "/x/g.txt").unwrap().len(), 2);
   }
 
   #[test]

@@ -688,6 +688,23 @@ fn track_last_doc_window(window: &tauri::Window, event: &tauri::WindowEvent) {
     _ => {}
   }
 }
+/// The labels among `labels` that belong to document windows.
+fn doc_window_labels<'a>(labels: impl Iterator<Item = &'a String>) -> Vec<&'a String> {
+  labels.filter(|label| label.starts_with("doc-")).collect()
+}
+/// Tell every document window that the app came to the front. Any window of the
+/// app gaining focus counts, so a document window learns of it when the user
+/// returns through the workspace or another document window as well.
+fn announce_app_focus(window: &tauri::Window, event: &tauri::WindowEvent) {
+  if !matches!(event, tauri::WindowEvent::Focused(true)) {
+    return;
+  }
+  let app = window.app_handle();
+  let windows = app.webview_windows();
+  for label in doc_window_labels(windows.keys()) {
+    let _ = app.emit_to(label.as_str(), "app-focused", ());
+  }
+}
 
 /// The tracked document window, if it is still open. Checking with the app
 /// handle rather than trusting the stored label alone covers the window being
@@ -859,6 +876,7 @@ pub(crate) fn apply_app_theme(app: &tauri::AppHandle, mode: &str) {
 fn handle_window_event(window: &tauri::Window, event: &tauri::WindowEvent) {
   sync_menu_focus(window, event);
   track_last_doc_window(window, event);
+  announce_app_focus(window, event);
   // muda caches a menu's light/dark colours per-HWND when the menu is attached
   // and never re-reads them, so a live app-mode switch leaves the native menu
   // bar stale while the title bar follows. `set_theme` re-pushes muda's Auto
@@ -1968,6 +1986,23 @@ pub(crate) fn record_recent(app: &tauri::AppHandle, path: &str) {
     Err(e) => log::warn!("failed to record recent file: {e}"),
   }
 }
+/// A file or folder in the recent list was renamed: follow it and repopulate the
+/// submenu.
+#[cfg(not(feature = "lite"))]
+pub(crate) fn retarget_recent(app: &tauri::AppHandle, from: &str, to: &str) {
+  match settings::retarget_recent_files(app, from, to) {
+    // This runs on a worker thread, and the menu is held while the platform
+    // answers menu calls on the main thread, which takes the same lock.
+    Ok(Some(recent)) => {
+      let on_main = app.clone();
+      if let Err(e) = app.run_on_main_thread(move || refresh_recent_menu(&on_main, &recent)) {
+        log::warn!("failed to refresh the recent menu: {e}");
+      }
+    }
+    Ok(None) => {}
+    Err(e) => log::warn!("failed to follow a rename in the recent files: {e}"),
+  }
+}
 
 /// Repopulate the live Open Recent submenu from `recent`. No-op if the menu has
 /// not been built yet.
@@ -2988,6 +3023,8 @@ pub fn run() {
       #[cfg(not(feature = "lite"))]
       windowed::windowed_save,
       #[cfg(not(feature = "lite"))]
+      windowed::windowed_set_path,
+      #[cfg(not(feature = "lite"))]
       windowed::windowed_close,
       #[cfg(not(feature = "lite"))]
       windowed::windowed_find,
@@ -3005,6 +3042,7 @@ pub fn run() {
       file_ops::rename_path,
       #[cfg(not(feature = "lite"))]
       file_ops::trash_path,
+      file_ops::missing_paths,
       file_ops::reveal_in_finder,
       #[cfg(not(feature = "lite"))]
       project::list_project_dir,
@@ -3650,5 +3688,51 @@ mod menu_focus_tests {
       ),
       (Some("workspace".to_string()), FocusKind::Workspace)
     );
+  }
+}
+
+#[cfg(test)]
+mod app_focus_tests {
+  use super::doc_window_labels;
+
+  #[test]
+  fn only_document_windows_are_told_the_app_came_to_the_front() {
+    let labels: Vec<String> = ["workspace", "doc-a", "note-b", "settings", "doc-c"]
+      .iter()
+      .map(|l| l.to_string())
+      .collect();
+    let told: Vec<&str> = doc_window_labels(labels.iter())
+      .into_iter()
+      .map(String::as_str)
+      .collect();
+    assert_eq!(told, vec!["doc-a", "doc-c"]);
+    assert!(doc_window_labels([].iter()).is_empty());
+  }
+
+  #[test]
+  fn every_window_event_reaches_the_app_focus_announcement() {
+    let source = include_str!("lib.rs");
+    let at = source.find("fn handle_window_event(").unwrap();
+    let body = &source[at..];
+    let body = &body[..body.find("\n}\n").unwrap()];
+    assert!(body.contains("announce_app_focus(window, event)"));
+    let at = source.find("fn announce_app_focus(").unwrap();
+    let body = &source[at..];
+    let body = &body[..body.find("\n}\n").unwrap()];
+    assert!(body.contains("WindowEvent::Focused(true)"));
+    assert!(body.contains("\"app-focused\""));
+  }
+}
+
+#[cfg(test)]
+mod recent_menu_threading_tests {
+  #[test]
+  fn following_a_rename_refreshes_the_menu_on_the_main_thread() {
+    let source = include_str!("lib.rs");
+    let at = source.find("pub(crate) fn retarget_recent(").unwrap();
+    let body = &source[at..];
+    let body = &body[..body.find("\n}\n").unwrap()];
+    assert!(body.contains("run_on_main_thread"));
+    assert!(!body.contains("=> refresh_recent_menu("));
   }
 }

@@ -16,12 +16,16 @@ export interface GateHost {
   label: string;
   /** Drop the clean tabs' records and destroy the window. */
   finishWindowClose(): Promise<void>;
-  /** Close the active tab. */
-  finishTabClose(): Promise<void>;
+  /** Close the active tab. With `keepWindow`, the window stays when it was the
+   *  last tab: a quit or close that was held back is about to take it over. */
+  finishTabClose(keepWindow?: boolean): Promise<void>;
   /** Bring this window forward: the gate may belong to a background window
    *  (a quit asks every window at once), and without it the user sees no
    *  reaction to the quit at all. */
   focusWindow(): Promise<void>;
+  /** Whether another dialog of this window must be answered first. While it is,
+   *  the prompt waits and is raised again by `resumeDeferred`. */
+  promptBlocked?(): boolean;
 }
 
 type GateWindow = Pick<
@@ -34,10 +38,12 @@ type GateWindow = Pick<
   | 'firstOversizedDirtyIndex'
   | 'firstUnwritableDirtyIndex'
   | 'flushAll'
+  | 'rangeBox'
   | 'rangeBoxBlocking'
   | 'rangeBoxCancel'
   | 'rangeBoxDirty'
   | 'rangeBoxSave'
+  | 'rangeConflictSaveAs'
   | 'saveActive'
   | 'saveAs'
   | 'switchTo'
@@ -64,6 +70,19 @@ export class CloseGate {
    *  window's own self-destroy via `confirm_close` — owns the shutdown; a
    *  window racing both would never send `flush_ack`, stalling the quit. */
   private quitting = false;
+  /** A prompt was asked for while another dialog held the window. */
+  private deferred = false;
+  /** Called when the gate has no more say: the dialog was cancelled or left
+   *  after a declined save, or the quit, close or tab close it guarded went
+   *  through. */
+  onDismissed: (() => void) | null = null;
+  /** Called when the quit this gate guards was vetoed (by any window), or the
+   *  gate dialog was cancelled: the quit or close will not go through. */
+  onVetoed: (() => void) | null = null;
+  private hide(): void {
+    this.visible = false;
+    this.onDismissed?.();
+  }
 
   private readonly win: GateWindow;
   private readonly host: GateHost;
@@ -88,6 +107,10 @@ export class CloseGate {
   /** Show the dialog for the first thing that blocks, or resume the pending
    *  action when nothing does. */
   async prompt(): Promise<void> {
+    if (this.host.promptBlocked?.() === true) {
+      this.deferred = true;
+      return;
+    }
     const blocking = this.blocking();
     if (blocking === null) {
       this.visible = false;
@@ -98,6 +121,7 @@ export class CloseGate {
       } else {
         await invoke('request_exit');
       }
+      this.onDismissed?.();
       return;
     }
     await this.win.switchTo(blocking.index);
@@ -109,6 +133,19 @@ export class CloseGate {
           : 'unwritable';
     this.visible = true;
     await this.host.focusWindow();
+  }
+  /** Whether a prompt is being held back behind another dialog. */
+  get held(): boolean {
+    return this.deferred;
+  }
+  /** The dialog that held a prompt back is gone: raise it again, which asks
+   *  about whatever still blocks or carries on with the quit or close. */
+  async resumeDeferred(): Promise<void> {
+    if (!this.deferred) {
+      return;
+    }
+    this.deferred = false;
+    await this.prompt();
   }
   /** Closing the active tab, which holds an edit box with changes. */
   async promptTabClose(): Promise<void> {
@@ -125,7 +162,19 @@ export class CloseGate {
     // or a failure leaves it open.
     let saved: boolean;
     if (this.reason === 'rangeBox') {
-      saved = (await this.win.rangeBoxSave()) === 'ok';
+      // A source that is gone cannot be written back into: the box's text goes
+      // to a new file instead.
+      if (this.win.rangeBox?.missing === true) {
+        saved = await this.win.rangeConflictSaveAs();
+        // The new file opened as the active tab, which a tab close would now
+        // take for the tab it was asked about.
+        if (saved && this.continuation === 'tab') {
+          this.hide();
+          return;
+        }
+      } else {
+        saved = (await this.win.rangeBoxSave()) === 'ok';
+      }
     } else if (this.reason === 'unwritable') {
       saved = await this.win.saveAs();
     } else {
@@ -134,7 +183,7 @@ export class CloseGate {
     // A cancelled or failed save leaves the item unsaved; dismiss the gate (the
     // quit is already vetoed, so the app simply stays open).
     if (!saved) {
-      this.visible = false;
+      this.hide();
       return;
     }
     await this.prompt();
@@ -155,7 +204,8 @@ export class CloseGate {
   }
 
   cancel(): void {
-    this.visible = false;
+    this.hide();
+    this.onVetoed?.();
   }
   /** `flush-request`: the quit handshake starts. Quit stays silent otherwise;
    *  restore reopens unsaved tabs afterward. */
@@ -186,6 +236,7 @@ export class CloseGate {
    *  completes. */
   onFlushCancelled(): void {
     this.quitting = false;
+    this.onVetoed?.();
   }
   /** `close-flush-request`: the OS close of this window. Dirty tabs are
    *  snapshotted (a restart restores them), then the backend destroys the
