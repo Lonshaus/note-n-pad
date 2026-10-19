@@ -521,6 +521,24 @@ describe('case-variant sibling folders', () => {
     expect([...kept].sort()).toEqual(['/r', '/r/Foo', '/r/Foo/x']);
   });
 
+  it('drops a spelling whose on-disk spelling is already open', () => {
+    const open = new Set(['/r', '/r/Foo', '/r/Foo/a', '/r/foo']);
+    const kept = reconcileExpanded(open, '/r', [entry('/r/foo', true)], true);
+    expect([...kept].sort()).toEqual(['/r', '/r/foo']);
+  });
+
+  it('keeps what is open below the on-disk spelling that stays', () => {
+    const open = new Set(['/r', '/r/Foo', '/r/Foo/a', '/r/foo', '/r/foo/b']);
+    const kept = reconcileExpanded(open, '/r', [entry('/r/foo', true)], true);
+    expect([...kept].sort()).toEqual(['/r', '/r/foo', '/r/foo/b']);
+  });
+
+  it('still renames when the on-disk spelling is not open', () => {
+    const open = new Set(['/r', '/r/Foo', '/r/Foo/a']);
+    const kept = reconcileExpanded(open, '/r', [entry('/r/foo', true)], true);
+    expect([...kept].sort()).toEqual(['/r', '/r/foo', '/r/foo/a']);
+  });
+
   it('keeps both open in a project walk', () => {
     const cache = new TreeCache();
     put(cache, '/r', '/r', listing(...siblings));

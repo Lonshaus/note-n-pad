@@ -111,7 +111,12 @@ export function reconcileExpanded(
     if (actual === undefined) {
       next = withoutSubtree(next ?? expanded, path, caseInsensitive);
     } else if (like.length === 1) {
-      next = renameInSet(next ?? expanded, path, actual, caseInsensitive);
+      if (actual !== path && expanded.has(actual)) {
+        // The on-disk spelling is already open, so this one is a leftover.
+        next = withoutSubtree(next ?? expanded, path, false);
+      } else {
+        next = renameInSet(next ?? expanded, path, actual, caseInsensitive);
+      }
     }
   }
   return next ?? expanded;
