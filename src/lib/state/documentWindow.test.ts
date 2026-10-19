@@ -1081,6 +1081,8 @@ const SAVED_AS = {
   fingerprint: { size: 1234, mtime_ms: 99 },
   total_bytes: 1234,
   total_lines: 12,
+  clean: true,
+  generation: 7,
 };
 
 describe('saveAs on a windowed tab', () => {
@@ -2014,11 +2016,14 @@ describe('runWindowedOp (a whole-file operation outliving its editor)', () => {
     const tab = windowedTab(31);
     documentWindow.tabs.push(tab);
     documentWindow.activeIndex = 0;
-    let finish: (r: {
+    type Totals = {
       total_bytes: number;
       total_lines: number;
-    }) => void = () => {};
-    const run = (): Promise<{ total_bytes: number; total_lines: number }> =>
+      clean: boolean;
+      generation: number;
+    };
+    let finish: (r: Totals) => void = () => {};
+    const run = (): Promise<Totals> =>
       new Promise((resolve) => {
         finish = resolve;
       });
@@ -2031,7 +2036,12 @@ describe('runWindowedOp (a whole-file operation outliving its editor)', () => {
     const mounted = gate.whenIdle(read);
     await Promise.resolve();
     expect(read).not.toHaveBeenCalled();
-    finish({ total_bytes: 5000, total_lines: 77 });
+    finish({
+      total_bytes: 5000,
+      total_lines: 77,
+      clean: false,
+      generation: 1,
+    });
     await op;
     // The read happens only after the tab learned the replaced totals.
     await expect(mounted).resolves.toBe(5000);
@@ -2047,7 +2057,14 @@ describe('runWindowedOp (a whole-file operation outliving its editor)', () => {
     documentWindow.activeIndex = 0;
     await documentWindow.runWindowedOp(
       32,
-      () => Promise.resolve({ count: 0, total_bytes: 1000, total_lines: 10 }),
+      () =>
+        Promise.resolve({
+          count: 0,
+          total_bytes: 1000,
+          total_lines: 10,
+          clean: true,
+          generation: 0,
+        }),
       (r) => r.count > 0,
     );
     expect(tab.windowed?.dirty).toBe(false);
@@ -2069,5 +2086,217 @@ describe('runWindowedOp (a whole-file operation outliving its editor)', () => {
     await documentWindow.windowedGate(33).whenIdle(() => Promise.resolve());
     expect(documentWindow.windowedGate(33).canApply()).toBe(true);
     expect(tab.windowed?.dirty).toBe(false);
+  });
+
+  it('passes the clean flag of the result on to the tab', async () => {
+    documentWindow.tabs.length = 0;
+    const tab = windowedTab(34);
+    tab.windowed!.dirty = true;
+    documentWindow.tabs.push(tab);
+    documentWindow.activeIndex = 0;
+    await documentWindow.runWindowedOp(
+      34,
+      () =>
+        Promise.resolve({
+          total_bytes: 900,
+          total_lines: 9,
+          clean: true,
+          generation: 3,
+        }),
+      () => true,
+    );
+    expect(tab.windowed?.dirty).toBe(false);
+    expect(tab.windowed?.totalBytes).toBe(900);
+    await documentWindow.runWindowedOp(
+      34,
+      () =>
+        Promise.resolve({
+          total_bytes: 950,
+          total_lines: 9,
+          clean: false,
+          generation: 4,
+        }),
+      () => true,
+    );
+    expect(tab.windowed?.dirty).toBe(true);
+  });
+});
+
+describe('windowedApplied (the dirty flag follows the clean flag)', () => {
+  function windowedTab(sessionId: number): DocTab {
+    return baseTab({
+      id: `applied-tab-${sessionId}`,
+      path: '/tmp/huge.log',
+      windowed: {
+        sessionId,
+        totalBytes: 1000,
+        totalLines: 10,
+        fingerprint: null,
+        dirty: false,
+        topLine: 0,
+      },
+    });
+  }
+
+  it('sets dirty for a changed result and clears it for a clean one', () => {
+    documentWindow.tabs.length = 0;
+    const tab = windowedTab(41);
+    documentWindow.tabs.push(tab);
+    documentWindow.activeIndex = 0;
+    documentWindow.windowedApplied(41, 1100, 11, false, 1);
+    expect(tab.windowed?.dirty).toBe(true);
+    expect(tab.windowed?.totalBytes).toBe(1100);
+    expect(tab.windowed?.totalLines).toBe(11);
+    documentWindow.windowedApplied(41, 1000, 10, true, 2);
+    expect(tab.windowed?.dirty).toBe(false);
+    expect(tab.windowed?.totalBytes).toBe(1000);
+  });
+
+  it('ignores a result older than one already applied', () => {
+    documentWindow.tabs.length = 0;
+    const tab = windowedTab(42);
+    documentWindow.tabs.push(tab);
+    documentWindow.activeIndex = 0;
+    documentWindow.windowedApplied(42, 1000, 10, true, 5);
+    documentWindow.windowedApplied(42, 1100, 11, false, 4);
+    expect(tab.windowed?.dirty).toBe(false);
+    expect(tab.windowed?.totalBytes).toBe(1000);
+    // The same generation is not older.
+    documentWindow.windowedApplied(42, 1200, 12, false, 5);
+    expect(tab.windowed?.dirty).toBe(true);
+  });
+
+  it('applies a result to the tab that owns the session, not the active one', () => {
+    documentWindow.tabs.length = 0;
+    const a = windowedTab(51);
+    const b = windowedTab(52);
+    documentWindow.tabs.push(a, b);
+    documentWindow.activeIndex = 1;
+    documentWindow.windowedApplied(51, 1200, 12, false, 1);
+    expect(a.windowed?.dirty).toBe(true);
+    expect(a.windowed?.totalBytes).toBe(1200);
+    expect(b.windowed?.dirty).toBe(false);
+    expect(b.windowed?.totalBytes).toBe(1000);
+  });
+
+  it('ignores a result for a closed session and keeps its generation out of the books', async () => {
+    mockInvoke.mockReset();
+    mockInvoke.mockImplementation((() =>
+      Promise.resolve(null)) as typeof invoke);
+    documentWindow.tabs.length = 0;
+    const a = windowedTab(53);
+    const b = windowedTab(54);
+    documentWindow.tabs.push(a, b);
+    documentWindow.activeIndex = 1;
+    await documentWindow.deleteTab(0);
+    expect(documentWindow.tabs).toEqual([b]);
+    documentWindow.windowedApplied(53, 9999, 99, false, 100);
+    expect(b.windowed?.dirty).toBe(false);
+    expect(b.windowed?.totalBytes).toBe(1000);
+    // A later result of the other session, with a far lower generation, lands.
+    documentWindow.windowedApplied(54, 1100, 11, false, 1);
+    expect(b.windowed?.dirty).toBe(true);
+    expect(b.windowed?.totalBytes).toBe(1100);
+    // Had the ignored result's generation been recorded, a tab that holds the
+    // same session id again would drop a lower one.
+    const again = windowedTab(53);
+    documentWindow.tabs.push(again);
+    documentWindow.windowedApplied(53, 1300, 13, false, 1);
+    expect(again.windowed?.dirty).toBe(true);
+    expect(again.windowed?.totalBytes).toBe(1300);
+  });
+
+  it('ignores a save result for a closed session', async () => {
+    documentWindow.tabs.length = 0;
+    const tab = windowedTab(55);
+    const other = windowedTab(56);
+    tab.windowed!.dirty = true;
+    documentWindow.tabs.push(tab, other);
+    documentWindow.activeIndex = 1;
+    let finish: (v: typeof SAVED_AS) => void = () => {};
+    mockInvoke.mockReset();
+    mockInvoke.mockImplementation(((cmd: string) =>
+      cmd === 'windowed_save'
+        ? new Promise<typeof SAVED_AS>((resolve) => {
+            finish = resolve;
+          })
+        : Promise.resolve(null)) as typeof invoke);
+    const saving = documentWindow.saveWindowed(tab, false);
+    // The tab is closed while the write runs.
+    await documentWindow.deleteTab(0);
+    finish({ ...SAVED_AS, clean: true, generation: 100 });
+    expect(await saving).toBe('ok');
+    expect(other.windowed?.dirty).toBe(false);
+    expect(other.windowed?.totalBytes).toBe(1000);
+    expect(other.windowed?.fingerprint).toBeNull();
+    expect(tab.windowed?.dirty).toBe(true);
+  });
+
+  it('save-as applies to the tab that owns the session while another tab is active', async () => {
+    documentWindow.tabs.length = 0;
+    const a = windowedTab(57);
+    const b = windowedTab(58);
+    a.windowed!.dirty = true;
+    b.windowed!.dirty = true;
+    documentWindow.tabs.push(a, b);
+    documentWindow.activeIndex = 1;
+    documentWindow.windowedConflict = a;
+    mockInvoke.mockReset();
+    mockInvoke.mockImplementation(((cmd: string) =>
+      Promise.resolve(
+        cmd === 'windowed_save' ? { ...SAVED_AS, generation: 3 } : null,
+      )) as typeof invoke);
+    expect(await documentWindow.windowedConflictSaveAs('/tmp/a-copy.log')).toBe(
+      true,
+    );
+    expect(a.path).toBe('/tmp/a-copy.log');
+    expect(a.windowed?.dirty).toBe(false);
+    expect(a.windowed?.fingerprint).toEqual(SAVED_AS.fingerprint);
+    expect(b.path).toBe('/tmp/huge.log');
+    expect(b.windowed?.dirty).toBe(true);
+    expect(b.windowed?.fingerprint).toBeNull();
+  });
+
+  it('save-as for a tab closed while the write ran changes no other tab', async () => {
+    documentWindow.tabs.length = 0;
+    const a = windowedTab(59);
+    const b = windowedTab(60);
+    b.windowed!.dirty = true;
+    documentWindow.tabs.push(a, b);
+    documentWindow.activeIndex = 1;
+    documentWindow.windowedConflict = a;
+    let finish: (v: typeof SAVED_AS) => void = () => {};
+    mockInvoke.mockReset();
+    mockInvoke.mockImplementation(((cmd: string) =>
+      cmd === 'windowed_save'
+        ? new Promise<typeof SAVED_AS>((resolve) => {
+            finish = resolve;
+          })
+        : Promise.resolve(null)) as typeof invoke);
+    const saving = documentWindow.windowedConflictSaveAs('/tmp/a-copy.log');
+    await documentWindow.deleteTab(0);
+    finish({ ...SAVED_AS, clean: true, generation: 100 });
+    await saving;
+    expect(b.path).toBe('/tmp/huge.log');
+    expect(b.windowed?.dirty).toBe(true);
+    expect(b.windowed?.fingerprint).toBeNull();
+    expect(b.windowed?.totalBytes).toBe(1000);
+  });
+
+  it('keeps a save result older than a newer edit from clearing dirty', async () => {
+    documentWindow.tabs.length = 0;
+    const tab = windowedTab(43);
+    documentWindow.tabs.push(tab);
+    documentWindow.activeIndex = 0;
+    documentWindow.windowedApplied(43, 1100, 11, false, 9);
+    mockInvoke.mockImplementation(((cmd: string) =>
+      Promise.resolve(
+        cmd === 'windowed_save'
+          ? { ...SAVED_AS, clean: true, generation: 8 }
+          : null,
+      )) as typeof invoke);
+    expect(await documentWindow.saveWindowed(tab, false)).toBe('ok');
+    expect(tab.windowed?.dirty).toBe(true);
+    expect(tab.windowed?.fingerprint).toEqual(SAVED_AS.fingerprint);
   });
 });

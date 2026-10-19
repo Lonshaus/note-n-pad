@@ -59,6 +59,7 @@ import {
 import { t } from '../i18n';
 import { rangeLabel } from '../util/rangeLabel';
 import { READ_ONLY_DESTINATION, isLiteRefusal } from '../util/protocol';
+import { appliedTarget } from '../util/windowedApplied';
 
 /** Rust `splice_file` rejects an out-of-band-edited source with this exact error
  *  string; the write-back keys its conflict flow off it (protocol value). */
@@ -181,6 +182,8 @@ interface WindowedSaved {
   fingerprint: Fingerprint;
   total_bytes: number;
   total_lines: number;
+  clean: boolean;
+  generation: number;
 }
 
 /** Result of the Rust `windowed_reopen` command. `rescanned` is true when a
@@ -467,6 +470,9 @@ class DocumentWindowState {
    *  the editor that started it, since the editor is mounted only for the
    *  active tab. Not reactive; an editor reads it when it mounts. */
   private windowedGates = new Map<number, OpGate>();
+  /** The newest content generation each windowed session has reported, by
+   *  session id: a result with a lower one is stale and changes nothing. */
+  private windowedGenerations = new Map<number, number>();
   viewTopLine(id: string): number | undefined {
     return this.viewPos.get(id)?.top;
   }
@@ -2314,14 +2320,27 @@ class DocumentWindowState {
    *  The tab's totals and dirty flag follow the result even when the editor
    *  that asked has been unmounted by then. `changed` says whether the result
    *  changed the content. */
-  runWindowedOp<T extends { total_bytes: number; total_lines: number }>(
+  runWindowedOp<
+    T extends {
+      total_bytes: number;
+      total_lines: number;
+      clean: boolean;
+      generation: number;
+    },
+  >(
     sessionId: number,
     run: () => Promise<T>,
     changed: (result: T) => boolean,
   ): Promise<T> {
     const op = run().then((result) => {
       if (changed(result)) {
-        this.windowedApplied(sessionId, result.total_bytes, result.total_lines);
+        this.windowedApplied(
+          sessionId,
+          result.total_bytes,
+          result.total_lines,
+          result.clean,
+          result.generation,
+        );
       }
       return result;
     });
@@ -2329,21 +2348,58 @@ class DocumentWindowState {
     return op;
   }
 
-  /** Called by the WindowedEditor after each successful apply: record the fresh
-   *  totals and mark the session's tab dirty (the first apply flips dirty). */
+  /** Called by the WindowedEditor after each successful apply, undo or redo:
+   *  record the fresh totals and set the session's tab dirty unless the content
+   *  equals the last save. A result older than one already seen is dropped. */
   windowedApplied(
     sessionId: number,
     totalBytes: number,
     totalLines: number,
+    clean: boolean,
+    generation: number,
   ): void {
-    const tab = this.tabs.find((t) => t.windowed?.sessionId === sessionId);
-    if (tab?.windowed === undefined) {
+    const tab = this.tabOfWindowedSession(sessionId);
+    if (
+      tab?.windowed === undefined ||
+      !this.noteWindowedGeneration(sessionId, generation)
+    ) {
       return;
     }
     tab.windowed.totalBytes = totalBytes;
     tab.windowed.totalLines = totalLines;
-    tab.windowed.dirty = true;
+    tab.windowed.dirty = !clean;
     this.persistActive();
+  }
+  /** The tab that holds windowed session `sessionId` right now, if any. */
+  private tabOfWindowedSession(sessionId: number): DocTab | undefined {
+    return appliedTarget(this.tabs, sessionId);
+  }
+  /** Take a finished save's result into the windowed state `w`. The
+   *  fingerprint always follows; the totals and the dirty flag only when no
+   *  newer result has been seen. */
+  private applyWindowedSaved(
+    w: NonNullable<DocTab['windowed']>,
+    saved: WindowedSaved,
+  ): void {
+    w.fingerprint = saved.fingerprint;
+    if (this.noteWindowedGeneration(w.sessionId, saved.generation)) {
+      w.totalBytes = saved.total_bytes;
+      w.totalLines = saved.total_lines;
+      w.dirty = !saved.clean;
+    }
+  }
+  /** Record `generation` as the newest seen for a session. False when it is
+   *  older than one already seen. */
+  private noteWindowedGeneration(
+    sessionId: number,
+    generation: number,
+  ): boolean {
+    const seen = this.windowedGenerations.get(sessionId);
+    if (seen !== undefined && generation < seen) {
+      return false;
+    }
+    this.windowedGenerations.set(sessionId, generation);
+    return true;
   }
   /** Record the line ending read from a large tab's first text. `style` is null
    *  when the sample had no line break, which falls back to the user's default.
@@ -2414,12 +2470,15 @@ class DocumentWindowState {
       this.saveFailed = { path: tab.path, error: String(e) };
       return 'error';
     }
-    w.fingerprint = saved.fingerprint;
-    w.totalBytes = saved.total_bytes;
-    w.totalLines = saved.total_lines;
-    w.dirty = false;
+    // The tab may have been closed, or reopened under a new session, while
+    // the write ran: the result belongs to the tab that has this session now.
+    const live = this.tabOfWindowedSession(w.sessionId);
+    if (live?.windowed === undefined) {
+      return 'ok';
+    }
+    this.applyWindowedSaved(live.windowed, saved);
     this.windowedConflict = null;
-    await this.upsertTab(tab);
+    await this.upsertTab(live);
     return 'ok';
   }
 
@@ -2457,6 +2516,7 @@ class DocumentWindowState {
       void invoke('windowed_close', { sessionId: w.sessionId });
     }
     this.windowedGates.delete(w.sessionId);
+    this.windowedGenerations.delete(w.sessionId);
     tab.windowed = {
       sessionId: open.session_id,
       totalBytes: open.total_bytes,
@@ -2588,17 +2648,20 @@ class DocumentWindowState {
       this.saveFailed = { path: chosen, error: String(e) };
       return false;
     }
-    // Rust has already moved the session to `chosen`; mirror that here.
-    tab.path = chosen;
-    if (!tab.explicit) {
-      tab.language = detectByFilename(chosen);
+    // The tab may have been closed, or reopened under a new session, while
+    // the write ran: the result belongs to the tab that has this session now.
+    const live = this.tabOfWindowedSession(w.sessionId);
+    if (live?.windowed === undefined) {
+      return true;
     }
-    w.fingerprint = saved.fingerprint;
-    w.totalBytes = saved.total_bytes;
-    w.totalLines = saved.total_lines;
-    w.dirty = false;
+    // Rust has already moved the session to `chosen`; mirror that here.
+    live.path = chosen;
+    if (!live.explicit) {
+      live.language = detectByFilename(chosen);
+    }
+    this.applyWindowedSaved(live.windowed, saved);
     this.windowedConflict = null;
-    await this.upsertTab(tab);
+    await this.upsertTab(live);
     void invoke('add_recent_file', { path: chosen });
     return true;
   }
@@ -2749,6 +2812,7 @@ class DocumentWindowState {
         void invoke('windowed_close', { sessionId: tab.windowed.sessionId });
       }
       this.windowedGates.delete(tab.windowed.sessionId);
+      this.windowedGenerations.delete(tab.windowed.sessionId);
     }
     if (tab === this.windowedConflict) {
       this.windowedConflict = null;

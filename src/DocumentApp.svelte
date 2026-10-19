@@ -1569,6 +1569,9 @@
               project: documentWindow.project,
             })),
           switchTab: (i: number) => void documentWindow.switchTo(i),
+          switchTabNow: (i: number) => {
+            documentWindow.activeIndex = i;
+          },
           openTab: (p: string) => void documentWindow.openTab(p),
           openTabSettled: (p: string) => documentWindow.openTab(p),
           newTab: () => void documentWindow.newTab(),
@@ -1923,16 +1926,14 @@
           wordWrap={settingsState.editorWordWrap}
           lineNumbers={settingsState.editorLineNumbers}
           modalOpen={anyModalOpen}
-          onapplied={(totalBytes, totalLines) => {
-            const t = documentWindow.activeTab;
-            if (t?.windowed !== undefined) {
-              documentWindow.windowedApplied(
-                t.windowed.sessionId,
-                totalBytes,
-                totalLines,
-              );
-            }
-          }}
+          onapplied={(sessionId, totalBytes, totalLines, clean, generation) =>
+            documentWindow.windowedApplied(
+              sessionId,
+              totalBytes,
+              totalLines,
+              clean,
+              generation,
+            )}
           onstatus={(info) => {
             documentWindow.setCursor(info.line, info.col);
             documentWindow.windowedTopLineChanged(info.windowStartLine);
