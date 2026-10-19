@@ -53,6 +53,7 @@ mod replace_layer;
 mod settings;
 mod shortcut;
 mod shortcuts;
+mod snapshot_lock;
 mod theme_store;
 mod webview2_runtime;
 mod win_menu_gray;
@@ -2695,9 +2696,9 @@ pub fn run() {
       // resolve the active snapshots dir from settings.
       note_store::migrate_legacy_snapshot_location_setting(handle);
       let fallback = note_store::SnapshotFallback::default();
-      let dir =
+      let (dir, dir_lock) =
         note_store::startup_snapshot_dir(handle, &settings::app_settings(handle), &fallback)?;
-      let fallback_active = fallback.in_use();
+      let fallback_active = fallback.reason().fell_back();
       app.manage(fallback);
       // `NoteStore::load` only fails when `dir` exists but cannot be listed
       // (e.g. permissions). Falling back to an empty store for the same `dir`
@@ -2710,6 +2711,7 @@ pub fn run() {
           (NoteStore::empty(dir), Vec::new(), false)
         }
       };
+      store.hold_lock(dir_lock);
       let notes = store.list();
       app.manage(store);
       // Snapshots are loaded before any window exists, so anything skipped is

@@ -5,6 +5,7 @@ import { invoke } from '@tauri-apps/api/core';
 import { listen, type UnlistenFn } from '@tauri-apps/api/event';
 import { withAddedFont } from '../util/font';
 import type { LineEnding } from '../util/text';
+import type { I18nKey } from '../i18n';
 import { resolveLocale, type Language, type Locale } from '../i18n/locale';
 import { localeRegistry } from '../i18n/localeRegistry.svelte';
 import { pickDefaultTheme, resolveEditorTheme } from '../theme/themes';
@@ -70,6 +71,32 @@ interface LoadedSettings {
   repaired_fields: string[];
   unset_defaults_to_notify?: string[];
   snapshot_dir_unavailable: boolean;
+  snapshot_dir_in_use: boolean;
+  snapshot_dir_unlockable: boolean;
+}
+/** What `set_snapshot_dir` returns: the snapshot-folder notices to show from
+ *  now on. Mirrors Rust's `SnapshotDirState`. */
+interface SnapshotDirState {
+  unavailable: boolean;
+  in_use: boolean;
+  unlockable: boolean;
+}
+/** The text for a failed `set_snapshot_dir`. Rust's `SetDirError` arrives as
+ *  `{ kind: 'in_use' }` or `{ kind: 'other', message }`; "in use" gets its own
+ *  wording, anything else shows what the core reported. */
+export function snapshotDirErrorText(
+  err: unknown,
+  translate: (key: I18nKey) => string,
+): string {
+  if (typeof err === 'object' && err !== null && 'kind' in err) {
+    if (err.kind === 'in_use') {
+      return translate('settings.snapshotDirInUseSwitch');
+    }
+    if ('message' in err) {
+      return String(err.message);
+    }
+  }
+  return String(err);
 }
 
 // Exported (alongside the `settingsState` singleton below) so tests can
@@ -217,6 +244,15 @@ export class SettingsState {
    *  used at startup and the default folder is in use instead. Set from
    *  `LoadedSettings.snapshot_dir_unavailable`, alongside `settingsRepaired`. */
   snapshotDirUnavailable = $state(false);
+  /** True when the chosen snapshot folder is in use by another app at startup
+   *  and the default folder is in use instead. From
+   *  `LoadedSettings.snapshot_dir_in_use`. */
+  snapshotDirInUse = $state(false);
+  /** True when the snapshot folder in use has no lock support, so another app
+   *  using it at the same time cannot be detected. From
+   *  `LoadedSettings.snapshot_dir_unlockable`, kept current by
+   *  `setSnapshotDir`. */
+  snapshotDirUnlockable = $state(false);
   /** Rows whose default key is taken and not yet acknowledged, from the last
    *  load. The Settings window acknowledges them once it has shown the notice. */
   unsetDefaultsToNotify: string[] = [];
@@ -245,7 +281,7 @@ export class SettingsState {
         const loaded = await invoke<LoadedSettings>('load_settings');
         this.apply(loaded.settings);
         this.settingsRepaired = loaded.repaired_fields.length > 0;
-        this.snapshotDirUnavailable = loaded.snapshot_dir_unavailable ?? false;
+        this.#applySnapshotDirState(loaded);
         this.unsetDefaultsToNotify = loaded.unset_defaults_to_notify ?? [];
       } catch {
         // The stored settings cannot be read back either; the flag is all the
@@ -254,12 +290,18 @@ export class SettingsState {
     }
   }
 
+  #applySnapshotDirState(loaded: LoadedSettings): void {
+    this.snapshotDirUnavailable = loaded.snapshot_dir_unavailable ?? false;
+    this.snapshotDirInUse = loaded.snapshot_dir_in_use ?? false;
+    this.snapshotDirUnlockable = loaded.snapshot_dir_unlockable ?? false;
+  }
+
   async init(): Promise<void> {
     try {
       const loaded = await invoke<LoadedSettings>('load_settings');
       this.apply(loaded.settings, true);
       this.settingsRepaired = loaded.repaired_fields.length > 0;
-      this.snapshotDirUnavailable = loaded.snapshot_dir_unavailable ?? false;
+      this.#applySnapshotDirState(loaded);
       this.unsetDefaultsToNotify = loaded.unset_defaults_to_notify ?? [];
     } finally {
       this.#markReady();
@@ -419,17 +461,21 @@ export class SettingsState {
    *  succeeds. `dir` is null to reset to the default. `moveFiles` false
    *  switches the active directory without touching any files (the "don't
    *  move" choice); `policy` resolves a name collision at the destination
-   *  and is ignored when there is nothing to move. */
+   *  and is ignored when there is nothing to move. The returned notice state
+   *  replaces the startup one: the folder is now the one the user picked. */
   async setSnapshotDir(
     dir: string | null,
     moveFiles: boolean,
     policy: CollisionPolicy,
   ): Promise<void> {
-    await invoke<void>('set_snapshot_dir', {
+    const state = await invoke<SnapshotDirState>('set_snapshot_dir', {
       dir,
       moveFiles,
       policy,
     });
+    this.snapshotDirUnavailable = state.unavailable;
+    this.snapshotDirInUse = state.in_use;
+    this.snapshotDirUnlockable = state.unlockable;
     this.snapshotDir = dir;
     await this.refreshResolvedSnapshotDir();
   }

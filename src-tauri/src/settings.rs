@@ -814,6 +814,12 @@ pub struct LoadedSettings {
   /// default one is in use instead. The setting itself is left alone, so the
   /// chosen folder is used again as soon as it works.
   pub snapshot_dir_unavailable: bool,
+  /// The chosen snapshot folder is in use by another app and the default one
+  /// is in use instead. The setting itself is left alone.
+  pub snapshot_dir_in_use: bool,
+  /// The snapshot folder in use has no lock support, so another app using it
+  /// at the same time cannot be detected.
+  pub snapshot_dir_unlockable: bool,
 }
 
 #[tauri::command]
@@ -824,13 +830,16 @@ pub fn load_settings(app: AppHandle) -> Result<LoadedSettings, String> {
     .filter_map(|field| field.strip_prefix("shortcut_defaults."))
     .map(str::to_string)
     .collect();
+  let dir_state = app
+    .try_state::<crate::note_store::SnapshotFallback>()
+    .map(|state| state.state());
   Ok(LoadedSettings {
     settings,
     repaired_fields,
     unset_defaults_to_notify,
-    snapshot_dir_unavailable: app
-      .try_state::<crate::note_store::SnapshotFallback>()
-      .is_some_and(|state| state.in_use()),
+    snapshot_dir_unavailable: dir_state.is_some_and(|state| state.unavailable),
+    snapshot_dir_in_use: dir_state.is_some_and(|state| state.in_use),
+    snapshot_dir_unlockable: dir_state.is_some_and(|state| state.unlockable),
   })
 }
 
