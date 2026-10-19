@@ -181,7 +181,12 @@ mod tests {
     assert_eq!(names(&a), vec!["b", "mid.txt"]);
     assert_eq!(
       a[1].path,
-      dir.path().join("a/mid.txt").to_string_lossy().to_string()
+      dir
+        .path()
+        .join("a")
+        .join("mid.txt")
+        .to_string_lossy()
+        .to_string()
     );
     assert!(a.iter().all(|e| e.children.is_none()));
   }
