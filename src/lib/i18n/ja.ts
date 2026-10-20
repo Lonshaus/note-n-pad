@@ -180,6 +180,8 @@ export const ja = {
   'doc.oversized.message':
     'このタブの未保存の内容は大きすぎてスナップショットを保持できません。閉じる前に処理が必要です。',
   'doc.oversized.discard': '変更を破棄',
+  'doc.rangeBox.unsaved':
+    '範囲の編集ボックスに未保存の変更があります。閉じる前に処理が必要です。',
   'doc.snapshotFailed.message':
     'このタブの未保存の内容を復元用スナップショットに保存できませんでした。閉じる前に処理が必要です。',
   'sticky.snapshotFailed.message':
@@ -308,8 +310,6 @@ export const ja = {
     '「{name}」を開けません。ファイルが移動・削除されたか、ファイル名にこのアプリが対応していない文字が含まれている可能性があります。',
   'doc.restoreUnreadable':
     '{names} を読み込めませんでした。ファイルをもう一度開いてください。',
-  'doc.keptTabs':
-    'このバージョンでは対応していないタブが {count} 個あるため、開いていません。',
   'edition.col.feature': '機能',
   'edition.col.lite': 'このバージョン',
   'edition.col.full': '製品版',

@@ -18,7 +18,6 @@ import {
   windowedRefusalReason,
   windowedSnapshotDirty,
   windowedSnapshotLarge,
-  rangeDisplayName,
   LARGE_FILE_THRESHOLD,
   type DocTab,
 } from './documentWindow.svelte';
@@ -167,136 +166,6 @@ describe('windowedSnapshotLarge (persist on-disk size, not post-edit size)', () 
 
   it('is null when nothing is available', () => {
     expect(windowedSnapshotLarge(null, null, null)).toBe(null);
-  });
-});
-
-describe('rangeDisplayName (derived, not frozen at extraction)', () => {
-  // Pinned to `ja` (not `en`) so the assertions below prove the same thing on
-  // every machine: pinning to English would make a mutation that hardcodes the
-  // English template (bypassing `t()` entirely) pass on every host, since the
-  // expected side's `t()` call would resolve to English too. `ja`'s template
-  // (`'{name}（{start}–{end} 行目）'`, see `src/lib/i18n/ja.ts`) differs in shape
-  // from English, so that mutation is caught regardless of the machine's own
-  // locale.
-  // Restored afterwards because `settingsState` is a singleton: leaving it
-  // pinned would silently apply to any locale-dependent test added later in
-  // this file.
-  let pinnedLanguageBefore: string;
-  beforeEach(() => {
-    pinnedLanguageBefore = settingsState.language;
-    settingsState.language = 'ja';
-  });
-  afterEach(() => {
-    settingsState.language = pinnedLanguageBefore;
-  });
-
-  it('is null for a non-range tab', () => {
-    expect(rangeDisplayName(baseTab({}))).toBe(null);
-  });
-
-  it('is null for a range tab restored with no start line (older snapshot)', () => {
-    const tab = baseTab({
-      content: Text.of(['a', 'b', 'c']),
-      range: {
-        sourcePath: '/tmp/big.log',
-        startByte: 0,
-        endByte: 10,
-        fingerprint: null,
-        startLine: null,
-        trailingBreak: false,
-      },
-    });
-    expect(rangeDisplayName(tab)).toBe(null);
-  });
-
-  it('derives the end line from the tab content line count, not a stored value', () => {
-    const tab = baseTab({
-      content: Text.of(['a', 'b', 'c']), // 3 lines
-      range: {
-        sourcePath: '/tmp/big.log',
-        startByte: 0,
-        endByte: 10,
-        fingerprint: null,
-        startLine: 5,
-        trailingBreak: false,
-      },
-    });
-    // Lines 5,6,7 for a 3-line buffer starting at line 5.
-    expect(rangeDisplayName(tab)).toBe(
-      t('doc.range.displayName', { name: 'big.log', start: 5, end: 7 }),
-    );
-  });
-
-  it('follows an edit that changes the line count (no rebase needed, unlike endByte)', () => {
-    const tab = baseTab({
-      content: Text.of(['a', 'b']), // shrunk from 3 to 2 lines after an edit
-      range: {
-        sourcePath: '/tmp/big.log',
-        startByte: 0,
-        endByte: 10,
-        fingerprint: null,
-        startLine: 5,
-        trailingBreak: false,
-      },
-    });
-    expect(rangeDisplayName(tab)).toBe(
-      t('doc.range.displayName', { name: 'big.log', start: 5, end: 6 }),
-    );
-  });
-
-  // `LargeFileView`'s extraction takes the end offset as the start of the line
-  // *after* the last selected line, so the extracted content almost always
-  // ends with the last selected line's trailing newline — the shape the two
-  // tests above (`Text.of(['a','b','c'])`, no trailing newline) don't cover.
-  it('does not count the trailing empty line a final newline opens (multi-line range)', () => {
-    const tab = baseTab({
-      content: Text.of(['line5', 'line6', 'line7', '']), // "line5\nline6\nline7\n"
-      range: {
-        sourcePath: '/tmp/big.log',
-        startByte: 0,
-        endByte: 10,
-        fingerprint: null,
-        startLine: 5,
-        trailingBreak: false,
-      },
-    });
-    expect(rangeDisplayName(tab)).toBe(
-      t('doc.range.displayName', { name: 'big.log', start: 5, end: 7 }),
-    );
-  });
-
-  it('does not count the trailing empty line a final newline opens (single-line range)', () => {
-    const tab = baseTab({
-      content: Text.of(['line5', '']), // "line5\n"
-      range: {
-        sourcePath: '/tmp/big.log',
-        startByte: 0,
-        endByte: 10,
-        fingerprint: null,
-        startLine: 5,
-        trailingBreak: false,
-      },
-    });
-    expect(rangeDisplayName(tab)).toBe(
-      t('doc.range.displayName', { name: 'big.log', start: 5, end: 5 }),
-    );
-  });
-
-  it('renders a single line for an empty range (Text.empty, no trailing newline to detect)', () => {
-    const tab = baseTab({
-      content: Text.empty,
-      range: {
-        sourcePath: '/tmp/big.log',
-        startByte: 0,
-        endByte: 0,
-        fingerprint: null,
-        startLine: 5,
-        trailingBreak: false,
-      },
-    });
-    expect(rangeDisplayName(tab)).toBe(
-      t('doc.range.displayName', { name: 'big.log', start: 5, end: 5 }),
-    );
   });
 });
 
@@ -811,49 +680,10 @@ describe('saveActive on a read-only-destination refusal', () => {
 });
 
 // A read-only destination gets the same doc.saveReadOnly modal as an ordinary
-// save, using the real write target (the range's source, and the windowed
-// tab's own path respectively), not the tab's own possibly-empty `path`.
-// The pair below pins that; the pair after them pins that an error which is
+// save, using the real write target (the windowed tab's own path), not a
+// possibly-empty `path`. The range box's write-back is pinned the same way in
+// rangeTrailingBreak.test.ts. The pair after them pins that an error which is
 // neither a conflict nor a refusal is reported just the same.
-describe('splice on a read-only-destination refusal', () => {
-  it('populates saveFailed with the source path and flags the tab, still returning error', async () => {
-    documentWindow.tabs.length = 0;
-    documentWindow.saveFailed = null;
-    const tab = baseTab({
-      id: 'range-tab',
-      path: '',
-      readOnlyFile: false,
-      content: Text.of(['changed']),
-      savedContent: Text.of(['original']),
-      range: {
-        sourcePath: '/tmp/source.log',
-        startByte: 0,
-        endByte: 10,
-        fingerprint: null,
-        startLine: 1,
-        trailingBreak: false,
-      },
-    });
-    documentWindow.tabs.push(tab);
-    documentWindow.activeIndex = 0;
-    mockInvoke.mockImplementation(((cmd: string) => {
-      if (cmd === 'splice_file') {
-        return Promise.reject(READ_ONLY_DESTINATION);
-      }
-      return Promise.resolve(null);
-    }) as typeof invoke);
-
-    const result = await documentWindow.rangeSave();
-
-    expect(result).toBe('error');
-    expect(documentWindow.saveFailed).toEqual({
-      path: '/tmp/source.log',
-      error: READ_ONLY_DESTINATION,
-    });
-    expect(tab.readOnlyFile).toBe(true);
-  });
-});
-
 describe('saveWindowed on a read-only-destination refusal', () => {
   it('populates saveFailed with the tab path and flags the tab, still returning error', async () => {
     documentWindow.tabs.length = 0;
@@ -935,51 +765,12 @@ describe('windowedConflictSaveAs on a read-only-destination refusal', () => {
   });
 });
 
-// The three paths below reached the same dead end for anything that was not a
+// Both paths below reached the same dead end for anything that was not a
 // conflict or a refusal: a bare 'error'/false, a tab left dirty, and nothing at
-// all on screen to say why. Cmd+S on a range or windowed tab discards the
-// return value, so the user pressed the key and saw no reaction whatsoever.
-// These pin that every one of them reports now, and that an unrelated error
-// does not raise the read-only flag the padlock is drawn from.
-describe('splice reports a failure that is not a refusal', () => {
-  it('populates saveFailed with the source path and leaves the read-only flag alone', async () => {
-    documentWindow.tabs.length = 0;
-    documentWindow.saveFailed = null;
-    const tab = baseTab({
-      id: 'range-tab',
-      path: '',
-      readOnlyFile: false,
-      content: Text.of(['changed']),
-      savedContent: Text.of(['original']),
-      range: {
-        sourcePath: '/tmp/source.log',
-        startByte: 0,
-        endByte: 10,
-        fingerprint: null,
-        startLine: 1,
-        trailingBreak: false,
-      },
-    });
-    documentWindow.tabs.push(tab);
-    documentWindow.activeIndex = 0;
-    mockInvoke.mockImplementation(((cmd: string) => {
-      if (cmd === 'splice_file') {
-        return Promise.reject('No space left on device (os error 28)');
-      }
-      return Promise.resolve(null);
-    }) as typeof invoke);
-
-    const result = await documentWindow.rangeSave();
-
-    expect(result).toBe('error');
-    expect(documentWindow.saveFailed).toEqual({
-      path: '/tmp/source.log',
-      error: 'No space left on device (os error 28)',
-    });
-    expect(tab.readOnlyFile).toBe(false);
-  });
-});
-
+// all on screen to say why. Cmd+S on a windowed tab discards the return value,
+// so the user pressed the key and saw no reaction whatsoever. These pin that
+// every one of them reports now, and that an unrelated error does not raise the
+// read-only flag the padlock is drawn from.
 describe('saveWindowed reports a failure that is not a refusal', () => {
   it('populates saveFailed with the tab path and leaves the read-only flag alone', async () => {
     documentWindow.tabs.length = 0;
@@ -1178,15 +969,19 @@ describe('windowedConflictSaveAs success', () => {
     expect(tab.language).toBe('markdown');
   });
 });
-
 // A failed `read_range`/`copy_range` used to be indistinguishable from a
 // successful extraction or a cancelled save (both were swallowed to the same
 // `null`/`false` the success/cancel paths already returned). These confirm
 // the three outcomes are now distinguishable: a genuine failure rejects
 // instead of resolving.
-describe('createRangeTab distinguishes failure from success and refusal', () => {
+describe('openRangeBox distinguishes failure from success and refusal', () => {
+  const viewer = (): DocTab =>
+    baseTab({ id: 'v', path: '/tmp/big.log', large: { size: 1000 } });
+  const info = { startByte: 0, endByte: 10, startLine: 1, endLine: 2 };
+
   beforeEach(() => {
     documentWindow.tabs.length = 0;
+    documentWindow.rangeBox = null;
   });
 
   it('rejects when read_range fails, instead of resolving null like a success', async () => {
@@ -1197,16 +992,11 @@ describe('createRangeTab distinguishes failure from success and refusal', () => 
       return Promise.resolve(undefined);
     }) as typeof invoke);
 
-    await expect(
-      documentWindow.createRangeTab('/tmp/big.log', {
-        startByte: 0,
-        endByte: 10,
-        startLine: 0,
-        endLine: 1,
-      }),
-    ).rejects.toThrow('file gone');
-    // No tab was opened for the failed read.
-    expect(documentWindow.tabs).toHaveLength(0);
+    await expect(documentWindow.openRangeBox(viewer(), info)).rejects.toThrow(
+      'file gone',
+    );
+    // No box was opened for the failed read.
+    expect(documentWindow.rangeBox).toBeNull();
   });
 
   it('resolves null on a real success (contrast with the failure above)', async () => {
@@ -1217,15 +1007,14 @@ describe('createRangeTab distinguishes failure from success and refusal', () => 
       return Promise.resolve(undefined);
     }) as typeof invoke);
 
-    const result = await documentWindow.createRangeTab('/tmp/big.log', {
-      startByte: 0,
-      endByte: 10,
-      startLine: 0,
-      endLine: 1,
-    });
+    const result = await documentWindow.openRangeBox(viewer(), info);
 
     expect(result).toBe(null);
-    expect(documentWindow.tabs).toHaveLength(1);
+    expect(documentWindow.rangeBox?.content.toString()).toBe('hello');
+    expect(documentWindow.rangeBox?.tabId).toBe('v');
+    expect(documentWindow.rangeBox?.sourcePath).toBe('/tmp/big.log');
+    // The box is not a tab.
+    expect(documentWindow.tabs).toHaveLength(0);
   });
 
   it('resolves a message when the range is refused for being lossy (contrast with the failure above)', async () => {
@@ -1236,37 +1025,25 @@ describe('createRangeTab distinguishes failure from success and refusal', () => 
       return Promise.resolve(undefined);
     }) as typeof invoke);
 
-    const result = await documentWindow.createRangeTab('/tmp/big.log', {
-      startByte: 0,
-      endByte: 10,
-      startLine: 0,
-      endLine: 1,
-    });
+    const result = await documentWindow.openRangeBox(viewer(), info);
 
     expect(result).toBe(t('doc.range.lossyRefusal'));
-    expect(documentWindow.tabs).toHaveLength(0);
+    expect(documentWindow.rangeBox).toBeNull();
   });
 
-  it('queries path_writable against the source file, not the (empty) tab path', async () => {
-    mockInvoke.mockImplementation(((cmd: string, args?: unknown) => {
+  it('keeps going without a fingerprint when it cannot be taken', async () => {
+    mockInvoke.mockImplementation(((cmd: string) => {
       if (cmd === 'read_range') {
         return Promise.resolve({ text: 'hello', lossy: false });
       }
-      if (cmd === 'path_writable') {
-        expect(args).toEqual({ path: '/tmp/big.log' });
-        return Promise.resolve(false);
+      if (cmd === 'file_fingerprint') {
+        return Promise.reject(new Error('gone'));
       }
       return Promise.resolve(undefined);
     }) as typeof invoke);
 
-    await documentWindow.createRangeTab('/tmp/big.log', {
-      startByte: 0,
-      endByte: 10,
-      startLine: 0,
-      endLine: 1,
-    });
-
-    expect(documentWindow.tabs[0]?.readOnlyFile).toBe(true);
+    expect(await documentWindow.openRangeBox(viewer(), info)).toBeNull();
+    expect(documentWindow.rangeBox?.fingerprint).toBeNull();
   });
 });
 
@@ -1288,17 +1065,101 @@ describe('saveRangeAs distinguishes failure from success and cancellation', () =
     ).rejects.toThrow('disk full');
   });
 
-  it('resolves true on a real success (contrast with the failure above)', async () => {
+  it('resolves false without copying when the dialog is cancelled', async () => {
+    mockSave.mockResolvedValueOnce(null);
+    mockInvoke.mockReset();
     mockInvoke.mockImplementation((() =>
       Promise.resolve(undefined)) as typeof invoke);
 
     const result = await documentWindow.saveRangeAs('/tmp/big.log', {
       startByte: 0,
       endByte: 10,
+    });
+
+    expect(result).toBe(false);
+    expect(mockInvoke.mock.calls.map(([cmd]) => cmd)).not.toContain(
+      'copy_range',
+    );
+  });
+});
+
+// The saved slice is a file like any other: it opens through the normal open
+// flow, as a new tab of this window.
+describe('saveRangeAs opens the saved file as a new tab', () => {
+  let readySpy: ReturnType<typeof vi.spyOn>;
+
+  afterEach(() => {
+    readySpy.mockRestore();
+  });
+
+  beforeEach(async () => {
+    readySpy = vi.spyOn(editionState, 'ready').mockResolvedValue();
+    documentWindow.tabs.length = 0;
+    documentWindow.activeIndex = 0;
+    mockInvoke.mockReset();
+    mockInvoke.mockImplementation(((cmd: string, args?: unknown) => {
+      switch (cmd) {
+        case 'copy_range':
+          return Promise.resolve(undefined);
+        case 'list_notes':
+          return Promise.resolve([]);
+        case 'live_doc_groups':
+          return Promise.resolve([]);
+        case 'path_writable':
+          return Promise.resolve(true);
+        case 'stat_file':
+          return Promise.resolve({ size: 10 });
+        case 'read_file_auto':
+        case 'read_file_as':
+          expect((args as { path: string }).path).toBe('/tmp/out.log');
+          return Promise.resolve({
+            content: 'slice',
+            encoding: 'UTF-8',
+            had_bom: false,
+            lossy: false,
+          });
+        default:
+          return Promise.resolve(undefined);
+      }
+    }) as typeof invoke);
+    // `init` throws on the bare mock answer but still settles `ready`.
+    await settingsState.init().catch(() => {});
+    // Opening a file waits for the window to know its tab indices.
+    await documentWindow.init('g', null, null);
+  });
+
+  it('resolves true and opens the new path, after the copy, with the slice as its content', async () => {
+    const ok = await documentWindow.saveRangeAs('/tmp/big.log', {
+      startByte: 0,
+      endByte: 10,
       pathOverride: '/tmp/out.log',
     });
 
-    expect(result).toBe(true);
+    expect(ok).toBe(true);
+    expect(documentWindow.tabs.map((tab) => tab.path)).toEqual([
+      '/tmp/out.log',
+    ]);
+    expect(documentWindow.activeTab?.content.toString()).toBe('slice');
+    const calls = mockInvoke.mock.calls.map(([cmd]) => cmd);
+    expect(calls.indexOf('copy_range')).toBeLessThan(
+      calls.indexOf('read_file_auto'),
+    );
+  });
+
+  it('opens nothing when the copy fails', async () => {
+    mockInvoke.mockImplementation(((cmd: string) =>
+      cmd === 'copy_range'
+        ? Promise.reject(new Error('disk full'))
+        : Promise.resolve(undefined)) as typeof invoke);
+
+    await expect(
+      documentWindow.saveRangeAs('/tmp/big.log', {
+        startByte: 0,
+        endByte: 10,
+        pathOverride: '/tmp/out.log',
+      }),
+    ).rejects.toThrow('disk full');
+    expect(documentWindow.tabs).toHaveLength(0);
   });
 });
 

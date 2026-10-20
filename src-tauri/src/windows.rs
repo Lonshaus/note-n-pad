@@ -897,29 +897,12 @@ pub fn open_document_group(
   tab: Option<i64>,
 ) -> Result<(), String> {
   let notes = store.list();
-  let plan = crate::note_store::plan_document_windows(&notes, crate::edition::is_lite())
+  let plan = crate::note_store::plan_document_windows(&notes)
     .into_iter()
     .find(|p| p.group == group)
     .ok_or_else(|| format!("no stored document group: {group}"))?;
   create_document_window(&app, &plan, tab)
 }
-/// The edition just turned full: open a window for every group the app closed
-/// for the trial (`HeldBackGroups`) that lite kept tabs of and whose window is
-/// not open, so those tabs return as at a startup restore. Windows still open
-/// reload their own kept tabs; groups the user closed wait for the next launch.
-pub fn reopen_kept_groups(app: &AppHandle) {
-  let notes = app.state::<NoteStore>().list();
-  let held = app.state::<crate::note_store::HeldBackGroups>().take_all();
-  let plans = crate::note_store::groups_to_reopen(&notes, &held, |group| {
-    app.get_webview_window(&format!("doc-{group}")).is_some()
-  });
-  for plan in plans {
-    if let Err(e) = create_document_window(app, &plan, None) {
-      log::warn!("failed to reopen document window {}: {e}", plan.group);
-    }
-  }
-}
-
 #[tauri::command]
 pub fn set_window_opacity(window: tauri::WebviewWindow, value: f64) -> Result<(), String> {
   apply_opacity(&window, value)

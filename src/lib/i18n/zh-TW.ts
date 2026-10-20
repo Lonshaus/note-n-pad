@@ -171,6 +171,7 @@ export const zhTW = {
   'doc.oversized.message':
     '此分頁的未儲存內容過大，無法保留快照，關閉前必須處理。',
   'doc.oversized.discard': '放棄變更',
+  'doc.rangeBox.unsaved': '範圍編輯框有未儲存的修改，關閉前必須處理。',
   'doc.snapshotFailed.message':
     '此分頁的未儲存內容無法寫入還原快照，關閉前必須處理。',
   'sticky.snapshotFailed.message':
@@ -290,7 +291,6 @@ export const zhTW = {
   'doc.openFailed':
     '無法開啟「{name}」。這個檔案可能已被移動或刪除，或是檔案名稱含有這個應用程式不支援的字元。',
   'doc.restoreUnreadable': '無法讀取 {names}。請重新開啟檔案。',
-  'doc.keptTabs': '未開啟：此版本不支援的分頁 {count} 個。',
   'edition.col.feature': '功能',
   'edition.col.lite': '此版本',
   'edition.col.full': '正式版',

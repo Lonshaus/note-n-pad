@@ -182,6 +182,8 @@ export const en = {
   'doc.oversized.message':
     'This tab’s unsaved content is too large to snapshot and must be handled before closing.',
   'doc.oversized.discard': 'Discard Changes',
+  'doc.rangeBox.unsaved':
+    'The range edit box has unsaved changes and must be handled before closing.',
   'doc.snapshotFailed.message':
     'This tab’s unsaved content could not be saved to the recovery snapshot and must be handled before closing.',
   'sticky.snapshotFailed.message':
@@ -310,7 +312,6 @@ export const en = {
     'Couldn’t open “{name}”. The file may have been moved or deleted, or its name may contain characters this app doesn’t support.',
   'doc.restoreUnreadable':
     'Couldn’t read: {names}. Open the file(s) again to continue.',
-  'doc.keptTabs': 'Not opened: {count} tab(s) not supported in this version.',
   'edition.col.feature': 'Feature',
   'edition.col.lite': 'This version',
   'edition.col.full': 'Full version',

@@ -2,7 +2,6 @@
 // SPDX-License-Identifier: GPL-3.0-only
 
 import type { NoteSnapshot } from '../state/stickyNote.svelte';
-import { requiresFullEdition } from './keptTabs';
 
 /** How a fresh file-open should be routed once the note store has been consulted:
  *  - 'fresh': no stored tab for this path in another window group; open normally.
@@ -23,21 +22,17 @@ export function documentGroup(note: NoteSnapshot): string {
 }
 
 /** Stored document tabs for `path` that live in a different window group than
- *  `thisGroup` — the candidates a fresh open must reconcile against. In lite a
- *  kept tab (one that needs a removed feature) is not a candidate: adopting it
- *  would load it, and its record must stay as it is. */
+ *  `thisGroup` — the candidates a fresh open must reconcile against. */
 export function orphanCandidates(
   notes: NoteSnapshot[],
   path: string,
   thisGroup: string,
-  lite: boolean,
 ): NoteSnapshot[] {
   return notes.filter(
     (n) =>
       n.kind === 'document' &&
       n.file_path === path &&
-      documentGroup(n) !== thisGroup &&
-      !(lite && requiresFullEdition(n)),
+      documentGroup(n) !== thisGroup,
   );
 }
 
@@ -52,9 +47,8 @@ export function routeOpen(
   path: string,
   thisGroup: string,
   liveGroups: ReadonlySet<string>,
-  lite: boolean,
 ): OpenRoute {
-  const candidates = orphanCandidates(notes, path, thisGroup, lite);
+  const candidates = orphanCandidates(notes, path, thisGroup);
   if (candidates.length === 0) {
     return { kind: 'fresh' };
   }

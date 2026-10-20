@@ -13,7 +13,6 @@ import {
 } from '../editor/language';
 import { beautifyJson, softWrapLongLines } from '../util/longLine';
 import {
-  KeptRestore,
   UnreadableRestore,
   activePositionAfterRestore,
   restoreOutcome,
@@ -29,10 +28,12 @@ import {
   type LineEnding,
 } from '../util/text';
 import {
-  rangeWriteText,
-  replacementByteLength,
-  sliceEndsWithBreak,
-} from '../util/rangeEdit';
+  isRangeBoxDirty,
+  nextRangeBox,
+  openRangeBox,
+  rangeBoxWriteText,
+  type RangeBox,
+} from '../util/rangeEditBox';
 import { detectBreakStyle } from '../util/windowedEdit';
 import { createOpGate, type OpGate } from '../util/windowedGate';
 import {
@@ -44,21 +45,15 @@ import {
 import type { CheckpointIndex, NoteSnapshot } from './stickyNote.svelte';
 import { settingsState } from './settings.svelte';
 import { editionState, isLite } from './edition.svelte';
-import {
-  keptTabsToLoad,
-  nextTabIndex,
-  partitionRestorable,
-  windowBoundsRecord,
-} from '../util/keptTabs';
+import { nextTabIndex } from '../util/keptTabs';
+import { isCleanOldRange, needsRewrite } from '../util/restoreRecords';
 import { isOrdinaryTab, pickHeldTab, touchMru } from './heldTab';
 import type { LargeIndexRef } from '../util/largeIndex';
 import {
   snapshotContentPolicy,
   debounceContentPolicy,
-  restoredRangeContent,
 } from '../util/snapshotPolicy';
 import { t } from '../i18n';
-import { rangeLabel } from '../util/rangeLabel';
 import { READ_ONLY_DESTINATION, isLiteRefusal } from '../util/protocol';
 
 /** Rust `splice_file` rejects an out-of-band-edited source with this exact error
@@ -206,9 +201,48 @@ interface WindowedIndexSnapshot {
   digest: string;
 }
 
-/** Result of a range-tab write-back: written, refused for a conflict (the
+/** Result of a range edit box write-back: written, refused for a conflict (the
  *  conflict modal is now up), or failed for another reason. */
 export type SpliceResult = 'ok' | 'mismatch' | 'error';
+
+/** What `spliceRange` found: the source rewritten (with its new fingerprint),
+ *  changed since `expected` was taken, or refused for another reason. */
+export type SpliceOutcome =
+  | { status: 'ok'; fingerprint: Fingerprint }
+  | { status: 'mismatch' }
+  | { status: 'error'; error: string };
+
+/** Replace `[startByte, endByte)` of `sourcePath` with `replacement`, and
+ *  tell every window so a large viewer of the file rebuilds its stale line
+ *  index. `expected` is the conflict baseline; null writes past the check. Not
+ *  tied to a tab: the caller owns what a result means. */
+export async function spliceRange(
+  target: { sourcePath: string; startByte: number; endByte: number },
+  replacement: string,
+  expected: Fingerprint | null,
+): Promise<SpliceOutcome> {
+  if (__LITE__) {
+    return { status: 'error', error: 'range editing is not in this build' };
+  }
+  let fingerprint: Fingerprint;
+  try {
+    fingerprint = await invoke<Fingerprint>('splice_file', {
+      path: target.sourcePath,
+      start: target.startByte,
+      end: target.endByte,
+      replacement,
+      expected,
+    });
+  } catch (e) {
+    if (String(e) === FINGERPRINT_MISMATCH) {
+      return { status: 'mismatch' };
+    }
+    return { status: 'error', error: String(e) };
+  }
+  // Every window, this one included.
+  void emit(RANGE_SPLICED_EVENT, target.sourcePath);
+  return { status: 'ok', fingerprint };
+}
 
 /** A byte slice decoded as text plus whether the decode was lossy (invalid
  *  UTF-8 replaced), mirroring the Rust `ReadRange`. */
@@ -286,26 +320,6 @@ export interface DocTab {
    *  is set (to the reason shown on the tab lock) once an in-place unlock is
    *  refused, e.g. a non-UTF-8 file; the lock then stays disabled. */
   large?: { size: number; unlockRefused?: string };
-  /** Present only on a range tab: an ordinary editable buffer seeded from a byte
-   *  slice of `sourcePath`. Cmd+S splices the edited buffer back into the source
-   *  over `[startByte, endByte)`, using `fingerprint` as the conflict baseline. A
-   *  successful splice rebases `endByte` and refreshes `fingerprint`. */
-  range?: {
-    sourcePath: string;
-    startByte: number;
-    endByte: number;
-    fingerprint: Fingerprint | null;
-    /** 1-based line number of the range's first line, fixed at extraction
-     *  time: nothing before this tab's content can shift while it stays open,
-     *  so unlike `endByte`/`endLine` this never needs rebasing after a splice.
-     *  Null only for a tab restored from an older snapshot that persisted a
-     *  formatted label instead of a line number — see `rangeDisplayName`. */
-    startLine: number | null;
-    /** Whether the source slice ended with a line break. `splice` adds one to
-     *  what it writes when the buffer ended up without one, so text typed on the
-     *  last line cannot join the next source line. */
-    trailingBreak: boolean;
-  };
   /** Present only on a windowed-editing tab: the buffer lives in the Rust core,
    *  streamed a window at a time by the WindowedEditor. `content`/`savedContent`
    *  stay empty (isDirty for this tab reads `windowed.dirty`, set by the first
@@ -349,51 +363,6 @@ export interface DocTab {
    *  the snapshot folder missing/unwritable, the disk full, made read-only.
    *  Cleared by the next write that succeeds. See `firstUnwritableDirtyIndex`. */
   writeFailed?: boolean;
-}
-
-/** The tab-bar/window-title label for a range tab: "{name} (lines X–Y)"
- *  through `t()`, so a language change or a locale edit is reflected the next
- *  time this is called rather than frozen at extraction time. The end line is
- *  derived from the tab's own content line count, so it stays correct after an
- *  edit that changes the line count (`splice` rebases `endByte` but has
- *  nothing else to keep in sync); `snapshot()` persists it as `range_end_line`
- *  for views that do not open the tab. Returns null for
- *  a non-range tab, or for a range tab restored from an older snapshot that
- *  carries no start line (its formatted label wasn't persisted in a form line
- *  numbers can be recovered from) — the caller's own fallback (the file name)
- *  covers that case, matching a fresh range tab's degraded display. */
-export function rangeDisplayName(tab: DocTab): string | null {
-  const r = tab.range;
-  const endLine = rangeEndLine(tab);
-  if (r === undefined || r.startLine === null || endLine === null) {
-    return null;
-  }
-  return rangeLabel(r.sourcePath, r.startLine, endLine);
-}
-/** 1-based line number of a range tab's last line, from its live content: the
- *  start line plus the lines the buffer covers. Null for a non-range tab and
- *  for a range tab with no start line (restored from an older snapshot). */
-export function rangeEndLine(tab: DocTab): number | null {
-  const r = tab.range;
-  if (r === undefined || r.startLine === null) {
-    return null;
-  }
-  return r.startLine + rangeLineCount(tab) - 1;
-}
-/** Number of source lines a range tab's buffer covers (at least 1). The slice's
- *  end offset is the start of the line *after* the last selected line (see
- *  `LargeFileView.svelte`'s `selectionByteRange`), so the content almost always
- *  ends with the last selected line's trailing newline. `Text.lines` counts the
- *  empty line that trailing newline opens, so it overcounts by one versus the
- *  real number of selected lines, except for the one case where the extraction
- *  reached EOF of a file with no final newline. Detect that trailing newline
- *  directly instead of assuming either shape, so an empty range (`Text.empty`,
- *  no trailing newline) still yields a single displayed line. */
-function rangeLineCount(tab: DocTab): number {
-  const content = tab.content;
-  const endsWithNewline =
-    content.length > 0 && content.sliceString(content.length - 1) === '\n';
-  return content.lines - (endsWithNewline ? 1 : 0);
 }
 
 interface Bounds {
@@ -532,10 +501,10 @@ export class DocumentWindowState {
   /** Bumped after a splice rewrites a source file whose large-file viewer tab is
    *  in this window, so the keyed view remounts and rebuilds its line index. */
   largeReloadSeq = $state(0);
-  /** The range tab whose splice hit a fingerprint conflict, awaiting the user's
-   *  choice (force-write / save-as / cancel). Null when no conflict is pending;
-   *  DocumentApp renders the conflict modal off this. */
-  rangeConflict = $state<DocTab | null>(null);
+  /** The range edit box over the active large-file tab, or null. While its
+   *  `conflict` is set the box's write-back found the source changed and
+   *  DocumentApp renders the conflict modal. It is never persisted. */
+  rangeBox = $state.raw<RangeBox | null>(null);
   /** The windowed tab whose save hit a fingerprint conflict, awaiting the user's
    *  choice (force-write / save-as / cancel). Null when none is pending. */
   windowedConflict = $state<DocTab | null>(null);
@@ -558,34 +527,12 @@ export class DocumentWindowState {
   /** Paths of restored clean tabs that exist but could not be read. They are
    *  not opened (a blank tab would pass for the file); reported once. */
   restoreUnreadable = $state<string[]>([]);
-  /** How many of this window's stored tabs a lite session left closed: the ones
-   *  that need the large-file viewer, windowed editing or range editing. Their
-   *  records are not touched, and they open once the edition is full. Shown once
-   *  as a notice; zero otherwise. */
-  keptTabs = $state(0);
   /** True when the most recent snapshot write did not reach disk. `upsertTab`
    *  never lets a write's rejection propagate (see its own comment), so this
    *  is the only surviving signal that a save failed; cleared by the next
    *  write that succeeds. No UI reads this yet (see the follow-up issue) —
    *  it exists so a failure is not swallowed into nothing. */
   snapshotFailed = $state(false);
-
-  /** Dismiss the kept-tabs notice. */
-  dismissKeptTabs(): void {
-    this.keptTabs = 0;
-  }
-  /** Dismiss the kept-tabs notice of a window that is about to close. When no
-   *  tab is left the core is told to hold the group back, so it returns when
-   *  the edition is full; resolves `true` then, and the window should be
-   *  destroyed. Nothing else holds a group back. */
-  async dismissKeptTabsAndHoldBack(): Promise<boolean> {
-    this.dismissKeptTabs();
-    if (this.tabs.length > 0) {
-      return false;
-    }
-    await invoke('hold_back_group', { group: this.group });
-    return true;
-  }
 
   /** Dismiss the unreadable-restore report. */
   dismissRestoreUnreadable(): void {
@@ -746,9 +693,8 @@ export class DocumentWindowState {
     const windowedTopLine =
       tab.windowed?.topLine ?? pendingRestore?.topLine ?? null;
     // Snapshot content exists only to carry unsaved edits across a restart, and
-    // the policy applies to every tab (range tabs included). A clean tab
-    // persists empty content — loadTab re-reads it from disk (a range tab from
-    // its source slice), so serializing the whole thing is wasted IPC. A dirty
+    // the policy applies to every tab. A clean tab persists empty content —
+    // loadTab re-reads it from disk, so serializing the whole thing is wasted IPC. A dirty
     // tab within the ceiling writes its full buffer; a dirty tab over the
     // ceiling ('skip') is too big to snapshot, so it persists empty too and the
     // quit gate forces the user to save or discard it before exit.
@@ -802,16 +748,15 @@ export class DocumentWindowState {
         windowedFpSize,
         tab.windowed?.totalBytes ?? null,
       ),
-      // A range tab persists its source, byte span, and conflict fingerprint so
-      // restore rebuilds the splice write-back baseline (buffer from `content`).
-      range_source: tab.range?.sourcePath ?? null,
-      range_start: tab.range?.startByte ?? null,
-      range_end: tab.range?.endByte ?? null,
-      range_fp_size: tab.range?.fingerprint?.size ?? null,
-      range_fp_mtime: tab.range?.fingerprint?.mtime_ms ?? null,
-      range_start_line: tab.range?.startLine ?? null,
-      range_end_line: rangeEndLine(tab),
-      range_trailing_break: tab.range?.trailingBreak ?? null,
+      // A range is an edit box now, never a tab: the fields only read old records.
+      range_source: null,
+      range_start: null,
+      range_end: null,
+      range_fp_size: null,
+      range_fp_mtime: null,
+      range_start_line: null,
+      range_end_line: null,
+      range_trailing_break: null,
       // A windowed tab persists what `beginWindowedRestore` needs to rebuild the
       // session with no rescan (see `windowed_reopen`); its presence is what
       // marks the tab as "was unlocked" on restore.
@@ -870,105 +815,38 @@ export class DocumentWindowState {
     path: string,
     snap: NoteSnapshot | null,
   ): Promise<DocTab> {
+    // A range tab of an earlier version restores as an ordinary untitled tab
+    // holding its edited slice; it has no source to write back to any more. Its
+    // record is written again by the caller. A clean one is never loaded here.
+    if (snap !== null && snap.range_source !== null) {
+      return {
+        id: snap.id,
+        path: '',
+        readOnlyFile: false,
+        content: textFromString(snap.content),
+        savedContent: Text.empty,
+        language: restoredLanguage(snap.language, snap.explicit, null),
+        explicit: snap.explicit,
+        lineEnding: snap.line_ending,
+        savedLineEnding: snap.line_ending,
+        hadBom: false,
+        encoding: settingsState.defaultEncoding,
+        lossy: false,
+        tabIndex: snap.tab_index,
+      };
+    }
     // Known up front so every branch below (windowed/large restore, or an
-    // ordinary decode) can stamp it on the tab it builds. A range restore's
-    // `path` argument is always '' (its real file lives in `range_source`); the
-    // range branch below computes its own answer against that instead of this
-    // one. A thrown check must never block the open, so it degrades to false.
+    // ordinary decode) can stamp it on the tab it builds. A thrown check must
+    // never block the open, so it degrades to false.
     const readOnlyFile =
       path === ''
         ? false
         : await invoke<boolean>('path_writable', { path })
             .then((writable) => !writable)
             .catch(() => false);
-    // A restored range tab rebuilds from the snapshot. A clean range tab persists
-    // empty content, so its buffer and saved baseline both come from the current
-    // on-disk slice; a dirty one restores its stored (edited) buffer against that
-    // slice as the saved baseline, so dirty is derived exactly as an ordinary tab
-    // is (buffer vs disk). If the source is gone the tab still opens (empty for a
-    // clean tab, its stored edits for a dirty one). A changed source shows as
-    // dirty and trips the conflict flow on save; the stored fingerprint is the
-    // conflict baseline either way.
-    if (snap !== null && snap.range_source !== null) {
-      const source = snap.range_source;
-      if (__LITE__) {
-        throw new KeptRestore();
-      }
-      // Shadows the outer `readOnlyFile`: a range tab's write-back target is
-      // `source`, not the tab's own (always-empty) `path`.
-      const readOnlyFile = await invoke<boolean>('path_writable', {
-        path: source,
-      })
-        .then((writable) => !writable)
-        .catch(() => false);
-      const startByte = snap.range_start ?? 0;
-      const endByte = snap.range_end ?? 0;
-      let diskSlice: string | null = null;
-      let rangeReadError: string | null = null;
-      try {
-        const r = await invoke<RangeRead>('read_range', {
-          path: source,
-          start: startByte,
-          end: endByte,
-        });
-        diskSlice = r.text;
-      } catch (e) {
-        diskSlice = null;
-        rangeReadError = String(e);
-      }
-      // The edition turned lite while this restore ran and the core refused the
-      // read: that says nothing about the file, and the record needs full.
-      if (
-        rangeReadError !== null &&
-        (isLite() || isLiteRefusal(rangeReadError))
-      ) {
-        throw new KeptRestore();
-      }
-      if (restoreOutcome(snap.dirty, rangeReadError) === 'unreadable') {
-        throw new UnreadableRestore(source);
-      }
-      const normalizedSlice =
-        diskSlice !== null ? normalizeToLf(diskSlice) : null;
-      const savedContent = textFromString(normalizedSlice ?? snap.content);
-      const savedLineEnding =
-        diskSlice !== null ? detectLineEnding(diskSlice) : snap.line_ending;
-      const fingerprint =
-        snap.range_fp_size !== null && snap.range_fp_mtime !== null
-          ? { size: snap.range_fp_size, mtime_ms: snap.range_fp_mtime }
-          : null;
-      return {
-        id: snap.id,
-        path: '',
-        readOnlyFile,
-        content: textFromString(
-          restoredRangeContent(snap.dirty, snap.content, normalizedSlice),
-        ),
-        savedContent,
-        language: restoredLanguage(snap.language, snap.explicit, null),
-        explicit: snap.explicit,
-        lineEnding: snap.line_ending,
-        savedLineEnding,
-        hadBom: false,
-        encoding: settingsState.defaultEncoding,
-        lossy: false,
-        tabIndex: snap.tab_index,
-        // An older snapshot has no start line (only the now-removed
-        // formatted `range_label`); `startLine: null` here is what makes
-        // `rangeDisplayName` fall back to the bare file name for it, matching
-        // a fresh tab's own degraded display rather than showing a stale or
-        // nonsensical line span.
-        range: {
-          sourcePath: source,
-          startByte,
-          endByte,
-          fingerprint,
-          startLine: snap.range_start_line ?? null,
-          trailingBreak:
-            snap.range_trailing_break ??
-            (diskSlice !== null ? sliceEndsWithBreak(diskSlice) : false),
-        },
-      };
-    }
+    // The trial has no large-file viewer or windowed editing: a record of
+    // either restores as an ordinary tab of its file.
+    const trial = __LITE__ || isLite();
     // A restored windowed-editing tab knows it was unlocked (the persisted
     // checkpoint index is the marker — see `NoteSnapshot.windowed_index`) but
     // has no live Rust session yet: it carries the data `beginWindowedRestore`
@@ -976,7 +854,12 @@ export class DocumentWindowState {
     // has neither `windowed` nor `large` set, so DocumentApp renders nothing
     // for it rather than flashing the read-only viewer for a fast-path restore
     // (see the class doc and `beginWindowedRestore`).
-    if (snap !== null && snap.windowed_index !== null && snap.large !== null) {
+    if (
+      snap !== null &&
+      !trial &&
+      snap.windowed_index !== null &&
+      snap.large !== null
+    ) {
       return {
         id: snap.id,
         path,
@@ -1007,7 +890,7 @@ export class DocumentWindowState {
     // already consented, so no re-stat and no confirm. Its size comes from the
     // snapshot; if the file has since vanished the tab still opens (matching an
     // ordinary tab, which survives a missing file) and the view surfaces reads.
-    if (snap !== null && snap.large !== null) {
+    if (snap !== null && !trial && snap.large !== null) {
       return {
         id: snap.id,
         path,
@@ -1030,7 +913,7 @@ export class DocumentWindowState {
     // decoding a huge file whole into the WebView — the same ceiling `openTab`
     // enforces before a fresh open ever reaches a full decode.
     // Lite has no viewer to degrade to, so it neither stats nor gates.
-    if (path !== '' && !__LITE__ && !isLite()) {
+    if (path !== '' && !trial) {
       let size: number | null = null;
       try {
         size = (await invoke<FileStat>('stat_file', { path })).size;
@@ -1179,22 +1062,26 @@ export class DocumentWindowState {
     if (entries.length > 0) {
       // Restore: adopt the project the group's tabs were saved with.
       this.project = entries[0]!.project;
-      // A lite session does not open a tab that needs a removed feature. It has
-      // no tab object for it, so nothing below can write, rewrite or delete its
-      // record (every snapshot write and delete goes through a tab in `tabs`);
-      // it is counted and noticed instead.
-      const { restorable, kept } = partitionRestorable(entries, isLite());
-      this.keptTabs = kept.length;
-      const dropped = new Set<number>(kept.map((n) => n.tab_index));
-      for (const entry of restorable) {
+      const trial = __LITE__ || isLite();
+      const dropped = new Set<number>();
+      // Tabs whose stored record no longer describes them, written below.
+      const rewrite: DocTab[] = [];
+      for (const entry of entries) {
+        // Normally gone at startup (see `drop_clean_range_records`); this
+        // catches one the core could not delete. A failed delete only means
+        // the next launch finds it again.
+        if (isCleanOldRange(entry)) {
+          await invoke('delete_note', { id: entry.id }).catch(() => {});
+          dropped.add(entry.tab_index);
+          continue;
+        }
         try {
-          this.tabs.push(await this.loadTab(entry.file_path ?? '', entry));
-        } catch (e) {
-          if (e instanceof KeptRestore) {
-            this.keptTabs += 1;
-            dropped.add(entry.tab_index);
-            continue;
+          const tab = await this.loadTab(entry.file_path ?? '', entry);
+          this.tabs.push(tab);
+          if (needsRewrite(entry, trial)) {
+            rewrite.push(tab);
           }
+        } catch (e) {
           if (!(e instanceof UnreadableRestore)) {
             throw e;
           }
@@ -1206,13 +1093,14 @@ export class DocumentWindowState {
           dropped.add(entry.tab_index);
         }
       }
-      const lowest = windowBoundsRecord(entries, isLite());
+      const lowest = entries[0]!;
       this.bounds = {
         x: lowest.x,
         y: lowest.y,
         width: lowest.width,
         height: lowest.height,
       };
+      await Promise.all(rewrite.map((tab) => this.upsertTab(tab)));
       // Writing `activeIndex` (even to its already-current value of 0) is what
       // kicks off the lazy reopen if the initial active tab is itself a
       // restored windowed tab — see the `activeIndex` setter. `initialTab` is a
@@ -1241,68 +1129,8 @@ export class DocumentWindowState {
       this.ensureWindowedRestore(this.activeTab);
     }
     this.ready = true;
-    // The edition turned full while the tabs above were loading.
-    if (this.keptTabs > 0 && !isLite()) {
-      await this.restoreKeptTabs();
-    }
   }
 
-  /** The edition turned full: open the tabs of this window that lite kept, from
-   *  their stored records exactly as a startup restore would, so a range tab
-   *  comes back with its unsaved edits. Tabs keep their stored order. */
-  restoreKeptTabs(): Promise<void> {
-    // One at a time: two flips in quick succession would otherwise both read
-    // the store before either had opened a tab, and open every one twice.
-    const run = this.keptRestore.then(() => this.restoreKeptTabsNow());
-    this.keptRestore = run.catch(() => {});
-    return run;
-  }
-
-  private keptRestore: Promise<void> = Promise.resolve();
-
-  private async restoreKeptTabsNow(): Promise<void> {
-    if (!this.ready || isLite()) {
-      return;
-    }
-    let all: NoteSnapshot[];
-    try {
-      all = await invoke<NoteSnapshot[]>('list_notes');
-    } catch {
-      return;
-    }
-    const kept = keptTabsToLoad(
-      all,
-      this.group,
-      new Set(this.tabs.map((tab) => tab.id)),
-    );
-    const activeId = this.activeTab?.id ?? null;
-    let stillKept = 0;
-    for (const entry of kept) {
-      try {
-        this.tabs.push(await this.loadTab(entry.file_path ?? '', entry));
-      } catch (e) {
-        if (e instanceof KeptRestore) {
-          // Lite again before this one could be read: it stays kept.
-          stillKept += 1;
-          continue;
-        }
-        if (!(e instanceof UnreadableRestore)) {
-          throw e;
-        }
-        await invoke('delete_note', { id: entry.id }).catch(() => {});
-        this.restoreUnreadable.push(e.path);
-      }
-    }
-    this.keptTabs = stillKept;
-    if (kept.length === 0) {
-      return;
-    }
-    this.tabs.sort((a, b) => a.tabIndex - b.tabIndex);
-    const at = this.tabs.findIndex((tab) => tab.id === activeId);
-    // Written even when unchanged: the setter is what starts the lazy reopen of
-    // a restored windowed tab that is now the active one.
-    this.activeIndex = at === -1 ? 0 : at;
-  }
   /** Set by the window: ends an IME composition in the active editor and
    *  resolves once its text is in the tab. A switch waits for it. */
   endComposition: (() => Promise<void>) | null = null;
@@ -1628,9 +1456,7 @@ export class DocumentWindowState {
       return { kind: 'fresh' };
     }
     const groups = [
-      ...new Set(
-        orphanCandidates(all, path, this.group, isLite()).map(documentGroup),
-      ),
+      ...new Set(orphanCandidates(all, path, this.group).map(documentGroup)),
     ];
     // Common case: no other group holds this path, so skip the liveness probe.
     if (groups.length === 0) {
@@ -1642,7 +1468,7 @@ export class DocumentWindowState {
     } catch {
       live = [];
     }
-    return routeOpen(all, path, this.group, new Set(live), isLite());
+    return routeOpen(all, path, this.group, new Set(live));
   }
 
   /** Re-home an orphaned stored tab (its window group is gone) into this window:
@@ -1652,14 +1478,15 @@ export class DocumentWindowState {
    *  orphan's old group keeps only its remaining tabs (restored as usual next
    *  launch). */
   private async adoptOrphan(path: string, note: NoteSnapshot): Promise<void> {
+    // An old range record with nothing unsaved has nothing to restore.
+    if (isCleanOldRange(note)) {
+      await invoke('delete_note', { id: note.id }).catch(() => {});
+      return;
+    }
     let tab: DocTab;
     try {
       tab = await this.loadTab(path, note);
     } catch (e) {
-      if (e instanceof KeptRestore) {
-        this.keptTabs += 1;
-        return;
-      }
       if (!(e instanceof UnreadableRestore)) {
         throw e;
       }
@@ -1873,13 +1700,6 @@ export class DocumentWindowState {
     if (tab.windowed !== undefined) {
       return (await this.saveWindowed(tab, false)) === 'ok';
     }
-    // A range tab never touches the save dialog: Cmd+S splices its buffer back
-    // into the source over the recorded byte span. Only a clean write counts as
-    // saved (a conflict raises the modal; any other failure raises the
-    // save-failure dialog -- `splice` reports rather than throwing).
-    if (tab.range !== undefined) {
-      return (await this.splice(tab, tab.range.fingerprint)) === 'ok';
-    }
     if (tab.path === '') {
       const chosen =
         pathOverride ??
@@ -1922,8 +1742,7 @@ export class DocumentWindowState {
 
   /** File > Save As: always prompt for a new path and write the active tab's
    *  buffer there, turning the tab into an ordinary saved document at that path.
-   *  A range tab sheds its range identity (like the range save-as conflict path);
-   *  a windowed tab is written by its Rust session and retargeted to the new path.
+   *  A windowed tab is written by its Rust session and retargeted to the new path.
    *  `pathOverride` skips the dialog (automation/E2E). Returns false on cancel. */
   async saveAs(pathOverride?: string): Promise<boolean> {
     const tab = this.activeTab;
@@ -1957,7 +1776,6 @@ export class DocumentWindowState {
       return false;
     }
     tab.path = chosen;
-    delete tab.range;
     if (!tab.explicit) {
       tab.language = detectByFilename(chosen);
     }
@@ -1968,136 +1786,167 @@ export class DocumentWindowState {
     return true;
   }
 
-  /** Splice a range tab's buffer back into its source over `[startByte, endByte)`.
-   *  The line ending is restored first (a CRLF source must get its `\r` bytes back
-   *  before the byte length is computed, or the rebased end drifts). On success it
-   *  rebases `endByte` and refreshes the fingerprint from the rewritten file, marks
-   *  the tab clean, persists it, and asks any large viewer of the source to reindex.
-   *  `expected` is the conflict baseline (null force-writes past the check). */
-  private async splice(
+  /** Open the range edit box over `tab`, a large-file viewer tab, on the byte
+   *  slice `info` of its file. The byte offsets are resolved by the caller (the
+   *  large-file view, which owns the line index); this reads the slice and
+   *  captures the file's fingerprint as the write-back's conflict baseline.
+   *
+   *  Returns `null` when the box opened, or a message when the range is refused
+   *  (lossy, non-UTF-8 content). A genuine read failure — the file was deleted,
+   *  permissions changed, the volume went away — is not swallowed: it throws,
+   *  so the caller can tell "opened" and "refused" apart from "failed" instead
+   *  of all three collapsing onto the same `null`. */
+  async openRangeBox(
     tab: DocTab,
-    expected: Fingerprint | null,
-  ): Promise<SpliceResult> {
-    const r = tab.range;
-    if (__LITE__ || r === undefined) {
-      return 'error';
+    info: {
+      startByte: number;
+      endByte: number;
+      startLine: number;
+      endLine: number;
+    },
+  ): Promise<string | null> {
+    if (__LITE__) {
+      return null;
     }
-    // Flush point: materialize the rope for the splice write-back. A slice that
-    // ended with a line break gets one back if the buffer lost it.
-    const out = rangeWriteText(
-      tab.content.toString(),
-      r.trailingBreak,
-      tab.lineEnding,
-    );
-    let fingerprint: Fingerprint;
+    const read = await invoke<RangeRead>('read_range', {
+      path: tab.path,
+      start: info.startByte,
+      end: info.endByte,
+    });
+    // A lossy decode means the slice has bytes UTF-8 can't represent; splicing a
+    // re-encoded buffer back would corrupt the file, so refuse the edit box. The
+    // byte-faithful "save range" path stays available for such ranges.
+    if (read.lossy) {
+      return t('doc.range.lossyRefusal');
+    }
+    let fingerprint: Fingerprint | null;
     try {
-      fingerprint = await invoke<Fingerprint>('splice_file', {
-        path: r.sourcePath,
-        start: r.startByte,
-        end: r.endByte,
-        replacement: out,
-        expected,
+      fingerprint = await invoke<Fingerprint>('file_fingerprint', {
+        path: tab.path,
       });
-    } catch (e) {
-      if (String(e) === FINGERPRINT_MISMATCH) {
-        this.rangeConflict = tab;
-        return 'mismatch';
-      }
-      // Every failure past the conflict check is reported: the write-back is a
-      // save, and a save that did not happen has to say so or the tab is left
-      // dirty with nothing on screen to explain it. The target is the source
-      // file, not the range tab's own (empty) path. A read-only source also
-      // marks the tab, so the padlock catches up without a reopen.
-      if (String(e) === READ_ONLY_DESTINATION) {
-        tab.readOnlyFile = true;
-      }
-      this.saveFailed = { path: r.sourcePath, error: String(e) };
+    } catch {
+      fingerprint = null;
+    }
+    this.rangeBox = openRangeBox({
+      tabId: tab.id,
+      sourcePath: tab.path,
+      startByte: info.startByte,
+      endByte: info.endByte,
+      startLine: info.startLine,
+      endLine: info.endLine,
+      fingerprint,
+      text: read.text,
+    });
+    return null;
+  }
+
+  /** The editor of the open box changed its document. */
+  rangeBoxEdited(content: Text): void {
+    this.rangeBox = nextRangeBox(this.rangeBox, { kind: 'edit', content });
+  }
+
+  /** Whether the open box holds changes that were not written back. */
+  rangeBoxDirty(): boolean {
+    return this.rangeBox !== null && isRangeBoxDirty(this.rangeBox);
+  }
+
+  /** Write the open box back into its source. `force` skips the conflict check.
+   *  Success closes the box; a changed source raises the conflict modal and
+   *  keeps it; any other failure is reported and keeps it too. */
+  private async writeBack(force: boolean): Promise<SpliceResult> {
+    const box = this.rangeBox;
+    if (box === null) {
       return 'error';
     }
-    r.endByte = r.startByte + replacementByteLength(out, tab.lineEnding);
-    r.fingerprint = fingerprint;
-    tab.savedContent = tab.content;
-    tab.savedLineEnding = tab.lineEnding;
-    this.rangeConflict = null;
-    await this.upsertTab(tab);
-    // Broadcast (all windows, including this one) so a large viewer of the now-
-    // rewritten source rebuilds its stale line index.
-    void emit(RANGE_SPLICED_EVENT, r.sourcePath);
+    // Flush point: materialize the rope for the write-back.
+    const outcome = await spliceRange(
+      box,
+      rangeBoxWriteText(box),
+      force ? null : box.fingerprint,
+    );
+    if (outcome.status === 'mismatch') {
+      this.rangeBox = nextRangeBox(this.rangeBox, { kind: 'mismatch' });
+      return 'mismatch';
+    }
+    if (outcome.status === 'error') {
+      // Every failure past the conflict check is reported: the write-back is a
+      // save, and a save that did not happen has to say so or the box is left
+      // dirty with nothing on screen to explain it. A read-only source also
+      // marks the viewer tab, so its padlock catches up without a reopen.
+      if (outcome.error === READ_ONLY_DESTINATION) {
+        const tab = this.tabs.find((t) => t.id === box.tabId);
+        if (tab !== undefined) {
+          tab.readOnlyFile = true;
+        }
+      }
+      this.saveFailed = { path: box.sourcePath, error: outcome.error };
+      return 'error';
+    }
+    this.rangeBox = nextRangeBox(this.rangeBox, { kind: 'saved' });
+    // The viewer's size stands for the rewritten file now.
+    const viewer = this.tabs.find((t) => t.id === box.tabId);
+    if (viewer?.large !== undefined) {
+      viewer.large.size = outcome.fingerprint.size;
+    }
     return 'ok';
   }
 
-  /** DEV/E2E: run the active range tab's write-back and report the outcome. */
-  async rangeSave(): Promise<SpliceResult> {
-    const tab = this.activeTab;
-    if (tab === null || tab.range === undefined) {
-      return 'error';
-    }
-    return this.splice(tab, tab.range.fingerprint);
+  /** Box 儲存: write back with the conflict check. */
+  rangeBoxSave(): Promise<SpliceResult> {
+    return this.writeBack(false);
   }
 
   /** Whether the write-back conflict modal is up (DEV/E2E surface). */
   rangeConflictVisible(): boolean {
-    return this.rangeConflict !== null;
+    return this.rangeBox?.conflict === true;
   }
 
   /** Conflict choice: write back anyway, ignoring the changed source. */
-  async rangeConflictForce(): Promise<SpliceResult> {
-    const tab = this.rangeConflict;
-    if (tab === null) {
-      return 'error';
-    }
-    return this.splice(tab, null);
+  rangeConflictForce(): Promise<SpliceResult> {
+    return this.writeBack(true);
   }
 
-  /** Conflict choice: abandon the splice and save the edited buffer as a new file.
-   *  The tab sheds its range identity and becomes an ordinary saved document. */
+  /** Conflict choice: abandon the write-back and save the edited buffer as a
+   *  new file, opened as a new tab. The box closes and the source is untouched. */
   async rangeConflictSaveAs(pathOverride?: string): Promise<boolean> {
-    const tab = this.rangeConflict;
-    if (tab === null) {
+    const box = this.rangeBox;
+    if (box === null) {
       return false;
     }
-    // A range tab has no path of its own; start from the source file's name.
     const chosen =
       pathOverride ??
-      (await save(
-        saveDialogOptions(
-          tab.language,
-          suggestedName(tab.range?.sourcePath ?? ''),
-        ),
-      ));
+      (await save(saveDialogOptions(null, suggestedName(box.sourcePath))));
     if (chosen === null) {
       return false;
     }
     // Flush point: materialize the rope for the save-as write.
-    const out = applyLineEnding(tab.content.toString(), tab.lineEnding);
+    const out = applyLineEnding(box.content.toString(), box.lineEnding);
     try {
       await invoke('write_file_encoded', {
         path: chosen,
         content: out,
-        encoding: tab.encoding,
-        withBom: tab.hadBom,
+        encoding: settingsState.defaultEncoding,
+        withBom: false,
       });
     } catch (e) {
-      // The conflict modal stays up (rangeConflict is untouched) and the tab
-      // keeps its range identity; report the failure rather than nothing.
+      // The conflict modal stays up and the box keeps its text; report the
+      // failure rather than nothing.
       this.saveFailed = { path: chosen, error: String(e) };
       return false;
     }
-    tab.path = chosen;
-    delete tab.range;
-    if (!tab.explicit) {
-      tab.language = detectByFilename(chosen);
-    }
-    tab.savedContent = tab.content;
-    tab.savedLineEnding = tab.lineEnding;
-    this.rangeConflict = null;
-    await this.upsertTab(tab);
+    this.rangeBox = nextRangeBox(this.rangeBox, { kind: 'cancel' });
+    await this.openTab(chosen);
     return true;
   }
 
-  /** Conflict choice: dismiss the modal, leaving the tab unsaved. */
+  /** Conflict choice: dismiss the modal, back to the box with its text. */
   rangeConflictCancel(): void {
-    this.rangeConflict = null;
+    this.rangeBox = nextRangeBox(this.rangeBox, { kind: 'conflict-dismissed' });
+  }
+
+  /** Box 取消: drop the text and close. */
+  rangeBoxCancel(): void {
+    this.rangeBox = nextRangeBox(this.rangeBox, { kind: 'cancel' });
   }
 
   /** Rebuild the line index of any large-file viewer of `path` open in this window
@@ -2116,94 +1965,9 @@ export class DocumentWindowState {
     }
   }
 
-  /** Extract a byte slice of `sourcePath` into a fresh, ordinary editable tab.
-   *  The byte offsets are resolved by the caller (the large-file view, which owns
-   *  the line index); this reads the slice, captures the source's fingerprint as
-   *  the splice write-back's conflict-check baseline, and builds the tab. The
-   *  tab's `path` stays empty (only `range.sourcePath` names the real file); Cmd+S
-   *  on it splices the edited buffer back into that source over the recorded byte
-   *  span instead of going through the save dialog (see `saveActive`, `splice`).
-   *
-   *  Returns `null` on success, or a message when the range is refused (lossy,
-   *  non-UTF-8 content). A genuine read failure — the file was deleted,
-   *  permissions changed, the volume went away — is not swallowed: it throws,
-   *  so the caller can tell "opened" and "refused" apart from "failed" instead
-   *  of all three collapsing onto the same `null`. */
-  async createRangeTab(
-    sourcePath: string,
-    info: {
-      startByte: number;
-      endByte: number;
-      startLine: number;
-      endLine: number;
-    },
-  ): Promise<string | null> {
-    if (__LITE__) {
-      return null;
-    }
-    const read = await invoke<RangeRead>('read_range', {
-      path: sourcePath,
-      start: info.startByte,
-      end: info.endByte,
-    });
-    // A lossy decode means the slice has bytes UTF-8 can't represent; splicing a
-    // re-encoded buffer back would corrupt the file, so refuse the edit tab. The
-    // byte-faithful "save range" path stays available for such ranges.
-    if (read.lossy) {
-      return t('doc.range.lossyRefusal');
-    }
-    let fingerprint: Fingerprint | null;
-    try {
-      fingerprint = await invoke<Fingerprint>('file_fingerprint', {
-        path: sourcePath,
-      });
-    } catch {
-      fingerprint = null;
-    }
-    // Clean range tab: one shared rope keeps its dirty check O(1) until edited.
-    const content = textFromString(normalizeToLf(read.text));
-    const lineEnding = detectLineEnding(read.text);
-    // The splice write-back targets `sourcePath`, not this tab's own (always
-    // empty) `path`, so that's what the pen needs to know about up front.
-    const readOnlyFile = await invoke<boolean>('path_writable', {
-      path: sourcePath,
-    })
-      .then((writable) => !writable)
-      .catch(() => false);
-    const tab: DocTab = {
-      id: crypto.randomUUID(),
-      path: '',
-      readOnlyFile,
-      content,
-      savedContent: content,
-      language: null,
-      explicit: false,
-      lineEnding,
-      savedLineEnding: lineEnding,
-      hadBom: false,
-      encoding: settingsState.defaultEncoding,
-      lossy: false,
-      tabIndex: this.allocIndex(),
-      // `info.endLine` is not kept: the end line is derived from the tab's
-      // content line count and persisted by `snapshot()` as `range_end_line`.
-      range: {
-        sourcePath,
-        startByte: info.startByte,
-        endByte: info.endByte,
-        fingerprint,
-        startLine: info.startLine,
-        trailingBreak: sliceEndsWithBreak(read.text),
-      },
-    };
-    this.tabs.push(tab);
-    await this.switchTo(this.tabs.length - 1);
-    await this.upsertTab(tab);
-    return null;
-  }
-
-  /** Read a byte slice of `sourcePath` and save it straight to a new file, without
-   *  opening a tab (the "save range" lightweight path). `pathOverride` skips the save
-   *  dialog (automation/E2E).
+  /** Read a byte slice of `sourcePath` and save it straight to a new file, then
+   *  open that file as a new tab (the "save range" lightweight path).
+   *  `pathOverride` skips the save dialog (automation/E2E).
    *
    *  Returns `false` only when the dialog was cancelled, `true` on success. A
    *  genuine write failure — disk full, permissions, volume gone — is not
@@ -2231,48 +1995,30 @@ export class DocumentWindowState {
     }
     // Copy the original bytes straight through (no decode/re-encode), so a slice
     // with non-UTF-8 content is preserved exactly — this is why "save range" stays
-    // available even when the range is too lossy to open as an edit tab.
+    // available even when the range is too lossy to open in the edit box.
     await invoke('copy_range', {
       path: sourcePath,
       start: info.startByte,
       end: info.endByte,
       dest: chosen,
     });
+    await this.openTab(chosen);
     return true;
   }
 
-  /** DEV/E2E: byte-faithful save of the active range tab's source span to `path`,
-   *  exercising the same `copy_range` write "save range" uses. */
-  async saveRangeBytes(pathOverride: string): Promise<boolean> {
-    const tab = this.activeTab;
-    if (tab === null || tab.range === undefined) {
-      return false;
-    }
-    return this.saveRangeAs(tab.range.sourcePath, {
-      startByte: tab.range.startByte,
-      endByte: tab.range.endByte,
-      pathOverride,
-    });
-  }
-
-  /** Whether the active tab is a range tab (DEV/E2E surface). */
-  isRangeTab(): boolean {
-    return this.activeTab?.range !== undefined;
-  }
-
-  /** The active range tab's source and byte span, or null (DEV/E2E surface). */
-  rangeInfo(): {
+  /** The open box's source and byte span, or null (DEV/E2E surface). */
+  rangeBoxInfo(): {
     sourcePath: string;
     startByte: number;
     endByte: number;
   } | null {
-    const r = this.activeTab?.range;
-    return r === undefined
+    const box = this.rangeBox;
+    return box === null
       ? null
       : {
-          sourcePath: r.sourcePath,
-          startByte: r.startByte,
-          endByte: r.endByte,
+          sourcePath: box.sourcePath,
+          startByte: box.startByte,
+          endByte: box.endByte,
         };
   }
 
@@ -2731,12 +2477,36 @@ export class DocumentWindowState {
     );
   }
 
-  /** The tab the quit/close gate must block on right now, if any. An oversized
-   *  dirty tab takes priority — it is known before a write is even attempted —
-   *  then a dirty tab whose write actually failed. `oversized` tells the
-   *  caller which condition applies, since the two need different wording and
-   *  a different save action. */
-  firstBlockingDirty(): { index: number; oversized: boolean } | null {
+  /** The viewer tab holding an edit box with changes, if any: the box is what
+   *  the quit, window-close and tab-close gates must ask about first. */
+  rangeBoxBlocking(): {
+    index: number;
+    oversized: false;
+    rangeBox: true;
+  } | null {
+    const box = this.rangeBox;
+    if (box === null || !isRangeBoxDirty(box)) {
+      return null;
+    }
+    const index = this.tabs.findIndex((t) => t.id === box.tabId);
+    return index === -1 ? null : { index, oversized: false, rangeBox: true };
+  }
+
+  /** The tab the quit/close gate must block on right now, if any. An edit box
+   *  with changes comes first (`rangeBox` is set then), then an oversized dirty
+   *  tab — it is known before a write is even attempted — then a dirty tab
+   *  whose write actually failed. `oversized` tells the caller which of the
+   *  last two applies, since they need different wording and a different save
+   *  action. */
+  firstBlockingDirty(): {
+    index: number;
+    oversized: boolean;
+    rangeBox?: true;
+  } | null {
+    const inBox = this.rangeBoxBlocking();
+    if (inBox !== null) {
+      return inBox;
+    }
     const oversized = this.firstOversizedDirtyIndex();
     if (oversized !== -1) {
       return { index: oversized, oversized: true };
@@ -2781,6 +2551,9 @@ export class DocumentWindowState {
     }
     if (tab === this.windowedConflict) {
       this.windowedConflict = null;
+    }
+    if (this.rangeBox?.tabId === tab.id) {
+      this.rangeBox = null;
     }
     await invoke('delete_note', { id: tab.id });
     this.releaseTabView(tab.id);

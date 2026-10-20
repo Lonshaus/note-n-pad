@@ -37,7 +37,7 @@
   import { shortcutsState } from '../state/shortcuts.svelte';
   import { matchWindowShortcut } from '../util/windowShortcut';
 
-  /** Byte span + line labels of a range selection, handed to the app to extract. */
+  /** Byte span + line labels of a range selection, handed to the app to edit. */
   export interface RangeExtract {
     startByte: number;
     endByte: number;
@@ -63,12 +63,12 @@
     // The first chunk's line-ending style (null: no line break in it), so the
     // tab shows the file's own ending instead of the user's default.
     ondetectending: (style: ReturnType<typeof detectBreakStyle>) => void;
-    // Resolves null when the range opened as an edit tab, or a message to show in
-    // the range toolbar when it was refused (e.g. a lossy, non-UTF-8 slice).
+    // Resolves null when the range opened in the edit box, or a message to show
+    // in the range toolbar when it was refused (e.g. a lossy, non-UTF-8 slice).
     // Rejects on a genuine read failure.
     onextract: (info: RangeExtract) => Promise<string | null>;
-    // Resolves true on success, false when the save dialog was cancelled.
-    // Rejects on a genuine write failure.
+    // Resolves true on success (the saved file opens as a new tab), false when
+    // the save dialog was cancelled. Rejects on a genuine write failure.
     onsaverange: (info: RangeSaveAs) => Promise<boolean>;
     // Fired once if the background line-index scan fails (open error or a
     // mid-scan I/O error), so the app can surface it via its existing
@@ -459,9 +459,8 @@
     const endOffset = await lineToOffset(sel.end + 1);
     return resolveByteRange(startOffset, endOffset, size);
   }
-
-  /** Extract the selection into an editable tab, refusing (with a hint) when the
-   *  span exceeds RANGE_EDIT_MAX. */
+  /** Open the selection in the edit box, refusing (with a hint) when the span
+   *  exceeds RANGE_EDIT_MAX. */
   async function triggerRangeEdit(): Promise<void> {
     if (sel === null || !editionUi(isLite()).rangeEdit) {
       return;
@@ -506,8 +505,8 @@
     clearSelection();
   }
 
-  /** Save the selection straight to a new file, without opening a tab. Same size
-   *  ceiling as extraction (the slice is read whole into memory). */
+  /** Save the selection straight to a new file, which then opens as a new tab.
+   *  Same size ceiling as extraction (the slice is read whole into memory). */
   async function triggerRangeSaveAs(pathOverride?: string): Promise<boolean> {
     const range = await selectionByteRange();
     if (range === null) {

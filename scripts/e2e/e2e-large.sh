@@ -313,7 +313,7 @@ mv "$WORK/big.log" "$WORK/big.gone"
 evl "$DL" "__auto.largeRangeEdit()" >/dev/null
 e2e_wait_eval "$DL" "String((document.querySelector('.range-error')||{textContent:''}).textContent!=='')" "true"
 check "edit-range says why nothing opened" "$(e2e_read "$DL" "String((document.querySelector('.range-error')||{textContent:''}).textContent!=='')")" "true"
-check "no range tab was opened" "$(e2e_read "$DL" "String(__auto.isRangeTab())")" "false"
+check "no edit box was opened" "$(e2e_read "$DL" "String(__auto.rangeBoxVisible())")" "false"
 evl "$DL" "window.__rsa='pending';__auto.largeRangeSaveAs('$WORK/vanished.out').then(function(r){window.__rsa=String(r)}).catch(function(e){window.__rsa='err'})" >/dev/null
 e2e_wait_eval "$DL" "String(window.__rsa)" "false"
 check "save-range reports failure rather than resolving quietly" "$(e2e_read "$DL" "String((document.querySelector('.range-error')||{textContent:''}).textContent!=='')")" "true"
