@@ -369,6 +369,12 @@ export const zhTW = {
   'settings.loadRepaired': '部分設定值無法讀取，已重設為預設值。',
   'settings.snapshotDirUnavailable':
     '你選擇的快照資料夾無法使用，目前暫時改用預設資料夾。',
+  'settings.snapshotDirInUse':
+    '你選擇的快照資料夾正由另一個應用程式使用中，目前暫時改用預設資料夾。',
+  'settings.snapshotDirUnlockable':
+    '這個位置無法偵測是否有其他應用程式同時使用。',
+  'settings.snapshotDirInUseSwitch':
+    '這個資料夾正由另一個應用程式使用中，無法切換。',
   'doc.longLine.confirm': '「{name}」包含超長的行，可能拖慢編輯。要如何開啟？',
   'doc.longLine.openAsIs': '原樣開啟',
   'doc.longLine.format': '格式化後開啟',

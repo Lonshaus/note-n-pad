@@ -399,6 +399,12 @@ export const en = {
     'Some of your settings couldn’t be read and were reset to their defaults.',
   'settings.snapshotDirUnavailable':
     'The snapshot folder you chose is unavailable, so the default folder is being used for now.',
+  'settings.snapshotDirInUse':
+    'The snapshot folder you chose is in use by another app, so the default folder is being used for now.',
+  'settings.snapshotDirUnlockable':
+    'This location can’t detect whether another app is using it at the same time.',
+  'settings.snapshotDirInUseSwitch':
+    "This folder is in use by another app, so you can't switch to it.",
   'doc.longLine.confirm':
     '“{name}” contains a very long line, which can slow down editing. How would you like to open it?',
   'doc.longLine.openAsIs': 'Open As-Is',

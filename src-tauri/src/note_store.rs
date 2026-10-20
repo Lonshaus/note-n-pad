@@ -4,6 +4,7 @@
 use crate::fs_ops::{is_ignored_file, write_text_atomic_private, Loaded, SkipReason, SkippedFile};
 use crate::mac_bookmark;
 use crate::settings;
+use crate::snapshot_lock::{self, LockError, LockFailure};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
@@ -500,6 +501,9 @@ struct Inner {
   notes: Vec<NoteSnapshot>,
   dir: PathBuf,
   seqs: std::collections::HashMap<String, u64>,
+  /// Holds the exclusive lock on `dir` (see `snapshot_lock`) while the store
+  /// lives. None when `dir` could not be locked and is used anyway.
+  lock: Option<std::fs::File>,
   /// Project rebinds made during this run (`from -> to`, one edge per rebind). A
   /// snapshot write still tagged with a `from` project is re-tagged on arrival,
   /// following the edges until a project with none.
@@ -547,6 +551,7 @@ impl NoteStore {
           notes: loaded.items,
           dir,
           seqs: std::collections::HashMap::new(),
+          lock: None,
           rebinds: std::collections::HashMap::new(),
         }),
       },
@@ -564,9 +569,14 @@ impl NoteStore {
         notes: Vec::new(),
         dir,
         seqs: std::collections::HashMap::new(),
+        lock: None,
         rebinds: std::collections::HashMap::new(),
       }),
     }
+  }
+  /// Make the store the holder of the lock taken on its directory at startup.
+  pub fn hold_lock(&self, lock: Option<std::fs::File>) {
+    self.inner.lock().unwrap().lock = lock;
   }
 
   pub fn list(&self) -> Vec<NoteSnapshot> {
@@ -705,7 +715,29 @@ impl NoteStore {
       collision_count,
     }
   }
+  /// `switch_dir` without a setting to write.
+  #[cfg(test)]
+  pub fn set_dir(
+    &self,
+    new_dir: PathBuf,
+    move_files: bool,
+    policy: CollisionPolicy,
+  ) -> Result<DirSwitch, SetDirError> {
+    self.switch_dir(new_dir, move_files, policy, snapshot_lock::try_lock, || {
+      Ok(())
+    })
+  }
 
+  #[cfg(test)]
+  fn set_dir_with(
+    &self,
+    new_dir: PathBuf,
+    move_files: bool,
+    policy: CollisionPolicy,
+    locker: impl FnOnce(&Path) -> Result<std::fs::File, LockFailure>,
+  ) -> Result<DirSwitch, SetDirError> {
+    self.switch_dir(new_dir, move_files, policy, locker, || Ok(()))
+  }
   /// Repoint the active directory at `new_dir`, optionally moving every
   /// `*.json` file physically present in the old one first (moving what is
   /// really on disk, not the in-memory list, so unparsable files, mismatched-
@@ -713,23 +745,86 @@ impl NoteStore {
   /// along rather than stranded). Collisions at the destination are resolved
   /// per `policy`. The in-memory notes are then reloaded from `new_dir`'s
   /// actual contents, so the list always agrees with disk.
-  pub fn set_dir(
+  ///
+  /// `new_dir` is locked before anything else happens and the old lock is
+  /// released only once the switch has gone through, so a failure leaves the
+  /// store on the old directory with its lock intact.
+  ///
+  /// `persist` runs once the files are moved and the new notes loaded, still
+  /// under the store's lock. The old lock and directory are given up only after
+  /// it succeeds; if it fails, the files are moved back and the store stays on
+  /// the old directory with its lock held, so no other app can take that folder
+  /// in between. `persist` must not call the store.
+  fn switch_dir(
     &self,
     new_dir: PathBuf,
     move_files: bool,
     policy: CollisionPolicy,
-  ) -> Result<(), String> {
+    locker: impl FnOnce(&Path) -> Result<std::fs::File, LockFailure>,
+    persist: impl FnOnce() -> Result<(), String>,
+  ) -> Result<DirSwitch, SetDirError> {
     let mut inner = self.inner.lock().unwrap();
     if inner.dir == new_dir {
-      return Ok(());
+      persist()?;
+      return Ok(DirSwitch::Unchanged);
     }
     std::fs::create_dir_all(&new_dir).map_err(|e| e.to_string())?;
+    let (new_lock, unlockable) = match locker(&new_dir) {
+      Ok(file) => (Some(file), false),
+      Err(LockFailure {
+        kind: LockError::Busy,
+        ..
+      }) => return Err(SetDirError::InUse),
+      Err(LockFailure {
+        kind: LockError::Unsupported,
+        ..
+      }) => (None, true),
+      Err(LockFailure { detail, .. }) => return Err(SetDirError::Other(detail)),
+    };
     if move_files {
       move_snapshot_files(&inner.dir, &new_dir, policy)?;
     }
-    inner.notes = load_dir(&new_dir)?.items;
+    let notes = load_dir(&new_dir)?.items;
+    if let Err(e) = persist() {
+      if move_files {
+        // Best-effort: the files just moved from the old directory win any
+        // collision moving back into it.
+        let _ = move_snapshot_files(&new_dir, &inner.dir, CollisionPolicy::Source);
+        // What came back may differ from the list in memory.
+        if let Ok(loaded) = load_dir(&inner.dir) {
+          inner.notes = loaded.items;
+        }
+      }
+      return Err(SetDirError::Other(e));
+    }
+    inner.notes = notes;
     inner.dir = new_dir;
-    Ok(())
+    inner.lock = new_lock;
+    Ok(DirSwitch::Switched { unlockable })
+  }
+}
+/// What `set_dir` did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DirSwitch {
+  /// The store was already on that directory.
+  Unchanged,
+  /// `unlockable`: the new directory's file system has no lock support, so it
+  /// is used without one.
+  Switched { unlockable: bool },
+}
+/// Why `set_dir` did not switch. Serialized for the frontend, which words
+/// `InUse` itself instead of showing an OS message.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(tag = "kind", content = "message", rename_all = "snake_case")]
+pub enum SetDirError {
+  /// Another app holds the lock on the new directory.
+  InUse,
+  Other(String),
+}
+
+impl From<String> for SetDirError {
+  fn from(message: String) -> Self {
+    SetDirError::Other(message)
   }
 }
 
@@ -914,59 +1009,221 @@ fn is_writable(dir: &Path) -> bool {
     }
   }
 }
-
-/// Whether this launch fell back to the default snapshots folder. Set once at
-/// startup and read by `settings::load_settings`, so the settings window can
-/// say so instead of the user finding out by noticing their notes are missing.
-#[derive(Default)]
-pub struct SnapshotFallback(std::sync::atomic::AtomicBool);
-
-impl SnapshotFallback {
-  pub fn in_use(&self) -> bool {
-    self.0.load(std::sync::atomic::Ordering::Relaxed)
-  }
-
-  fn mark(&self) {
-    self.0.store(true, std::sync::atomic::Ordering::Relaxed);
-  }
+/// Why this launch is using the default snapshots folder instead of the chosen
+/// one, if it is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FallbackReason {
+  None,
+  /// The chosen folder cannot be written to.
+  Unwritable,
+  /// Another app holds the lock on the chosen folder.
+  InUse,
 }
 
-/// The snapshots directory to actually use at startup: the folder the settings
-/// point at when it works, the default inside the app's own data directory when
-/// it does not.
+impl FallbackReason {
+  /// Whether the chosen folder's notes were left unread. Their file and project
+  /// paths are then missing from the store, so the grants they alone refer to
+  /// must not be pruned.
+  pub fn fell_back(self) -> bool {
+    self != FallbackReason::None
+  }
+
+  fn to_u8(self) -> u8 {
+    match self {
+      FallbackReason::None => 0,
+      FallbackReason::Unwritable => 1,
+      FallbackReason::InUse => 2,
+    }
+  }
+
+  fn from_u8(value: u8) -> Self {
+    match value {
+      1 => FallbackReason::Unwritable,
+      2 => FallbackReason::InUse,
+      _ => FallbackReason::None,
+    }
+  }
+}
+/// What the settings window is told about the snapshots folder in use.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct SnapshotDirState {
+  /// The chosen folder cannot be written to; the default one is in use.
+  pub unavailable: bool,
+  /// The chosen folder is in use by another app; the default one is in use.
+  pub in_use: bool,
+  /// The folder in use has no lock support, so another app using it at the
+  /// same time cannot be detected.
+  pub unlockable: bool,
+}
+/// How this launch's snapshots folder was settled. Set once at startup and read
+/// by `settings::load_settings`, so the settings window can say so instead of
+/// the user finding out by noticing their notes are missing. A successful folder
+/// switch from the settings window updates it (`switched`).
+#[derive(Default)]
+pub struct SnapshotFallback {
+  reason: std::sync::atomic::AtomicU8,
+  unlockable: std::sync::atomic::AtomicBool,
+}
+
+impl SnapshotFallback {
+  pub fn reason(&self) -> FallbackReason {
+    FallbackReason::from_u8(self.reason.load(std::sync::atomic::Ordering::Relaxed))
+  }
+
+  pub fn state(&self) -> SnapshotDirState {
+    let reason = self.reason();
+    SnapshotDirState {
+      unavailable: reason == FallbackReason::Unwritable,
+      in_use: reason == FallbackReason::InUse,
+      unlockable: self.unlockable.load(std::sync::atomic::Ordering::Relaxed),
+    }
+  }
+
+  fn mark(&self, reason: FallbackReason, unlockable: bool) {
+    self
+      .reason
+      .store(reason.to_u8(), std::sync::atomic::Ordering::Relaxed);
+    self
+      .unlockable
+      .store(unlockable, std::sync::atomic::Ordering::Relaxed);
+  }
+  /// The user picked a folder from the settings window: the startup fallback no
+  /// longer describes what is in use. `unlockable` is None when the store was
+  /// already on that folder.
+  fn switched(&self, unlockable: Option<bool>) {
+    let unlockable = unlockable.unwrap_or_else(|| self.state().unlockable);
+    self.mark(FallbackReason::None, unlockable);
+  }
+}
+/// The outcome of the startup folder decision.
+#[derive(Debug)]
+struct StartupChoice {
+  dir: PathBuf,
+  /// The lock to hand to the store; None when the folder is used unlocked.
+  lock: Option<std::fs::File>,
+  reason: FallbackReason,
+  unlockable: bool,
+}
+/// The startup decision with the file system behind `writable` and `locker`, so
+/// every branch can be tested. `chosen` is the resolved folder the settings
+/// point at, `None` for the default.
+///
+/// The chosen folder is used when it is writable and locks (or has no lock
+/// support). If it is unusable, or another app holds its lock, the default
+/// folder is used instead. The default folder can never fail startup: if it
+/// cannot be locked it is used unlocked and the problem is only logged, except
+/// that a default folder without lock support sets `unlockable` like any other.
+fn decide_startup_dir(
+  chosen: Option<PathBuf>,
+  default_dir: PathBuf,
+  writable: impl Fn(&Path) -> bool,
+  locker: impl Fn(&Path) -> Result<std::fs::File, LockFailure>,
+) -> StartupChoice {
+  let mut reason = FallbackReason::None;
+  match &chosen {
+    Some(dir) if !writable(dir) => {
+      log::warn!(
+        "snapshot folder {} cannot be written to; using the default folder",
+        dir.display()
+      );
+      reason = FallbackReason::Unwritable;
+    }
+    Some(dir) => match locker(dir) {
+      Ok(lock) => {
+        return StartupChoice {
+          dir: dir.clone(),
+          lock: Some(lock),
+          reason,
+          unlockable: false,
+        }
+      }
+      Err(failure) if failure.kind == LockError::Unsupported => {
+        log::warn!(
+          "snapshot folder {} cannot be locked ({}); using it without a lock",
+          dir.display(),
+          failure.detail
+        );
+        return StartupChoice {
+          dir: dir.clone(),
+          lock: None,
+          reason,
+          unlockable: true,
+        };
+      }
+      Err(failure) => {
+        log::warn!(
+          "snapshot folder {} cannot be locked ({}); using the default folder",
+          dir.display(),
+          failure.detail
+        );
+        reason = if failure.kind == LockError::Busy {
+          FallbackReason::InUse
+        } else {
+          FallbackReason::Unwritable
+        };
+      }
+    },
+    None => {}
+  }
+  let mut unlockable = false;
+  let lock = match locker(&default_dir) {
+    Ok(lock) => Some(lock),
+    Err(failure) => {
+      log::warn!(
+        "default snapshot folder {} cannot be locked ({}); using it without a lock",
+        default_dir.display(),
+        failure.detail
+      );
+      // Only a missing lock support is worth a notice; a busy or otherwise
+      // unlockable default folder is just logged.
+      unlockable = failure.kind == LockError::Unsupported;
+      None
+    }
+  };
+  StartupChoice {
+    dir: default_dir,
+    lock,
+    reason,
+    unlockable,
+  }
+}
+/// The snapshots directory to actually use at startup, with the lock taken on
+/// it: the folder the settings point at when it works, the default inside the
+/// app's own data directory when it does not.
 ///
 /// The picked folder can be unusable for reasons the user cannot be expected to
 /// have anticipated — an external disk that is not mounted, a synced folder
-/// that went read-only, or, in a sandboxed build, a grant that did not survive
-/// the last launch. None of those is a reason to have no snapshots at all:
+/// that went read-only, a grant that did not survive the last launch in a
+/// sandboxed build, or another app (or another copy of this one) pointed at the
+/// same folder holding it. None of those is a reason to have no snapshots at all:
 /// before this fallback, a sticky could not be created, so the startup window
 /// never opened and the app sat there with a menu bar and nothing else. The
 /// default folder is inside the app's own data directory, which is the one
 /// place it is always allowed to write.
 ///
 /// The setting is deliberately left as the user wrote it, so the folder is used
-/// again the moment it works. `fallback` records that this happened for the
-/// settings window to report.
+/// again the moment it works. `fallback` records what happened for the settings
+/// window to report.
 pub fn startup_snapshot_dir(
   app: &AppHandle,
   settings: &settings::AppSettings,
   fallback: &SnapshotFallback,
-) -> Result<PathBuf, String> {
+) -> Result<(PathBuf, Option<std::fs::File>), String> {
   let app_data = app.path().app_data_dir().map_err(|e| e.to_string())?;
   let default_dir = snapshot_dir_for(&app_data, None);
-  let Some(picked) = picked_snapshot_dir(settings) else {
-    return Ok(default_dir);
-  };
-  let dir = snapshot_dir_for(&app_data, Some(picked.as_path()));
-  if is_writable(&dir) {
-    return Ok(dir);
-  }
-  log::warn!(
-    "snapshot folder {} cannot be written to; using the default folder",
-    dir.display()
-  );
-  fallback.mark();
-  Ok(default_dir)
+  let chosen =
+    picked_snapshot_dir(settings).map(|picked| snapshot_dir_for(&app_data, Some(picked.as_path())));
+  // `is_writable` also creates the folder, which the lock file needs; the
+  // default folder gets the same treatment, as before.
+  let choice = decide_startup_dir(chosen, default_dir, is_writable, |dir| {
+    std::fs::create_dir_all(dir).map_err(|e| LockFailure {
+      kind: LockError::Other,
+      detail: e.to_string(),
+    })?;
+    snapshot_lock::try_lock(dir)
+  });
+  fallback.mark(choice.reason, choice.unlockable);
+  Ok((choice.dir, choice.lock))
 }
 
 /// The folder the settings choose, or `None` for the default. Prefers the
@@ -1058,29 +1315,26 @@ pub fn migrate_legacy_snapshot_location_setting(app: &AppHandle) {
 }
 
 /// Switch `store`'s active directory to `new_dir` (optionally moving the old
-/// directory's files into it first, resolving collisions per `policy`), then
-/// call `write_setting` to persist the choice. The setting is written only
-/// after a successful switch; if `write_setting` fails, the switch is rolled
-/// back (files moved back, active dir reverted) so files and setting never
-/// disagree. Split out of `apply_snapshot_dir` so this ordering guarantee is
-/// unit-testable against a real `NoteStore` without a running Tauri app.
+/// directory's files into it first, resolving collisions per `policy`), calling
+/// `write_setting` to persist the choice once the files are moved. The setting
+/// is written only after the move; if `write_setting` fails, the move is undone
+/// and the store keeps the old directory and its lock, so files and setting
+/// never disagree. Split out of `apply_snapshot_dir` so this ordering guarantee
+/// is unit-testable against a real `NoteStore` without a running Tauri app.
 fn switch_and_persist(
   store: &NoteStore,
   new_dir: PathBuf,
   move_files: bool,
   policy: CollisionPolicy,
   write_setting: impl FnOnce() -> Result<(), String>,
-) -> Result<(), String> {
-  let old_dir = store.current_dir();
-  store.set_dir(new_dir, move_files, policy)?;
-  if let Err(e) = write_setting() {
-    // The switch already happened but the setting didn't take; move back so
-    // the two never disagree about where the files live. Best-effort: the
-    // files just moved from old_dir win any collision moving back into it.
-    let _ = store.set_dir(old_dir, move_files, CollisionPolicy::Source);
-    return Err(e);
-  }
-  Ok(())
+) -> Result<DirSwitch, SetDirError> {
+  store.switch_dir(
+    new_dir,
+    move_files,
+    policy,
+    snapshot_lock::try_lock,
+    write_setting,
+  )
 }
 
 /// Validate the picked folder, then switch and persist via `switch_and_persist`.
@@ -1090,10 +1344,12 @@ pub fn apply_snapshot_dir(
   dir: Option<PathBuf>,
   move_files: bool,
   policy: CollisionPolicy,
-) -> Result<(), String> {
+) -> Result<DirSwitch, SetDirError> {
   if let Some(picked) = &dir {
     if !picked.is_dir() {
-      return Err("the chosen folder does not exist".to_string());
+      return Err(SetDirError::Other(
+        "the chosen folder does not exist".to_string(),
+      ));
     }
   }
   let new_dir = resolve_snapshot_dir(app, dir.as_deref())?;
@@ -1241,18 +1497,23 @@ pub fn preview_snapshot_dir_move(
   let new_dir = resolve_snapshot_dir(&app, dir.map(PathBuf::from).as_deref())?;
   Ok(store.preview_move(&new_dir))
 }
-
+/// Returns the state the settings window should show from now on.
 #[tauri::command]
 pub fn set_snapshot_dir(
   app: AppHandle,
   store: State<NoteStore>,
+  fallback: State<SnapshotFallback>,
   dir: Option<String>,
   move_files: bool,
   policy: CollisionPolicy,
-) -> Result<(), String> {
-  apply_snapshot_dir(&app, &store, dir.map(PathBuf::from), move_files, policy)?;
+) -> Result<SnapshotDirState, SetDirError> {
+  let switch = apply_snapshot_dir(&app, &store, dir.map(PathBuf::from), move_files, policy)?;
+  fallback.switched(match switch {
+    DirSwitch::Switched { unlockable } => Some(unlockable),
+    DirSwitch::Unchanged => None,
+  });
   emit_store_changed(&app, None);
-  Ok(())
+  Ok(fallback.state())
 }
 
 /// The currently resolved snapshots directory, for the settings UI to display.
@@ -1307,9 +1568,306 @@ mod tests {
   #[test]
   fn a_fallback_starts_unmarked_and_stays_marked() {
     let fallback = SnapshotFallback::default();
-    assert!(!fallback.in_use());
-    fallback.mark();
-    assert!(fallback.in_use());
+    assert_eq!(fallback.reason(), FallbackReason::None);
+    assert!(!fallback.reason().fell_back());
+    fallback.mark(FallbackReason::Unwritable, false);
+    assert_eq!(fallback.reason(), FallbackReason::Unwritable);
+  }
+
+  #[test]
+  fn each_fallback_reason_reports_only_its_own_flag() {
+    let fallback = SnapshotFallback::default();
+    let state = |reason, unlockable| {
+      fallback.mark(reason, unlockable);
+      fallback.state()
+    };
+    let none = state(FallbackReason::None, false);
+    assert!(!none.unavailable && !none.in_use && !none.unlockable);
+    let unwritable = state(FallbackReason::Unwritable, false);
+    assert!(unwritable.unavailable && !unwritable.in_use && !unwritable.unlockable);
+    let busy = state(FallbackReason::InUse, false);
+    assert!(!busy.unavailable && busy.in_use && !busy.unlockable);
+    let unlockable = state(FallbackReason::None, true);
+    assert!(!unlockable.unavailable && !unlockable.in_use && unlockable.unlockable);
+  }
+
+  #[test]
+  fn only_a_real_fallback_disables_pruning_not_a_missing_lock_support() {
+    assert!(FallbackReason::Unwritable.fell_back());
+    assert!(FallbackReason::InUse.fell_back());
+    assert!(!FallbackReason::None.fell_back());
+  }
+
+  #[test]
+  fn falling_back_because_the_folder_is_in_use_keeps_grants_from_being_pruned() {
+    let mut referencing = note("a");
+    referencing.file_path = Some("/only/in/the/chosen/folder.txt".into());
+    let notes = vec![referencing];
+    let report = Ok((settings::AppSettings::default(), Vec::new()));
+    let fallback = SnapshotFallback::default();
+    fallback.mark(FallbackReason::InUse, false);
+    assert!(
+      crate::grants::prune_set(true, fallback.reason().fell_back(), false, &report, &notes)
+        .is_none()
+    );
+    // No lock support is not a fallback: the chosen folder was read, so pruning is safe.
+    fallback.mark(FallbackReason::None, true);
+    let kept =
+      crate::grants::prune_set(true, fallback.reason().fell_back(), false, &report, &notes)
+        .unwrap();
+    assert!(kept.contains("/only/in/the/chosen/folder.txt"));
+  }
+
+  #[test]
+  fn a_switch_from_the_settings_window_ends_the_startup_fallback() {
+    let fallback = SnapshotFallback::default();
+    fallback.mark(FallbackReason::InUse, false);
+    fallback.switched(Some(true));
+    assert_eq!(fallback.reason(), FallbackReason::None);
+    assert!(fallback.state().unlockable);
+    // Switching to a lockable folder clears the flag again.
+    fallback.switched(Some(false));
+    assert!(!fallback.state().unlockable);
+    // Already on that folder: the flag stays as it was.
+    fallback.mark(FallbackReason::InUse, true);
+    fallback.switched(None);
+    assert_eq!(fallback.reason(), FallbackReason::None);
+    assert!(fallback.state().unlockable);
+  }
+
+  fn failure(kind: LockError) -> LockFailure {
+    LockFailure {
+      kind,
+      detail: "test".into(),
+    }
+  }
+
+  fn decide(
+    chosen: Option<&str>,
+    writable: bool,
+    chosen_lock: Result<(), LockError>,
+    default_lock: Result<(), LockError>,
+  ) -> StartupChoice {
+    decide_startup_dir(
+      chosen.map(PathBuf::from),
+      PathBuf::from("/default"),
+      |_| writable,
+      |dir| {
+        let outcome = if dir == Path::new("/default") {
+          default_lock
+        } else {
+          chosen_lock
+        };
+        outcome
+          .map(|()| tempfile::tempfile().unwrap())
+          .map_err(failure)
+      },
+    )
+  }
+
+  #[test]
+  fn a_writable_lockable_chosen_folder_is_used_and_locked() {
+    let c = decide(Some("/picked"), true, Ok(()), Ok(()));
+    assert_eq!(c.dir, PathBuf::from("/picked"));
+    assert!(c.lock.is_some());
+    assert_eq!(c.reason, FallbackReason::None);
+    assert!(!c.unlockable);
+  }
+
+  #[test]
+  fn an_unwritable_chosen_folder_falls_back_to_the_locked_default() {
+    let c = decide(Some("/picked"), false, Ok(()), Ok(()));
+    assert_eq!(c.dir, PathBuf::from("/default"));
+    assert!(c.lock.is_some());
+    assert_eq!(c.reason, FallbackReason::Unwritable);
+    assert!(!c.unlockable);
+  }
+
+  #[test]
+  fn a_chosen_folder_locked_by_another_app_falls_back_to_the_default() {
+    let c = decide(Some("/picked"), true, Err(LockError::Busy), Ok(()));
+    assert_eq!(c.dir, PathBuf::from("/default"));
+    assert!(c.lock.is_some());
+    assert_eq!(c.reason, FallbackReason::InUse);
+    assert!(!c.unlockable);
+  }
+
+  #[test]
+  fn a_chosen_folder_without_lock_support_is_used_unlocked_and_flagged() {
+    let c = decide(Some("/picked"), true, Err(LockError::Unsupported), Ok(()));
+    assert_eq!(c.dir, PathBuf::from("/picked"));
+    assert!(c.lock.is_none());
+    assert_eq!(c.reason, FallbackReason::None);
+    assert!(c.unlockable);
+  }
+
+  #[test]
+  fn a_lock_that_fails_for_another_reason_counts_as_an_unusable_folder() {
+    let c = decide(Some("/picked"), true, Err(LockError::Other), Ok(()));
+    assert_eq!(c.dir, PathBuf::from("/default"));
+    assert_eq!(c.reason, FallbackReason::Unwritable);
+  }
+
+  #[test]
+  fn startup_never_fails_when_even_the_default_folder_cannot_be_locked() {
+    for kind in [LockError::Busy, LockError::Unsupported, LockError::Other] {
+      // After a fallback: the default folder is used unlocked, the reason stays.
+      let c = decide(Some("/picked"), true, Err(LockError::Busy), Err(kind));
+      assert_eq!(c.dir, PathBuf::from("/default"));
+      assert!(c.lock.is_none());
+      assert_eq!(c.reason, FallbackReason::InUse);
+      assert_eq!(
+        c.unlockable,
+        kind == LockError::Unsupported,
+        "a notice only when the folder in use has no lock support"
+      );
+      // With nothing chosen.
+      let c = decide(None, true, Ok(()), Err(kind));
+      assert_eq!(c.dir, PathBuf::from("/default"));
+      assert!(c.lock.is_none());
+      assert_eq!(c.reason, FallbackReason::None);
+    }
+  }
+
+  #[test]
+  fn with_nothing_chosen_the_default_is_locked_and_lock_support_is_flagged() {
+    let c = decide(None, true, Ok(()), Ok(()));
+    assert_eq!(c.dir, PathBuf::from("/default"));
+    assert!(c.lock.is_some());
+    assert!(!c.unlockable);
+    let c = decide(None, true, Ok(()), Err(LockError::Unsupported));
+    assert!(c.unlockable);
+    let c = decide(None, true, Ok(()), Err(LockError::Busy));
+    assert!(!c.unlockable);
+  }
+
+  #[test]
+  fn a_fallback_default_folder_without_lock_support_is_flagged() {
+    let busy = decide(
+      Some("/picked"),
+      true,
+      Err(LockError::Busy),
+      Err(LockError::Unsupported),
+    );
+    assert_eq!(busy.reason, FallbackReason::InUse);
+    assert!(busy.unlockable);
+    let unwritable = decide(Some("/picked"), false, Ok(()), Err(LockError::Unsupported));
+    assert_eq!(unwritable.reason, FallbackReason::Unwritable);
+    assert!(unwritable.unlockable);
+  }
+
+  #[test]
+  fn the_lock_file_is_neither_loaded_nor_moved() {
+    let root = tempdir().unwrap();
+    let dir1 = root.path().join("local");
+    let dir2 = root.path().join("dst");
+    std::fs::create_dir_all(&dir2).unwrap();
+    let store = NoteStore::load(dir1.clone()).unwrap();
+    store.upsert(note("a")).unwrap();
+    let lock = snapshot_lock::try_lock(&dir1).unwrap();
+    assert!(dir1.join(snapshot_lock::LOCK_FILE_NAME).exists());
+    let loaded = load_dir(&dir1).unwrap();
+    assert_eq!(loaded.items.len(), 1);
+    assert!(
+      loaded.skipped.is_empty(),
+      "the lock file is not a skipped file"
+    );
+    move_snapshot_files(&dir1, &dir2, CollisionPolicy::Source).unwrap();
+    assert!(dir2.join("a.json").exists());
+    assert!(!dir2.join(snapshot_lock::LOCK_FILE_NAME).exists());
+    assert!(dir1.join(snapshot_lock::LOCK_FILE_NAME).exists());
+    drop(lock);
+  }
+
+  #[test]
+  fn switching_to_a_folder_in_use_fails_without_moving_or_unlocking_anything() {
+    let root = tempdir().unwrap();
+    let dir1 = root.path().join("local");
+    let dir2 = root.path().join("busy");
+    let store = NoteStore::load(dir1.clone()).unwrap();
+    store.upsert(note("a")).unwrap();
+    store.hold_lock(Some(snapshot_lock::try_lock(&dir1).unwrap()));
+    std::fs::create_dir_all(&dir2).unwrap();
+    let other_app = snapshot_lock::try_lock(&dir2).unwrap();
+    let result = store.set_dir(dir2.clone(), true, CollisionPolicy::Source);
+    assert_eq!(result, Err(SetDirError::InUse));
+    assert!(dir1.join("a.json").exists());
+    assert!(!dir2.join("a.json").exists());
+    assert_eq!(store.current_dir(), dir1);
+    assert_eq!(
+      snapshot_lock::try_lock(&dir1).unwrap_err().kind,
+      LockError::Busy,
+      "the old folder is still locked"
+    );
+    drop(other_app);
+  }
+
+  #[test]
+  fn a_successful_switch_locks_the_new_folder_and_releases_the_old_one() {
+    let root = tempdir().unwrap();
+    let dir1 = root.path().join("local");
+    let dir2 = root.path().join("cloud");
+    let store = NoteStore::load(dir1.clone()).unwrap();
+    store.upsert(note("a")).unwrap();
+    store.hold_lock(Some(snapshot_lock::try_lock(&dir1).unwrap()));
+    let result = store.set_dir(dir2.clone(), true, CollisionPolicy::Source);
+    assert_eq!(result, Ok(DirSwitch::Switched { unlockable: false }));
+    assert_eq!(
+      snapshot_lock::try_lock(&dir2).unwrap_err().kind,
+      LockError::Busy
+    );
+    assert!(snapshot_lock::try_lock(&dir1).is_ok());
+    assert_eq!(
+      store.set_dir(dir2, true, CollisionPolicy::Source),
+      Ok(DirSwitch::Unchanged)
+    );
+  }
+
+  #[test]
+  fn switching_to_a_folder_without_lock_support_works_and_is_flagged() {
+    let root = tempdir().unwrap();
+    let dir1 = root.path().join("local");
+    let dir2 = root.path().join("nas");
+    let store = NoteStore::load(dir1.clone()).unwrap();
+    store.upsert(note("a")).unwrap();
+    store.hold_lock(Some(snapshot_lock::try_lock(&dir1).unwrap()));
+    let result = store.set_dir_with(dir2.clone(), true, CollisionPolicy::Source, |_| {
+      Err(failure(LockError::Unsupported))
+    });
+    assert_eq!(result, Ok(DirSwitch::Switched { unlockable: true }));
+    assert_eq!(store.current_dir(), dir2);
+    assert!(dir2.join("a.json").exists());
+    assert!(
+      snapshot_lock::try_lock(&dir1).is_ok(),
+      "the old lock is released"
+    );
+  }
+
+  #[test]
+  fn switching_to_a_folder_whose_lock_fails_otherwise_is_an_error() {
+    let root = tempdir().unwrap();
+    let dir1 = root.path().join("local");
+    let dir2 = root.path().join("odd");
+    let store = NoteStore::load(dir1.clone()).unwrap();
+    store.upsert(note("a")).unwrap();
+    let result = store.set_dir_with(dir2, true, CollisionPolicy::Source, |_| {
+      Err(failure(LockError::Other))
+    });
+    assert_eq!(result, Err(SetDirError::Other("test".into())));
+    assert_eq!(store.current_dir(), dir1);
+    assert!(dir1.join("a.json").exists());
+  }
+
+  #[test]
+  fn the_switch_error_reaches_the_frontend_as_a_tagged_object() {
+    assert_eq!(
+      serde_json::to_value(SetDirError::InUse).unwrap(),
+      serde_json::json!({ "kind": "in_use" })
+    );
+    assert_eq!(
+      serde_json::to_value(SetDirError::Other("boom".into())).unwrap(),
+      serde_json::json!({ "kind": "other", "message": "boom" })
+    );
   }
 
   #[test]
@@ -1994,6 +2552,74 @@ mod tests {
   }
 
   #[test]
+  fn a_failed_setting_write_never_lets_another_app_take_the_old_folder() {
+    let root = tempdir().unwrap();
+    let dir1 = root.path().join("local");
+    let dir2 = root.path().join("cloud");
+    let store = NoteStore::load(dir1.clone()).unwrap();
+    store.upsert(note("a")).unwrap();
+    store.hold_lock(Some(snapshot_lock::try_lock(&dir1).unwrap()));
+    let persist_calls = std::cell::Cell::new(0);
+    let other_app = std::cell::RefCell::new(None);
+    let result = switch_and_persist(&store, dir2.clone(), true, CollisionPolicy::Source, || {
+      // Another app tries for the old folder at the moment the write fails.
+      *other_app.borrow_mut() = Some(snapshot_lock::try_lock(&dir1));
+      persist_calls.set(persist_calls.get() + 1);
+      Err("disk full".to_string())
+    });
+    assert!(result.is_err());
+    let other_app = other_app.into_inner().unwrap();
+    assert_eq!(
+      other_app.err().map(|failure| failure.kind),
+      Some(LockError::Busy),
+      "the old folder stays locked until the setting is written"
+    );
+    assert_eq!(
+      persist_calls.get(),
+      1,
+      "the write is attempted exactly once"
+    );
+    assert_eq!(store.current_dir(), dir1);
+    assert!(dir1.join("a.json").exists());
+    assert!(!dir2.join("a.json").exists());
+    assert_eq!(
+      snapshot_lock::try_lock(&dir1).unwrap_err().kind,
+      LockError::Busy,
+      "the store still holds the old lock"
+    );
+    assert!(
+      snapshot_lock::try_lock(&dir2).is_ok(),
+      "the new folder's lock was dropped"
+    );
+  }
+
+  #[test]
+  fn after_a_failed_setting_write_the_list_agrees_with_the_old_folder_on_disk() {
+    let root = tempdir().unwrap();
+    let dir1 = root.path().join("local");
+    let dir2 = root.path().join("cloud");
+    let store = NoteStore::load(dir1.clone()).unwrap();
+    store.upsert(note("a")).unwrap();
+    // The destination already holds a note the failed move drags back with it.
+    NoteStore::load(dir2.clone())
+      .unwrap()
+      .upsert(note("b"))
+      .unwrap();
+    let result = switch_and_persist(&store, dir2.clone(), true, CollisionPolicy::Source, || {
+      Err("disk full".to_string())
+    });
+    assert!(result.is_err());
+    let ids = |notes: Vec<NoteSnapshot>| {
+      let mut ids: Vec<String> = notes.into_iter().map(|n| n.id).collect();
+      ids.sort();
+      ids
+    };
+    assert_eq!(ids(load_dir(&dir1).unwrap().items), vec!["a", "b"]);
+    assert_eq!(ids(store.list()), ids(load_dir(&dir1).unwrap().items));
+    assert_eq!(store.current_dir(), dir1);
+  }
+
+  #[test]
   fn the_setting_is_only_written_after_a_successful_move() {
     // This ordering was documented but never tested.
     let root = tempdir().unwrap();
@@ -2001,18 +2627,17 @@ mod tests {
     let dir2 = root.path().join("cloud");
     let store = NoteStore::load(dir1.clone()).unwrap();
     store.upsert(note("a")).unwrap();
-    // Observed from *inside* the setting-write closure: proves the move (and
-    // the dir switch it implies) already happened before this callback ran,
-    // not just that it happened by the time the outer call returns.
-    let seen_before_write = std::sync::Mutex::new((false, PathBuf::new()));
+    // Observed from *inside* the setting-write closure: proves the move already
+    // happened before this callback ran, not just by the time the outer call
+    // returns. The store is locked there, so only the disk can be looked at.
+    let moved_before_write = std::cell::Cell::new(false);
     let result = switch_and_persist(&store, dir2.clone(), true, CollisionPolicy::Source, || {
-      *seen_before_write.lock().unwrap() = (dir2.join("a.json").exists(), store.current_dir());
+      moved_before_write.set(dir2.join("a.json").exists());
       Ok(())
     });
     assert!(result.is_ok());
-    let (moved_before_write, dir_before_write) = seen_before_write.into_inner().unwrap();
-    assert!(moved_before_write);
-    assert_eq!(dir_before_write, dir2);
+    assert!(moved_before_write.get());
+    assert_eq!(store.current_dir(), dir2);
   }
 
   #[test]

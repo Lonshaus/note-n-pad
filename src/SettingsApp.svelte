@@ -5,6 +5,7 @@
   import { onMount } from 'svelte';
   import {
     settingsState,
+    snapshotDirErrorText,
     type LargeOpenMode,
     type OpenTarget,
   } from './lib/state/settings.svelte';
@@ -204,7 +205,7 @@
       }
       await settingsState.setSnapshotDir(dir, true, policy);
     } catch (err) {
-      snapshotDirError = String(err);
+      snapshotDirError = snapshotDirErrorText(err, t);
     }
   }
 
@@ -793,6 +794,11 @@
         {t('settings.snapshotDirUnavailable')}
       </p>
     {/if}
+    {#if settingsState.snapshotDirInUse}
+      <p class="error save-failed" role="alert">
+        {t('settings.snapshotDirInUse')}
+      </p>
+    {/if}
     {#if choiceModal !== null}
       {@const modal = choiceModal}
       <div class="modal-overlay" role="presentation">
@@ -1284,6 +1290,9 @@
         </div>
         {#if snapshotDirError !== ''}
           <span class="error">{snapshotDirError}</span>
+        {/if}
+        {#if settingsState.snapshotDirUnlockable}
+          <span class="hint">{t('settings.snapshotDirUnlockable')}</span>
         {/if}
         <span class="hint">{t('settings.general.snapshotCloudHint')}</span>
       </div>

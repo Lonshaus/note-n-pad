@@ -399,6 +399,12 @@ export const ja = {
     '一部の設定を読み込めなかったため、既定値にリセットされました。',
   'settings.snapshotDirUnavailable':
     '選択したスナップショットフォルダーを利用できないため、現在は既定のフォルダーを使用しています。',
+  'settings.snapshotDirInUse':
+    '選択したスナップショットフォルダーは別のアプリが使用中のため、現在は既定のフォルダーを使用しています。',
+  'settings.snapshotDirUnlockable':
+    'この場所では、別のアプリが同時に使用しているかどうかを検出できません。',
+  'settings.snapshotDirInUseSwitch':
+    'このフォルダーは別のアプリが使用中のため、切り替えられません。',
   'doc.longLine.confirm':
     '「{name}」には非常に長い行が含まれ、編集が遅くなることがあります。どのように開きますか？',
   'doc.longLine.openAsIs': 'そのまま開く',

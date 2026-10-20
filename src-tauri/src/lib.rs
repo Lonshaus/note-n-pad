@@ -46,6 +46,7 @@ mod replace_layer;
 mod settings;
 mod shortcut;
 mod shortcuts;
+mod snapshot_lock;
 #[cfg_attr(not(all(target_os = "macos", feature = "storekit")), allow(dead_code))]
 mod store_state;
 #[cfg(all(target_os = "macos", feature = "storekit"))]
@@ -2811,9 +2812,9 @@ pub fn run() {
       // resolve the active snapshots dir from settings.
       note_store::migrate_legacy_snapshot_location_setting(handle);
       let fallback = note_store::SnapshotFallback::default();
-      let dir =
+      let (dir, dir_lock) =
         note_store::startup_snapshot_dir(handle, &settings::app_settings(handle), &fallback)?;
-      let fallback_active = fallback.in_use();
+      let fallback_active = fallback.reason().fell_back();
       app.manage(fallback);
       // `NoteStore::load` only fails when `dir` exists but cannot be listed
       // (e.g. permissions). Falling back to an empty store for the same `dir`
@@ -2826,6 +2827,7 @@ pub fn run() {
           (NoteStore::empty(dir), Vec::new(), false)
         }
       };
+      store.hold_lock(dir_lock);
       // A clean range tab of an earlier version has nothing to restore.
       note_store::drop_clean_range_records(&store);
       let notes = store.list();
