@@ -46,6 +46,7 @@ import { settingsState } from './settings.svelte';
 import { editionState, isLite } from './edition.svelte';
 import {
   keptTabsToLoad,
+  nextTabIndex,
   partitionRestorable,
   windowBoundsRecord,
 } from '../util/keptTabs';
@@ -415,7 +416,7 @@ interface Bounds {
  * closed) is still pending when the grace timer fires, and only then does the
  * tab fall back to the read-only viewer — the existing large-index-progress
  * indicator is what shows that honestly, not a new one. */
-class DocumentWindowState {
+export class DocumentWindowState {
   group = '';
   /** Project root this window is bound to, or null for a projectless window.
    *  Set from the URL on a fresh window; adopted from the group's notes on
@@ -627,6 +628,12 @@ class DocumentWindowState {
    *  pretty-print). `formatAvailable` mirrors `!== null`. */
   private pendingLongLineFormatted: string | null = null;
   private nextIndex = 0;
+  /** Settles once `init` knows the group's stored tab indices; a new tab asked
+   *  for before then waits, or it would take an index a stored tab holds. */
+  private settleIndex: () => void = () => {};
+  private indexSettled = new Promise<void>((resolve) => {
+    this.settleIndex = resolve;
+  });
   private lastSave: Promise<void> = Promise.resolve();
   /** Tab ids with a `beginWindowedRestore` in flight, so re-activating a tab
    *  mid-restore (switch away and back) never starts a second reopen. Plain
@@ -1044,7 +1051,7 @@ class DocumentWindowState {
           hadBom: false,
           encoding: settingsState.defaultEncoding,
           lossy: false,
-          tabIndex: snap?.tab_index ?? this.nextIndex++,
+          tabIndex: snap?.tab_index ?? this.allocIndex(),
           large: { size },
         };
       }
@@ -1083,7 +1090,7 @@ class DocumentWindowState {
     const diskContent = normalizeToLf(diskRaw);
     const diskEnding = detectLineEnding(diskRaw);
     const id = snap?.id ?? crypto.randomUUID();
-    const tabIndex = snap?.tab_index ?? this.nextIndex++;
+    const tabIndex = snap?.tab_index ?? this.allocIndex();
     const detected = detectByFilename(path);
     // Existing files keep their detected/stored encoding; a file that never
     // existed on disk (no decode, no snapshot) falls back to the user default.
@@ -1151,13 +1158,24 @@ class DocumentWindowState {
     this.project = project;
     // The edition decides how a snapshot may be restored, so it is settled
     // before the first tab is loaded.
-    await editionState.ready();
-    const all = await invoke<NoteSnapshot[]>('list_notes');
+    let all: NoteSnapshot[];
+    try {
+      await editionState.ready();
+      all = await invoke<NoteSnapshot[]>('list_notes');
+    } catch (e) {
+      // Let waiting opens through rather than hang them behind a failed init.
+      this.settleIndex();
+      throw e;
+    }
     const entries = all
       .filter(
         (n) => n.kind === 'document' && (n.window_group ?? n.id) === group,
       )
       .sort((a, b) => a.tab_index - b.tab_index);
+    // Before the restore below, so a restore that throws midway still leaves
+    // later tabs above every stored index.
+    this.nextIndex = nextTabIndex(entries);
+    this.settleIndex();
     if (entries.length > 0) {
       // Restore: adopt the project the group's tabs were saved with.
       this.project = entries[0]!.project;
@@ -1195,7 +1213,6 @@ class DocumentWindowState {
         width: lowest.width,
         height: lowest.height,
       };
-      this.nextIndex = Math.max(...entries.map((e) => e.tab_index)) + 1;
       // Writing `activeIndex` (even to its already-current value of 0) is what
       // kicks off the lazy reopen if the initial active tab is itself a
       // restored windowed tab — see the `activeIndex` setter. `initialTab` is a
@@ -1210,7 +1227,6 @@ class DocumentWindowState {
       // A fresh window opened for one file routes through the same open gate, so
       // an over-threshold file prompts before loading (and may leave the window
       // empty if cancelled — DocumentApp collapses it then).
-      this.nextIndex = 0;
       await this.openTab(initialPath);
       if (this.tabs.length > 0) {
         // The window now shows a document, so it can no longer be a launch
@@ -1421,8 +1437,20 @@ class DocumentWindowState {
     void this.switchTo((this.activeIndex + delta + count) % count);
   }
 
+  /** The next free tab index: above both the counter and every open tab, so an
+   *  index is never handed out twice even if the counter fell behind. */
+  private allocIndex(): number {
+    const index = this.tabs.reduce(
+      (max, t) => Math.max(max, t.tabIndex + 1),
+      this.nextIndex,
+    );
+    this.nextIndex = index + 1;
+    return index;
+  }
+
   /** Open a fresh untitled tab (no path, empty buffer) and switch to it. */
   async newTab(): Promise<void> {
+    await this.indexSettled;
     const lineEnding = settingsState.defaultLineEnding;
     const tab: DocTab = {
       id: crypto.randomUUID(),
@@ -1437,7 +1465,7 @@ class DocumentWindowState {
       hadBom: false,
       encoding: settingsState.defaultEncoding,
       lossy: false,
-      tabIndex: this.nextIndex++,
+      tabIndex: this.allocIndex(),
     };
     this.tabs.push(tab);
     await this.switchTo(this.tabs.length - 1);
@@ -1453,6 +1481,7 @@ class DocumentWindowState {
    *  that mode. The confirm itself never auto-picks edit mode — that would load a
    *  GB file whole; view is always the safe default. */
   async openTab(path: string): Promise<void> {
+    await this.indexSettled;
     this.openFailed = null;
     await this.route(path);
     // Recorded after the open rather than before it: a path that cannot be read
@@ -1640,7 +1669,7 @@ class DocumentWindowState {
       this.openFailed = path;
       return;
     }
-    tab.tabIndex = this.nextIndex++;
+    tab.tabIndex = this.allocIndex();
     this.tabs.push(tab);
     await this.switchTo(this.tabs.length - 1);
     await this.upsertTab(tab);
@@ -1698,7 +1727,7 @@ class DocumentWindowState {
       hadBom: false,
       encoding: settingsState.defaultEncoding,
       lossy: false,
-      tabIndex: this.nextIndex++,
+      tabIndex: this.allocIndex(),
       large: { size: pending.size },
     };
     this.tabs.push(tab);
@@ -2154,7 +2183,7 @@ class DocumentWindowState {
       hadBom: false,
       encoding: settingsState.defaultEncoding,
       lossy: false,
-      tabIndex: this.nextIndex++,
+      tabIndex: this.allocIndex(),
       // `info.endLine` is not kept: the end line is derived from the tab's
       // content line count and persisted by `snapshot()` as `range_end_line`.
       range: {
@@ -2283,7 +2312,7 @@ class DocumentWindowState {
       hadBom: false,
       encoding: settingsState.defaultEncoding,
       lossy: false,
-      tabIndex: this.nextIndex++,
+      tabIndex: this.allocIndex(),
       windowed: {
         sessionId: open.session_id,
         totalBytes: open.total_bytes,

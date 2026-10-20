@@ -14,6 +14,7 @@ import { editionState } from './edition.svelte';
 import { effectiveLanguage } from '../editor/language';
 import {
   documentWindow,
+  DocumentWindowState,
   LARGE_FILE_THRESHOLD,
   type DocTab,
   opensInLargeViewer,
@@ -973,5 +974,73 @@ describe('the large-file question when the edition turns lite under it', () => {
     expect(documentWindow.pendingLargeOpen).toBeNull();
     expect(documentWindow.tabs[0]?.large).toBeUndefined();
     expect(documentWindow.tabs[0]?.content.toString()).toBe('disk text');
+  });
+});
+
+describe('tab indices handed out after a restore', () => {
+  const plain = (id: string, tab_index: number): NoteSnapshot =>
+    note({ id, tab_index, file_path: `/tmp/${id}.txt` });
+  const flush = (): Promise<void> => new Promise((r) => setTimeout(r, 0));
+
+  it('stay above every stored tab when the restore throws midway', async () => {
+    backend({ list_notes: [plain('a', 0), plain('b', 3), plain('c', 5)] });
+    const win = new DocumentWindowState();
+    const proto = win as unknown as {
+      loadTab: (...args: unknown[]) => Promise<DocTab>;
+    };
+    const real = proto.loadTab.bind(win);
+    let calls = 0;
+    vi.spyOn(proto, 'loadTab').mockImplementation((...args: unknown[]) => {
+      calls += 1;
+      return calls === 1 ? real(...args) : Promise.reject(new Error('boom'));
+    });
+    await expect(win.init('g', null, null)).rejects.toThrow('boom');
+    await win.newTab();
+    expect(win.tabs.map((t) => t.tabIndex)).toEqual([0, 6]);
+  });
+
+  it('wait for the stored indices when asked for before list_notes returns', async () => {
+    let release: (v: NoteSnapshot[]) => void = () => {};
+    backend({
+      list_notes: () =>
+        new Promise<NoteSnapshot[]>((r) => {
+          release = r;
+        }),
+    });
+    const win = new DocumentWindowState();
+    const init = win.init('g', null, null);
+    const opened = win.newTab();
+    await flush();
+    expect(win.tabs).toHaveLength(0);
+    release([plain('a', 0), plain('b', 3)]);
+    await Promise.all([init, opened]);
+    const indices = win.tabs.map((t) => t.tabIndex).sort((x, y) => x - y);
+    expect(indices).toEqual([0, 3, 4]);
+  });
+
+  it('stay above every stored tab when a new tab opens mid-restore', async () => {
+    let release: () => void = () => {};
+    let held = false;
+    backend({
+      list_notes: [plain('a', 0), plain('b', 3)],
+      path_writable: () => {
+        if (held) {
+          return Promise.resolve(true);
+        }
+        held = true;
+        return new Promise((r) => {
+          release = () => r(true);
+        });
+      },
+    });
+    const win = new DocumentWindowState();
+    const init = win.init('g', null, null);
+    await flush();
+    await win.newTab();
+    expect(win.tabs.map((t) => t.tabIndex)).toEqual([4]);
+    release();
+    await init;
+    const indices = win.tabs.map((t) => t.tabIndex).sort((x, y) => x - y);
+    expect(indices).toEqual([0, 3, 4]);
   });
 });

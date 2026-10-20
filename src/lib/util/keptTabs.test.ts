@@ -4,6 +4,7 @@
 import { describe, expect, it } from 'vitest';
 import {
   keptTabsToLoad,
+  nextTabIndex,
   partitionRestorable,
   requiresFullEdition,
   windowBoundsRecord,
@@ -153,5 +154,25 @@ describe('windowBoundsRecord', () => {
   it('falls back to the lowest kept tab when every tab is kept', () => {
     const second = note({ id: 'k2', tab_index: 2, large: 1 });
     expect(windowBoundsRecord([keptFirst, second], true)).toBe(keptFirst);
+  });
+});
+
+describe('nextTabIndex', () => {
+  it('is 0 for a group with no stored tabs', () => {
+    expect(nextTabIndex([])).toBe(0);
+  });
+
+  it('is one above the highest stored index, gaps and order aside', () => {
+    expect(
+      nextTabIndex([
+        note({ id: 'a', tab_index: 5 }),
+        note({ id: 'b', tab_index: 1 }),
+      ]),
+    ).toBe(6);
+  });
+
+  it('counts a tab lite keeps unopened', () => {
+    const kept = note({ id: 'k', tab_index: 7, range_source: '/big.log' });
+    expect(nextTabIndex([note({ id: 's', tab_index: 2 }), kept])).toBe(8);
   });
 });
