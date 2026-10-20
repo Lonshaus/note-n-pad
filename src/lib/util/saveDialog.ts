@@ -1,8 +1,11 @@
 // Copyright © 2026 Lonshaus
 // SPDX-License-Identifier: GPL-3.0-only
 
-import { fileExtension, languageInfos } from '../editor/language';
-import type { LanguageInfo } from '../editor/liteLanguages';
+import {
+  fileExtension,
+  languageInfos,
+  type LanguageInfo,
+} from '../editor/language';
 
 /** Extensions the CodeMirror registry does not give us correctly.
  *  CSV/TSV are display-only pseudo-languages with no CM mode of their own

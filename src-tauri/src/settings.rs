@@ -322,7 +322,6 @@ fn push_recent_in(file: &Path, path: &str) -> Result<Vec<String>, String> {
 }
 /// `recent` with every path at or below `from` moved to `to`. A path that ends up
 /// listed twice keeps its first place.
-#[cfg(not(feature = "lite"))]
 pub fn retarget_recent(recent: &[String], from: &str, to: &str) -> Vec<String> {
   let mut out: Vec<String> = Vec::with_capacity(recent.len());
   for path in recent {
@@ -336,7 +335,6 @@ pub fn retarget_recent(recent: &[String], from: &str, to: &str) -> Vec<String> {
 /// Move the recent files at or below `from` to `to` on disk. Returns the new
 /// list, or `None` when nothing in it changed. See `push_recent_file` for the
 /// read-failure handling.
-#[cfg(not(feature = "lite"))]
 pub fn retarget_recent_files(
   app: &AppHandle,
   from: &str,
@@ -345,7 +343,6 @@ pub fn retarget_recent_files(
   retarget_recent_in(&settings_path(app)?, from, to)
 }
 
-#[cfg(not(feature = "lite"))]
 fn retarget_recent_in(file: &Path, from: &str, to: &str) -> Result<Option<Vec<String>>, String> {
   let _guard = SETTINGS_WRITE_LOCK.lock().unwrap();
   let mut settings = load_or_default_for_write(file)?;
@@ -2054,7 +2051,6 @@ mod tests {
     assert!(!list.contains(&"/f0".to_string()));
   }
 
-  #[cfg(not(feature = "lite"))]
   #[test]
   fn retarget_recent_moves_the_file_and_what_is_below_a_folder() {
     let list: Vec<String> = ["/x/f.txt", "/x/y/a.txt", "/x/y/b/c.txt", "/x/y2/d.txt"]
@@ -2072,7 +2068,6 @@ mod tests {
     assert_eq!(retarget_recent(&list, "/q", "/r"), list);
   }
 
-  #[cfg(not(feature = "lite"))]
   #[test]
   fn retarget_recent_writes_the_new_list_to_the_settings_file() {
     let dir = tempdir().unwrap();
@@ -2108,7 +2103,6 @@ mod tests {
     finished_under_lock
   }
 
-  #[cfg(not(feature = "lite"))]
   #[test]
   fn following_a_rename_waits_for_the_settings_write_lock() {
     let dir = tempdir().unwrap();

@@ -66,7 +66,6 @@ pub fn remember(path: &str) {
 }
 /// A file or folder was renamed: its grant, and the grants of everything below
 /// it, move to the new path. The bookmark itself keeps pointing at the item.
-#[cfg(not(feature = "lite"))]
 pub fn rekey(from: &str, to: &str) {
   if sandboxed() {
     GRANTS.rekey_with(from, to);
@@ -235,7 +234,6 @@ impl Grants {
     }
   }
 
-  #[cfg(not(feature = "lite"))]
   fn rekey_with(&self, from: &str, to: &str) {
     use crate::file_ops::retarget_path;
     let mut state = self.lock();
@@ -361,7 +359,6 @@ mod tests {
     assert_eq!(reloaded.len(), 2);
   }
 
-  #[cfg(not(feature = "lite"))]
   #[test]
   fn a_renamed_file_keeps_its_grant_under_the_new_path() {
     let dir = tempdir().unwrap();
@@ -380,7 +377,6 @@ mod tests {
     assert_eq!(reloaded.len(), 2);
   }
 
-  #[cfg(not(feature = "lite"))]
   #[test]
   fn a_renamed_folder_moves_the_grants_below_it() {
     let dir = tempdir().unwrap();
@@ -394,7 +390,6 @@ mod tests {
     assert_eq!(keys, vec!["/x/y2/b.txt", "/x/z", "/x/z/a.txt"]);
   }
 
-  #[cfg(not(feature = "lite"))]
   #[test]
   fn a_rename_without_a_matching_grant_leaves_the_file_alone() {
     let dir = tempdir().unwrap();

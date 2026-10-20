@@ -4,12 +4,9 @@
 use crate::fs_ops::{is_ignored_file, write_text_atomic, Loaded, SkipReason, SkippedFile};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
-#[cfg(not(feature = "lite"))]
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-#[cfg(not(feature = "lite"))]
 use std::sync::{Mutex, OnceLock};
-#[cfg(not(feature = "lite"))]
 use tauri::Emitter;
 use tauri::{AppHandle, Manager};
 
@@ -257,7 +254,6 @@ fn free_theme_file(dir: &Path, id: &str) -> PathBuf {
 }
 /// Validate then atomically write one theme into the file that declares its
 /// id, or into a new free file when none does.
-#[cfg(any(test, not(feature = "lite")))]
 fn save_theme_to(dir: &Path, theme: &CustomTheme) -> Result<(), String> {
   validate(theme)?;
   let json = serde_json::to_string_pretty(theme).map_err(|e| e.to_string())?;
@@ -265,7 +261,6 @@ fn save_theme_to(dir: &Path, theme: &CustomTheme) -> Result<(), String> {
   write_text_atomic(&path, &json)
 }
 /// Remove the file that declares `id`. A missing file is not an error.
-#[cfg(any(test, not(feature = "lite")))]
 fn delete_theme_file(dir: &Path, id: &str) -> Result<(), String> {
   if !valid_id(id) {
     return Err(format!("invalid theme id: {id}"));
@@ -370,7 +365,6 @@ pub fn list_with_defaults(
 }
 /// Overwrite the file declaring `id` (or write a new one) with the bundled
 /// default seed for `id`, undoing any edits or the deletion of that one default theme.
-#[cfg(any(test, not(feature = "lite")))]
 fn restore_default_from(
   resource_dir: &Path,
   data_dir: &Path,
@@ -387,7 +381,6 @@ fn restore_default_from(
 }
 
 /// Absolute path of the bundled default seed file for `id` inside `resource_dir`.
-#[cfg(any(test, not(feature = "lite")))]
 fn resource_themes_file(resource_dir: &Path, id: &str) -> PathBuf {
   resource_dir.join(format!("{id}.json"))
 }
@@ -473,7 +466,6 @@ pub fn list_themes(app: AppHandle) -> Result<Loaded<ThemeListItem>, String> {
 /// see its doc comment) against the live color editor's 300ms-debounced
 /// `persist()`, whose two overlapping calls for the same theme are no longer
 /// guaranteed to land in call order — mirrors `NoteStore::upsert_ordered`.
-#[cfg(not(feature = "lite"))]
 fn theme_seqs() -> &'static Mutex<HashMap<String, u64>> {
   static SEQS: OnceLock<Mutex<HashMap<String, u64>>> = OnceLock::new();
   SEQS.get_or_init(|| Mutex::new(HashMap::new()))
@@ -483,7 +475,6 @@ fn theme_seqs() -> &'static Mutex<HashMap<String, u64>> {
 /// serialize + atomic write must not block the UI thread. `seq` (assigned by
 /// the frontend at the moment the write is issued, so it reflects true call
 /// order) guards against a stale drag tick landing after a newer one.
-#[cfg(not(feature = "lite"))]
 #[tauri::command(async)]
 pub fn save_theme(app: AppHandle, theme: CustomTheme, seq: u64) -> Result<(), String> {
   crate::edition::require_full("themes")?;
@@ -500,7 +491,6 @@ pub fn save_theme(app: AppHandle, theme: CustomTheme, seq: u64) -> Result<(), St
   Ok(())
 }
 
-#[cfg(not(feature = "lite"))]
 #[tauri::command]
 pub fn delete_theme(app: AppHandle, id: String) -> Result<(), String> {
   crate::edition::require_full("themes")?;
@@ -509,7 +499,6 @@ pub fn delete_theme(app: AppHandle, id: String) -> Result<(), String> {
   Ok(())
 }
 
-#[cfg(not(feature = "lite"))]
 #[tauri::command]
 pub fn import_theme(path: String) -> Result<CustomTheme, String> {
   crate::edition::require_full("themes")?;
@@ -519,7 +508,6 @@ pub fn import_theme(path: String) -> Result<CustomTheme, String> {
   Ok(theme)
 }
 
-#[cfg(not(feature = "lite"))]
 #[tauri::command]
 pub fn export_theme(theme: CustomTheme, path: String) -> Result<(), String> {
   crate::edition::require_full("themes")?;
@@ -528,7 +516,6 @@ pub fn export_theme(theme: CustomTheme, path: String) -> Result<(), String> {
   std::fs::write(&path, json).map_err(|e| e.to_string())
 }
 
-#[cfg(not(feature = "lite"))]
 #[tauri::command]
 pub fn restore_default_theme(app: AppHandle, id: String) -> Result<CustomTheme, String> {
   crate::edition::require_full("themes")?;

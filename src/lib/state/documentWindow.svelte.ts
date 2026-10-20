@@ -220,9 +220,6 @@ export async function spliceRange(
   replacement: string,
   expected: Fingerprint | null,
 ): Promise<SpliceOutcome> {
-  if (__LITE__) {
-    return { status: 'error', error: 'range editing is not in this build' };
-  }
   let fingerprint: Fingerprint;
   try {
     fingerprint = await invoke<Fingerprint>('splice_file', {
@@ -478,9 +475,7 @@ export class DocumentWindowState {
     }
     const tab = this.tabs.find((t) => t.id === id);
     if (tab?.large === undefined) {
-      if (!__LITE__) {
-        void invoke('drop_line_index', { id: ref.id });
-      }
+      void invoke('drop_line_index', { id: ref.id });
       return;
     }
     this.largeIndexes.set(id, ref);
@@ -489,9 +484,7 @@ export class DocumentWindowState {
     const ref = this.largeIndexes.get(id);
     if (ref !== undefined) {
       this.largeIndexes.delete(id);
-      if (!__LITE__) {
-        void invoke('drop_line_index', { id: ref.id });
-      }
+      void invoke('drop_line_index', { id: ref.id });
     }
   }
   private releaseTabView(id: string): void {
@@ -696,7 +689,7 @@ export class DocumentWindowState {
     // degrades to no index rather than throwing; `windowed?.totalBytes` is a
     // last-resort fallback so the tab still restores as *something* large.
     let windowedIndexSnap: WindowedIndexSnapshot | null = null;
-    if (!__LITE__ && tab.windowed !== undefined) {
+    if (tab.windowed !== undefined) {
       try {
         windowedIndexSnap = await invoke<WindowedIndexSnapshot>(
           'windowed_index',
@@ -883,7 +876,7 @@ export class DocumentWindowState {
             .catch(() => false);
     // The trial has no large-file viewer or windowed editing: a record of
     // either restores as an ordinary tab of its file.
-    const trial = __LITE__ || isLite();
+    const trial = isLite();
     // A restored windowed-editing tab knows it was unlocked (the persisted
     // checkpoint index is the marker — see `NoteSnapshot.windowed_index`) but
     // has no live Rust session yet: it carries the data `beginWindowedRestore`
@@ -1099,7 +1092,7 @@ export class DocumentWindowState {
     if (entries.length > 0) {
       // Restore: adopt the project the group's tabs were saved with.
       this.project = entries[0]!.project;
-      const trial = __LITE__ || isLite();
+      const trial = isLite();
       const dropped = new Set<number>();
       // Tabs whose stored record no longer describes them, written below.
       const rewrite: DocTab[] = [];
@@ -1244,7 +1237,7 @@ export class DocumentWindowState {
    *    way `unlockLargeTab` surfaces one — a failed restore never leaves the
    *    tab broken or blank. */
   private beginWindowedRestore(tab: DocTab): Promise<void> {
-    if (__LITE__ || tab.windowedRestore === undefined) {
+    if (tab.windowedRestore === undefined) {
       return Promise.resolve();
     }
     this.restoringWindowedIds.add(tab.id);
@@ -1287,9 +1280,7 @@ export class DocumentWindowState {
     // just opened rather than leaking it, and don't resurrect the deleted note
     // by upserting a tab no longer in this window.
     if (!this.tabs.includes(tab)) {
-      if (!__LITE__) {
-        void invoke('windowed_close', { sessionId: reopened.session_id });
-      }
+      void invoke('windowed_close', { sessionId: reopened.session_id });
       return;
     }
     delete tab.large;
@@ -1424,7 +1415,7 @@ export class DocumentWindowState {
     }
     let size = 0;
     // Lite has no large-file viewer, so it does not even ask for the size.
-    if (!__LITE__ && !isLite()) {
+    if (!isLite()) {
       try {
         size = (await invoke<FileStat>('stat_file', { path })).size;
       } catch {
@@ -1657,7 +1648,7 @@ export class DocumentWindowState {
     // Lite has no editing session to start. Nothing is asked of the core, and
     // nothing is recorded on the tab: its lock must be as it was when the
     // edition is full again.
-    if (__LITE__ || isLite()) {
+    if (isLite()) {
       return null;
     }
     return this.runTabOp(tab, () => this.unlockTabNow(tab, topLine));
@@ -1901,9 +1892,6 @@ export class DocumentWindowState {
     large: { size: number },
     chosen: string,
   ): Promise<boolean> {
-    if (__LITE__) {
-      return false;
-    }
     if (chosen === tab.path) {
       return true;
     }
@@ -1952,7 +1940,7 @@ export class DocumentWindowState {
       if (!tab.explicit) {
         tab.language = detectByFilename(next);
       }
-      if (!__LITE__ && tab.windowed !== undefined) {
+      if (tab.windowed !== undefined) {
         void invoke('windowed_set_path', {
           sessionId: tab.windowed.sessionId,
           path: next,
@@ -1990,9 +1978,6 @@ export class DocumentWindowState {
       endLine: number;
     },
   ): Promise<string | null> {
-    if (__LITE__) {
-      return null;
-    }
     const read = await invoke<RangeRead>('read_range', {
       path: tab.path,
       start: info.startByte,
@@ -2152,9 +2137,6 @@ export class DocumentWindowState {
     sourcePath: string,
     info: { startByte: number; endByte: number; pathOverride?: string },
   ): Promise<boolean> {
-    if (__LITE__) {
-      return false;
-    }
     // The slice is copied byte-for-byte, so it keeps the source file's type;
     // its name is the natural starting point for the copy.
     const chosen =
@@ -2202,9 +2184,6 @@ export class DocumentWindowState {
    *  ponytail: DEV/__auto entry only this segment; the normal open gate keeps
    *  routing oversized files to the read-only viewer until the final step. */
   async openWindowedTab(path: string): Promise<string | null> {
-    if (__LITE__) {
-      return t('doc.unlock.cannot');
-    }
     let open: WindowedOpen;
     try {
       open = await invoke<WindowedOpen>('windowed_open', { path });
@@ -2337,7 +2316,7 @@ export class DocumentWindowState {
    *  fingerprint refreshes, totals update, and the tab goes clean. */
   async saveWindowed(tab: DocTab, force: boolean): Promise<WindowedSaveResult> {
     const w = tab.windowed;
-    if (__LITE__ || w === undefined) {
+    if (w === undefined) {
       return 'error';
     }
     let saved: WindowedSaved;
@@ -2377,7 +2356,7 @@ export class DocumentWindowState {
    *  (keyed on it), reloading the window from disk. */
   async discardWindowed(tab: DocTab): Promise<void> {
     const w = tab.windowed;
-    if (__LITE__ || w === undefined) {
+    if (w === undefined) {
       return;
     }
     // The fresh session is opened before the old one is let go: when the open
@@ -2402,9 +2381,7 @@ export class DocumentWindowState {
         return;
       }
     }
-    if (!__LITE__) {
-      void invoke('windowed_close', { sessionId: w.sessionId });
-    }
+    void invoke('windowed_close', { sessionId: w.sessionId });
     this.windowedGates.delete(w.sessionId);
     tab.windowed = {
       sessionId: open.session_id,
@@ -2425,9 +2402,6 @@ export class DocumentWindowState {
     path: string,
     sessionId: number,
   ): Promise<WindowedOpen> {
-    if (__LITE__) {
-      throw new Error('windowed editing is not in this build');
-    }
     const base = await invoke<WindowedIndexSnapshot>('windowed_index', {
       sessionId,
     });
@@ -2519,7 +2493,7 @@ export class DocumentWindowState {
    *  writes the old path. */
   private async windowedSaveTo(tab: DocTab, chosen: string): Promise<boolean> {
     const w = tab.windowed;
-    if (__LITE__ || w === undefined) {
+    if (w === undefined) {
       return false;
     }
     let saved: WindowedSaved;
@@ -2717,9 +2691,7 @@ export class DocumentWindowState {
     }
     // Release the Rust windowed session before dropping the tab.
     if (tab.windowed !== undefined) {
-      if (!__LITE__) {
-        void invoke('windowed_close', { sessionId: tab.windowed.sessionId });
-      }
+      void invoke('windowed_close', { sessionId: tab.windowed.sessionId });
       this.windowedGates.delete(tab.windowed.sessionId);
     }
     if (tab === this.windowedConflict) {
@@ -2774,9 +2746,7 @@ export class DocumentWindowState {
     for (const tab of clean) {
       // Release the Rust windowed session too; the record is going away.
       if (tab.windowed !== undefined) {
-        if (!__LITE__) {
-          void invoke('windowed_close', { sessionId: tab.windowed.sessionId });
-        }
+        void invoke('windowed_close', { sessionId: tab.windowed.sessionId });
       }
     }
     await invoke('drop_closed_tabs', { label, ids: clean.map((t) => t.id) });
