@@ -54,6 +54,8 @@ mod settings;
 mod shortcut;
 mod shortcuts;
 mod theme_store;
+#[cfg(not(feature = "lite"))]
+mod transfer;
 mod webview2_runtime;
 mod win_menu_gray;
 #[cfg(not(feature = "lite"))]
@@ -3042,6 +3044,12 @@ pub fn run() {
       file_ops::rename_path,
       #[cfg(not(feature = "lite"))]
       file_ops::trash_path,
+      #[cfg(not(feature = "lite"))]
+      transfer::move_path,
+      #[cfg(not(feature = "lite"))]
+      transfer::copy_path,
+      #[cfg(not(feature = "lite"))]
+      transfer::path_volume,
       file_ops::missing_paths,
       file_ops::reveal_in_finder,
       #[cfg(not(feature = "lite"))]

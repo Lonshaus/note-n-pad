@@ -304,6 +304,40 @@ export const ja = {
   'workspace.tree.newFileAria': 'このフォルダーに新規ファイル',
   'workspace.tree.newFolder': '新規フォルダー',
   'workspace.tree.newFolderAria': 'このフォルダーにサブフォルダーを作成',
+  'workspace.drop.move': '移動',
+  'workspace.drop.confirmMoveFile': '「{name}」を「{folder}」に移動しますか？',
+  'workspace.drop.confirmMoveFolder':
+    '「{name}」とその中身をすべて「{folder}」に移動しますか？',
+  'workspace.drop.confirmMoveMany':
+    '{count} 件の項目を「{folder}」に移動しますか？',
+  'workspace.drop.refuseMoveProject': '別のプロジェクトには移動できません。',
+  'workspace.drop.refuseMoveVolume': '別のディスクには移動できません。',
+  'workspace.drop.refuseCopyProject': '別のプロジェクトにはコピーできません。',
+  'workspace.drop.refuseCopyVolume': '別のディスクにはコピーできません。',
+  'workspace.drop.partialMove':
+    '{total} 件中 {count} 件は「{folder}」に移動できません：',
+  'workspace.drop.partialCopy':
+    '{total} 件中 {count} 件は「{folder}」にコピーできません：',
+  'workspace.drop.moveRest': '残りの {rest} 件だけ移動',
+  'workspace.drop.copyRest': '残りの {rest} 件だけコピー',
+  'workspace.drop.abandonAll': 'すべて中止',
+  'workspace.drop.reasonSameName': '対象フォルダーに同じ名前の項目があります',
+  'workspace.drop.reasonIntoSelfMove':
+    '自分自身やそのサブフォルダーには移動できません',
+  'workspace.drop.reasonIntoSelfCopy':
+    '自分自身やそのサブフォルダーにはコピーできません',
+  'workspace.drop.halfMove':
+    '{total} 件中 {done} 件を移動しました。残りは完了していません：',
+  'workspace.drop.halfCopy':
+    '{total} 件中 {done} 件をコピーしました。残りは完了していません：',
+  'workspace.drop.failedOneMove': '「{name}」を移動できません：{reason}',
+  'workspace.drop.failedOneCopy': '「{name}」をコピーできません：{reason}',
+  'workspace.drop.failedManyMove': '{count} 件の項目を移動できません：',
+  'workspace.drop.failedManyCopy': '{count} 件の項目をコピーできません：',
+  'workspace.drop.linksSkipped':
+    'コピーしましたが、次のリンクは作成できなかったためコピーされていません：',
+  'workspace.drop.reasonSymlinkPrivilege':
+    'シンボリックリンクを作成する権限がありません',
   // Long-line handling
   'status.longLine.worker':
     '長い行：シンタックスハイライトをバックグラウンドスレッドで実行',

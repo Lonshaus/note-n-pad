@@ -629,7 +629,13 @@ mod gate_tests {
     let start = lib.find("generate_handler![").unwrap();
     let handlers = &lib[start..start + lib[start..].find("])").unwrap()];
     let lines: Vec<&str> = handlers.lines().map(str::trim).collect();
-    let cut_modules = ["large_file::", "range_edit::", "windowed::", "project::"];
+    let cut_modules = [
+      "large_file::",
+      "range_edit::",
+      "windowed::",
+      "project::",
+      "transfer::",
+    ];
     let cut_commands = [
       "theme_store::save_theme",
       "theme_store::delete_theme",

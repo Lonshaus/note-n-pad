@@ -21,6 +21,10 @@ function entry(path: string, isDir: boolean): TreeEntry {
     path,
     is_dir: isDir,
     children: null,
+    volume: 1,
+    volume_error: null,
+    target_volume: null,
+    target_volume_error: null,
   };
 }
 
