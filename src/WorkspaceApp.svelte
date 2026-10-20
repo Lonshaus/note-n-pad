@@ -36,6 +36,29 @@
     withoutSubtree,
     type DirListing,
   } from './lib/util/treeCache';
+  import {
+    applyDropResult,
+    confirmMoveDialog,
+    dragItems,
+    DragGesture,
+    dropDecision,
+    dropFolder,
+    failureDialog,
+    folderEntries,
+    hoverFeedback,
+    modifierOp,
+    outcomeDialogs,
+    partialDialog,
+    refuseDialog,
+    runBatch,
+    targetVolumeOfPath,
+    volumeOfPath,
+    type DialogModel,
+    type DragItem,
+    type DropDecision,
+    type DropOp,
+    type DropTarget,
+  } from './lib/util/treeMove';
   import ConfirmModal from './lib/ConfirmModal.svelte';
   import type { NoteSnapshot } from './lib/state/stickyNote.svelte';
 
@@ -89,8 +112,9 @@
     }
     return map;
   });
+  const hostOs = guessOsFromUserAgent(navigator.userAgent);
   // Project folders are matched without regard to case on macOS and Windows.
-  const caseInsensitive = guessOsFromUserAgent(navigator.userAgent) !== 'linux';
+  const caseInsensitive = hostOs !== 'linux';
   // Projects never overlap, so one expanded set and one row key (the path)
   // serve every project.
   let projectRoots = $state<string[]>([]);
@@ -144,9 +168,37 @@
     cacheVersion += 1;
   }
 
+  const rootVolumeReads = new Map<string, Promise<void>>();
+  /** Ask which disk a project folder is on. Its listing does not include the
+   *  folder itself, so it is read on its own. */
+  function loadRootVolume(root: string, again = false): Promise<void> {
+    if (!again && cache.rootVolume(root) !== undefined) {
+      return Promise.resolve();
+    }
+    let read = rootVolumeReads.get(root);
+    if (read === undefined) {
+      read = invoke<number>('path_volume', { path: root })
+        .then(
+          (volume) => ({ volume, volumeError: null }),
+          (e) => ({ volume: null, volumeError: String(e) }),
+        )
+        .then((info) => {
+          rootVolumeReads.delete(root);
+          if (projectRoots.includes(root)) {
+            cache.setRootVolume(root, info);
+          }
+        });
+      rootVolumeReads.set(root, read);
+    }
+    return read;
+  }
+
   async function readDir(root: string, dir: string): Promise<void> {
     const token = cache.begin(root, dir);
     listDirCalls += 1;
+    if (dir === root) {
+      void loadRootVolume(root, true);
+    }
     let listing: DirListing;
     try {
       const entries = await invoke<TreeEntry[]>('list_project_dir', { dir });
@@ -503,7 +555,304 @@
     }
     await treeIdle();
   }
+  // A drag of tree rows to a folder. The press is tracked on the window so the
+  // drag keeps going outside the row it started on.
+  const gesture = new DragGesture();
+  interface ActiveDrag {
+    items: DragItem[];
+    op: DropOp;
+    /** The folder a drop would land in, or null when none accepts it. */
+    target: string | null;
+    cursor: string;
+  }
+  let drag = $state.raw<ActiveDrag | null>(null);
+  let pressedPath = '';
+  let lastPointer = { x: 0, y: 0 };
+  // A dialog about a drop. Several can be waiting; the first is shown.
+  interface DropDialog extends DialogModel {
+    onprimary?: (() => void | Promise<void>) | undefined;
+  }
+  let dialogs = $state.raw<DropDialog[]>([]);
+  let dropBusy = false;
 
+  function itemOf(row: VisibleRow): DragItem {
+    return {
+      path: row.path,
+      root: row.project,
+      isDir: row.isDir,
+      ...volumeOfPath(cache, row.project, row.path),
+    };
+  }
+
+  function targetOf(path: string, root: string): DropTarget {
+    return { path, root, ...targetVolumeOfPath(cache, root, path) };
+  }
+
+  function rowAt(x: number, y: number): VisibleRow | undefined {
+    const li = document
+      .elementFromPoint(x, y)
+      ?.closest<HTMLElement>('.tree-li[data-path]');
+    const path = li?.dataset['path'];
+    return visibleRows.find((r) => r.path === path && !r.isError);
+  }
+
+  function updateDrag(point: {
+    clientX: number;
+    clientY: number;
+    altKey: boolean;
+    ctrlKey: boolean;
+  }): void {
+    if (drag === null) {
+      return;
+    }
+    const op = modifierOp(point, hostOs);
+    const row = rowAt(point.clientX, point.clientY);
+    let target: string | null = null;
+    let cursor = 'default';
+    if (row !== undefined) {
+      const folder = dropFolder(row);
+      const feedback = hoverFeedback(
+        dropDecision({
+          op,
+          items: drag.items,
+          target: targetOf(folder, row.project),
+          targetChildren: [],
+          caseInsensitive,
+        }),
+        op,
+      );
+      target = feedback.allowed ? folder : null;
+      cursor = feedback.cursor;
+    }
+    if (op !== drag.op || target !== drag.target || cursor !== drag.cursor) {
+      drag = { ...drag, op, target, cursor };
+    }
+  }
+
+  function endPress(): void {
+    window.removeEventListener('pointermove', onPointerMove);
+    window.removeEventListener('pointerup', onPointerUp);
+    window.removeEventListener('pointercancel', onPointerCancel);
+    window.removeEventListener('keydown', onDragKey);
+    window.removeEventListener('keyup', onDragKey);
+  }
+
+  function onRowPointerDown(e: PointerEvent, row: VisibleRow): void {
+    if (
+      e.button !== 0 ||
+      row.root ||
+      row.isError ||
+      inlineEdit !== null ||
+      dialogs.length > 0 ||
+      dropBusy
+    ) {
+      return;
+    }
+    pressedPath = row.path;
+    lastPointer = { x: e.clientX, y: e.clientY };
+    gesture.press(e.clientX, e.clientY);
+    window.addEventListener('pointermove', onPointerMove);
+    window.addEventListener('pointerup', onPointerUp);
+    window.addEventListener('pointercancel', onPointerCancel);
+    window.addEventListener('keydown', onDragKey);
+    window.addEventListener('keyup', onDragKey);
+  }
+
+  function onPointerMove(e: PointerEvent): void {
+    lastPointer = { x: e.clientX, y: e.clientY };
+    if (!gesture.move(e.clientX, e.clientY)) {
+      return;
+    }
+    if (drag === null) {
+      const rows = dragItems(
+        pressedPath,
+        visibleRows,
+        selectedPaths,
+        caseInsensitive,
+      );
+      if (rows.length === 0) {
+        gesture.cancel();
+        return;
+      }
+      drag = {
+        items: rows.map(itemOf),
+        op: 'move',
+        target: null,
+        cursor: 'default',
+      };
+    }
+    updateDrag(e);
+  }
+  /** Esc: the drop does not happen. The button is still down, so its click is
+   *  still to come and is ignored. */
+  function abortDrag(): void {
+    gesture.cancel();
+    drag = null;
+  }
+  /** The system took the pointer away: no button-up and no click will follow. */
+  function onPointerCancel(): void {
+    endPress();
+    gesture.reset();
+    drag = null;
+  }
+
+  function onDragKey(e: KeyboardEvent): void {
+    if (e.type === 'keydown' && e.key === 'Escape') {
+      e.preventDefault();
+      abortDrag();
+    } else {
+      updateDrag({
+        clientX: lastPointer.x,
+        clientY: lastPointer.y,
+        altKey: e.altKey,
+        ctrlKey: e.ctrlKey,
+      });
+    }
+  }
+
+  function onPointerUp(e: PointerEvent): void {
+    endPress();
+    const dropped = gesture.release();
+    const active = drag;
+    drag = null;
+    // The click that follows a drag arrives right after this event.
+    setTimeout(() => gesture.forgetClick(), 0);
+    const row = rowAt(e.clientX, e.clientY);
+    if (dropped && active !== null && row !== undefined) {
+      void finishDrop(active.items, row, modifierOp(e, hostOs));
+    }
+  }
+
+  function showDialogs(models: DropDialog[]): void {
+    dialogs = [...dialogs, ...models];
+  }
+
+  function dismissDialog(): void {
+    dialogs = dialogs.slice(1);
+  }
+
+  async function pressPrimary(dialog: DropDialog): Promise<void> {
+    dismissDialog();
+    await dialog.onprimary?.();
+  }
+  /** Decide what a drop means, then ask, report, or do it. */
+  async function finishDrop(
+    items: DragItem[],
+    row: VisibleRow,
+    op: DropOp,
+  ): Promise<void> {
+    const root = row.project;
+    const folder = dropFolder(row);
+    dropBusy = true;
+    try {
+      await loadRootVolume(root);
+      let children: readonly { name: string }[];
+      try {
+        children = await folderEntries(cache, root, folder, (dir) =>
+          invoke<TreeEntry[]>('list_project_dir', { dir }),
+        );
+      } catch (e) {
+        showDialogs([
+          failureDialog(
+            op,
+            items.map((i) => ({ name: basename(i.path), reason: String(e) })),
+            t,
+          ),
+        ]);
+        return;
+      }
+      const target = targetOf(folder, root);
+      const decision = dropDecision({
+        op,
+        items,
+        target,
+        targetChildren: children,
+        caseInsensitive,
+      });
+      await actOn(decision, target);
+    } finally {
+      dropBusy = false;
+    }
+  }
+
+  async function actOn(
+    decision: DropDecision,
+    target: DropTarget,
+  ): Promise<void> {
+    switch (decision.kind) {
+      case 'noop':
+        break;
+      case 'refuse':
+        showDialogs([refuseDialog(decision.messageKey, t)]);
+        break;
+      case 'error':
+        showDialogs([failureDialog(decision.op, decision.failures, t)]);
+        break;
+      case 'copyNow':
+        await runDrop('copy', decision.items, target);
+        break;
+      case 'confirmMove':
+        showDialogs([
+          {
+            ...confirmMoveDialog(decision.items, target, t),
+            onprimary: () => runDrop('move', decision.items, target),
+          },
+        ]);
+        break;
+      case 'partial': {
+        const model = partialDialog(decision, target, t);
+        showDialogs([
+          decision.allowed.length === 0
+            ? model
+            : {
+                ...model,
+                onprimary: () => runDrop(decision.op, decision.allowed, target),
+              },
+        ]);
+        break;
+      }
+    }
+  }
+
+  async function runDrop(
+    op: DropOp,
+    items: DragItem[],
+    target: DropTarget,
+  ): Promise<void> {
+    dropBusy = true;
+    try {
+      const outcome = await runBatch(
+        op,
+        items,
+        target.path,
+        target.root,
+        (command, args) => invoke(command, args),
+        t,
+      );
+      applyDropResult(
+        {
+          cache,
+          expanded,
+          selected: selectedPaths,
+          setState: (nextExpanded, nextSelected) => {
+            expanded = nextExpanded;
+            selectedPaths = nextSelected;
+          },
+          touch,
+          persistExpanded: () => void persistExpanded(),
+          refreshDir,
+        },
+        op,
+        target.root,
+        outcome.done,
+        target.path,
+      );
+      showDialogs(outcomeDialogs(op, outcome, t));
+      await treeIdle();
+    } finally {
+      dropBusy = false;
+    }
+  }
   // Path of a reveal that could not be carried out. The list can outlive the
   // file it names (a document whose file was deleted while the tab stayed
   // open), and a reveal that quietly does nothing reads as a broken menu item.
@@ -854,6 +1203,41 @@
           // without opening Finder in tests.
           ctxRevealSupported: () => true,
           inlineEditorOpen: () => inlineEdit !== null,
+          getSelectedPaths: () => [...selectedPaths].sort(),
+          dragState: () =>
+            drag === null
+              ? null
+              : { target: drag.target, cursor: drag.cursor, op: drag.op },
+          dialogState: () => {
+            const dialog = dialogs[0];
+            return dialog === undefined
+              ? null
+              : {
+                  message: dialog.message,
+                  items: dialog.items,
+                  buttons: [
+                    ...(dialog.primaryLabel === null
+                      ? []
+                      : [dialog.primaryLabel]),
+                    dialog.cancelLabel,
+                  ],
+                };
+          },
+          dialogPress: async (label: string) => {
+            const dialog = dialogs[0];
+            if (dialog === undefined) {
+              return false;
+            }
+            if (label === dialog.primaryLabel && dialog.onprimary) {
+              await pressPrimary(dialog);
+              return true;
+            }
+            if (label === dialog.cancelLabel) {
+              dismissDialog();
+              return true;
+            }
+            return false;
+          },
           // Drive the row-hover quick-add buttons: find the folder row and open
           // the same inline naming flow a real button click would.
           folderQuickAdd: (path: string, kind: 'file' | 'folder') => {
@@ -871,6 +1255,7 @@
       );
     }
     return () => {
+      endPress();
       refetch.cancel();
       captureBounds.cancel();
       unlistenTheme();
@@ -889,7 +1274,11 @@
   });
 </script>
 
-<div class="workspace">
+<div
+  class="workspace"
+  class:dragging={drag !== null}
+  style:--drag-cursor={drag?.cursor}
+>
   <div class="content">
     {#if inlineError !== null && inlineEdit === null}
       <!-- Same field the inline rename/create row's tooltip uses; shown here
@@ -1200,6 +1589,7 @@
           {#each visibleRows as row (row.path)}
             <li
               class="tree-li"
+              class:drop-target={drag?.target === row.path}
               data-path={row.path}
               oncontextmenu={(e) => {
                 if (row.isError) {
@@ -1222,7 +1612,11 @@
                   class:selected={selectedPaths.has(row.path)}
                   style="padding-left: {0.4 + row.depth * 0.85}rem;"
                   title={row.root ? row.project : undefined}
+                  onpointerdown={(e) => onRowPointerDown(e, row)}
                   onclick={(e) => {
+                    if (gesture.consumeClick()) {
+                      return;
+                    }
                     // Cmd/Option-click toggles selection only, never expand.
                     if (e.metaKey || e.altKey) {
                       toggleSelected(row.path);
@@ -1347,7 +1741,11 @@
                   class:selected={selectedPaths.has(row.path)}
                   style="padding-left: {0.4 + row.depth * 0.85}rem;"
                   title={row.path}
+                  onpointerdown={(e) => onRowPointerDown(e, row)}
                   onclick={(e) => {
+                    if (gesture.consumeClick()) {
+                      return;
+                    }
                     if (e.metaKey || e.altKey) {
                       toggleSelected(row.path);
                     } else {
@@ -1392,6 +1790,21 @@
     </section>
   </div>
 
+  {#if dialogs[0] !== undefined}
+    {@const dialog = dialogs[0]}
+    {#key dialog}
+      <ConfirmModal
+        message={dialog.message}
+        items={dialog.items}
+        primaryLabel={dialog.primaryLabel ?? undefined}
+        onprimary={dialog.onprimary === undefined
+          ? undefined
+          : () => pressPrimary(dialog)}
+        cancelLabel={dialog.cancelLabel}
+        oncancel={() => dismissDialog()}
+      />
+    {/key}
+  {/if}
   {#if revealFailed !== null}
     <!-- Report only: once the file is gone from where the row remembers it,
          there is no action left to offer. -->
@@ -1578,6 +1991,19 @@
   .tree-li:has(.row.selected) .row,
   .tree-li:hover:has(.row.selected) .row {
     background: none;
+  }
+  /* The folder a drop would land in, while a drag is under way. */
+  .tree-li.drop-target,
+  .tree-li.drop-target:hover {
+    background: color-mix(in srgb, var(--accent) 32%, transparent);
+    outline: 1px solid var(--accent);
+    outline-offset: -1px;
+  }
+  .workspace.dragging,
+  .workspace.dragging * {
+    cursor: var(--drag-cursor) !important;
+    -webkit-user-select: none;
+    user-select: none;
   }
   .open-dot {
     flex: 0 0 auto;

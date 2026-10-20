@@ -388,6 +388,18 @@ export interface WorkspaceHooks {
   ctxTrash: (path: string) => Promise<void>;
   ctxRevealSupported: () => boolean;
   inlineEditorOpen: () => boolean;
+  getSelectedPaths: () => string[];
+  /** The folder a drag would drop into and the cursor shown, or null when no
+   *  drag is under way. */
+  dragState: () => { target: string | null; cursor: string; op: string } | null;
+  /** The dialog on screen: its message, listed items and button labels. */
+  dialogState: () => {
+    message: string;
+    items: { label: string; detail: string }[];
+    buttons: string[];
+  } | null;
+  /** Press the button with this label; false when there is none. */
+  dialogPress: (label: string) => Promise<boolean>;
   folderQuickAdd: (path: string, kind: 'file' | 'folder') => void;
 }
 

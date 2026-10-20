@@ -7,12 +7,20 @@ use std::path::Path;
 use tauri::{AppHandle, Emitter, Manager, State};
 /// One node of the project tree. `children` is always `None`: the tree is read
 /// one folder at a time, so a folder's entries come from its own listing.
+/// `volume` names the disk the entry itself is on (a link reports its own, not
+/// the one it points to); when that cannot be read it is `None` and
+/// `volume_error` says why. A folder also carries `target_volume`, the disk it
+/// leads to: a disk mounted on it, or the folder a link points to.
 #[derive(Debug, Serialize, PartialEq)]
 pub struct TreeEntry {
   pub name: String,
   pub path: String,
   pub is_dir: bool,
   pub children: Option<Vec<TreeEntry>>,
+  pub volume: Option<u64>,
+  pub volume_error: Option<String>,
+  pub target_volume: Option<u64>,
+  pub target_volume_error: Option<String>,
 }
 /// Read one directory level. An unreadable entry is skipped.
 fn read_level(dir: &Path) -> Result<Vec<TreeEntry>, String> {
@@ -25,11 +33,18 @@ fn read_level(dir: &Path) -> Result<Vec<TreeEntry>, String> {
       continue;
     }
     let path = entry.path();
+    let volume = crate::transfer::source_volume_of(&path);
+    let is_dir = path.is_dir();
+    let target = is_dir.then(|| crate::transfer::volume_of(&path));
     entries.push(TreeEntry {
       name,
-      is_dir: path.is_dir(),
+      is_dir,
       path: path.to_string_lossy().to_string(),
       children: None,
+      volume: volume.as_ref().ok().copied(),
+      volume_error: volume.err(),
+      target_volume: target.as_ref().and_then(|t| t.as_ref().ok().copied()),
+      target_volume_error: target.and_then(Result::err),
     });
   }
   // Directories first, then case-insensitive alphabetical.
@@ -221,6 +236,68 @@ mod tests {
       names(&list(root)),
       vec!["Docs", "src", "apple.txt", "Zebra.txt"]
     );
+  }
+
+  #[test]
+  fn entries_carry_the_disk_they_are_on() {
+    let dir = tempdir().unwrap();
+    fs::create_dir(dir.path().join("a")).unwrap();
+    fs::write(dir.path().join("f.txt"), "x").unwrap();
+    let here = crate::transfer::volume_of(dir.path()).unwrap();
+    let top = list(dir.path());
+    assert_eq!(top.len(), 2);
+    assert!(top
+      .iter()
+      .all(|e| e.volume == Some(here) && e.volume_error.is_none()));
+    // Only a folder can be dropped into, so only a folder has a disk it leads to.
+    assert_eq!(top[0].target_volume, Some(here));
+    assert_eq!(top[1].target_volume, None);
+    assert!(top.iter().all(|e| e.target_volume_error.is_none()));
+  }
+  /// A folder that lives on another disk than a temp folder, if this machine
+  /// has one reachable.
+  #[cfg(unix)]
+  fn other_disk(here: u64) -> Option<&'static Path> {
+    ["/dev", "/proc", "/sys"]
+      .into_iter()
+      .map(Path::new)
+      .find(|p| p.is_dir() && crate::transfer::volume_of(p).is_ok_and(|v| v != here))
+  }
+
+  #[cfg(unix)]
+  #[test]
+  fn a_link_is_on_its_own_disk_and_leads_to_the_one_it_points_to() {
+    let dir = tempdir().unwrap();
+    let here = crate::transfer::volume_of(dir.path()).unwrap();
+    let Some(elsewhere) = other_disk(here) else {
+      return;
+    };
+    std::os::unix::fs::symlink(elsewhere, dir.path().join("portal")).unwrap();
+    let top = list(dir.path());
+    assert_eq!(top.len(), 1);
+    assert!(top[0].is_dir);
+    assert_eq!(top[0].volume, Some(here));
+    assert_eq!(
+      top[0].target_volume,
+      Some(crate::transfer::volume_of(elsewhere).unwrap())
+    );
+    assert_ne!(top[0].target_volume, top[0].volume);
+  }
+
+  #[cfg(unix)]
+  #[test]
+  fn a_dangling_link_still_has_a_disk_of_its_own() {
+    let dir = tempdir().unwrap();
+    std::os::unix::fs::symlink(dir.path().join("nowhere"), dir.path().join("dangling")).unwrap();
+    let top = list(dir.path());
+    assert_eq!(top.len(), 1);
+    assert!(!top[0].is_dir);
+    assert_eq!(
+      top[0].volume,
+      Some(crate::transfer::volume_of(dir.path()).unwrap())
+    );
+    assert_eq!(top[0].volume_error, None);
+    assert_eq!(top[0].target_volume, None);
   }
 
   #[test]

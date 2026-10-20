@@ -53,6 +53,9 @@
 
   interface BaseProps {
     message: string;
+    // Names listed under the message, each with an optional reason. The list
+    // scrolls when it is long.
+    items?: { label: string; detail?: string | undefined }[] | undefined;
     // Optional, so a dialog that only reports something renders one button
     // rather than offering an action it does not have.
     primaryLabel?: string | undefined;
@@ -87,6 +90,7 @@
 
   let {
     message,
+    items,
     primaryLabel,
     secondaryLabel,
     tertiaryLabel,
@@ -197,6 +201,18 @@
 >
   <div class="modal" role="dialog" aria-modal="true" tabindex="-1" {onkeydown}>
     <p>{message}</p>
+    {#if items !== undefined && items.length > 0}
+      <ul class="modal-items">
+        {#each items as item, i (i)}
+          <li>
+            <span class="item-label">{item.label}</span>
+            {#if item.detail}
+              <span class="item-detail">{item.detail}</span>
+            {/if}
+          </li>
+        {/each}
+      </ul>
+    {/if}
     <div class="modal-actions">
       {#if primaryLabel !== undefined && onprimary !== undefined}
         <button class="btn primary" onclick={() => fire(onprimary)}
@@ -245,6 +261,29 @@
   .modal p {
     margin: 0 0 0.8rem;
     font-size: 13px;
+  }
+  .modal-items {
+    max-height: 9rem;
+    margin: 0 0 0.8rem;
+    padding: 0.3rem 0.5rem;
+    overflow-y: auto;
+    list-style: none;
+    text-align: left;
+    font-size: 12px;
+    border: 1px solid var(--modal-border);
+    border-radius: 5px;
+  }
+  .modal-items li {
+    display: flex;
+    flex-direction: column;
+    padding: 0.15rem 0;
+  }
+  .item-label {
+    overflow-wrap: anywhere;
+  }
+  .item-detail {
+    opacity: 0.65;
+    overflow-wrap: anywhere;
   }
   .modal-actions {
     display: flex;

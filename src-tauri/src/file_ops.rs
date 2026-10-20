@@ -11,7 +11,7 @@ use tauri::{AppHandle, Emitter, State};
 /// Validate a user-entered file or folder name. Trims surrounding whitespace and
 /// rejects empty names, the `.`/`..` directory aliases, and any path separator so
 /// the name can only ever create a sibling inside its parent directory.
-fn validate_name(name: &str) -> Result<&str, String> {
+pub(crate) fn validate_name(name: &str) -> Result<&str, String> {
   let trimmed = name.trim();
   if trimmed.is_empty() {
     return Err("name cannot be empty".to_string());
@@ -121,7 +121,7 @@ struct PathsMoved {
 /// Point everything that remembers `from` at `to`: stored tabs, the recent list
 /// and sandbox grants, then tell the open windows. A failure to follow is
 /// logged and never undoes the rename.
-fn follow_move(app: &AppHandle, store: &NoteStore, from: &str, to: &str) {
+pub(crate) fn follow_move(app: &AppHandle, store: &NoteStore, from: &str, to: &str) {
   if let Err(e) = store.retarget_paths(from, to) {
     log::warn!("could not follow a rename in the stored tabs: {e}");
   }
@@ -150,7 +150,7 @@ pub fn rename_path(
 }
 /// Byte span of every segment of `path`. `/` always separates; a backslash does
 /// only when `backslash` is set, since it is an ordinary name character on Unix.
-fn segment_spans(path: &str, backslash: bool) -> Vec<(usize, usize)> {
+pub(crate) fn segment_spans(path: &str, backslash: bool) -> Vec<(usize, usize)> {
   let mut spans = Vec::new();
   let mut start = None;
   for (i, c) in path.char_indices() {

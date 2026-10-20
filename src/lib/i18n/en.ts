@@ -306,6 +306,40 @@ export const en = {
   'workspace.tree.newFileAria': 'New file in this folder',
   'workspace.tree.newFolder': 'New folder',
   'workspace.tree.newFolderAria': 'New subfolder in this folder',
+  'workspace.drop.move': 'Move',
+  'workspace.drop.confirmMoveFile': 'Move “{name}” to “{folder}”?',
+  'workspace.drop.confirmMoveFolder':
+    'Move “{name}” and everything in it to “{folder}”?',
+  'workspace.drop.confirmMoveMany': 'Move {count} item(s) to “{folder}”?',
+  'workspace.drop.refuseMoveProject': 'Can’t move to another project.',
+  'workspace.drop.refuseMoveVolume': 'Can’t move to another disk.',
+  'workspace.drop.refuseCopyProject': 'Can’t copy to another project.',
+  'workspace.drop.refuseCopyVolume': 'Can’t copy to another disk.',
+  'workspace.drop.partialMove':
+    '{count} of {total} item(s) can’t be moved to “{folder}”:',
+  'workspace.drop.partialCopy':
+    '{count} of {total} item(s) can’t be copied to “{folder}”:',
+  'workspace.drop.moveRest': 'Move Only the Other {rest} Item(s)',
+  'workspace.drop.copyRest': 'Copy Only the Other {rest} Item(s)',
+  'workspace.drop.abandonAll': 'Abandon All',
+  'workspace.drop.reasonSameName':
+    'The destination already has an item with that name',
+  'workspace.drop.reasonIntoSelfMove':
+    'Can’t move an item into itself or its own subfolder',
+  'workspace.drop.reasonIntoSelfCopy':
+    'Can’t copy an item into itself or its own subfolder',
+  'workspace.drop.halfMove':
+    'Of {total} item(s), {done} moved; the rest were not completed:',
+  'workspace.drop.halfCopy':
+    'Of {total} item(s), {done} copied; the rest were not completed:',
+  'workspace.drop.failedOneMove': 'Couldn’t move “{name}”: {reason}',
+  'workspace.drop.failedOneCopy': 'Couldn’t copy “{name}”: {reason}',
+  'workspace.drop.failedManyMove': 'Couldn’t move {count} item(s):',
+  'workspace.drop.failedManyCopy': 'Couldn’t copy {count} item(s):',
+  'workspace.drop.linksSkipped':
+    'Copied, but these links couldn’t be created and were not copied:',
+  'workspace.drop.reasonSymlinkPrivilege':
+    'No permission to create symbolic links',
   // Long-line handling
   'status.longLine.worker':
     'Long lines: syntax highlighting moved to a background thread',

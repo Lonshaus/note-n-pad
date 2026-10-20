@@ -51,6 +51,7 @@ mod store_state;
 #[cfg(all(target_os = "macos", feature = "storekit"))]
 mod storekit;
 mod theme_store;
+mod transfer;
 mod webview2_runtime;
 mod win_menu_gray;
 mod windowed;
@@ -3088,6 +3089,9 @@ pub fn run() {
       file_ops::create_folder,
       file_ops::rename_path,
       file_ops::trash_path,
+      transfer::move_path,
+      transfer::copy_path,
+      transfer::path_volume,
       file_ops::missing_paths,
       file_ops::reveal_in_finder,
       project::list_project_dir,

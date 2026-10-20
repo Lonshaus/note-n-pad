@@ -1,7 +1,7 @@
 // Copyright © 2026 Lonshaus
 // SPDX-License-Identifier: GPL-3.0-only
 
-import type { TreeEntry, VisibleRow } from './projectTree';
+import type { TreeEntry, VisibleRow, VolumeInfo } from './projectTree';
 /** One folder's listing, or the error that reading it produced. */
 export interface DirListing {
   entries: TreeEntry[];
@@ -14,6 +14,8 @@ interface RootState {
   stale: Set<string>;
   /** Folder -> token of the read that may still fill it. */
   reading: Map<string, number>;
+  /** The disk the project folder is on; its listing does not include itself. */
+  volume: VolumeInfo | undefined;
 }
 function fold(path: string, caseInsensitive: boolean): string {
   return caseInsensitive ? path.toLowerCase() : path;
@@ -130,7 +132,12 @@ export class TreeCache {
   private state(root: string): RootState {
     let state = this.roots.get(root);
     if (state === undefined) {
-      state = { dirs: new Map(), stale: new Set(), reading: new Map() };
+      state = {
+        dirs: new Map(),
+        stale: new Set(),
+        reading: new Map(),
+        volume: undefined,
+      };
       this.roots.set(root, state);
     }
     return state;
@@ -138,6 +145,18 @@ export class TreeCache {
 
   get(root: string, dir: string): DirListing | undefined {
     return this.roots.get(root)?.dirs.get(dir);
+  }
+  /** True when the listing of `dir` is shown but must be read again. */
+  isStale(root: string, dir: string): boolean {
+    return this.roots.get(root)?.stale.has(dir) ?? false;
+  }
+  /** The disk of a project folder, once it has been read. */
+  rootVolume(root: string): VolumeInfo | undefined {
+    return this.roots.get(root)?.volume;
+  }
+
+  setRootVolume(root: string, volume: VolumeInfo): void {
+    this.state(root).volume = volume;
   }
   /** Start reading `dir`. The returned token goes back with the result. */
   begin(root: string, dir: string): number {
