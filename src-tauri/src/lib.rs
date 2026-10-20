@@ -1,13 +1,11 @@
 // Copyright © 2026 Lonshaus
 // SPDX-License-Identifier: GPL-3.0-only
 
-#[cfg(not(feature = "lite"))]
 mod altgr;
 mod app_watch;
 #[cfg(debug_assertions)]
 mod automation;
 mod cmdline;
-#[cfg(not(feature = "lite"))]
 mod ctx_menu;
 mod data_files;
 mod default_apps;
@@ -25,7 +23,6 @@ mod grants;
 mod i18n;
 #[cfg(target_os = "windows")]
 mod jumplist;
-#[cfg(not(feature = "lite"))]
 mod large_file;
 mod launch_windows;
 mod licenses;
@@ -39,16 +36,12 @@ mod navigation;
 mod note_store;
 mod path_guard;
 mod pending_opens;
-#[cfg(not(feature = "lite"))]
 mod piece_table;
 mod platform;
 mod preview_img;
 mod privacy;
-#[cfg(not(feature = "lite"))]
 mod project;
-#[cfg(not(feature = "lite"))]
 mod range_edit;
-#[cfg(not(feature = "lite"))]
 mod replace_layer;
 mod settings;
 mod shortcut;
@@ -56,9 +49,7 @@ mod shortcuts;
 mod theme_store;
 mod webview2_runtime;
 mod win_menu_gray;
-#[cfg(not(feature = "lite"))]
 mod windowed;
-#[cfg(not(feature = "lite"))]
 mod windowed_scan;
 mod windows;
 
@@ -1102,7 +1093,6 @@ fn build_menu(
     accel("settings"),
   )?;
   // Brand name; not localized (macOS shows the app name as the first submenu).
-  // "Note&Pad Lite" in the Lite build.
   let app_menu = Submenu::with_items(
     app,
     escape_menu_label(edition::app_name()),
@@ -1420,7 +1410,6 @@ fn build_menu(
     ],
   )?;
   // View menu: the Workspace (moved here from Window) and the Line Numbers toggle.
-  #[cfg(not(feature = "lite"))]
   let workspace = MenuItem::with_id(
     app,
     "workspace",
@@ -1437,7 +1426,6 @@ fn build_menu(
     accel("line-numbers"),
   )?;
   let view_menu = Submenu::new(app, tr(i18n::Key::ViewMenu), true)?;
-  #[cfg(not(feature = "lite"))]
   if edition::workspace_enabled(edition::is_lite()) {
     view_menu.append(&workspace)?;
   }
@@ -1627,7 +1615,6 @@ fn handle_menu_id(app: &tauri::AppHandle, id: &str) {
     "line-numbers" => toggle_line_numbers(app),
     "always-on-top" => toggle_always_on_top(app),
     "recent-clear" => clear_recent(app),
-    #[cfg(not(feature = "lite"))]
     "workspace" => {
       let _ = windows::show_workspace(app);
     }
@@ -1663,7 +1650,6 @@ fn handle_menu_id(app: &tauri::AppHandle, id: &str) {
       emit_to_focused(app, "menu-action", format!("set-language:{}", &id[5..]));
     }
     _ if id.starts_with("recent:") => open_recent(app, id),
-    #[cfg(not(feature = "lite"))]
     _ if id.starts_with("ctx:") => ctx_menu::route_ctx_event(app, id),
     _ => {}
   }
@@ -1988,7 +1974,6 @@ pub(crate) fn record_recent(app: &tauri::AppHandle, path: &str) {
 }
 /// A file or folder in the recent list was renamed: follow it and repopulate the
 /// submenu.
-#[cfg(not(feature = "lite"))]
 pub(crate) fn retarget_recent(app: &tauri::AppHandle, from: &str, to: &str) {
   match settings::retarget_recent_files(app, from, to) {
     // This runs on a worker thread, and the menu is held while the platform
@@ -2375,7 +2360,6 @@ fn build_tray_menu(
     true,
     None::<&str>,
   )?;
-  #[cfg(not(feature = "lite"))]
   let workspace_item = MenuItem::with_id(
     app,
     "workspace",
@@ -2397,7 +2381,6 @@ fn build_tray_menu(
   let menu = Menu::new(app)?;
   menu.append(&new_item)?;
   menu.append(&show_item)?;
-  #[cfg(not(feature = "lite"))]
   if edition::workspace_enabled(edition::is_lite()) {
     menu.append(&workspace_item)?;
   }
@@ -2437,7 +2420,6 @@ fn build_tray(
         let _ = windows::new_sticky(app, &store);
       }
       "show_all" => show_all_notes(app),
-      #[cfg(not(feature = "lite"))]
       "workspace" => {
         let _ = windows::show_workspace(app);
       }
@@ -2503,7 +2485,6 @@ fn activate_existing(app: &tauri::AppHandle) {
 /// The workspace holds no document of its own, so Open there is the same
 /// situation as a file arriving from Finder: it honours the tab-or-window
 /// setting and reuses the last document window when that setting says tabs.
-#[cfg(not(feature = "lite"))]
 #[tauri::command]
 fn open_picked_files(app: tauri::AppHandle, paths: Vec<String>) {
   open_shell_paths(&app, paths);
@@ -2562,12 +2543,9 @@ fn apply_launch_action(app: &tauri::AppHandle, action: cmdline::Action) {
       let store = app.state::<NoteStore>();
       let _ = windows::new_sticky(app, &store);
     }
-    #[cfg(not(feature = "lite"))]
     cmdline::Action::Workspace => {
       let _ = windows::show_workspace(app);
     }
-    #[cfg(feature = "lite")]
-    cmdline::Action::Workspace => {}
     cmdline::Action::Note(id) => {
       let store = app.state::<NoteStore>();
       let _ = windows::focus_note_window(app.clone(), store, id);
@@ -2767,13 +2745,11 @@ pub fn run() {
           );
           grants::restore_all(&app_data, keep.as_ref());
           // Change lists of replace-alls from an earlier run are of no use.
-          #[cfg(not(feature = "lite"))]
           replace_layer::cleanup_tmp(&app_data.join(replace_layer::TMP_DIR));
         }
         Err(e) => log::warn!("grants: no app data dir: {e}"),
       }
       app.manage(FlushGate::default());
-      #[cfg(not(feature = "lite"))]
       {
         app.manage(ctx_menu::CtxPending::default());
         app.manage(large_file::LargeFileState::default());
@@ -2878,7 +2854,6 @@ pub fn run() {
       // and document window is restored, so the workspace opens on top of them
       // rather than being buried; as the explicitly requested window it does
       // take focus, which is the expected behavior for this opt-in.
-      #[cfg(not(feature = "lite"))]
       if startup.open_workspace_on_startup && edition::workspace_enabled(edition::is_lite()) {
         if launch_has_files {
           launch_windows::focus_launch_window_after_workspace();
@@ -2926,24 +2901,16 @@ pub fn run() {
       settings::save_settings,
       settings::ack_unset_defaults,
       theme_store::list_themes,
-      #[cfg(not(feature = "lite"))]
       theme_store::save_theme,
-      #[cfg(not(feature = "lite"))]
       theme_store::delete_theme,
-      #[cfg(not(feature = "lite"))]
       theme_store::import_theme,
-      #[cfg(not(feature = "lite"))]
       theme_store::export_theme,
-      #[cfg(not(feature = "lite"))]
       theme_store::restore_default_theme,
       locale_store::list_locales,
       locale_store::save_locale,
       locale_store::delete_locale,
-      #[cfg(not(feature = "lite"))]
       locale_store::import_locale,
-      #[cfg(not(feature = "lite"))]
       locale_store::read_locale_file,
-      #[cfg(not(feature = "lite"))]
       locale_store::export_locale,
       locale_store::restore_default_locale,
       licenses::list_acknowledgements,
@@ -2958,7 +2925,6 @@ pub fn run() {
       windows::set_window_opacity,
       windows::reveal_self,
       pending_opens::doc_window_ready,
-      #[cfg(not(feature = "lite"))]
       windows::show_workspace_window,
       windows::show_settings_window,
       windows::show_about_window,
@@ -2975,91 +2941,52 @@ pub fn run() {
       windows::focus_note_window,
       windows::focus_doc_tab,
       windows::report_doc_tabs,
-      #[cfg(not(feature = "lite"))]
       windows::close_doc_tab,
       windows::live_doc_groups,
-      #[cfg(not(feature = "lite"))]
       windows::sticky_row_action,
-      #[cfg(not(feature = "lite"))]
       ctx_menu::popup_row_menu,
-      #[cfg(not(feature = "lite"))]
       large_file::stat_file,
-      #[cfg(not(feature = "lite"))]
       large_file::read_chunk,
-      #[cfg(not(feature = "lite"))]
       large_file::start_line_index,
-      #[cfg(not(feature = "lite"))]
       large_file::line_to_offset,
-      #[cfg(not(feature = "lite"))]
       large_file::index_line_count,
-      #[cfg(not(feature = "lite"))]
       large_file::drop_line_index,
-      #[cfg(not(feature = "lite"))]
       large_file::stream_search,
-      #[cfg(not(feature = "lite"))]
       large_file::cancel_search,
-      #[cfg(not(feature = "lite"))]
       range_edit::file_fingerprint,
-      #[cfg(not(feature = "lite"))]
       range_edit::splice_file,
-      #[cfg(not(feature = "lite"))]
       range_edit::read_range,
-      #[cfg(not(feature = "lite"))]
       range_edit::copy_range,
-      #[cfg(not(feature = "lite"))]
       windowed::windowed_open,
-      #[cfg(not(feature = "lite"))]
       windowed::windowed_reopen,
-      #[cfg(not(feature = "lite"))]
       windowed::windowed_index,
-      #[cfg(not(feature = "lite"))]
       windowed::windowed_read,
-      #[cfg(not(feature = "lite"))]
       windowed::windowed_apply,
-      #[cfg(not(feature = "lite"))]
       windowed::windowed_undo,
-      #[cfg(not(feature = "lite"))]
       windowed::windowed_redo,
-      #[cfg(not(feature = "lite"))]
       windowed::windowed_save,
-      #[cfg(not(feature = "lite"))]
       windowed::windowed_set_path,
-      #[cfg(not(feature = "lite"))]
       windowed::windowed_close,
-      #[cfg(not(feature = "lite"))]
       windowed::windowed_find,
-      #[cfg(not(feature = "lite"))]
       windowed::windowed_search,
-      #[cfg(not(feature = "lite"))]
       windowed::windowed_search_cancel,
-      #[cfg(not(feature = "lite"))]
       windowed::windowed_replace_all,
-      #[cfg(not(feature = "lite"))]
       file_ops::create_file,
-      #[cfg(not(feature = "lite"))]
       file_ops::create_folder,
-      #[cfg(not(feature = "lite"))]
       file_ops::rename_path,
-      #[cfg(not(feature = "lite"))]
       file_ops::trash_path,
       file_ops::missing_paths,
       file_ops::reveal_in_finder,
-      #[cfg(not(feature = "lite"))]
       project::list_project_dir,
-      #[cfg(not(feature = "lite"))]
       project::open_project_file,
-      #[cfg(not(feature = "lite"))]
       project::rebind_project,
-      #[cfg(not(feature = "lite"))]
       project::forget_project_rebinds,
-      #[cfg(not(feature = "lite"))]
       open_picked_files,
       app_watch::list_running_apps,
       platform::platform_info,
       edition::edition_info,
       #[cfg(debug_assertions)]
       edition::debug_set_edition,
-      #[cfg(not(feature = "lite"))]
       altgr::altgr_table,
       default_apps::default_apps_page_supported,
       default_apps::open_default_apps_page,

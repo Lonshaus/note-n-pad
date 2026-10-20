@@ -4,7 +4,7 @@
 import type { I18nKey } from '../i18n';
 
 /** One line of the "Full Version Features" table. `lite` is whether the Lite
- *  edition (the macOS Lite build, the Windows trial) has the feature; the full
+ *  edition (the Windows trial) has the feature; the full
  *  version has every row. `note` is a second line under the feature. */
 export interface FeatureRow {
   label: I18nKey;

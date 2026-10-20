@@ -1,22 +1,16 @@
 // Copyright © 2026 Lonshaus
 // SPDX-License-Identifier: GPL-3.0-only
 
-#[cfg(not(feature = "lite"))]
 use crate::note_store::NoteStore;
-#[cfg(not(feature = "lite"))]
 use serde::Serialize;
-#[cfg(not(feature = "lite"))]
 use std::fs;
 use std::path::Path;
-#[cfg(not(feature = "lite"))]
 use std::path::PathBuf;
-#[cfg(not(feature = "lite"))]
 use tauri::{AppHandle, Emitter, State};
 
 /// Validate a user-entered file or folder name. Trims surrounding whitespace and
 /// rejects empty names, the `.`/`..` directory aliases, and any path separator so
 /// the name can only ever create a sibling inside its parent directory.
-#[cfg(not(feature = "lite"))]
 fn validate_name(name: &str) -> Result<&str, String> {
   let trimmed = name.trim();
   if trimmed.is_empty() {
@@ -33,7 +27,6 @@ fn validate_name(name: &str) -> Result<&str, String> {
 
 /// Create an empty file named `name` inside `parent`. Errors on a bad name, a
 /// missing parent directory, or an existing target (collision).
-#[cfg(not(feature = "lite"))]
 fn create_file_at(parent: &Path, name: &str) -> Result<PathBuf, String> {
   let name = validate_name(name)?;
   if !parent.is_dir() {
@@ -52,7 +45,6 @@ fn create_file_at(parent: &Path, name: &str) -> Result<PathBuf, String> {
 
 /// Create a folder named `name` inside `parent`. Same validation and collision
 /// rules as `create_file_at`.
-#[cfg(not(feature = "lite"))]
 fn create_folder_at(parent: &Path, name: &str) -> Result<PathBuf, String> {
   let name = validate_name(name)?;
   if !parent.is_dir() {
@@ -71,7 +63,6 @@ fn create_folder_at(parent: &Path, name: &str) -> Result<PathBuf, String> {
 
 /// Rename `path` to `new_name`, keeping it in the same parent directory. A rename
 /// to the current name is a no-op; any other existing sibling is a collision.
-#[cfg(not(feature = "lite"))]
 fn rename_to(path: &Path, new_name: &str) -> Result<PathBuf, String> {
   let new_name = validate_name(new_name)?;
   let parent = path
@@ -91,7 +82,6 @@ fn rename_to(path: &Path, new_name: &str) -> Result<PathBuf, String> {
 /// Pre-validate a trash request. The actual `trash::delete` is not covered by a
 /// unit test (it would pollute the real system Trash), so this split keeps the
 /// "missing path" guard testable on its own.
-#[cfg(not(feature = "lite"))]
 fn ensure_trashable(path: &Path) -> Result<(), String> {
   if !path.exists() {
     return Err(format!("path does not exist: {}", path.display()));
@@ -99,20 +89,17 @@ fn ensure_trashable(path: &Path) -> Result<(), String> {
   Ok(())
 }
 
-#[cfg(not(feature = "lite"))]
 #[tauri::command]
 pub fn create_file(parent: String, name: String) -> Result<String, String> {
   create_file_at(Path::new(&parent), &name).map(|p| p.to_string_lossy().to_string())
 }
 
-#[cfg(not(feature = "lite"))]
 #[tauri::command]
 pub fn create_folder(parent: String, name: String) -> Result<String, String> {
   create_folder_at(Path::new(&parent), &name).map(|p| p.to_string_lossy().to_string())
 }
 /// Rename `path`, then hand the old and new path to `follow`. A failed rename
 /// calls nothing, so no record is rewritten for a path that did not move.
-#[cfg(not(feature = "lite"))]
 fn rename_following(
   path: &Path,
   new_name: &str,
@@ -126,7 +113,6 @@ fn rename_following(
   Ok(renamed)
 }
 
-#[cfg(not(feature = "lite"))]
 #[derive(Clone, Serialize)]
 struct PathsMoved {
   from: String,
@@ -135,7 +121,6 @@ struct PathsMoved {
 /// Point everything that remembers `from` at `to`: stored tabs, the recent list
 /// and sandbox grants, then tell the open windows. A failure to follow is
 /// logged and never undoes the rename.
-#[cfg(not(feature = "lite"))]
 fn follow_move(app: &AppHandle, store: &NoteStore, from: &str, to: &str) {
   if let Err(e) = store.retarget_paths(from, to) {
     log::warn!("could not follow a rename in the stored tabs: {e}");
@@ -152,7 +137,6 @@ fn follow_move(app: &AppHandle, store: &NoteStore, from: &str, to: &str) {
   );
 }
 
-#[cfg(not(feature = "lite"))]
 #[tauri::command(async)]
 pub fn rename_path(
   app: AppHandle,
@@ -166,7 +150,6 @@ pub fn rename_path(
 }
 /// Byte span of every segment of `path`. `/` always separates; a backslash does
 /// only when `backslash` is set, since it is an ordinary name character on Unix.
-#[cfg(not(feature = "lite"))]
 fn segment_spans(path: &str, backslash: bool) -> Vec<(usize, usize)> {
   let mut spans = Vec::new();
   let mut start = None;
@@ -187,7 +170,6 @@ fn segment_spans(path: &str, backslash: bool) -> Vec<(usize, usize)> {
 /// `path` with the leading `from` replaced by `to`, when `path` is `from` or lies
 /// below it; otherwise `path` unchanged. Matched by whole segment, so `/a/Tools`
 /// does not match `/a/Tools2`.
-#[cfg(not(feature = "lite"))]
 fn retarget_with(path: &str, from: &str, to: &str, fold_case: bool, backslash: bool) -> String {
   let from_spans = segment_spans(from, backslash);
   let path_spans = segment_spans(path, backslash);
@@ -210,7 +192,6 @@ fn retarget_with(path: &str, from: &str, to: &str, fold_case: bool, backslash: b
 }
 /// `retarget_with` under this platform's rules: macOS and Windows ignore case,
 /// and Windows accepts both separators.
-#[cfg(not(feature = "lite"))]
 pub(crate) fn retarget_path(path: &str, from: &str, to: &str) -> String {
   retarget_with(
     path,
@@ -245,7 +226,6 @@ pub fn missing_paths(paths: Vec<String>) -> Vec<String> {
 /// item lands where the OS "Put Back" expects it. The actual delete must run on
 /// the main thread: macOS's trashItemAtURL hangs forever when called from a
 /// Tauri command worker thread (found live in E2E).
-#[cfg(not(feature = "lite"))]
 #[tauri::command]
 pub fn trash_path(app: tauri::AppHandle, path: String) -> Result<(), String> {
   ensure_trashable(Path::new(&path))?;
@@ -364,7 +344,7 @@ mod tests {
   }
 }
 
-#[cfg(all(test, not(feature = "lite")))]
+#[cfg(test)]
 mod tree_tests {
   use super::*;
   use tempfile::tempdir;

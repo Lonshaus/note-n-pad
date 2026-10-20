@@ -1,9 +1,9 @@
 // Copyright © 2026 Lonshaus
 // SPDX-License-Identifier: GPL-3.0-only
-// Which edition is running: full, or Lite (the macOS Lite build, and the
-// packaged MSIX build while its license is a trial). Everything that cuts a
-// feature asks `is_lite()`; the frontend mirrors the answer in `editionState`,
-// kept in sync by `edition_info` and the `edition-changed` event.
+// Which edition is running: full, or Lite (the packaged MSIX build while its
+// license is a trial). Everything that cuts a feature asks `is_lite()`; the
+// frontend mirrors the answer in `editionState`, kept in sync by `edition_info`
+// and the `edition-changed` event.
 //
 // The flag starts as lite (fail-safe) and `init` settles it in `setup` before
 // any window or edition-dependent menu is built, so no consumer ever sees the
@@ -11,18 +11,10 @@
 use std::sync::atomic::{AtomicBool, Ordering};
 use tauri::{AppHandle, Emitter, Manager};
 
-/// The macOS Lite build: the answer is lite, constant.
-const LITE_FEATURE: bool = cfg!(feature = "lite");
-
-/// The name the app calls itself. Compile-time, like the bundle name: only the
-/// macOS Lite build is named "Note&Pad Lite"; the Windows trial is the full
-/// package and never changes its name.
+/// The name the app calls itself. The Windows trial is the full package and
+/// never changes its name.
 pub const fn app_name() -> &'static str {
-  if LITE_FEATURE {
-    "Note&Pad Lite"
-  } else {
-    "Note&Pad"
-  }
+  "Note&Pad"
 }
 
 /// Lite until `init` says otherwise.
@@ -42,10 +34,7 @@ pub enum LicenseRead {
 /// The one decision: is this process lite? `packaged` is "runs from an MSIX
 /// package"; an unpackaged process (any unpackaged Windows build, macOS full,
 /// Linux) is never lite on its own.
-pub fn resolve(lite_feature: bool, packaged: bool, license: LicenseRead) -> bool {
-  if lite_feature {
-    return true;
-  }
+pub fn resolve(packaged: bool, license: LicenseRead) -> bool {
   if !packaged {
     return false;
   }
@@ -86,7 +75,6 @@ pub(crate) fn require_lite(what: &str) -> Result<(), String> {
 }
 
 /// Entry-point guard of a command that belongs to a removed feature.
-#[cfg(not(feature = "lite"))]
 pub(crate) fn require_full(feature: &str) -> Result<(), String> {
   refuse_if(is_lite(), feature)
 }
@@ -131,17 +119,13 @@ pub fn init(app: &AppHandle) {
   {
     debug_delay();
     let value = std::env::var("NOTENPAD_EDITION").ok();
-    if let (false, Some(lite)) = (LITE_FEATURE, parse_override(value.as_deref())) {
+    if let Some(lite) = parse_override(value.as_deref()) {
       LITE.store(lite, Ordering::Relaxed);
       return;
     }
   }
-  let (packaged, license) = if LITE_FEATURE {
-    (false, LicenseRead::Failed)
-  } else {
-    read_license(app)
-  };
-  LITE.store(resolve(LITE_FEATURE, packaged, license), Ordering::Relaxed);
+  let (packaged, license) = read_license(app);
+  LITE.store(resolve(packaged, license), Ordering::Relaxed);
 }
 
 /// Store a new value and tell everyone: the flag, every window (`edition-changed`
@@ -191,9 +175,6 @@ pub fn edition_info() -> bool {
 #[cfg(debug_assertions)]
 #[tauri::command]
 pub fn debug_set_edition(app: AppHandle, lite: bool) -> Result<(), String> {
-  if LITE_FEATURE && !lite {
-    return Err("the Lite build is always lite".to_string());
-  }
   set_lite(&app, lite);
   Ok(())
 }
@@ -225,7 +206,7 @@ fn read_license(app: &AppHandle) -> (bool, LicenseRead) {
       let late_app = app.clone();
       std::thread::spawn(move || {
         if let Ok(late) = rx.recv() {
-          set_lite(&late_app, resolve(LITE_FEATURE, true, late));
+          set_lite(&late_app, resolve(true, late));
         }
       });
       LicenseRead::TimedOut
@@ -237,7 +218,7 @@ fn read_license(app: &AppHandle) -> (bool, LicenseRead) {
 
 #[cfg(target_os = "windows")]
 mod store {
-  use super::{resolve, set_lite, LicenseRead, LITE_FEATURE};
+  use super::{resolve, set_lite, LicenseRead};
   use std::sync::mpsc::{channel, Sender};
   use tauri::AppHandle;
   use windows::core::IInspectable;
@@ -283,10 +264,10 @@ mod store {
       log::warn!("edition: could not subscribe to license changes: {e}");
     }
     if let Err(late) = first.send(read(&context)) {
-      set_lite(&app, resolve(LITE_FEATURE, true, late.0));
+      set_lite(&app, resolve(true, late.0));
     }
     while changed_rx.recv().is_ok() {
-      set_lite(&app, resolve(LITE_FEATURE, true, read(&context)));
+      set_lite(&app, resolve(true, read(&context)));
     }
   }
 }
@@ -296,36 +277,23 @@ mod tests {
   use super::*;
 
   #[test]
-  fn lite_feature_is_always_lite() {
-    for license in [
-      LicenseRead::Full,
-      LicenseRead::Trial,
-      LicenseRead::Failed,
-      LicenseRead::TimedOut,
-    ] {
-      assert!(resolve(true, false, license));
-      assert!(resolve(true, true, license));
-    }
-  }
-
-  #[test]
   fn packaged_unreadable_license_is_lite() {
-    assert!(resolve(false, true, LicenseRead::Failed));
+    assert!(resolve(true, LicenseRead::Failed));
   }
 
   #[test]
   fn packaged_timed_out_read_is_lite() {
-    assert!(resolve(false, true, LicenseRead::TimedOut));
+    assert!(resolve(true, LicenseRead::TimedOut));
   }
 
   #[test]
   fn packaged_full_license_is_full() {
-    assert!(!resolve(false, true, LicenseRead::Full));
+    assert!(!resolve(true, LicenseRead::Full));
   }
 
   #[test]
   fn packaged_trial_is_lite() {
-    assert!(resolve(false, true, LicenseRead::Trial));
+    assert!(resolve(true, LicenseRead::Trial));
   }
 
   #[test]
@@ -336,7 +304,7 @@ mod tests {
       LicenseRead::Failed,
       LicenseRead::TimedOut,
     ] {
-      assert!(!resolve(false, false, license));
+      assert!(!resolve(false, license));
     }
   }
 
@@ -358,13 +326,6 @@ mod tests {
     assert_eq!(parse_delay_ms(None), None);
   }
 
-  #[cfg(feature = "lite")]
-  #[test]
-  fn the_lite_build_is_named_lite() {
-    assert_eq!(app_name(), "Note&Pad Lite");
-  }
-
-  #[cfg(not(feature = "lite"))]
   #[test]
   fn the_full_build_keeps_its_name() {
     assert_eq!(app_name(), "Note&Pad");
@@ -620,69 +581,6 @@ mod gate_tests {
       &["resolve_current"],
       "workspace_enabled(",
     );
-  }
-  /// The commands of a cut feature are compiled out of the Lite binary, and the
-  /// ones Lite keeps from the same modules stay in it.
-  #[test]
-  fn the_lite_binary_registers_only_the_commands_it_keeps() {
-    let lib = include_str!("lib.rs");
-    let start = lib.find("generate_handler![").unwrap();
-    let handlers = &lib[start..start + lib[start..].find("])").unwrap()];
-    let lines: Vec<&str> = handlers.lines().map(str::trim).collect();
-    let cut_modules = ["large_file::", "range_edit::", "windowed::", "project::"];
-    let cut_commands = [
-      "theme_store::save_theme",
-      "theme_store::delete_theme",
-      "theme_store::import_theme",
-      "theme_store::export_theme",
-      "theme_store::restore_default_theme",
-      "locale_store::import_locale",
-      "locale_store::read_locale_file",
-      "locale_store::export_locale",
-      "windows::show_workspace_window",
-      "windows::sticky_row_action",
-      "windows::close_doc_tab",
-      "ctx_menu::popup_row_menu",
-      "file_ops::create_file",
-      "file_ops::create_folder",
-      "file_ops::rename_path",
-      "file_ops::trash_path",
-      "open_picked_files",
-      "altgr::altgr_table",
-    ];
-    let kept_commands = [
-      "theme_store::list_themes",
-      "locale_store::list_locales",
-      "locale_store::save_locale",
-      "locale_store::delete_locale",
-      "locale_store::restore_default_locale",
-      "file_ops::reveal_in_finder",
-      "file_ops::missing_paths",
-      "windows::focus_doc_tab",
-      "windows::live_doc_groups",
-      "windows::open_document_group",
-    ];
-    let attribute = "#[cfg(not(feature = \"lite\"))]";
-    for (i, line) in lines.iter().enumerate() {
-      let name = line.trim_end_matches(',');
-      let cut = cut_modules.iter().any(|m| name.starts_with(m)) || cut_commands.contains(&name);
-      if cut {
-        assert_eq!(
-          lines[i - 1],
-          attribute,
-          "{name} must not be in the Lite build"
-        );
-      }
-      if kept_commands.contains(&name) {
-        assert_ne!(lines[i - 1], attribute, "{name} is kept in the Lite build");
-      }
-    }
-    for name in cut_commands.iter().chain(&kept_commands) {
-      assert!(
-        lines.iter().any(|l| l.trim_end_matches(',') == *name),
-        "{name}"
-      );
-    }
   }
 
   #[test]
