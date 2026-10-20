@@ -362,6 +362,10 @@ export interface WorkspaceHooks {
   clearProject: () => Promise<void>;
   getTreeRows: () => unknown;
   toggleFolder: (path: string) => void;
+  getProjectRoots: () => string[];
+  getExpandedPaths: () => string[];
+  getListDirCalls: () => number;
+  treeIdle: () => Promise<void>;
   clickFile: (path: string) => void;
   ctxCreateFile: (
     parentPath: string,

@@ -122,6 +122,11 @@ pub struct AppSettings {
   /// until the user adds one; each entry is a sibling top-level node.
   #[serde(default)]
   pub project_roots: Vec<String>,
+  /// Expanded folders of each project tree, by project root (the root itself
+  /// is listed when its node is open). A root with no entry has never been
+  /// expanded or collapsed by the user and opens expanded.
+  #[serde(default)]
+  pub project_expanded: BTreeMap<String, Vec<String>>,
   /// Whether the system tray / status-bar icon is shown. When off the icon is
   /// hidden (the app keeps running); its actions stay reachable from the menu
   /// bar, global shortcut, and Dock menu. Cross-platform.
@@ -278,6 +283,7 @@ impl Default for AppSettings {
       workspace_width: default_workspace_width(),
       workspace_height: default_workspace_height(),
       project_roots: Vec::new(),
+      project_expanded: BTreeMap::new(),
       show_tray_icon: default_show_tray_icon(),
       open_workspace_on_startup: default_open_workspace_on_startup(),
       recent_files: Vec::new(),
@@ -384,6 +390,14 @@ fn migrate_custom_font(settings: &mut AppSettings) {
       settings.editor_extra_fonts.push(family);
     }
   }
+}
+/// Drop the expanded-folder lists of projects that are no longer in
+/// `project_roots`, so removing a project takes its saved state with it.
+fn prune_project_expanded(settings: &mut AppSettings) {
+  let roots = &settings.project_roots;
+  settings
+    .project_expanded
+    .retain(|root, _| roots.contains(root));
 }
 
 /// Reject an empty shortcut. `theme`, `language`, and `snapshot_dir` are not
@@ -715,6 +729,7 @@ fn tolerant_settings(
       &mut dropped,
     ),
     project_roots: field_or_default(obj, "project_roots", Vec::new, &mut dropped),
+    project_expanded: field_or_default(obj, "project_expanded", BTreeMap::new, &mut dropped),
     show_tray_icon: field_or_default(obj, "show_tray_icon", default_show_tray_icon, &mut dropped),
     open_workspace_on_startup: field_or_default(
       obj,
@@ -901,6 +916,7 @@ pub fn save_settings(app: AppHandle, settings: serde_json::Value) -> Result<(), 
     let current = load_or_default_for_write(&path)?;
     let mut merged = merge_settings(&current, &settings)?;
     normalize_fonts(&mut merged);
+    prune_project_expanded(&mut merged);
     save_to(&path, &merged)?;
     (current, merged)
   };
@@ -1320,6 +1336,10 @@ mod tests {
       workspace_width: 320.0,
       workspace_height: 600.0,
       project_roots: vec!["/tmp/project".into(), "/tmp/other".into()],
+      project_expanded: BTreeMap::from([(
+        "/tmp/project".to_string(),
+        vec!["/tmp/project".to_string(), "/tmp/project/src".to_string()],
+      )]),
       show_tray_icon: false,
       open_workspace_on_startup: true,
       recent_files: vec!["/tmp/a.txt".into(), "/tmp/b.txt".into()],
@@ -1392,6 +1412,56 @@ mod tests {
     // A null patch leaves the field untouched.
     let untouched = merge_settings(&set, &serde_json::json!({ "project_roots": null })).unwrap();
     assert_eq!(untouched.project_roots, vec!["/tmp/a", "/tmp/b"]);
+  }
+
+  #[test]
+  fn project_expanded_defaults_to_empty_and_replaces_as_a_whole() {
+    assert!(AppSettings::default().project_expanded.is_empty());
+    assert!(load_json(r#"{"theme":"dark"}"#).project_expanded.is_empty());
+    let set = merge_settings(
+      &AppSettings::default(),
+      &serde_json::json!({ "project_expanded": { "/a": ["/a", "/a/b"], "/c": [] } }),
+    )
+    .unwrap();
+    assert_eq!(set.project_expanded["/a"], vec!["/a", "/a/b"]);
+    // An empty list is kept: a collapsed root is not the same as a new one.
+    assert_eq!(set.project_expanded["/c"], Vec::<String>::new());
+    // A patch replaces the whole map, and null leaves it alone.
+    let replaced = merge_settings(
+      &set,
+      &serde_json::json!({ "project_expanded": { "/a": ["/a"] } }),
+    )
+    .unwrap();
+    assert_eq!(replaced.project_expanded.len(), 1);
+    let untouched = merge_settings(&set, &serde_json::json!({ "project_expanded": null })).unwrap();
+    assert_eq!(untouched.project_expanded, set.project_expanded);
+  }
+
+  #[test]
+  fn wrong_typed_project_expanded_costs_only_that_field() {
+    let settings = load_json(r#"{"project_roots":["/a"],"project_expanded":["nope"]}"#);
+    assert!(settings.project_expanded.is_empty());
+    assert_eq!(settings.project_roots, vec!["/a"]);
+  }
+
+  #[test]
+  fn pruning_drops_the_expanded_state_of_removed_projects() {
+    let mut settings = AppSettings {
+      project_roots: vec!["/a".into(), "/c".into()],
+      project_expanded: BTreeMap::from([
+        ("/a".to_string(), vec!["/a".to_string()]),
+        ("/b".to_string(), vec!["/b".to_string()]),
+        ("/c".to_string(), Vec::new()),
+      ]),
+      ..AppSettings::default()
+    };
+    prune_project_expanded(&mut settings);
+    let kept: Vec<&str> = settings
+      .project_expanded
+      .keys()
+      .map(String::as_str)
+      .collect();
+    assert_eq!(kept, vec!["/a", "/c"]);
   }
 
   #[test]

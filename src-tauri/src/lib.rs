@@ -3007,9 +3007,13 @@ pub fn run() {
       file_ops::trash_path,
       file_ops::reveal_in_finder,
       #[cfg(not(feature = "lite"))]
-      project::list_project_tree,
+      project::list_project_dir,
       #[cfg(not(feature = "lite"))]
       project::open_project_file,
+      #[cfg(not(feature = "lite"))]
+      project::rebind_project,
+      #[cfg(not(feature = "lite"))]
+      project::forget_project_rebinds,
       #[cfg(not(feature = "lite"))]
       open_picked_files,
       app_watch::list_running_apps,

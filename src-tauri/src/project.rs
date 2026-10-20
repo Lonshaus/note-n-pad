@@ -3,12 +3,10 @@
 
 use crate::note_store::NoteStore;
 use serde::Serialize;
-use std::collections::HashSet;
 use std::path::Path;
-use tauri::{AppHandle, Manager, State};
-
-/// One node of the project tree. `children` is populated only for directories
-/// whose path was in the expanded set; every other directory carries `None`.
+use tauri::{AppHandle, Emitter, Manager, State};
+/// One node of the project tree. `children` is always `None`: the tree is read
+/// one folder at a time, so a folder's entries come from its own listing.
 #[derive(Debug, Serialize, PartialEq)]
 pub struct TreeEntry {
   pub name: String,
@@ -16,15 +14,10 @@ pub struct TreeEntry {
   pub is_dir: bool,
   pub children: Option<Vec<TreeEntry>>,
 }
-
-/// Read one directory level. A child directory is read too (recursively) when
-/// its path string is in `expanded`; otherwise it carries `None` children. An
-/// unreadable directory yields an empty list instead of failing the whole tree.
-fn read_level(dir: &Path, expanded: &HashSet<&str>) -> Vec<TreeEntry> {
+/// Read one directory level. An unreadable entry is skipped.
+fn read_level(dir: &Path) -> Result<Vec<TreeEntry>, String> {
+  let read = std::fs::read_dir(dir).map_err(|e| e.to_string())?;
   let mut entries = Vec::new();
-  let Ok(read) = std::fs::read_dir(dir) else {
-    return entries;
-  };
   for entry in read.flatten() {
     let name = entry.file_name().to_string_lossy().to_string();
     // Skip dotfiles/dotfolders.
@@ -32,18 +25,11 @@ fn read_level(dir: &Path, expanded: &HashSet<&str>) -> Vec<TreeEntry> {
       continue;
     }
     let path = entry.path();
-    let is_dir = path.is_dir();
-    let path_str = path.to_string_lossy().to_string();
-    let children = if is_dir && expanded.contains(path_str.as_str()) {
-      Some(read_level(&path, expanded))
-    } else {
-      None
-    };
     entries.push(TreeEntry {
       name,
-      path: path_str,
-      is_dir,
-      children,
+      is_dir: path.is_dir(),
+      path: path.to_string_lossy().to_string(),
+      children: None,
     });
   }
   // Directories first, then case-insensitive alphabetical.
@@ -52,25 +38,63 @@ fn read_level(dir: &Path, expanded: &HashSet<&str>) -> Vec<TreeEntry> {
     (false, true) => std::cmp::Ordering::Greater,
     _ => a.name.to_lowercase().cmp(&b.name.to_lowercase()),
   });
-  entries
+  Ok(entries)
 }
-
-/// List `root` and every directory below it whose path is in `expanded`. Errors
-/// when `root` is missing or is not a directory.
-#[tauri::command]
-pub fn list_project_tree(root: String, expanded: Vec<String>) -> Result<Vec<TreeEntry>, String> {
-  let path = Path::new(&root);
+/// List the entries directly inside `dir`, one level only. Errors when `dir` is
+/// missing or is not a directory. Async so a slow volume never blocks the UI
+/// thread.
+#[tauri::command(async)]
+pub fn list_project_dir(dir: String) -> Result<Vec<TreeEntry>, String> {
+  let path = Path::new(&dir);
   if !path.is_dir() {
-    return Err(format!("not a directory: {root}"));
+    return Err(format!("not a directory: {dir}"));
   }
-  let expanded: HashSet<&str> = expanded.iter().map(String::as_str).collect();
-  Ok(read_level(path, &expanded))
+  read_level(path)
 }
-
+/// A stored document tab, reduced to what the window choice looks at.
+struct StoredTab<'a> {
+  group: &'a str,
+  file_path: Option<&'a str>,
+  project: Option<&'a str>,
+}
+/// Which document window a tree-open goes to.
+#[derive(Debug, PartialEq)]
+enum OpenTarget {
+  /// A live window already holding the file: switch to its tab.
+  Holder(String),
+  /// A live window bound to the project.
+  Project(String),
+  /// No such window: open a new one.
+  Fresh,
+}
+/// Choose the window for opening `path` from project `root`. Only live windows
+/// count: a stored group whose window is closed is skipped in both steps. A
+/// window holding the file wins, so one file never opens in two windows; then a
+/// window bound to the project.
+fn choose_window(
+  tabs: &[StoredTab],
+  path: &str,
+  root: &str,
+  is_live: impl Fn(&str) -> bool,
+) -> OpenTarget {
+  if let Some(tab) = tabs
+    .iter()
+    .find(|t| t.file_path == Some(path) && is_live(t.group))
+  {
+    return OpenTarget::Holder(tab.group.to_string());
+  }
+  if let Some(tab) = tabs
+    .iter()
+    .find(|t| t.project == Some(root) && is_live(t.group))
+  {
+    return OpenTarget::Project(tab.group.to_string());
+  }
+  OpenTarget::Fresh
+}
 /// Open a file picked under a project `root` in the workspace tree. Tree-opens
-/// are isolated per project: route to the open document window whose tabs belong
-/// to `root` (found via the note store), else open a fresh document window tagged
-/// with the project so its tabs adopt it.
+/// are isolated per project: a live window already holding the file gets it
+/// switched to, else the live window bound to `root` opens it as a tab, else a
+/// fresh document window is opened tagged with the project so its tabs adopt it.
 #[tauri::command(async)]
 pub fn open_project_file(
   app: AppHandle,
@@ -78,24 +102,54 @@ pub fn open_project_file(
   path: String,
   root: String,
 ) -> Result<(), String> {
-  // A document window bound to this project has at least one stored tab whose
-  // `project == root`; its group id names the window.
-  let group = store.list().into_iter().find_map(|n| {
-    if n.kind == "document" && n.project.as_deref() == Some(root.as_str()) {
-      Some(n.window_group.unwrap_or(n.id))
-    } else {
-      None
-    }
-  });
-  if let Some(group) = group {
-    let label = format!("doc-{group}");
-    if let Some(win) = app.get_webview_window(&label) {
+  let notes = store.list();
+  let tabs: Vec<StoredTab> = notes
+    .iter()
+    .filter(|n| n.kind == "document")
+    .map(|n| StoredTab {
+      group: crate::note_store::resolved_group(n),
+      file_path: n.file_path.as_deref(),
+      project: n.project.as_deref(),
+    })
+    .collect();
+  let window_of = |group: &str| app.get_webview_window(&format!("doc-{group}"));
+  let target = choose_window(&tabs, &path, &root, |group| window_of(group).is_some());
+  if let OpenTarget::Holder(group) | OpenTarget::Project(group) = target {
+    if let Some(win) = window_of(&group) {
       let _ = crate::pending_opens::open_in_window(&win, &path);
       return Ok(());
     }
   }
-  // No window for this project yet: open a fresh one carrying the project root.
   crate::windows::open_document(&app, &path, Some(&root))
+}
+/// These folders are projects of their own again (just added, or kept at
+/// startup): any rebind that folded one into another project is forgotten, so
+/// writes still tagged with it stay on it.
+#[tauri::command(async)]
+pub fn forget_project_rebinds(store: State<NoteStore>, roots: Vec<String>) {
+  for root in &roots {
+    store.forget_rebind(root);
+  }
+}
+#[derive(Clone, Serialize)]
+struct ProjectRebound {
+  from: String,
+  to: String,
+}
+/// Move every stored document tab of project `from` to project `to` (the folder
+/// `from` now lives under), then tell the open windows so they re-tag their next
+/// snapshots. Called when a project is merged into the one above it.
+#[tauri::command(async)]
+pub fn rebind_project(
+  app: AppHandle,
+  store: State<NoteStore>,
+  from: String,
+  to: String,
+) -> Result<(), String> {
+  store.rebind_project(&from, &to)?;
+  crate::note_store::emit_store_changed(&app, None);
+  let _ = app.emit("project-rebound", ProjectRebound { from, to });
+  Ok(())
 }
 
 #[cfg(test)]
@@ -108,124 +162,41 @@ mod tests {
     entries.iter().map(|e| e.name.as_str()).collect()
   }
 
-  fn list(root: &Path, expanded: &[&Path]) -> Vec<TreeEntry> {
-    list_project_tree(
-      root.to_string_lossy().to_string(),
-      expanded
-        .iter()
-        .map(|p| p.to_string_lossy().to_string())
-        .collect(),
-    )
-    .unwrap()
+  fn list(dir: &Path) -> Vec<TreeEntry> {
+    list_project_dir(dir.to_string_lossy().to_string()).unwrap()
   }
 
-  fn nested_root() -> tempfile::TempDir {
+  #[test]
+  fn lists_one_level_and_never_loads_children() {
     let dir = tempdir().unwrap();
     fs::create_dir_all(dir.path().join("a/b/c")).unwrap();
     fs::write(dir.path().join("a/b/c/deep.txt"), "x").unwrap();
     fs::write(dir.path().join("a/mid.txt"), "x").unwrap();
-    dir
-  }
-
-  #[test]
-  fn nothing_expanded_lists_root_entries_only() {
-    let dir = nested_root();
-    let tree = list(dir.path(), &[]);
-    assert_eq!(names(&tree), vec!["a"]);
-    assert!(tree[0].is_dir);
-    assert_eq!(tree[0].children, None);
-  }
-
-  #[test]
-  fn expanded_dir_loads_one_level() {
-    let dir = nested_root();
-    let a = dir.path().join("a");
-    let tree = list(dir.path(), &[&a]);
-    let a_children = tree[0].children.as_ref().unwrap();
-    assert_eq!(names(a_children), vec!["b", "mid.txt"]);
-    assert_eq!(a_children[0].children, None);
-  }
-
-  #[test]
-  fn deeply_expanded_dirs_load_every_level() {
-    let dir = nested_root();
-    let a = dir.path().join("a");
-    let b = a.join("b");
-    let c = b.join("c");
-    let tree = list(dir.path(), &[&a, &b, &c]);
-    let a_children = tree[0].children.as_ref().unwrap();
-    let b_children = a_children[0].children.as_ref().unwrap();
-    let c_children = b_children[0].children.as_ref().unwrap();
-    assert_eq!(names(c_children), vec!["deep.txt"]);
+    fs::write(dir.path().join("top.txt"), "x").unwrap();
+    let top = list(dir.path());
+    assert_eq!(names(&top), vec!["a", "top.txt"]);
+    assert!(top[0].is_dir && !top[1].is_dir);
+    assert!(top.iter().all(|e| e.children.is_none()));
+    let a = list(&dir.path().join("a"));
+    assert_eq!(names(&a), vec!["b", "mid.txt"]);
     assert_eq!(
-      c_children[0].path,
-      c.join("deep.txt").to_string_lossy().to_string()
+      a[1].path,
+      dir
+        .path()
+        .join("a")
+        .join("mid.txt")
+        .to_string_lossy()
+        .to_string()
     );
-  }
-
-  #[test]
-  fn expanded_child_without_expanded_parent_stays_unloaded() {
-    let dir = nested_root();
-    let b = dir.path().join("a/b");
-    let tree = list(dir.path(), &[&b]);
-    assert_eq!(tree[0].children, None);
-  }
-
-  #[test]
-  fn missing_expanded_path_is_ignored() {
-    let dir = nested_root();
-    let a = dir.path().join("a");
-    let gone = dir.path().join("a/gone");
-    let tree = list(dir.path(), &[&a, &gone]);
-    let a_children = tree[0].children.as_ref().unwrap();
-    assert_eq!(names(a_children), vec!["b", "mid.txt"]);
+    assert!(a.iter().all(|e| e.children.is_none()));
   }
 
   #[cfg(unix)]
   #[test]
-  fn unreadable_expanded_dir_yields_empty_list_and_rest_loads() {
-    use std::os::unix::fs::PermissionsExt;
-    let dir = tempdir().unwrap();
-    let root = dir.path();
-    fs::create_dir(root.join("locked")).unwrap();
-    fs::write(root.join("locked/x.txt"), "x").unwrap();
-    fs::create_dir(root.join("open")).unwrap();
-    fs::write(root.join("open/y.txt"), "x").unwrap();
-    let locked = root.join("locked");
-    let open = root.join("open");
-    fs::set_permissions(&locked, fs::Permissions::from_mode(0o000)).unwrap();
-    let tree = list(root, &[&locked, &open]);
-    fs::set_permissions(&locked, fs::Permissions::from_mode(0o755)).unwrap();
-    assert_eq!(names(&tree), vec!["locked", "open"]);
-    // Running as root can read a mode-000 directory, so only the shape is fixed.
-    if let Some(children) = tree[0].children.as_ref() {
-      assert!(children.is_empty() || names(children) == vec!["x.txt"]);
-    }
-    assert_eq!(names(tree[1].children.as_ref().unwrap()), vec!["y.txt"]);
-  }
-
-  #[test]
-  fn expanded_path_outside_root_is_ignored() {
-    let dir = nested_root();
-    let other = nested_root();
-    let other_a = other.path().join("a");
-    let tree = list(dir.path(), &[&other_a]);
-    assert_eq!(tree[0].children, None);
-  }
-
-  #[test]
-  fn expanded_matches_whole_path_not_prefix() {
-    let dir = tempdir().unwrap();
-    let root = dir.path();
-    fs::create_dir(root.join("Tools")).unwrap();
-    fs::write(root.join("Tools/t.txt"), "x").unwrap();
-    fs::create_dir(root.join("Tools2")).unwrap();
-    fs::write(root.join("Tools2/u.txt"), "x").unwrap();
-    let tools2 = root.join("Tools2");
-    let tree = list(root, &[&tools2]);
-    assert_eq!(names(&tree), vec!["Tools", "Tools2"]);
-    assert_eq!(tree[0].children, None);
-    assert_eq!(names(tree[1].children.as_ref().unwrap()), vec!["u.txt"]);
+  fn children_of_the_filesystem_root_are_named_slash_name() {
+    let top = list(Path::new("/"));
+    assert!(!top.is_empty());
+    assert!(top.iter().all(|e| e.path == format!("/{}", e.name)));
   }
 
   #[test]
@@ -235,8 +206,7 @@ mod tests {
     fs::write(root.join(".secret"), "x").unwrap();
     fs::create_dir(root.join(".git")).unwrap();
     fs::write(root.join("visible.txt"), "x").unwrap();
-    let tree = list(root, &[]);
-    assert_eq!(names(&tree), vec!["visible.txt"]);
+    assert_eq!(names(&list(root)), vec!["visible.txt"]);
   }
 
   #[test]
@@ -247,23 +217,94 @@ mod tests {
     fs::write(root.join("apple.txt"), "x").unwrap();
     fs::create_dir(root.join("src")).unwrap();
     fs::create_dir(root.join("Docs")).unwrap();
-    let tree = list(root, &[]);
-    assert_eq!(names(&tree), vec!["Docs", "src", "apple.txt", "Zebra.txt"]);
+    assert_eq!(
+      names(&list(root)),
+      vec!["Docs", "src", "apple.txt", "Zebra.txt"]
+    );
   }
 
   #[test]
-  fn missing_root_errors() {
+  fn missing_dir_errors() {
     let dir = tempdir().unwrap();
     let missing = dir.path().join("does-not-exist");
-    assert!(list_project_tree(missing.to_string_lossy().to_string(), vec![]).is_err());
+    assert!(list_project_dir(missing.to_string_lossy().to_string()).is_err());
   }
 
   #[test]
-  fn file_as_root_errors() {
+  fn file_as_dir_errors() {
     let dir = tempdir().unwrap();
     let file = dir.path().join("file.txt");
     fs::write(&file, "x").unwrap();
-    assert!(list_project_tree(file.to_string_lossy().to_string(), vec![]).is_err());
+    assert!(list_project_dir(file.to_string_lossy().to_string()).is_err());
+  }
+
+  fn tab<'a>(group: &'a str, file: Option<&'a str>, project: Option<&'a str>) -> StoredTab<'a> {
+    StoredTab {
+      group,
+      file_path: file,
+      project,
+    }
+  }
+
+  #[test]
+  fn window_holding_the_file_wins_over_the_project_window() {
+    let tabs = [
+      tab("proj", Some("/x/other.txt"), Some("/x")),
+      tab("holder", Some("/x/y/a.txt"), Some("/x/y")),
+    ];
+    let target = choose_window(&tabs, "/x/y/a.txt", "/x", |_| true);
+    assert_eq!(target, OpenTarget::Holder("holder".into()));
+  }
+
+  #[test]
+  fn project_window_is_used_when_nothing_holds_the_file() {
+    let tabs = [
+      tab("elsewhere", Some("/z/a.txt"), Some("/z")),
+      tab("proj", Some("/x/other.txt"), Some("/x")),
+    ];
+    let target = choose_window(&tabs, "/x/new.txt", "/x", |_| true);
+    assert_eq!(target, OpenTarget::Project("proj".into()));
+  }
+
+  #[test]
+  fn a_new_window_opens_when_no_live_window_matches() {
+    let tabs = [tab("elsewhere", Some("/z/a.txt"), Some("/z"))];
+    let target = choose_window(&tabs, "/x/new.txt", "/x", |_| true);
+    assert_eq!(target, OpenTarget::Fresh);
+    assert_eq!(
+      choose_window(&[], "/x/new.txt", "/x", |_| true),
+      OpenTarget::Fresh
+    );
+  }
+
+  #[test]
+  fn a_closed_group_listed_first_never_wins_over_a_live_one() {
+    let tabs = [
+      tab("closed", Some("/x/other.txt"), Some("/x")),
+      tab("live", Some("/x/more.txt"), Some("/x")),
+    ];
+    let live = |group: &str| group == "live";
+    let target = choose_window(&tabs, "/x/new.txt", "/x", live);
+    assert_eq!(target, OpenTarget::Project("live".into()));
+    // The same holds for the window holding the file.
+    let tabs = [
+      tab("closed", Some("/x/a.txt"), Some("/x")),
+      tab("live", Some("/x/a.txt"), Some("/x")),
+    ];
+    let target = choose_window(&tabs, "/x/a.txt", "/x", live);
+    assert_eq!(target, OpenTarget::Holder("live".into()));
+  }
+
+  #[test]
+  fn only_closed_groups_open_a_new_window() {
+    let tabs = [
+      tab("closed", Some("/x/a.txt"), Some("/x")),
+      tab("closed2", Some("/x/b.txt"), Some("/x")),
+    ];
+    assert_eq!(
+      choose_window(&tabs, "/x/a.txt", "/x", |_| false),
+      OpenTarget::Fresh
+    );
   }
 }
 
@@ -271,16 +312,38 @@ mod tests {
 mod window_command_threading_tests {
   const SOURCE: &str = include_str!("project.rs");
 
-  #[test]
-  fn open_project_file_is_async() {
+  fn assert_async(function: &str) {
     let at = SOURCE
-      .find("pub fn open_project_file")
-      .expect("open_project_file");
+      .find(&format!("pub fn {function}("))
+      .unwrap_or_else(|| panic!("{function}"));
     let attribute = SOURCE[..at].trim_end();
     assert!(
       attribute.ends_with("#[tauri::command(async)]"),
-      "open_project_file must be #[tauri::command(async)]: a blocking command that \
-       builds a window deadlocks the Windows UI thread"
+      "{function} must be #[tauri::command(async)]"
     );
+  }
+
+  #[test]
+  fn open_project_file_is_async() {
+    // A blocking command that builds a window deadlocks the Windows UI thread.
+    assert_async("open_project_file");
+  }
+
+  #[test]
+  fn list_project_dir_is_async() {
+    // A synchronous command reads the folder on the main thread.
+    assert_async("list_project_dir");
+  }
+
+  #[test]
+  fn forget_project_rebinds_is_async() {
+    // Same worker-thread rule as the other project commands.
+    assert_async("forget_project_rebinds");
+  }
+
+  #[test]
+  fn rebind_project_is_async() {
+    // It rewrites snapshot files, which a worker thread should do.
+    assert_async("rebind_project");
   }
 }

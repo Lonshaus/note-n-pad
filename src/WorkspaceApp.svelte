@@ -2,7 +2,7 @@
   // Copyright © 2026 Lonshaus
   // SPDX-License-Identifier: GPL-3.0-only
 
-  import { onMount } from 'svelte';
+  import { onMount, tick } from 'svelte';
   import { invoke } from '@tauri-apps/api/core';
   import { getCurrentWindow } from '@tauri-apps/api/window';
   import { open } from '@tauri-apps/plugin-dialog';
@@ -15,17 +15,27 @@
   import { debounce } from './lib/util/debounce';
   import { nativeFieldHistory, nativeSelectAll } from './lib/util/menuBar';
   import { docLabel, groupOpenDocuments } from './lib/util/openDocuments';
+  import { guessOsFromUserAgent } from './lib/util/guessOs';
   import {
+    addRoot,
+    expandedByRoot,
+    normalizeRoots,
+    projectExpandedFrom,
     projectRootsFrom,
+    restoreExpanded,
+    revealPaths,
+    rootContaining,
     type LoadedProjectRoots,
   } from './lib/util/projectRoots';
+  import type { TreeEntry, VisibleRow } from './lib/util/projectTree';
   import {
-    createProjectLoader,
-    flattenTree,
-    type LoadedProject,
-    type TreeEntry,
-    type VisibleRow,
-  } from './lib/util/projectTree';
+    flatten,
+    parentOf,
+    renameInSet,
+    TreeCache,
+    withoutSubtree,
+    type DirListing,
+  } from './lib/util/treeCache';
   import ConfirmModal from './lib/ConfirmModal.svelte';
   import type { NoteSnapshot } from './lib/state/stickyNote.svelte';
 
@@ -79,11 +89,17 @@
     }
     return map;
   });
-
+  // Project folders are matched without regard to case on macOS and Windows.
+  const caseInsensitive = guessOsFromUserAgent(navigator.userAgent) !== 'linux';
+  // Projects never overlap, so one expanded set and one row key (the path)
+  // serve every project.
   let projectRoots = $state<string[]>([]);
-  let projects = $state<LoadedProject[]>([]);
-  // Paths of expanded folders. Sub-folders default collapsed; project roots are
-  // seeded here on load so they default expanded.
+  // Folder listings, read one level at a time. Plain mutable state: every change
+  // bumps `cacheVersion`, which the derived rows read.
+  const cache = new TreeCache();
+  let cacheVersion = $state(0);
+  // Paths of expanded folders. Sub-folders default collapsed; a new project's
+  // root is added here so it defaults expanded.
   let expanded = $state<Set<string>>(new Set());
   // Tree rows currently selected (Finder-style multi-select: click selects, a
   // file opens on double-click, and the row context menu can open the whole
@@ -96,49 +112,11 @@
     return path.split(/[/\\]/).filter(Boolean).pop() ?? path;
   }
 
-  /** Parent directory of a path (POSIX-normalised), keeping a leading slash. */
-  function dirname(path: string): string {
-    const parts = path.split(/[/\\]/);
-    parts.pop();
-    return parts.join('/');
-  }
-
   const visibleRows = $derived.by<VisibleRow[]>(() => {
-    const out: VisibleRow[] = [];
-    for (const p of projects) {
-      const rootOpen = expanded.has(p.root);
-      out.push({
-        name: p.name,
-        path: p.root,
-        isDir: true,
-        depth: 0,
-        expanded: rootOpen,
-        // A root whose folder failed to load is kept but not expandable.
-        expandable: p.error === null,
-        root: true,
-        project: p.root,
-        isError: false,
-      });
-      if (!rootOpen) {
-        continue;
-      }
-      if (p.error !== null) {
-        out.push({
-          name: '',
-          path: `${p.root}\u0000error`,
-          isDir: false,
-          depth: 1,
-          expanded: false,
-          expandable: false,
-          root: false,
-          project: p.root,
-          isError: true,
-        });
-      } else {
-        out.push(...flattenTree(p.tree, expanded, 1, p.root));
-      }
-    }
-    return out;
+    void cacheVersion;
+    return projectRoots.flatMap((root) =>
+      flatten(cache, root, basename(root), expanded),
+    );
   });
 
   async function reload(): Promise<void> {
@@ -155,55 +133,180 @@
       }
     }
   }
+  // DEV automation only: how many folder reads were issued, and the reads still
+  // running.
+  let listDirCalls = 0;
+  const inflight = new Set<Promise<void>>();
+  // Folder to scroll to once its row exists.
+  let revealPath: string | null = null;
 
-  async function loadTreeFor(
-    root: string,
-    expandedPaths: ReadonlySet<string>,
-  ): Promise<LoadedProject> {
+  function touch(): void {
+    cacheVersion += 1;
+  }
+
+  async function readDir(root: string, dir: string): Promise<void> {
+    const token = cache.begin(root, dir);
+    listDirCalls += 1;
+    let listing: DirListing;
     try {
-      const tree = await invoke<TreeEntry[]>('list_project_tree', {
-        root,
-        expanded: [...expandedPaths],
-      });
-      return { root, name: basename(root), tree, error: null };
+      const entries = await invoke<TreeEntry[]>('list_project_dir', { dir });
+      listing = { entries, error: null };
     } catch (e) {
-      // Folder moved or deleted: keep the root row, surface a muted error row.
-      return { root, name: basename(root), tree: [], error: String(e) };
+      // Folder moved or deleted: the root keeps a muted error row.
+      listing = { entries: [], error: String(e) };
+    }
+    if (!cache.setDir(root, dir, token, listing)) {
+      return;
+    }
+    syncExpanded(root);
+    touch();
+    loadPending();
+    void scrollToReveal();
+  }
+  /** Make the open folders agree with what was read: one that is gone is
+   *  dropped from the saved state, one spelled with another case than on disk
+   *  takes the on-disk spelling. */
+  function syncExpanded(root: string): void {
+    const kept = cache.reconcile(root, expanded, caseInsensitive);
+    if (kept !== expanded) {
+      expanded = new Set(kept);
+      void persistExpanded();
     }
   }
-  // Only the newest load assigns `projects`; a cleared project list also drops
-  // any load still in flight.
-  const loader = createProjectLoader(loadTreeFor, (loaded) => {
-    projects = loaded;
-  });
-
-  async function loadAllTrees(): Promise<void> {
-    await loader.load(projectRoots, expanded);
+  /** Read every visible folder that has no listing yet (or a stale one). */
+  function loadPending(): void {
+    for (const root of projectRoots) {
+      for (const dir of cache.dirsToLoad(root, expanded)) {
+        const read: Promise<void> = readDir(root, dir).finally(() => {
+          inflight.delete(read);
+        });
+        inflight.add(read);
+      }
+    }
   }
 
-  async function persistRoots(): Promise<void> {
-    await settingsState.save({ project_roots: projectRoots });
+  async function treeIdle(): Promise<void> {
+    while (inflight.size > 0) {
+      await Promise.all([...inflight]);
+    }
+  }
+
+  async function scrollToReveal(): Promise<void> {
+    const path = revealPath;
+    if (path === null) {
+      return;
+    }
+    // The row spelled exactly so; else the one row that differs only in case.
+    const paths = visibleRows.map((r) => r.path);
+    const like = paths.filter(
+      (p) => caseInsensitive && p.toLowerCase() === path.toLowerCase(),
+    );
+    const target = paths.includes(path)
+      ? path
+      : like.length === 1
+        ? like[0]
+        : undefined;
+    if (target === undefined) {
+      return;
+    }
+    revealPath = null;
+    await tick();
+    const row = [...document.querySelectorAll<HTMLElement>('.tree-li')].find(
+      (el) => el.dataset['path'] === target,
+    );
+    row?.scrollIntoView({ block: 'nearest' });
+  }
+  /** Read a folder again; its old listing stays on screen until the new one
+   *  arrives. */
+  function refreshDir(dir: string): void {
+    const root = rootContaining(projectRoots, dir, caseInsensitive);
+    if (root === null) {
+      return;
+    }
+    cache.invalidate(root, dir);
+    loadPending();
+  }
+
+  function refreshAll(): void {
+    for (const root of projectRoots) {
+      cache.invalidateRoot(root);
+    }
+    loadPending();
+  }
+  // Saves run one after another, each built from the state at the time it runs,
+  // so the last toggle is the one that sticks.
+  let saving: Promise<void> = Promise.resolve();
+
+  function persistExpanded(): Promise<void> {
+    saving = saving.then(() =>
+      settingsState.save({
+        project_expanded: expandedByRoot(
+          projectRoots,
+          expanded,
+          caseInsensitive,
+        ),
+      }),
+    );
+    return saving;
+  }
+
+  function persistProjects(): Promise<void> {
+    saving = saving.then(() =>
+      settingsState.save({
+        project_roots: projectRoots,
+        project_expanded: expandedByRoot(
+          projectRoots,
+          expanded,
+          caseInsensitive,
+        ),
+      }),
+    );
+    return saving;
   }
 
   async function addProject(path: string): Promise<void> {
-    // Dedupe identical roots.
-    if (projectRoots.includes(path)) {
+    const result = addRoot(projectRoots, path, caseInsensitive);
+    if (result.kind === 'same') {
       return;
     }
-    projectRoots = [...projectRoots, path];
-    // A newly added project defaults expanded.
-    expanded = new Set(expanded).add(path);
-    await persistRoots();
-    await loadAllTrees();
+    if (result.kind === 'new' || result.kind === 'merged') {
+      // A folder that was folded into another project earlier in this run is a
+      // project of its own again.
+      await invoke('forget_project_rebinds', { roots: [result.project] });
+    }
+    // Notes of a project that folds into this one move to it first, so no
+    // window is left pointing at a project that is gone.
+    for (const change of result.rebinds) {
+      await invoke('rebind_project', { from: change.from, to: change.to });
+      cache.dropRoot(change.from);
+    }
+    expanded = revealPaths(
+      expanded,
+      result.project,
+      result.reveal,
+      caseInsensitive,
+    );
+    if (result.kind === 'inside') {
+      void persistExpanded();
+    } else {
+      projectRoots = result.roots;
+      void persistProjects();
+    }
+    syncExpanded(result.project);
+    revealPath = result.reveal[0] ?? result.project;
+    touch();
+    loadPending();
+    await treeIdle();
+    void scrollToReveal();
   }
 
   async function removeProject(path: string): Promise<void> {
     projectRoots = projectRoots.filter((r) => r !== path);
-    const next = new Set(expanded);
-    next.delete(path);
-    expanded = next;
-    await persistRoots();
-    await loadAllTrees();
+    cache.dropRoot(path);
+    expanded = withoutSubtree(expanded, path);
+    selectedPaths = withoutSubtree(selectedPaths, path);
+    touch();
+    await persistProjects();
   }
 
   async function pickProject(): Promise<void> {
@@ -215,11 +318,14 @@
   }
 
   async function clearProject(): Promise<void> {
+    for (const root of projectRoots) {
+      cache.dropRoot(root);
+    }
     projectRoots = [];
-    loader.invalidate();
-    projects = [];
     expanded = new Set();
-    await persistRoots();
+    selectedPaths = new Set();
+    touch();
+    await persistProjects();
   }
 
   function toggleFolder(path: string): void {
@@ -230,9 +336,10 @@
     } else {
       next.add(path);
       expanded = next;
-      // The folder's entries are read only once it is expanded.
-      void loadAllTrees();
+      // Only this folder's own level is read, and only if it has no listing.
+      loadPending();
     }
+    void persistExpanded();
   }
 
   function openFile(path: string, project: string): void {
@@ -342,25 +449,50 @@
     name: string,
   ): Promise<void> {
     const path = await invoke<string>('create_file', { parent, name });
-    await loadAllTrees();
+    refreshDir(parent);
+    await treeIdle();
     // A new file opens immediately, matching the row's project routing.
     openFile(path, project);
   }
 
   async function doCreateFolder(parent: string, name: string): Promise<void> {
     await invoke('create_folder', { parent, name });
-    await loadAllTrees();
+    refreshDir(parent);
+    await treeIdle();
   }
 
   async function doRename(path: string, newName: string): Promise<void> {
-    await invoke('rename_path', { path, newName });
+    const renamed = await invoke<string>('rename_path', { path, newName });
     // v1: a renamed open file keeps its old path in its tab until reopened.
-    await loadAllTrees();
+    const root = rootContaining(projectRoots, path, caseInsensitive);
+    if (root === path) {
+      // The project folder itself: reading it again shows the load error.
+      cache.invalidate(root, root);
+      loadPending();
+    } else if (root !== null) {
+      // A renamed folder keeps what was read below it and stays open.
+      cache.renameSubtree(root, path, renamed);
+      expanded = renameInSet(expanded, path, renamed);
+      selectedPaths = renameInSet(selectedPaths, path, renamed);
+      touch();
+      void persistExpanded();
+      refreshDir(parentOf(path));
+    }
+    await treeIdle();
   }
 
   async function doTrash(path: string): Promise<void> {
     await invoke('trash_path', { path });
-    await loadAllTrees();
+    const root = rootContaining(projectRoots, path, caseInsensitive);
+    if (root !== null && root !== path) {
+      cache.dropSubtree(root, path);
+      expanded = withoutSubtree(expanded, path);
+      selectedPaths = withoutSubtree(selectedPaths, path);
+      touch();
+      void persistExpanded();
+      refreshDir(parentOf(path));
+    }
+    await treeIdle();
   }
 
   // Path of a reveal that could not be carried out. The list can outlive the
@@ -381,11 +513,12 @@
     // Into a folder row: create as its first child. On a file row: create a
     // sibling in the file's parent directory.
     const intoDir = p.isDir;
-    const parent = intoDir ? p.path : dirname(p.path);
+    const parent = intoDir ? p.path : parentOf(p.path);
     const depth = intoDir ? p.depth + 1 : p.depth;
     if (intoDir && !expanded.has(p.path)) {
       expanded = new Set(expanded).add(p.path);
-      void loadAllTrees();
+      loadPending();
+      void persistExpanded();
     }
     inlineError = null;
     inlineEdit = {
@@ -559,14 +692,28 @@
     // dark-theme window never flashes its default white background.
     void revealWhenThemed();
     void reload();
-
-    // Restore the saved project roots (each default expanded) and load their
-    // trees on startup.
+    // Restore the saved project roots and what was expanded in them, and read
+    // the visible folders. A list an older version left with nested projects is
+    // folded into the outer ones, and the result is saved back.
     void (async (): Promise<void> => {
       const loaded = await invoke<LoadedProjectRoots>('load_settings');
-      projectRoots = projectRootsFrom(loaded);
-      expanded = new Set(projectRoots);
-      await loadAllTrees();
+      const saved = projectRootsFrom(loaded);
+      const merged = normalizeRoots(saved, caseInsensitive);
+      await invoke('forget_project_rebinds', { roots: merged.roots });
+      for (const change of merged.rebinds) {
+        await invoke('rebind_project', { from: change.from, to: change.to });
+      }
+      projectRoots = merged.roots;
+      expanded = restoreExpanded(
+        merged.roots,
+        projectExpandedFrom(loaded),
+        merged.reveal,
+        caseInsensitive,
+      );
+      if (merged.rebinds.length > 0 || merged.roots.length !== saved.length) {
+        await persistProjects();
+      }
+      loadPending();
     })();
 
     // Live sync: any store mutation re-reads the note list (debounced so a burst
@@ -667,6 +814,10 @@
                 dirty: !r.isDir && (openDocs.get(r.path) ?? false),
               })),
           toggleFolder: (path: string) => toggleFolder(path),
+          getProjectRoots: () => [...projectRoots],
+          getExpandedPaths: () => [...expanded].sort(),
+          getListDirCalls: () => listDirCalls,
+          treeIdle: () => treeIdle(),
           clickFile: (path: string) => {
             // Route with the row's project, matching a real click.
             const row = visibleRows.find(
@@ -934,7 +1085,7 @@
               class="icon-btn"
               title={t('workspace.project.refresh')}
               aria-label={t('workspace.project.refresh')}
-              onclick={() => loadAllTrees()}
+              onclick={() => refreshAll()}
             >
               <svg
                 viewBox="0 0 24 24"
@@ -1033,6 +1184,7 @@
           {#each visibleRows as row (row.path)}
             <li
               class="tree-li"
+              data-path={row.path}
               oncontextmenu={(e) => {
                 if (row.isError) {
                   return;

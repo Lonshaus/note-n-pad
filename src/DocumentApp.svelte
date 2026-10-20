@@ -87,6 +87,7 @@
   import { CloseGate } from './lib/state/closeGate.svelte';
   import { READ_ONLY_DESTINATION } from './lib/util/protocol';
   import { fileName } from './lib/util/filePath';
+  import { reboundProject } from './lib/util/projectRoots';
   import { formatFileSize } from './lib/util/format';
   import { textFromString } from './lib/util/text';
   import { focusEditorIfIdle } from './lib/util/editorFocus';
@@ -1450,6 +1451,17 @@
       void documentWindow.openTab(event.payload);
     });
     openFileListening = unlistenOpenFile;
+    // The project this window's tabs belong to was folded into the one above it.
+    const unlistenRebound = listen<{ from: string; to: string }>(
+      'project-rebound',
+      (event) => {
+        documentWindow.project = reboundProject(
+          documentWindow.project,
+          event.payload.from,
+          event.payload.to,
+        );
+      },
+    );
 
     // A splice rewrote a source file (this window or another): if a large-file
     // viewer of that path is open here, rebuild its stale line index.
@@ -1686,6 +1698,7 @@
       void unlistenSwitchTab.then((u) => u());
       void unlistenCloseTab.then((u) => u());
       void unlistenOpenFile.then((u) => u());
+      void unlistenRebound.then((u) => u());
       void unlistenSpliced.then((u) => u());
       void unlistenFlush.then((u) => u());
       void unlistenFlushCancelled.then((u) => u());
