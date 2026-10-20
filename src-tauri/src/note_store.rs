@@ -617,7 +617,6 @@ impl NoteStore {
   /// Move every stored note tagged `from` (closed window groups included) to
   /// project `to`, and remember the rebind so a write still tagged `from` that
   /// arrives later is re-tagged too. Returns how many notes were rewritten.
-  #[cfg(not(feature = "lite"))]
   pub fn rebind_project(&self, from: &str, to: &str) -> Result<usize, String> {
     let mut inner = self.inner.lock().unwrap();
     let edge = to;
@@ -643,7 +642,6 @@ impl NoteStore {
   /// as its range source, closed window groups included) at `to` instead, for
   /// notes under `from` too. Returns how many notes were rewritten. Sequence
   /// numbers stay as they are: a window re-sends its tabs with newer ones.
-  #[cfg(not(feature = "lite"))]
   pub fn retarget_paths(&self, from: &str, to: &str) -> Result<usize, String> {
     use crate::file_ops::retarget_path;
     let mut inner = self.inner.lock().unwrap();
@@ -673,7 +671,6 @@ impl NoteStore {
   /// `root` is a project of its own again: drop the rebind that folded it into
   /// another project, so a later write tagged `root` stays on it. A chain that
   /// runs through `root` stops there.
-  #[cfg(not(feature = "lite"))]
   pub fn forget_rebind(&self, root: &str) {
     self.inner.lock().unwrap().rebinds.remove(root);
   }
@@ -2402,7 +2399,6 @@ mod tests {
     assert_eq!(reloaded, vec![d]);
   }
 
-  #[cfg(not(feature = "lite"))]
   fn doc_in(id: &str, group: &str, project: Option<&str>) -> NoteSnapshot {
     NoteSnapshot {
       project: project.map(str::to_string),
@@ -2410,7 +2406,6 @@ mod tests {
     }
   }
 
-  #[cfg(not(feature = "lite"))]
   #[test]
   fn rebind_project_rewrites_only_the_matching_project() {
     let dir = tempdir().unwrap();
@@ -2433,7 +2428,6 @@ mod tests {
     assert_eq!(reloaded.get("b").unwrap().project.as_deref(), Some("/x"));
   }
 
-  #[cfg(not(feature = "lite"))]
   #[test]
   fn ordered_write_that_arrives_after_a_rebind_keeps_the_new_project() {
     let dir = tempdir().unwrap();
@@ -2463,7 +2457,6 @@ mod tests {
     assert_eq!(store.get("c").unwrap().project.as_deref(), Some("/x/other"));
   }
 
-  #[cfg(not(feature = "lite"))]
   #[test]
   fn chained_rebinds_resolve_to_the_last_project() {
     let dir = tempdir().unwrap();
@@ -2481,7 +2474,6 @@ mod tests {
     assert_eq!(store.get("b").unwrap().project.as_deref(), Some("/x"));
   }
 
-  #[cfg(not(feature = "lite"))]
   #[test]
   fn a_forgotten_rebind_leaves_later_writes_on_their_project() {
     let dir = tempdir().unwrap();
@@ -2500,7 +2492,6 @@ mod tests {
     store.forget_rebind("/never");
   }
 
-  #[cfg(not(feature = "lite"))]
   #[test]
   fn a_chain_stops_at_the_project_that_was_forgotten() {
     let dir = tempdir().unwrap();
@@ -2519,7 +2510,6 @@ mod tests {
     assert_eq!(store.get("c").unwrap().project.as_deref(), Some("/x"));
   }
 
-  #[cfg(not(feature = "lite"))]
   #[test]
   fn rebinding_a_project_to_itself_changes_nothing() {
     let dir = tempdir().unwrap();
@@ -2530,7 +2520,6 @@ mod tests {
     assert_eq!(store.get("a").unwrap().project.as_deref(), Some("/x"));
   }
 
-  #[cfg(not(feature = "lite"))]
   fn doc_at(id: &str, group: &str, file: Option<&str>, range: Option<&str>) -> NoteSnapshot {
     NoteSnapshot {
       file_path: file.map(str::to_string),
@@ -2539,7 +2528,6 @@ mod tests {
     }
   }
 
-  #[cfg(not(feature = "lite"))]
   #[test]
   fn retarget_paths_rewrites_the_file_and_the_range_source() {
     let dir = tempdir().unwrap();
@@ -2578,7 +2566,6 @@ mod tests {
     );
   }
 
-  #[cfg(not(feature = "lite"))]
   #[test]
   fn renaming_a_folder_moves_every_record_below_it() {
     let dir = tempdir().unwrap();
@@ -2607,7 +2594,6 @@ mod tests {
     );
   }
 
-  #[cfg(not(feature = "lite"))]
   #[test]
   fn a_write_from_before_a_rename_never_wins_over_the_newer_one() {
     let dir = tempdir().unwrap();

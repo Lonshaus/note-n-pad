@@ -79,9 +79,6 @@ class ThemeRegistry {
     } else {
       this.themes.push(theme);
     }
-    if (__LITE__) {
-      return;
-    }
     await invoke('save_theme', { theme, seq: nextSeq() });
     await this.load();
   }
@@ -90,16 +87,10 @@ class ThemeRegistry {
    *  reactive entry in place (so the preview updates), so a reload would only
    *  replace the array with an identical copy mid-edit. Use for debounced edits. */
   async persist(theme: Theme): Promise<void> {
-    if (__LITE__) {
-      return;
-    }
     await invoke('save_theme', { theme, seq: nextSeq() });
   }
 
   async remove(id: string): Promise<void> {
-    if (__LITE__) {
-      return;
-    }
     await invoke('delete_theme', { id });
     await this.load();
   }
@@ -107,25 +98,16 @@ class ThemeRegistry {
   /** Read + validate a theme file (no persistence); the caller assigns a fresh
    *  id and calls `save` so an import never clobbers an existing theme. */
   async importFile(path: string): Promise<Theme> {
-    if (__LITE__) {
-      throw new Error('Theme import is not available');
-    }
     return await invoke<Theme>('import_theme', { path });
   }
 
   async exportFile(theme: Theme, path: string): Promise<void> {
-    if (__LITE__) {
-      return;
-    }
     await invoke('export_theme', { theme, path });
   }
 
   /** Restore a default theme to its seeded values (colors + name). Only valid
    *  for themes whose id has a bundled default (`isDefault`). */
   async restoreDefault(id: string): Promise<void> {
-    if (__LITE__) {
-      return;
-    }
     await invoke('restore_default_theme', { id });
     await this.load();
   }
