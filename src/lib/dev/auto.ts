@@ -188,6 +188,17 @@ export interface DocumentHooks {
   // Drives the same handoff the Tauri window-focus event triggers, so E2E can
   // exercise the focus-reclaim path without a real OS focus change.
   windowFocusGained: () => void;
+  /** File name shown by the missing-file dialog now up, or null. */
+  missingVisible: () => string | null;
+  /** Labels of the buttons drawn in that dialog, or null when it is not up. */
+  missingButtons: () => string[] | null;
+  /** Its "save as new" button, with the target given instead of the dialog. */
+  missingSaveAs: (path: string) => Promise<boolean>;
+  /** Its "discard changes" button. */
+  missingDiscard: () => Promise<void>;
+  /** Labels of the buttons drawn in the write-back conflict dialog now up (the
+   *  range box's or the windowed tab's), or null when neither is. */
+  conflictButtons: () => string[] | null;
 }
 
 /** Whether the active editor's content DOM currently holds keyboard focus. */

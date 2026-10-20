@@ -33,6 +33,9 @@ export interface RangeBox {
   content: Text;
   /** The last write-back found the source changed; the conflict dialog is up. */
   conflict: boolean;
+  /** The source file was found deleted or moved away while the box held
+   *  changes. The box then offers no write-back into it. */
+  missing: boolean;
 }
 /** What opening a box needs: the span and lines it was selected by, the source
  *  fingerprint, and the slice's text exactly as read. */
@@ -62,6 +65,7 @@ export function openRangeBox(init: RangeBoxInit): RangeBox {
     saved: content,
     content,
     conflict: false,
+    missing: false,
   };
 }
 /** What can happen to an open box. */

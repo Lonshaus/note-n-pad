@@ -85,6 +85,7 @@
     type DocTab,
   } from './lib/state/documentWindow.svelte';
   import { CloseGate } from './lib/state/closeGate.svelte';
+  import { MissingFiles } from './lib/state/missingFiles.svelte';
   import { READ_ONLY_DESTINATION } from './lib/util/protocol';
   import { fileName } from './lib/util/filePath';
   import { reboundProject } from './lib/util/projectRoots';
@@ -125,16 +126,24 @@
   // A window made by New Window starts with one blank tab.
   const startBlank = params.get('blank') === '1';
 
-  let showModal = $state(false);
   // The gate before a quit, a window close or a tab close that would lose what no
   // snapshot can carry; see CloseGate. Its host callbacks are function
   // declarations below, so they are ready by the time a handshake runs.
-  const gate = new CloseGate(documentWindow, {
+  const gate: CloseGate = new CloseGate(documentWindow, {
     label: win.label,
     finishWindowClose: () => finishWindowClose(),
     finishTabClose: () => finishTabClose(),
     focusWindow: () => win.setFocus(),
+    promptBlocked: () => missing.current() !== null,
   });
+  // The tabs whose file is gone, and the close confirmation they share a rule
+  // with; see MissingFiles.
+  const missing: MissingFiles = new MissingFiles(documentWindow, gate, {
+    finishTabClose: (keepWindow) => finishTabClose(keepWindow),
+    closeEmptyWindow: () => win.destroy(),
+  });
+  // The dialog for the first tab whose file is gone, if it is showing.
+  const missingItem = $derived(missing.current());
   // Set when a windowed apply/read fails: the editor has locked itself and the
   // message is shown so the divergence is visible rather than silent.
   let windowedError = $state<string | null>(null);
@@ -677,6 +686,24 @@
   function tabName(path: string): string {
     return fileName(path) || t('doc.untitled');
   }
+  /** The message of the missing-file dialog now showing, or an empty string. */
+  function missingMessage(): string {
+    return missingItem === null
+      ? ''
+      : t('doc.missing.message', { name: tabName(missingItem.path) });
+  }
+  /** The button labels of the dialog showing `message`, or null when none shows
+   *  it (DEV/E2E surface, read from what is drawn). */
+  function buttonsOf(message: string): string[] | null {
+    for (const modal of document.querySelectorAll('.modal')) {
+      if (modal.querySelector('p')?.textContent === message) {
+        return [...modal.querySelectorAll('button')].map(
+          (button) => button.textContent?.trim() ?? '',
+        );
+      }
+    }
+    return null;
+  }
 
   /** The folder holding `path`, or null when there is none (an unsaved tab, or
    *  a bare file name). There is no dirname helper in this codebase; this
@@ -751,7 +778,8 @@
   // Any dialog/modal currently up. The automatic focus handoff is suppressed
   // while one is open so a gate/confirm keeps the keyboard.
   const anyModalOpen = $derived(
-    showModal ||
+    missing.confirmClose ||
+      missingItem !== null ||
       gate.visible ||
       pendingLarge !== null ||
       pendingLongLine !== null ||
@@ -780,7 +808,6 @@
       focusEditorIfIdle(liveView(), anyModalOpen);
     }
   }
-
   // The mounted TableView (only while the table view is shown), exposing its
   // menu API to the DEV automation surface.
   let tableRef = $state<{
@@ -1149,10 +1176,14 @@
     }
     switch (action) {
       case 'new-tab':
-        void documentWindow.newTab();
+        if (!missing.navigationLocked()) {
+          void documentWindow.newTab();
+        }
         break;
       case 'open':
-        void openInThisWindow();
+        if (!missing.navigationLocked()) {
+          void openInThisWindow();
+        }
         break;
       case 'save':
         void documentWindow.saveActive();
@@ -1187,8 +1218,9 @@
   }
 
   // Close the current active tab; its store entry is removed and the window
-  // closes when it was the last tab.
-  async function finishTabClose(): Promise<void> {
+  // closes when it was the last tab, unless a held-back quit or close is about
+  // to end it (`keepWindow`).
+  async function finishTabClose(keepWindow = false): Promise<void> {
     // Read the tab before deleting it: `deleteTab` splices it out of `tabs`, so
     // by the time it resolves there is nothing left to look the id up from and
     // its `viewModes` entry would sit there for the life of the window.
@@ -1197,52 +1229,21 @@
     if (closing !== null) {
       viewModes.delete(closing.id);
     }
-    if (documentWindow.tabs.length === 0) {
+    if (documentWindow.tabs.length === 0 && !keepWindow) {
       await win.destroy();
     }
   }
 
   function closeActive(): void {
-    const tab = documentWindow.activeTab;
-    if (tab === null) {
-      return;
-    }
-    // An edit box with changes must be dealt with before its tab goes.
-    if (
-      documentWindow.rangeBox?.tabId === tab.id &&
-      documentWindow.rangeBoxDirty()
-    ) {
-      void gate.promptTabClose();
-    } else if (documentWindow.isDirty(tab)) {
-      showModal = true;
-    } else {
-      void finishTabClose();
-    }
+    missing.requestClose();
   }
 
   async function requestCloseTab(index: number): Promise<void> {
-    await documentWindow.switchTo(index);
-    closeActive();
-  }
-
-  async function modalSave(): Promise<void> {
-    // A cancelled save dialog (untitled tab) aborts: keep the tab open and the
-    // confirm modal up, never falling through to close/discard.
-    if (!(await documentWindow.saveActive())) {
+    if (missing.navigationLocked()) {
       return;
     }
-    showModal = false;
-    await finishTabClose();
-  }
-
-  async function modalDiscard(): Promise<void> {
-    documentWindow.cancelPending();
-    showModal = false;
-    await finishTabClose();
-  }
-
-  function modalCancel(): void {
-    showModal = false;
+    await documentWindow.switchTo(index);
+    closeActive();
   }
 
   // Finish closing this window: clean tabs leave the store (a closed document
@@ -1364,7 +1365,7 @@
         }
       }
       // The box covers the tab bar: the tabs stay as they are until it closes.
-      if (documentWindow.rangeBox !== null) {
+      if (documentWindow.rangeBox !== null || missing.navigationLocked()) {
         return;
       }
       const next = shortcutsState.accel('window.next-tab');
@@ -1408,6 +1409,18 @@
         focusActiveEditor();
       }
     });
+    // Some window of the app came to the front: a file that was open here may
+    // have been deleted or moved meanwhile.
+    const unlistenAppFocused = win.listen('app-focused', () => {
+      void missing.check();
+    });
+    // A file or folder was renamed: tabs on it follow.
+    const unlistenPathsMoved = listen<{ from: string; to: string }>(
+      'paths-moved',
+      (event) => {
+        documentWindow.retargetPaths(event.payload.from, event.payload.to);
+      },
+    );
 
     // Cmd+W (routed from the app menu) closes the active tab, not the window.
     const unlistenMenuClose = win.listen('menu-close', () => closeActive());
@@ -1422,6 +1435,9 @@
     const unlistenSwitchTab = win.listen<number>(
       'workspace-switch-tab',
       (event) => {
+        if (missing.navigationLocked()) {
+          return;
+        }
         const index = documentWindow.tabs.findIndex(
           (t) => t.tabIndex === event.payload,
         );
@@ -1436,6 +1452,9 @@
     const unlistenCloseTab = win.listen<number>(
       'workspace-close-tab',
       (event) => {
+        if (missing.navigationLocked()) {
+          return;
+        }
         const index = documentWindow.tabs.findIndex(
           (t) => t.tabIndex === event.payload,
         );
@@ -1448,7 +1467,7 @@
     // Open a path as a tab in this window. Two producers: the workspace project
     // tree, and the shell handing over a file when the open target is "tab".
     const unlistenOpenFile = win.listen<string>('open-file-here', (event) => {
-      void documentWindow.openTab(event.payload);
+      void missing.openFile(event.payload);
     });
     openFileListening = unlistenOpenFile;
     // The project this window's tabs belong to was folded into the one above it.
@@ -1678,6 +1697,17 @@
           setLargeOpenMode: (m: LargeOpenMode) =>
             settingsState.setLargeOpenMode(m),
           windowFocusGained: () => focusActiveEditor(),
+          missingVisible: () =>
+            missingItem === null ? null : tabName(missingItem.path),
+          missingButtons: () => buttonsOf(missingMessage()),
+          missingSaveAs: (path: string) => missing.saveAs(path),
+          missingDiscard: () => missing.discard(),
+          conflictButtons: () =>
+            buttonsOf(
+              documentWindow.rangeBox?.conflict === true
+                ? t('doc.rangeConflict.message')
+                : t('doc.windowedConflict.message'),
+            ),
         }),
       );
     }
@@ -1693,6 +1723,8 @@
       void unlistenMoved.then((u) => u());
       void unlistenResized.then((u) => u());
       void unlistenFocus.then((u) => u());
+      void unlistenAppFocused.then((u) => u());
+      void unlistenPathsMoved.then((u) => u());
       void unlistenMenuClose.then((u) => u());
       void unlistenMenuAction.then((u) => u());
       void unlistenSwitchTab.then((u) => u());
@@ -2070,15 +2102,15 @@
     />
   {/if}
 
-  {#if showModal}
+  {#if missing.confirmClose}
     <ConfirmModal
       message={t('dialog.saveBeforeClose')}
       primaryLabel={t('common.save')}
       secondaryLabel={t('dialog.dontSave')}
       cancelLabel={t('common.cancel')}
-      onprimary={modalSave}
-      onsecondary={modalDiscard}
-      oncancel={modalCancel}
+      onprimary={() => missing.confirmSave()}
+      onsecondary={() => missing.confirmDiscard()}
+      oncancel={() => missing.cancelClose()}
     />
   {/if}
 
@@ -2176,9 +2208,13 @@
   {/if}
 
   {#if documentWindow.rangeBox?.conflict === true}
+    <!-- No "write anyway" once the source is gone: it would not be rewritten
+         but made again. -->
     <ConfirmModal
       message={t('doc.rangeConflict.message')}
-      primaryLabel={t('doc.conflict.writeAnyway')}
+      primaryLabel={documentWindow.rangeBox.missing
+        ? undefined
+        : t('doc.conflict.writeAnyway')}
       secondaryLabel={t('doc.conflict.saveAsNew')}
       cancelLabel={t('common.cancel')}
       onprimary={async () => {
@@ -2194,7 +2230,9 @@
   {#if documentWindow.windowedConflict !== null}
     <ConfirmModal
       message={t('doc.windowedConflict.message')}
-      primaryLabel={t('doc.conflict.writeAnyway')}
+      primaryLabel={documentWindow.windowedConflict.missing === true
+        ? undefined
+        : t('doc.conflict.writeAnyway')}
       secondaryLabel={t('doc.conflict.saveAsNew')}
       cancelLabel={t('common.cancel')}
       onprimary={async () => {
@@ -2238,6 +2276,22 @@
         await gate.discard();
       }}
       oncancel={() => gate.cancel()}
+    />
+  {/if}
+
+  {#if missingItem !== null}
+    <!-- Answered through its two buttons only: the tab keeps its unsaved
+         content, and a save dialog that is cancelled comes back here, so the
+         tab can never be written to the path that is gone. -->
+    <ConfirmModal
+      dismissable={false}
+      message={t('doc.missing.message', { name: tabName(missingItem.path) })}
+      primaryLabel={t('doc.missing.saveAs')}
+      secondaryLabel={t('doc.missing.discard')}
+      onprimary={async () => {
+        await missing.saveAs();
+      }}
+      onsecondary={() => missing.discard()}
     />
   {/if}
 

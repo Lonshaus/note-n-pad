@@ -1198,6 +1198,27 @@ pub fn windowed_save(
     path_override.map(PathBuf::from),
   )
 }
+/// Core of `windowed_set_path`: waits for a running replace-all, then points the
+/// session at `path`. The file's bytes are the same, so its index, digest and
+/// fingerprint stay valid.
+fn set_path_core(state: &WindowedState, session_id: u64, path: PathBuf) -> Result<(), String> {
+  let mut map = state.lock_idle(session_id)?;
+  let session = map
+    .get_mut(&session_id)
+    .ok_or_else(|| UNKNOWN_SESSION.to_string())?;
+  session.path = path;
+  Ok(())
+}
+/// The file a session edits was renamed or moved: later saves and conflict
+/// checks go to `path`. Nothing is read or written.
+#[tauri::command(async)]
+pub fn windowed_set_path(
+  state: State<WindowedState>,
+  session_id: u64,
+  path: String,
+) -> Result<(), String> {
+  set_path_core(&state, session_id, PathBuf::from(path))
+}
 /// Core of `windowed_close`: waits for a running replace-all, then drops the
 /// session. Its layers and journal go with it, and with them every change-list
 /// file nothing else reads; the user's file is never touched.
@@ -4267,6 +4288,48 @@ mod replace_tests {
     })
   }
 
+  fn fingerprint_of_session(fx: &Fixture) -> Fingerprint {
+    fx.with(|s| s.fingerprint.clone())
+  }
+
+  #[test]
+  fn a_save_after_set_path_writes_the_new_path_and_leaves_no_file_at_the_old_one() {
+    let fx = fixture(b"one\ntwo\n");
+    let moved = fx.dir.path().join("renamed.txt");
+    fs::rename(&fx.path, &moved).unwrap();
+    set_path_core(&fx.state, ID, moved.clone()).unwrap();
+    fx.edit(vec![ed(0, 3, "ONE")], true);
+    save_core(&fx.state, ID, None, None).unwrap();
+    assert_eq!(fs::read(&moved).unwrap(), b"ONE\ntwo\n");
+    assert!(!fx.path.exists(), "the old path must not come back");
+    assert_eq!(fx.with(|s| s.path.clone()), moved);
+  }
+
+  #[test]
+  fn the_conflict_check_after_set_path_reads_the_fingerprint_of_the_new_path() {
+    let fx = fixture(b"one\ntwo\n");
+    let before = fingerprint_of_session(&fx);
+    let moved = fx.dir.path().join("renamed.txt");
+    fs::rename(&fx.path, &moved).unwrap();
+    // Still aimed at the old path, the file looks gone and the save is refused.
+    let refused = save_core(&fx.state, ID, Some(before.clone()), None).unwrap_err();
+    assert_eq!(refused, FINGERPRINT_MISMATCH);
+    set_path_core(&fx.state, ID, moved.clone()).unwrap();
+    fx.edit(vec![ed(0, 3, "ONE")], true);
+    save_core(&fx.state, ID, Some(before), None).unwrap();
+    assert_eq!(fs::read(&moved).unwrap(), b"ONE\ntwo\n");
+    assert!(!fx.path.exists());
+  }
+
+  #[test]
+  fn set_path_on_an_unknown_session_is_refused() {
+    let fx = fixture(b"x");
+    assert_eq!(
+      set_path_core(&fx.state, ID + 1, fx.path.clone()).unwrap_err(),
+      UNKNOWN_SESSION
+    );
+  }
+
   fn tok_doc() -> Vec<u8> {
     "tok one\ntwo tok\nthree\nfour tok tok\nfive\n"
       .repeat(8)
@@ -4362,6 +4425,7 @@ mod heavy_io_command_threading_tests {
     "windowed_open",
     "windowed_reopen",
     "windowed_save",
+    "windowed_set_path",
     "windowed_read",
     "windowed_apply",
     "windowed_undo",
@@ -4410,6 +4474,7 @@ mod heavy_io_command_threading_tests {
     }
     for core in [
       "fn save_core",
+      "fn set_path_core",
       "fn close_core",
       "fn find_once",
       "fn search_core",

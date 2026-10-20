@@ -171,6 +171,10 @@ export const zhTW = {
   'doc.oversized.message':
     '此分頁的未儲存內容過大，無法保留快照，關閉前必須處理。',
   'doc.oversized.discard': '放棄變更',
+  'doc.missing.message':
+    '找不到「{name}」。檔案可能已被移動或刪除，未儲存的內容仍保留在分頁中。',
+  'doc.missing.saveAs': '另存新檔',
+  'doc.missing.discard': '放棄變更',
   'doc.rangeBox.unsaved': '範圍編輯框有未儲存的修改，關閉前必須處理。',
   'doc.snapshotFailed.message':
     '此分頁的未儲存內容無法寫入還原快照，關閉前必須處理。',

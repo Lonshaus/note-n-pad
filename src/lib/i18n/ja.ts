@@ -180,6 +180,10 @@ export const ja = {
   'doc.oversized.message':
     'このタブの未保存の内容は大きすぎてスナップショットを保持できません。閉じる前に処理が必要です。',
   'doc.oversized.discard': '変更を破棄',
+  'doc.missing.message':
+    '「{name}」が見つかりません。ファイルが移動または削除された可能性があります。未保存の内容はタブに残っています。',
+  'doc.missing.saveAs': '別名で保存',
+  'doc.missing.discard': '変更を破棄',
   'doc.rangeBox.unsaved':
     '範囲の編集ボックスに未保存の変更があります。閉じる前に処理が必要です。',
   'doc.snapshotFailed.message':

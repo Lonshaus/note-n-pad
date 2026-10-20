@@ -253,6 +253,46 @@ describe('dirsToLoad', () => {
   });
 });
 
+describe('shownDirs', () => {
+  function tree(): TreeCache {
+    const cache = new TreeCache();
+    put(cache, '/p', '/p', listing(entry('/p/x', true), entry('/p/z', true)));
+    put(cache, '/p', '/p/x', listing(entry('/p/x/y', true)));
+    put(cache, '/p', '/p/x/y', listing(entry('/p/x/y/f.txt', false)));
+    put(cache, '/p', '/p/z', listing(entry('/p/z/f.txt', false)));
+    return cache;
+  }
+
+  it('lists the open, read folders from the root down', () => {
+    const open = new Set(['/p', '/p/x', '/p/x/y']);
+    expect(tree().shownDirs('/p', open)).toEqual(['/p', '/p/x', '/p/x/y']);
+  });
+
+  it('leaves out an open folder under a closed one', () => {
+    // x is closed while y, below it, is still remembered as open.
+    const open = new Set(['/p', '/p/x/y', '/p/z']);
+    expect(tree().shownDirs('/p', open)).toEqual(['/p', '/p/z']);
+  });
+
+  it('lists nothing of a closed project', () => {
+    expect(tree().shownDirs('/p', new Set(['/p/x']))).toEqual([]);
+  });
+
+  it('leaves out an open folder that was never read, and what is below it', () => {
+    const cache = new TreeCache();
+    put(cache, '/p', '/p', listing(entry('/p/x', true)));
+    const open = new Set(['/p', '/p/x', '/p/x/y']);
+    expect(cache.shownDirs('/p', open)).toEqual(['/p']);
+  });
+
+  it('stops at a folder that could not be read', () => {
+    const cache = new TreeCache();
+    put(cache, '/p', '/p', { entries: [entry('/p/sub', true)], error: 'gone' });
+    put(cache, '/p', '/p/sub', listing());
+    expect(cache.shownDirs('/p', new Set(['/p', '/p/sub']))).toEqual(['/p']);
+  });
+});
+
 describe('dropSubtree and renameSubtree', () => {
   it('drops a folder and what is below it, not a sibling with the same prefix', () => {
     const cache = new TreeCache();

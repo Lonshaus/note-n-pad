@@ -299,6 +299,32 @@ export class TreeCache {
     visit(root, expanded.has(root));
     return out;
   }
+  /** The folders of a project that are on screen and already read: open, with
+   *  every folder above them up to the root open too. An open folder below a
+   *  closed one is not on screen and is left out. */
+  shownDirs(root: string, expanded: ReadonlySet<string>): string[] {
+    const out: string[] = [];
+    const state = this.roots.get(root);
+    const visit = (dir: string): void => {
+      const listing = state?.dirs.get(dir);
+      if (listing === undefined) {
+        return;
+      }
+      out.push(dir);
+      if (listing.error !== null) {
+        return;
+      }
+      for (const entry of listing.entries) {
+        if (entry.is_dir && expanded.has(entry.path)) {
+          visit(entry.path);
+        }
+      }
+    };
+    if (expanded.has(root)) {
+      visit(root);
+    }
+    return out;
+  }
 }
 /** The visible rows of one project: its folder row, then, while it is open, the
  *  rows below it. Each folder shows only what has been read of it. */

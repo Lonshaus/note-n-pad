@@ -657,6 +657,7 @@ mod gate_tests {
       "locale_store::delete_locale",
       "locale_store::restore_default_locale",
       "file_ops::reveal_in_finder",
+      "file_ops::missing_paths",
       "windows::focus_doc_tab",
       "windows::live_doc_groups",
       "windows::open_document_group",

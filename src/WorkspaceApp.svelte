@@ -226,6 +226,16 @@
     cache.invalidate(root, dir);
     loadPending();
   }
+  /** Read every folder on screen again: files may have been added, moved or
+   *  removed while another app had the focus. Folders that are closed, or open
+   *  under a closed one, are left alone; they are read when shown. */
+  function refreshOpenFolders(): void {
+    for (const root of projectRoots) {
+      for (const dir of cache.shownDirs(root, expanded)) {
+        refreshDir(dir);
+      }
+    }
+  }
 
   function refreshAll(): void {
     for (const root of projectRoots) {
@@ -463,7 +473,6 @@
 
   async function doRename(path: string, newName: string): Promise<void> {
     const renamed = await invoke<string>('rename_path', { path, newName });
-    // v1: a renamed open file keeps its old path in its tab until reopened.
     const root = rootContaining(projectRoots, path, caseInsensitive);
     if (root === path) {
       // The project folder itself: reading it again shows the load error.
@@ -722,6 +731,12 @@
       void reload();
     }, 100);
     const unlistenStore = win.listen('store-changed', () => refetch());
+    // Coming back to the workspace shows what the file system looks like now.
+    const unlistenFocus = win.onFocusChanged(({ payload: focused }) => {
+      if (focused) {
+        refreshOpenFolders();
+      }
+    });
 
     // Native context-menu selection: Rust echoes the chosen action plus the row
     // payload the menu was opened with.
@@ -863,6 +878,7 @@
       void unlistenThemes.then((u) => u());
       void unlistenLocales.then((u) => u());
       void unlistenStore.then((u) => u());
+      void unlistenFocus.then((u) => u());
       void unlistenCtx.then((u) => u());
       void unlistenMoved.then((u) => u());
       void unlistenResized.then((u) => u());

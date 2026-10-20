@@ -51,7 +51,7 @@
   import { onMount } from 'svelte';
   import { modalActsOnEscape } from './util/popupEscape';
 
-  interface Props {
+  interface BaseProps {
     message: string;
     // Optional, so a dialog that only reports something renders one button
     // rather than offering an action it does not have.
@@ -62,7 +62,6 @@
     // A tertiary button is optional too, rendered between secondary and cancel
     // (a third choice, e.g. the open dialog's "soft-wrap and open").
     tertiaryLabel?: string | undefined;
-    cancelLabel: string;
     // Widened so an async handler's returned promise is visible here rather
     // than discarded: a bare `() => void` parameter also accepts an
     // `async () => Promise<void>` argument (TypeScript never checks return-type
@@ -73,8 +72,18 @@
     onprimary?: (() => void | Promise<void>) | undefined;
     onsecondary?: (() => void | Promise<void>) | undefined;
     ontertiary?: (() => void | Promise<void>) | undefined;
-    oncancel: () => void;
   }
+  // A dialog can be dismissed (a Cancel button and Esc) or, with `dismissable`
+  // false, only answered through its other buttons.
+  type Props = BaseProps &
+    (
+      | { dismissable?: true; cancelLabel: string; oncancel: () => void }
+      | {
+          dismissable: false;
+          cancelLabel?: string | undefined;
+          oncancel?: (() => void) | undefined;
+        }
+    );
 
   let {
     message,
@@ -86,6 +95,7 @@
     onsecondary,
     ontertiary,
     oncancel,
+    dismissable = true,
   }: Props = $props();
 
   let root: HTMLElement;
@@ -148,8 +158,8 @@
       }
       e.preventDefault();
       e.stopPropagation();
-      if (isTop) {
-        oncancel();
+      if (isTop && dismissable) {
+        oncancel?.();
       }
     } else if (e.key === 'Tab') {
       // Focus never leaves the dialog: Tab cycles through its own buttons.
@@ -203,7 +213,10 @@
           >{tertiaryLabel}</button
         >
       {/if}
-      <button class="btn" data-cancel onclick={oncancel}>{cancelLabel}</button>
+      {#if dismissable}
+        <button class="btn" data-cancel onclick={oncancel}>{cancelLabel}</button
+        >
+      {/if}
     </div>
   </div>
 </div>

@@ -7,6 +7,7 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { Text } from '@codemirror/state';
 import { invoke } from '@tauri-apps/api/core';
+import { save } from '@tauri-apps/plugin-dialog';
 import { CloseGate, type GateHost } from './closeGate.svelte';
 import { DocumentWindowState, type DocTab } from './documentWindow.svelte';
 import { SNAPSHOT_CONTENT_MAX } from '../util/snapshotPolicy';
@@ -16,6 +17,7 @@ vi.mock('@tauri-apps/api/event', () => ({ emit: vi.fn(), listen: vi.fn() }));
 vi.mock('@tauri-apps/plugin-dialog', () => ({ save: vi.fn() }));
 
 const mockInvoke = vi.mocked(invoke);
+const mockSave = vi.mocked(save);
 vi.stubGlobal('window', globalThis);
 
 const SRC = '/tmp/big.log';
@@ -344,5 +346,105 @@ describe('what the gate asked about before the box', () => {
     await gate.discard();
     expect(gate.visible).toBe(true);
     expect(gate.reason).toBe('oversized');
+  });
+});
+
+describe('an edit box whose source file is gone', () => {
+  it('saves the box to a new file instead of writing back into the source', async () => {
+    await withBox(true);
+    win.rangeBox = { ...win.rangeBox!, missing: true };
+    const opened = vi.spyOn(win, 'openTab').mockResolvedValue();
+    mockSave.mockResolvedValue('/tmp/part.txt');
+    await gate.onFlushRequest();
+    expect(gate.reason).toBe('rangeBox');
+
+    await gate.save();
+
+    expect(sent()).not.toContain('splice_file');
+    expect(sent()).toContain('write_file_encoded');
+    expect(opened).toHaveBeenCalledWith('/tmp/part.txt');
+    expect(win.rangeBox).toBeNull();
+    expect(sent()).toContain('request_exit');
+  });
+
+  it('keeps the gate and the box when the new file is not chosen', async () => {
+    await withBox(true);
+    win.rangeBox = { ...win.rangeBox!, missing: true };
+    mockSave.mockResolvedValue(null);
+    await gate.onFlushRequest();
+
+    await gate.save();
+
+    expect(sent()).not.toContain('splice_file');
+    expect(sent()).not.toContain('write_file_encoded');
+    expect(win.rangeBox).not.toBeNull();
+    expect(sent()).not.toContain('request_exit');
+  });
+
+  it('closes no tab when a tab close asked about it: the new file is the active tab then', async () => {
+    await withBox(true);
+    win.rangeBox = { ...win.rangeBox!, missing: true };
+    vi.spyOn(win, 'openTab').mockResolvedValue();
+    mockSave.mockResolvedValue('/tmp/part.txt');
+    await gate.promptTabClose();
+
+    await gate.save();
+
+    expect(gate.visible).toBe(false);
+    expect(host.finishTabClose).not.toHaveBeenCalled();
+  });
+});
+
+describe('a prompt that another dialog holds back', () => {
+  let blocked: boolean;
+
+  beforeEach(() => {
+    blocked = true;
+    gate = new CloseGate(win, { ...host, promptBlocked: () => blocked });
+  });
+
+  it('is not shown while blocked, and the quit stays vetoed', async () => {
+    await withBox(true);
+    await gate.onFlushRequest();
+
+    expect(sent()).toContain('flush_cancel');
+    expect(gate.visible).toBe(false);
+    expect(sent()).not.toContain('request_exit');
+    expect(host.focusWindow).not.toHaveBeenCalled();
+  });
+
+  it('is shown when resumed, and only once', async () => {
+    await withBox(true);
+    await gate.onFlushRequest();
+    blocked = false;
+
+    await gate.resumeDeferred();
+    expect(gate.visible).toBe(true);
+    expect(gate.reason).toBe('rangeBox');
+
+    gate.cancel();
+    await gate.resumeDeferred();
+    expect(gate.visible).toBe(false);
+  });
+
+  it('keeps a window close waiting and goes on with it after the answer', async () => {
+    await withBox(true);
+    await gate.onCloseFlushRequest();
+    expect(host.finishWindowClose).not.toHaveBeenCalled();
+    expect(gate.visible).toBe(false);
+    blocked = false;
+
+    await gate.resumeDeferred();
+    expect(gate.visible).toBe(true);
+    await gate.discard();
+
+    expect(host.finishWindowClose).toHaveBeenCalledTimes(1);
+  });
+
+  it('does nothing when no prompt was held back', async () => {
+    blocked = false;
+    await gate.resumeDeferred();
+    expect(gate.visible).toBe(false);
+    expect(sent()).not.toContain('request_exit');
   });
 });

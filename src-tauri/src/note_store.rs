@@ -639,6 +639,37 @@ impl NoteStore {
     }
     Ok(rewritten)
   }
+  /// Point every stored note that names the file or folder `from` (as its file or
+  /// as its range source, closed window groups included) at `to` instead, for
+  /// notes under `from` too. Returns how many notes were rewritten. Sequence
+  /// numbers stay as they are: a window re-sends its tabs with newer ones.
+  #[cfg(not(feature = "lite"))]
+  pub fn retarget_paths(&self, from: &str, to: &str) -> Result<usize, String> {
+    use crate::file_ops::retarget_path;
+    let mut inner = self.inner.lock().unwrap();
+    let mut rewritten = 0;
+    for index in 0..inner.notes.len() {
+      let note = &inner.notes[index];
+      let file = note
+        .file_path
+        .as_deref()
+        .map(|p| retarget_path(p, from, to));
+      let source = note
+        .range_source
+        .as_deref()
+        .map(|p| retarget_path(p, from, to));
+      if file == note.file_path && source == note.range_source {
+        continue;
+      }
+      let mut moved = note.clone();
+      moved.file_path = file;
+      moved.range_source = source;
+      save_note(&inner.dir, &moved)?;
+      inner.notes[index] = moved;
+      rewritten += 1;
+    }
+    Ok(rewritten)
+  }
   /// `root` is a project of its own again: drop the rebind that folded it into
   /// another project, so a later write tagged `root` stays on it. A chain that
   /// runs through `root` stops there.
@@ -2497,6 +2528,114 @@ mod tests {
     assert_eq!(store.rebind_project("/x", "/x").unwrap(), 0);
     store.upsert(doc_in("a", "g1", Some("/x"))).unwrap();
     assert_eq!(store.get("a").unwrap().project.as_deref(), Some("/x"));
+  }
+
+  #[cfg(not(feature = "lite"))]
+  fn doc_at(id: &str, group: &str, file: Option<&str>, range: Option<&str>) -> NoteSnapshot {
+    NoteSnapshot {
+      file_path: file.map(str::to_string),
+      range_source: range.map(str::to_string),
+      ..doc(id, Some(group), 0)
+    }
+  }
+
+  #[cfg(not(feature = "lite"))]
+  #[test]
+  fn retarget_paths_rewrites_the_file_and_the_range_source() {
+    let dir = tempdir().unwrap();
+    let store = NoteStore::load(dir.path().to_path_buf()).unwrap();
+    store
+      .upsert(doc_at("a", "g1", Some("/x/f.txt"), None))
+      .unwrap();
+    // A group whose window is closed is still a stored record.
+    store
+      .upsert(doc_at("b", "g2", Some("/x/f.txt"), None))
+      .unwrap();
+    store
+      .upsert(doc_at("c", "g3", None, Some("/x/f.txt")))
+      .unwrap();
+    store
+      .upsert(doc_at("d", "g4", Some("/x/other.txt"), None))
+      .unwrap();
+    store.upsert(doc_at("e", "g5", None, None)).unwrap();
+    store.upsert(note("s")).unwrap();
+    assert_eq!(store.retarget_paths("/x/f.txt", "/x/g.txt").unwrap(), 3);
+    let file_of = |id: &str| store.get(id).unwrap().file_path;
+    assert_eq!(file_of("a").as_deref(), Some("/x/g.txt"));
+    assert_eq!(file_of("b").as_deref(), Some("/x/g.txt"));
+    assert_eq!(
+      store.get("c").unwrap().range_source.as_deref(),
+      Some("/x/g.txt")
+    );
+    assert_eq!(file_of("d").as_deref(), Some("/x/other.txt"));
+    assert_eq!(file_of("e"), None);
+    assert_eq!(file_of("s"), None);
+    // The rewrite reached the disk, not just the in-memory list.
+    let reloaded = NoteStore::load(dir.path().to_path_buf()).unwrap();
+    assert_eq!(
+      reloaded.get("b").unwrap().file_path.as_deref(),
+      Some("/x/g.txt")
+    );
+  }
+
+  #[cfg(not(feature = "lite"))]
+  #[test]
+  fn renaming_a_folder_moves_every_record_below_it() {
+    let dir = tempdir().unwrap();
+    let store = NoteStore::load(dir.path().to_path_buf()).unwrap();
+    store
+      .upsert(doc_at("a", "g1", Some("/x/y/f.txt"), None))
+      .unwrap();
+    store
+      .upsert(doc_at("b", "g1", Some("/x/y/deep/g.txt"), None))
+      .unwrap();
+    store
+      .upsert(doc_at("c", "g2", Some("/x/y2/f.txt"), None))
+      .unwrap();
+    store
+      .upsert(doc_at("d", "g2", None, Some("/x/y/big.log")))
+      .unwrap();
+    assert_eq!(store.retarget_paths("/x/y", "/x/z").unwrap(), 3);
+    let file_of = |id: &str| store.get(id).unwrap().file_path;
+    assert_eq!(file_of("a").as_deref(), Some("/x/z/f.txt"));
+    assert_eq!(file_of("b").as_deref(), Some("/x/z/deep/g.txt"));
+    // `/x/y2` is a different folder, not something below `/x/y`.
+    assert_eq!(file_of("c").as_deref(), Some("/x/y2/f.txt"));
+    assert_eq!(
+      store.get("d").unwrap().range_source.as_deref(),
+      Some("/x/z/big.log")
+    );
+  }
+
+  #[cfg(not(feature = "lite"))]
+  #[test]
+  fn a_write_from_before_a_rename_never_wins_over_the_newer_one() {
+    let dir = tempdir().unwrap();
+    let store = NoteStore::load(dir.path().to_path_buf()).unwrap();
+    let old = || doc_at("a", "g1", Some("/x/f.txt"), None);
+    let moved = || doc_at("a", "g1", Some("/x/g.txt"), None);
+    // Sent before the rename and applied.
+    assert!(store.upsert_ordered(old(), 7).unwrap());
+    store.retarget_paths("/x/f.txt", "/x/g.txt").unwrap();
+    assert_eq!(
+      store.get("a").unwrap().file_path.as_deref(),
+      Some("/x/g.txt")
+    );
+    // The window writes the tab again with the new path and a newer seq.
+    assert!(store.upsert_ordered(moved(), 8).unwrap());
+    // The old write, sent before the rename with seq 7, arrives only now.
+    assert!(!store.upsert_ordered(old(), 7).unwrap());
+    assert_eq!(
+      store.get("a").unwrap().file_path.as_deref(),
+      Some("/x/g.txt")
+    );
+    // A write after the rename is applied as usual.
+    assert!(store.upsert_ordered(moved(), 9).unwrap());
+    let reloaded = NoteStore::load(dir.path().to_path_buf()).unwrap();
+    assert_eq!(
+      reloaded.get("a").unwrap().file_path.as_deref(),
+      Some("/x/g.txt")
+    );
   }
 
   #[test]
