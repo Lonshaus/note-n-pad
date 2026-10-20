@@ -46,12 +46,19 @@ mod replace_layer;
 mod settings;
 mod shortcut;
 mod shortcuts;
+#[cfg_attr(not(all(target_os = "macos", feature = "storekit")), allow(dead_code))]
+mod store_state;
+#[cfg(all(target_os = "macos", feature = "storekit"))]
+mod storekit;
 mod theme_store;
 mod webview2_runtime;
 mod win_menu_gray;
 mod windowed;
 mod windowed_scan;
 mod windows;
+
+#[cfg(all(feature = "storekit", not(target_os = "macos")))]
+compile_error!("the `storekit` feature is the sandboxed store build, which is macOS only");
 
 use flush::{FlushGate, FlushOutcome};
 use note_store::NoteStore;
@@ -1050,13 +1057,14 @@ pub(crate) fn escape_menu_label(label: &str) -> String {
 }
 
 /// The Help menu's items in order, by menu id and label. "Full Version Features"
-/// sits between Report an Issue and Acknowledgements and exists only in lite.
-fn help_menu_entries(lite: bool) -> Vec<(&'static str, i18n::Key)> {
+/// sits between Report an Issue and Acknowledgements and exists only in a build
+/// with editions.
+fn help_menu_entries(editions: bool) -> Vec<(&'static str, i18n::Key)> {
   let mut entries = vec![
     ("help-documentation", i18n::Key::Documentation),
     ("help-report-issue", i18n::Key::ReportIssue),
   ];
-  if lite {
+  if editions {
     entries.push(("help-full-features", i18n::Key::FullFeatures));
   }
   entries.push(("help-acknowledgements", i18n::Key::Acknowledgements));
@@ -1474,9 +1482,10 @@ fn build_menu(
   let _ = window_menu.set_as_windows_menu_for_nsapp();
   // Help menu: Documentation and Report an Issue open the browser (routed to
   // `tauri_plugin_opener` in the menu-event handler); Full Version Features
-  // (Lite only), Acknowledgements and Privacy Policy each open our own window.
+  // (builds with editions only), Acknowledgements and Privacy Policy each open
+  // our own window.
   let help_menu = Submenu::new(app, tr(i18n::Key::HelpMenu), true)?;
-  for (id, key) in help_menu_entries(edition::is_lite()) {
+  for (id, key) in help_menu_entries(edition::editions_exist()) {
     help_menu.append(&MenuItem::with_id(app, id, tr(key), true, accel(id))?)?;
   }
   // On macOS this also gets the system-inserted menu search field; Windows and
@@ -2052,15 +2061,15 @@ mod help_menu_tests {
   use super::{accelerator_enabled, help_menu_entries, FocusKind};
   use crate::i18n::Key;
 
-  fn ids(lite: bool) -> Vec<&'static str> {
-    help_menu_entries(lite)
+  fn ids(editions: bool) -> Vec<&'static str> {
+    help_menu_entries(editions)
       .into_iter()
       .map(|(id, _)| id)
       .collect()
   }
 
   #[test]
-  fn lite_has_full_version_features_between_report_an_issue_and_acknowledgements() {
+  fn editions_have_full_version_features_between_report_an_issue_and_acknowledgements() {
     assert_eq!(
       ids(true),
       vec![
@@ -2075,7 +2084,7 @@ mod help_menu_tests {
   }
 
   #[test]
-  fn full_never_has_it() {
+  fn a_build_without_editions_never_has_it() {
     assert_eq!(
       ids(false),
       vec![
@@ -2106,7 +2115,9 @@ mod help_menu_tests {
     let source = include_str!("lib.rs");
     let at = source.find("fn build_menu(").unwrap();
     let body = &source[at..];
-    assert!(body[..body.find("\n}\n").unwrap()].contains("help_menu_entries(edition::is_lite())"));
+    assert!(
+      body[..body.find("\n}\n").unwrap()].contains("help_menu_entries(edition::editions_exist())")
+    );
   }
 }
 
@@ -2598,6 +2609,97 @@ fn launch_carries_files_at_startup() -> bool {
   launch_windows::opened_any()
 }
 
+/// The purchase part of the "Full Version Features" window: whether this build
+/// sells the full version, its price, and whether the store has answered about
+/// the version first installed.
+#[tauri::command(async)]
+fn store_info() -> store_state::StoreInfo {
+  #[cfg(all(target_os = "macos", feature = "storekit"))]
+  {
+    storekit::info()
+  }
+  #[cfg(not(all(target_os = "macos", feature = "storekit")))]
+  {
+    store_state::StoreInfo::unavailable()
+  }
+}
+
+/// Buy the full version: "purchased", "cancelled", "pending" or "failed".
+/// The purchase sheet can stay open indefinitely, so it waits on the blocking
+/// pool instead of holding an async worker.
+#[tauri::command]
+async fn store_purchase(app: tauri::AppHandle, window: tauri::WebviewWindow) -> &'static str {
+  #[cfg(all(target_os = "macos", feature = "storekit"))]
+  {
+    if !store_state::store_caller_allowed(window.label()) {
+      return "failed";
+    }
+    tauri::async_runtime::spawn_blocking(move || storekit::purchase(&app, &window))
+      .await
+      .unwrap_or("failed")
+  }
+  #[cfg(not(all(target_os = "macos", feature = "storekit")))]
+  {
+    let _ = (app, window);
+    "failed"
+  }
+}
+
+/// Restore an earlier purchase: "restored", "nothing", "cancelled" or "failed".
+/// The sign-in prompt can stay open indefinitely; see `store_purchase`.
+#[tauri::command]
+async fn store_restore(app: tauri::AppHandle, window: tauri::WebviewWindow) -> &'static str {
+  #[cfg(all(target_os = "macos", feature = "storekit"))]
+  {
+    if !store_state::store_caller_allowed(window.label()) {
+      return "failed";
+    }
+    tauri::async_runtime::spawn_blocking(move || storekit::restore(&app))
+      .await
+      .unwrap_or("failed")
+  }
+  #[cfg(not(all(target_os = "macos", feature = "storekit")))]
+  {
+    let _ = (app, window);
+    "failed"
+  }
+}
+
+/// Ask the store again about the version first installed: "known" or
+/// "unknown", or "failed" when not allowed. The sign-in prompt can stay open
+/// indefinitely; see `store_purchase`.
+#[tauri::command]
+async fn store_refresh_original(
+  app: tauri::AppHandle,
+  window: tauri::WebviewWindow,
+) -> &'static str {
+  #[cfg(all(target_os = "macos", feature = "storekit"))]
+  {
+    if !store_state::store_caller_allowed(window.label()) {
+      return "failed";
+    }
+    tauri::async_runtime::spawn_blocking(move || storekit::refresh(&app))
+      .await
+      .unwrap_or("failed")
+  }
+  #[cfg(not(all(target_os = "macos", feature = "storekit")))]
+  {
+    let _ = (app, window);
+    "failed"
+  }
+}
+
+#[cfg(all(test, not(feature = "storekit")))]
+mod store_command_tests {
+  #[test]
+  fn a_build_without_the_store_has_no_store_controls() {
+    let info = super::store_info();
+    assert!(!info.available);
+    assert_eq!(info.price, None);
+    assert!(info.original_known);
+  }
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
   // Install the diagnostic logger first, before anything else can call into
@@ -2854,7 +2956,18 @@ pub fn run() {
       // and document window is restored, so the workspace opens on top of them
       // rather than being buried; as the explicitly requested window it does
       // take focus, which is the expected behavior for this opt-in.
-      if startup.open_workspace_on_startup && edition::workspace_enabled(edition::is_lite()) {
+      // The store build may still turn full after this check; the token lets
+      // exactly one of the two open the workspace.
+      #[cfg(all(target_os = "macos", feature = "storekit"))]
+      let open_workspace = {
+        edition::STARTUP_WORKSPACE_TOKEN.store(startup.open_workspace_on_startup, Ordering::SeqCst);
+        edition::workspace_enabled(edition::is_lite())
+          && edition::STARTUP_WORKSPACE_TOKEN.swap(false, Ordering::SeqCst)
+      };
+      #[cfg(not(all(target_os = "macos", feature = "storekit")))]
+      let open_workspace =
+        startup.open_workspace_on_startup && edition::workspace_enabled(edition::is_lite());
+      if open_workspace {
         if launch_has_files {
           launch_windows::focus_launch_window_after_workspace();
         }
@@ -2987,6 +3100,10 @@ pub fn run() {
       edition::edition_info,
       #[cfg(debug_assertions)]
       edition::debug_set_edition,
+      store_info,
+      store_purchase,
+      store_restore,
+      store_refresh_original,
       altgr::altgr_table,
       default_apps::default_apps_page_supported,
       default_apps::open_default_apps_page,

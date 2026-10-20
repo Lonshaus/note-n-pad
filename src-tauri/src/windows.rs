@@ -1132,9 +1132,10 @@ pub fn show_privacy_window(app: AppHandle) -> Result<(), String> {
 }
 
 /// Open (or focus) the singleton "Full Version Features" window, the table of
-/// what the full version adds. Lite only: the full version has no such window.
+/// what the full version adds and the edition this one is. Only a build with
+/// editions has it.
 pub fn show_edition(app: &AppHandle) -> Result<(), String> {
-  crate::edition::require_lite("the full version features window")?;
+  crate::edition::require_editions("the full version features window")?;
   if let Some(win) = app.get_webview_window("edition") {
     reveal(&win);
     return Ok(());

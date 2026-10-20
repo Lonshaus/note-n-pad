@@ -2,7 +2,12 @@
 // SPDX-License-Identifier: GPL-3.0-only
 
 import { describe, expect, it } from 'vitest';
-import { featureRows } from './editionFeatures';
+import {
+  editionStatus,
+  featureRows,
+  storeControls,
+  storeMessage,
+} from './editionFeatures';
 import { en } from '../i18n/en';
 import { ja } from '../i18n/ja';
 import { zhTW } from '../i18n/zh-TW';
@@ -89,6 +94,16 @@ describe('the strings the table uses', () => {
     'edition.col.full',
     'edition.mark.yes',
     'edition.mark.no',
+    'edition.status.free',
+    'edition.status.full',
+    'edition.store.buy',
+    'edition.store.buyPrice',
+    'edition.store.restore',
+    'edition.store.retry',
+    'edition.store.unreachable',
+    'edition.store.pending',
+    'edition.store.nothing',
+    'edition.store.failed',
     ...new Set(
       ['macos', 'windows', 'linux'].flatMap((os) =>
         featureRows(os).flatMap((r) => [
@@ -130,5 +145,86 @@ describe('the strings the table uses', () => {
       expect(seed.strings['edition.row.table']).toContain('CSV / TSV');
       expect(seed.strings['edition.row.markdown']).toContain('Markdown');
     }
+  });
+
+  it('name the two editions as decided', () => {
+    expect(zhTW['edition.col.lite']).toBe('免費版');
+    expect(zhTW['edition.col.full']).toBe('完整版');
+    expect(zhTW['edition.status.free']).toBe('目前版本：免費版');
+    expect(zhTW['edition.status.full']).toBe('目前版本：完整版');
+    expect(en['edition.col.lite']).toBe('Free version');
+    expect(en['edition.col.full']).toBe('Full version');
+    expect(en['edition.status.free']).toBe('Current version: Free');
+    expect(en['edition.status.full']).toBe('Current version: Full');
+    expect(ja['edition.col.lite']).toBe('無料版');
+    expect(ja['edition.col.full']).toBe('完全版');
+    expect(ja['edition.status.free']).toBe('現在のバージョン：無料版');
+    expect(ja['edition.status.full']).toBe('現在のバージョン：完全版');
+  });
+
+  it('keep the price placeholder in every locale', () => {
+    for (const strings of [
+      zhTW,
+      ja,
+      en,
+      ...Object.values(seeds).map((s) => s.strings),
+    ]) {
+      expect(strings['edition.store.buyPrice']).toContain('{price}');
+    }
+  });
+});
+
+describe('editionStatus', () => {
+  it('names the free version when lite and the full version otherwise', () => {
+    expect(editionStatus(true)).toBe('edition.status.free');
+    expect(editionStatus(false)).toBe('edition.status.full');
+  });
+});
+
+describe('storeControls', () => {
+  const info = { available: true, price: '¥800', originalKnown: true };
+
+  it('shows nothing in a build without the store', () => {
+    for (const lite of [true, false]) {
+      expect(
+        storeControls(
+          { available: false, price: null, originalKnown: true },
+          lite,
+        ),
+      ).toBe('none');
+    }
+  });
+
+  it('shows nothing before the store has answered', () => {
+    expect(storeControls(null, true)).toBe('none');
+  });
+
+  it('shows nothing once full', () => {
+    expect(storeControls(info, false)).toBe('none');
+    expect(storeControls({ ...info, originalKnown: false }, false)).toBe(
+      'none',
+    );
+  });
+
+  it('offers a retry instead of a purchase while the original version is unknown', () => {
+    expect(storeControls({ ...info, originalKnown: false }, true)).toBe(
+      'retry',
+    );
+  });
+
+  it('offers Buy and Restore otherwise', () => {
+    expect(storeControls(info, true)).toBe('buy');
+    expect(storeControls({ ...info, price: null }, true)).toBe('buy');
+  });
+});
+
+describe('storeMessage', () => {
+  it('has a line for pending, nothing found and failure only', () => {
+    expect(storeMessage('pending')).toBe('edition.store.pending');
+    expect(storeMessage('nothing')).toBe('edition.store.nothing');
+    expect(storeMessage('failed')).toBe('edition.store.failed');
+    expect(storeMessage('cancelled')).toBeNull();
+    expect(storeMessage('purchased')).toBeNull();
+    expect(storeMessage('restored')).toBeNull();
   });
 });
