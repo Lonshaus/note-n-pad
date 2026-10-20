@@ -28,6 +28,7 @@
   import {
     settingsState,
     type LargeOpenMode,
+    type OpenTarget,
   } from './lib/state/settings.svelte';
   import { revealWhenThemed } from './lib/util/reveal';
   import { onFileDragOver, onFileDrop } from './lib/util/fileDrop';
@@ -1739,6 +1740,7 @@
           getLargeOpenMode: () => settingsState.largeOpenMode,
           setLargeOpenMode: (m: LargeOpenMode) =>
             settingsState.setLargeOpenMode(m),
+          setOpenTarget: (t: OpenTarget) => settingsState.setOpenTarget(t),
           windowFocusGained: () => focusActiveEditor(),
         }),
       );

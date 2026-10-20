@@ -18,6 +18,7 @@ on:
           - all
           - e2e-close-flush
           - e2e-editor-focus
+          - e2e-file-drop
           - e2e-highlight
           - e2e-i18n
           - e2e-large

@@ -2,7 +2,11 @@
 // SPDX-License-Identifier: GPL-3.0-only
 
 import { activeView } from './editorRegistry';
-import { settingsState, type LargeOpenMode } from '../state/settings.svelte';
+import {
+  settingsState,
+  type LargeOpenMode,
+  type OpenTarget,
+} from '../state/settings.svelte';
 import type { LineEnding } from '../util/text';
 import type { Language } from '../i18n/locale';
 import type { ViewMode } from '../util/viewModes';
@@ -181,6 +185,7 @@ export interface DocumentHooks {
   workerHighlightActive: () => boolean;
   getLargeOpenMode: () => LargeOpenMode;
   setLargeOpenMode: (m: LargeOpenMode) => void;
+  setOpenTarget: (t: OpenTarget) => void;
   // Drives the same handoff the Tauri window-focus event triggers, so E2E can
   // exercise the focus-reclaim path without a real OS focus change.
   windowFocusGained: () => void;
@@ -267,6 +272,7 @@ export function installSettingsAuto(hooks: SettingsHooks): void {
     setLineNumbers: (b: boolean) => settingsState.setLineNumbers(b),
     setWorkerHighlight: (b: boolean) => settingsState.setWorkerHighlight(b),
     setLargeOpenMode: (m: LargeOpenMode) => settingsState.setLargeOpenMode(m),
+    setOpenTarget: (t: OpenTarget) => settingsState.setOpenTarget(t),
     setDefaultLineEnding: (v: LineEnding) =>
       settingsState.setDefaultLineEnding(v),
     setDefaultEncoding: (v: string) => settingsState.setDefaultEncoding(v),
