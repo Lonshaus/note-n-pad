@@ -4,6 +4,7 @@
 use crate::fs_ops::{is_ignored_file, write_text_atomic_private, Loaded, SkipReason, SkippedFile};
 use crate::mac_bookmark;
 use crate::settings;
+use crate::snapshot_lock::{self, LockError, LockFailure};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
@@ -78,9 +79,9 @@ pub struct NoteSnapshot {
   /// straight in the large-file view without re-stat. None for ordinary tabs.
   #[serde(default)]
   pub large: Option<u64>,
-  /// Source file a range-edit tab was sliced from. Its presence marks the tab
-  /// as a range tab on restore; the byte span and fingerprint below rebuild the
-  /// splice write-back baseline. None for every non-range tab.
+  /// The range_* fields are only read, from records an earlier version wrote
+  /// when a range opened as a tab of its own; every record written now has them
+  /// None. Source file the range tab was sliced from.
   #[serde(default)]
   pub range_source: Option<String>,
   /// Byte span `[range_start, range_end)` of the slice within `range_source`.
@@ -88,34 +89,23 @@ pub struct NoteSnapshot {
   pub range_start: Option<u64>,
   #[serde(default)]
   pub range_end: Option<u64>,
-  /// Source fingerprint captured at slice/last-splice time, restored as the
-  /// conflict baseline so an out-of-band edit still triggers the mismatch flow.
+  /// Source fingerprint captured at slice/last-splice time.
   #[serde(default)]
   pub range_fp_size: Option<u64>,
   #[serde(default)]
   pub range_fp_mtime: Option<u64>,
-  /// 1-based line number of the range's first line, fixed at extraction time
-  /// (nothing before this tab's content can shift while it stays open). The
-  /// label is formatted from this and `range_end_line` when it is shown, so it
-  /// follows a language change. None for a non-range tab, and for a range tab
-  /// restored from an older snapshot, which persisted a formatted label
-  /// (`range_label`, removed) instead of a line number; the frontend falls
-  /// back to the bare file name for such a tab rather than reconstructing a
-  /// line span from the old string.
+  /// 1-based line number of the range's first line, fixed at extraction time.
+  /// None for a record from before this field (it persisted a formatted
+  /// `range_label`, removed, which is not read back).
   #[serde(default)]
   pub range_start_line: Option<i64>,
-  /// 1-based line number of the range's last line, kept in step with the live
-  /// content on every write (so it also follows edits and saves, and is stored
-  /// when `content` is empty). Lets a view that never opens the tab, such as
-  /// the workspace list, label the range. None for a non-range tab and for a
-  /// record written before this field existed.
+  /// 1-based line number of the range's last line, so a view that never opens
+  /// the tab (the workspace list) can label it. None for a record from before
+  /// this field.
   #[serde(default)]
   pub range_end_line: Option<u64>,
-  /// Whether the source slice ended with a line break. The buffer keeps that
-  /// break; on write-back one is added only if the slice ended with one and
-  /// the non-empty buffer no longer does. None for a non-range tab and for a
-  /// record written before this field existed; restore then derives it from the
-  /// source slice.
+  /// Whether the source slice ended with a line break. None for a record from
+  /// before this field.
   #[serde(default)]
   pub range_trailing_break: Option<bool>,
   /// Sparse line-checkpoint index of a windowed-editing tab (see
@@ -395,18 +385,16 @@ pub struct DocWindowPlan {
 
 /// A document note's effective group id: its window_group, or its own id when
 /// None (a legacy/solo document becomes its own single-tab window).
-fn resolved_group(note: &NoteSnapshot) -> &str {
+pub(crate) fn resolved_group(note: &NoteSnapshot) -> &str {
   note.window_group.as_deref().unwrap_or(&note.id)
 }
 
 /// Plan one document window per group from stored notes. Stickies are ignored.
 /// Groups keep first-appearance order; each window inherits the bounds of its
-/// lowest-tab_index tab. In lite a kept tab is not shown and nothing writes its
-/// record, so its bounds go stale: the lowest shown tab is preferred, and only a
-/// group of kept tabs alone falls back to the lowest overall.
-pub fn plan_document_windows(notes: &[NoteSnapshot], lite: bool) -> Vec<DocWindowPlan> {
+/// lowest-tab_index tab.
+pub fn plan_document_windows(notes: &[NoteSnapshot]) -> Vec<DocWindowPlan> {
   let mut order: Vec<String> = Vec::new();
-  let mut plans: std::collections::HashMap<String, ((bool, i64), DocWindowPlan)> =
+  let mut plans: std::collections::HashMap<String, (i64, DocWindowPlan)> =
     std::collections::HashMap::new();
   for note in notes {
     if note.kind != "document" {
@@ -420,17 +408,16 @@ pub fn plan_document_windows(notes: &[NoteSnapshot], lite: bool) -> Vec<DocWindo
       width: note.width,
       height: note.height,
     };
-    let rank = (lite && needs_full_edition(note), note.tab_index);
     match plans.get_mut(&group) {
       Some((best, plan)) => {
-        if rank < *best {
-          *best = rank;
+        if note.tab_index < *best {
+          *best = note.tab_index;
           *plan = candidate;
         }
       }
       None => {
         order.push(group.clone());
-        plans.insert(group, (rank, candidate));
+        plans.insert(group, (note.tab_index, candidate));
       }
     }
   }
@@ -440,28 +427,12 @@ pub fn plan_document_windows(notes: &[NoteSnapshot], lite: bool) -> Vec<DocWindo
     .collect()
 }
 
-/// Whether restoring `note` needs a feature the Lite edition removes: the
-/// large-file viewer (`large`), windowed editing (`windowed_index`) or a range
-/// tab (`range_source`). In lite such a record is a kept tab: never opened,
-/// never rewritten, never dropped, and restored as usual once the edition is
-/// full again.
-pub fn needs_full_edition(note: &NoteSnapshot) -> bool {
-  note.kind == "document"
-    && (note.large.is_some() || note.windowed_index.is_some() || note.range_source.is_some())
-}
-
-/// Whether startup should rewrite a group-less document into its own solo
-/// group. Never a kept tab in lite: its record stays byte for byte as it is.
-pub fn needs_group_migration(note: &NoteSnapshot, lite: bool) -> bool {
-  note.kind == "document" && note.window_group.is_none() && !(lite && needs_full_edition(note))
-}
-
 /// Migrate every group-less document in `notes` to its own solo group (keyed by
 /// its id) so future restores keep it grouped. A store that cannot be written to
 /// (read-only dir, full disk) only loses the migration, never the launch.
-pub fn migrate_group_less_documents(store: &NoteStore, notes: &[NoteSnapshot], lite: bool) {
+pub fn migrate_group_less_documents(store: &NoteStore, notes: &[NoteSnapshot]) {
   for note in notes {
-    if needs_group_migration(note, lite) {
+    if note.kind == "document" && note.window_group.is_none() {
       let mut migrated = note.clone();
       migrated.window_group = Some(note.id.clone());
       if let Err(e) = store.upsert(migrated) {
@@ -473,49 +444,23 @@ pub fn migrate_group_less_documents(store: &NoteStore, notes: &[NoteSnapshot], l
     }
   }
 }
-/// Document groups whose window the app closed for the trial: the user
-/// dismissed the kept-tabs notice of a window that held nothing else. Only the
-/// frontend's `dismissKeptTabsAndHoldBack` adds to it. Held in memory only, and
-/// emptied when the edition turns full.
-#[derive(Default)]
-pub struct HeldBackGroups(Mutex<std::collections::HashSet<String>>);
-
-impl HeldBackGroups {
-  pub fn hold(&self, group: String) {
-    self.0.lock().unwrap().insert(group);
-  }
-  /// Every held group; the set is empty afterwards.
-  pub fn take_all(&self) -> std::collections::HashSet<String> {
-    std::mem::take(&mut *self.0.lock().unwrap())
-  }
+/// Whether `note` is a range tab from an earlier version with nothing unsaved.
+/// A range tab is now an edit box that is never persisted, so there is nothing
+/// to restore for it.
+pub fn is_clean_range_record(note: &NoteSnapshot) -> bool {
+  note.kind == "document" && note.range_source.is_some() && !note.dirty
 }
-/// Remember that the app closed the window of `group` for the trial, so it
-/// returns when the edition is full again.
-#[tauri::command]
-pub fn hold_back_group(state: State<HeldBackGroups>, group: String) {
-  state.hold(group);
-}
-/// The windows to open when the edition turns full: every group in `held` that
-/// holds a tab lite kept and whose window is not open (`is_live`), planned
-/// exactly as a startup restore would. A group missing from `held` is one the
-/// user closed, so its kept tabs wait for the next launch.
-pub fn groups_to_reopen(
-  notes: &[NoteSnapshot],
-  held: &std::collections::HashSet<String>,
-  is_live: impl Fn(&str) -> bool,
-) -> Vec<DocWindowPlan> {
-  let kept: std::collections::HashSet<&str> = notes
-    .iter()
-    .filter(|n| needs_full_edition(n))
-    .map(resolved_group)
-    .collect();
-  // Only called once the edition is full, when every tab is shown.
-  plan_document_windows(notes, false)
-    .into_iter()
-    .filter(|plan| {
-      held.contains(&plan.group) && kept.contains(plan.group.as_str()) && !is_live(&plan.group)
-    })
-    .collect()
+/// Delete every clean old range record from `store`, before any window is
+/// planned, so a group made only of them opens no empty window. A record that
+/// cannot be deleted stays and is deleted again by the window that restores it.
+pub fn drop_clean_range_records(store: &NoteStore) {
+  for note in store.list() {
+    if is_clean_range_record(&note) {
+      if let Err(e) = store.delete(&note.id) {
+        log::warn!("failed to drop the old range record {}: {e}", note.id);
+      }
+    }
+  }
 }
 
 /// The snapshot files that could not be loaded at startup, held until a window
@@ -556,6 +501,28 @@ struct Inner {
   notes: Vec<NoteSnapshot>,
   dir: PathBuf,
   seqs: std::collections::HashMap<String, u64>,
+  /// Holds the exclusive lock on `dir` (see `snapshot_lock`) while the store
+  /// lives. None when `dir` could not be locked and is used anyway.
+  lock: Option<std::fs::File>,
+  /// Project rebinds made during this run (`from -> to`, one edge per rebind). A
+  /// snapshot write still tagged with a `from` project is re-tagged on arrival,
+  /// following the edges until a project with none.
+  rebinds: std::collections::HashMap<String, String>,
+}
+/// The project a write tagged `project` ends up with once this run's rebinds
+/// are applied. The step cap only guards against a cyclic map.
+fn rebound_project(
+  rebinds: &std::collections::HashMap<String, String>,
+  project: Option<String>,
+) -> Option<String> {
+  let mut current = project?;
+  for _ in 0..=rebinds.len() {
+    match rebinds.get(&current) {
+      Some(next) => current = next.clone(),
+      None => break,
+    }
+  }
+  Some(current)
 }
 
 /// The single owner of note snapshots: an in-memory Vec guarded by a Mutex,
@@ -584,6 +551,8 @@ impl NoteStore {
           notes: loaded.items,
           dir,
           seqs: std::collections::HashMap::new(),
+          lock: None,
+          rebinds: std::collections::HashMap::new(),
         }),
       },
       loaded.skipped,
@@ -600,8 +569,14 @@ impl NoteStore {
         notes: Vec::new(),
         dir,
         seqs: std::collections::HashMap::new(),
+        lock: None,
+        rebinds: std::collections::HashMap::new(),
       }),
     }
+  }
+  /// Make the store the holder of the lock taken on its directory at startup.
+  pub fn hold_lock(&self, lock: Option<std::fs::File>) {
+    self.inner.lock().unwrap().lock = lock;
   }
 
   pub fn list(&self) -> Vec<NoteSnapshot> {
@@ -619,8 +594,9 @@ impl NoteStore {
       .cloned()
   }
 
-  pub fn upsert(&self, note: NoteSnapshot) -> Result<(), String> {
+  pub fn upsert(&self, mut note: NoteSnapshot) -> Result<(), String> {
     let mut inner = self.inner.lock().unwrap();
+    note.project = rebound_project(&inner.rebinds, note.project.take());
     save_note(&inner.dir, &note)?;
     upsert(&mut inner.notes, note);
     Ok(())
@@ -634,18 +610,79 @@ impl NoteStore {
   /// though `upsert_note` runs `(async)` and worker-pool scheduling gives no
   /// such guarantee on its own. Returns whether the write was applied, so the
   /// caller can skip broadcasting `store-changed` for a dropped write.
-  pub fn upsert_ordered(&self, note: NoteSnapshot, seq: u64) -> Result<bool, String> {
+  pub fn upsert_ordered(&self, mut note: NoteSnapshot, seq: u64) -> Result<bool, String> {
     let mut inner = self.inner.lock().unwrap();
     if let Some(&last) = inner.seqs.get(&note.id) {
       if seq < last {
         return Ok(false);
       }
     }
+    note.project = rebound_project(&inner.rebinds, note.project.take());
     let id = note.id.clone();
     save_note(&inner.dir, &note)?;
     inner.seqs.insert(id, seq);
     upsert(&mut inner.notes, note);
     Ok(true)
+  }
+  /// Move every stored note tagged `from` (closed window groups included) to
+  /// project `to`, and remember the rebind so a write still tagged `from` that
+  /// arrives later is re-tagged too. Returns how many notes were rewritten.
+  pub fn rebind_project(&self, from: &str, to: &str) -> Result<usize, String> {
+    let mut inner = self.inner.lock().unwrap();
+    let edge = to;
+    let to = rebound_project(&inner.rebinds, Some(to.to_string())).unwrap_or_default();
+    if from == to {
+      return Ok(0);
+    }
+    inner.rebinds.insert(from.to_string(), edge.to_string());
+    let mut rewritten = 0;
+    for index in 0..inner.notes.len() {
+      if inner.notes[index].project.as_deref() != Some(from) {
+        continue;
+      }
+      let mut note = inner.notes[index].clone();
+      note.project = Some(to.clone());
+      save_note(&inner.dir, &note)?;
+      inner.notes[index] = note;
+      rewritten += 1;
+    }
+    Ok(rewritten)
+  }
+  /// Point every stored note that names the file or folder `from` (as its file or
+  /// as its range source, closed window groups included) at `to` instead, for
+  /// notes under `from` too. Returns how many notes were rewritten. Sequence
+  /// numbers stay as they are: a window re-sends its tabs with newer ones.
+  pub fn retarget_paths(&self, from: &str, to: &str) -> Result<usize, String> {
+    use crate::file_ops::retarget_path;
+    let mut inner = self.inner.lock().unwrap();
+    let mut rewritten = 0;
+    for index in 0..inner.notes.len() {
+      let note = &inner.notes[index];
+      let file = note
+        .file_path
+        .as_deref()
+        .map(|p| retarget_path(p, from, to));
+      let source = note
+        .range_source
+        .as_deref()
+        .map(|p| retarget_path(p, from, to));
+      if file == note.file_path && source == note.range_source {
+        continue;
+      }
+      let mut moved = note.clone();
+      moved.file_path = file;
+      moved.range_source = source;
+      save_note(&inner.dir, &moved)?;
+      inner.notes[index] = moved;
+      rewritten += 1;
+    }
+    Ok(rewritten)
+  }
+  /// `root` is a project of its own again: drop the rebind that folded it into
+  /// another project, so a later write tagged `root` stays on it. A chain that
+  /// runs through `root` stops there.
+  pub fn forget_rebind(&self, root: &str) {
+    self.inner.lock().unwrap().rebinds.remove(root);
   }
 
   pub fn delete(&self, id: &str) -> Result<(), String> {
@@ -678,7 +715,29 @@ impl NoteStore {
       collision_count,
     }
   }
+  /// `switch_dir` without a setting to write.
+  #[cfg(test)]
+  pub fn set_dir(
+    &self,
+    new_dir: PathBuf,
+    move_files: bool,
+    policy: CollisionPolicy,
+  ) -> Result<DirSwitch, SetDirError> {
+    self.switch_dir(new_dir, move_files, policy, snapshot_lock::try_lock, || {
+      Ok(())
+    })
+  }
 
+  #[cfg(test)]
+  fn set_dir_with(
+    &self,
+    new_dir: PathBuf,
+    move_files: bool,
+    policy: CollisionPolicy,
+    locker: impl FnOnce(&Path) -> Result<std::fs::File, LockFailure>,
+  ) -> Result<DirSwitch, SetDirError> {
+    self.switch_dir(new_dir, move_files, policy, locker, || Ok(()))
+  }
   /// Repoint the active directory at `new_dir`, optionally moving every
   /// `*.json` file physically present in the old one first (moving what is
   /// really on disk, not the in-memory list, so unparsable files, mismatched-
@@ -686,23 +745,86 @@ impl NoteStore {
   /// along rather than stranded). Collisions at the destination are resolved
   /// per `policy`. The in-memory notes are then reloaded from `new_dir`'s
   /// actual contents, so the list always agrees with disk.
-  pub fn set_dir(
+  ///
+  /// `new_dir` is locked before anything else happens and the old lock is
+  /// released only once the switch has gone through, so a failure leaves the
+  /// store on the old directory with its lock intact.
+  ///
+  /// `persist` runs once the files are moved and the new notes loaded, still
+  /// under the store's lock. The old lock and directory are given up only after
+  /// it succeeds; if it fails, the files are moved back and the store stays on
+  /// the old directory with its lock held, so no other app can take that folder
+  /// in between. `persist` must not call the store.
+  fn switch_dir(
     &self,
     new_dir: PathBuf,
     move_files: bool,
     policy: CollisionPolicy,
-  ) -> Result<(), String> {
+    locker: impl FnOnce(&Path) -> Result<std::fs::File, LockFailure>,
+    persist: impl FnOnce() -> Result<(), String>,
+  ) -> Result<DirSwitch, SetDirError> {
     let mut inner = self.inner.lock().unwrap();
     if inner.dir == new_dir {
-      return Ok(());
+      persist()?;
+      return Ok(DirSwitch::Unchanged);
     }
     std::fs::create_dir_all(&new_dir).map_err(|e| e.to_string())?;
+    let (new_lock, unlockable) = match locker(&new_dir) {
+      Ok(file) => (Some(file), false),
+      Err(LockFailure {
+        kind: LockError::Busy,
+        ..
+      }) => return Err(SetDirError::InUse),
+      Err(LockFailure {
+        kind: LockError::Unsupported,
+        ..
+      }) => (None, true),
+      Err(LockFailure { detail, .. }) => return Err(SetDirError::Other(detail)),
+    };
     if move_files {
       move_snapshot_files(&inner.dir, &new_dir, policy)?;
     }
-    inner.notes = load_dir(&new_dir)?.items;
+    let notes = load_dir(&new_dir)?.items;
+    if let Err(e) = persist() {
+      if move_files {
+        // Best-effort: the files just moved from the old directory win any
+        // collision moving back into it.
+        let _ = move_snapshot_files(&new_dir, &inner.dir, CollisionPolicy::Source);
+        // What came back may differ from the list in memory.
+        if let Ok(loaded) = load_dir(&inner.dir) {
+          inner.notes = loaded.items;
+        }
+      }
+      return Err(SetDirError::Other(e));
+    }
+    inner.notes = notes;
     inner.dir = new_dir;
-    Ok(())
+    inner.lock = new_lock;
+    Ok(DirSwitch::Switched { unlockable })
+  }
+}
+/// What `set_dir` did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DirSwitch {
+  /// The store was already on that directory.
+  Unchanged,
+  /// `unlockable`: the new directory's file system has no lock support, so it
+  /// is used without one.
+  Switched { unlockable: bool },
+}
+/// Why `set_dir` did not switch. Serialized for the frontend, which words
+/// `InUse` itself instead of showing an OS message.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(tag = "kind", content = "message", rename_all = "snake_case")]
+pub enum SetDirError {
+  /// Another app holds the lock on the new directory.
+  InUse,
+  Other(String),
+}
+
+impl From<String> for SetDirError {
+  fn from(message: String) -> Self {
+    SetDirError::Other(message)
   }
 }
 
@@ -887,59 +1009,221 @@ fn is_writable(dir: &Path) -> bool {
     }
   }
 }
-
-/// Whether this launch fell back to the default snapshots folder. Set once at
-/// startup and read by `settings::load_settings`, so the settings window can
-/// say so instead of the user finding out by noticing their notes are missing.
-#[derive(Default)]
-pub struct SnapshotFallback(std::sync::atomic::AtomicBool);
-
-impl SnapshotFallback {
-  pub fn in_use(&self) -> bool {
-    self.0.load(std::sync::atomic::Ordering::Relaxed)
-  }
-
-  fn mark(&self) {
-    self.0.store(true, std::sync::atomic::Ordering::Relaxed);
-  }
+/// Why this launch is using the default snapshots folder instead of the chosen
+/// one, if it is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FallbackReason {
+  None,
+  /// The chosen folder cannot be written to.
+  Unwritable,
+  /// Another app holds the lock on the chosen folder.
+  InUse,
 }
 
-/// The snapshots directory to actually use at startup: the folder the settings
-/// point at when it works, the default inside the app's own data directory when
-/// it does not.
+impl FallbackReason {
+  /// Whether the chosen folder's notes were left unread. Their file and project
+  /// paths are then missing from the store, so the grants they alone refer to
+  /// must not be pruned.
+  pub fn fell_back(self) -> bool {
+    self != FallbackReason::None
+  }
+
+  fn to_u8(self) -> u8 {
+    match self {
+      FallbackReason::None => 0,
+      FallbackReason::Unwritable => 1,
+      FallbackReason::InUse => 2,
+    }
+  }
+
+  fn from_u8(value: u8) -> Self {
+    match value {
+      1 => FallbackReason::Unwritable,
+      2 => FallbackReason::InUse,
+      _ => FallbackReason::None,
+    }
+  }
+}
+/// What the settings window is told about the snapshots folder in use.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct SnapshotDirState {
+  /// The chosen folder cannot be written to; the default one is in use.
+  pub unavailable: bool,
+  /// The chosen folder is in use by another app; the default one is in use.
+  pub in_use: bool,
+  /// The folder in use has no lock support, so another app using it at the
+  /// same time cannot be detected.
+  pub unlockable: bool,
+}
+/// How this launch's snapshots folder was settled. Set once at startup and read
+/// by `settings::load_settings`, so the settings window can say so instead of
+/// the user finding out by noticing their notes are missing. A successful folder
+/// switch from the settings window updates it (`switched`).
+#[derive(Default)]
+pub struct SnapshotFallback {
+  reason: std::sync::atomic::AtomicU8,
+  unlockable: std::sync::atomic::AtomicBool,
+}
+
+impl SnapshotFallback {
+  pub fn reason(&self) -> FallbackReason {
+    FallbackReason::from_u8(self.reason.load(std::sync::atomic::Ordering::Relaxed))
+  }
+
+  pub fn state(&self) -> SnapshotDirState {
+    let reason = self.reason();
+    SnapshotDirState {
+      unavailable: reason == FallbackReason::Unwritable,
+      in_use: reason == FallbackReason::InUse,
+      unlockable: self.unlockable.load(std::sync::atomic::Ordering::Relaxed),
+    }
+  }
+
+  fn mark(&self, reason: FallbackReason, unlockable: bool) {
+    self
+      .reason
+      .store(reason.to_u8(), std::sync::atomic::Ordering::Relaxed);
+    self
+      .unlockable
+      .store(unlockable, std::sync::atomic::Ordering::Relaxed);
+  }
+  /// The user picked a folder from the settings window: the startup fallback no
+  /// longer describes what is in use. `unlockable` is None when the store was
+  /// already on that folder.
+  fn switched(&self, unlockable: Option<bool>) {
+    let unlockable = unlockable.unwrap_or_else(|| self.state().unlockable);
+    self.mark(FallbackReason::None, unlockable);
+  }
+}
+/// The outcome of the startup folder decision.
+#[derive(Debug)]
+struct StartupChoice {
+  dir: PathBuf,
+  /// The lock to hand to the store; None when the folder is used unlocked.
+  lock: Option<std::fs::File>,
+  reason: FallbackReason,
+  unlockable: bool,
+}
+/// The startup decision with the file system behind `writable` and `locker`, so
+/// every branch can be tested. `chosen` is the resolved folder the settings
+/// point at, `None` for the default.
+///
+/// The chosen folder is used when it is writable and locks (or has no lock
+/// support). If it is unusable, or another app holds its lock, the default
+/// folder is used instead. The default folder can never fail startup: if it
+/// cannot be locked it is used unlocked and the problem is only logged, except
+/// that a default folder without lock support sets `unlockable` like any other.
+fn decide_startup_dir(
+  chosen: Option<PathBuf>,
+  default_dir: PathBuf,
+  writable: impl Fn(&Path) -> bool,
+  locker: impl Fn(&Path) -> Result<std::fs::File, LockFailure>,
+) -> StartupChoice {
+  let mut reason = FallbackReason::None;
+  match &chosen {
+    Some(dir) if !writable(dir) => {
+      log::warn!(
+        "snapshot folder {} cannot be written to; using the default folder",
+        dir.display()
+      );
+      reason = FallbackReason::Unwritable;
+    }
+    Some(dir) => match locker(dir) {
+      Ok(lock) => {
+        return StartupChoice {
+          dir: dir.clone(),
+          lock: Some(lock),
+          reason,
+          unlockable: false,
+        }
+      }
+      Err(failure) if failure.kind == LockError::Unsupported => {
+        log::warn!(
+          "snapshot folder {} cannot be locked ({}); using it without a lock",
+          dir.display(),
+          failure.detail
+        );
+        return StartupChoice {
+          dir: dir.clone(),
+          lock: None,
+          reason,
+          unlockable: true,
+        };
+      }
+      Err(failure) => {
+        log::warn!(
+          "snapshot folder {} cannot be locked ({}); using the default folder",
+          dir.display(),
+          failure.detail
+        );
+        reason = if failure.kind == LockError::Busy {
+          FallbackReason::InUse
+        } else {
+          FallbackReason::Unwritable
+        };
+      }
+    },
+    None => {}
+  }
+  let mut unlockable = false;
+  let lock = match locker(&default_dir) {
+    Ok(lock) => Some(lock),
+    Err(failure) => {
+      log::warn!(
+        "default snapshot folder {} cannot be locked ({}); using it without a lock",
+        default_dir.display(),
+        failure.detail
+      );
+      // Only a missing lock support is worth a notice; a busy or otherwise
+      // unlockable default folder is just logged.
+      unlockable = failure.kind == LockError::Unsupported;
+      None
+    }
+  };
+  StartupChoice {
+    dir: default_dir,
+    lock,
+    reason,
+    unlockable,
+  }
+}
+/// The snapshots directory to actually use at startup, with the lock taken on
+/// it: the folder the settings point at when it works, the default inside the
+/// app's own data directory when it does not.
 ///
 /// The picked folder can be unusable for reasons the user cannot be expected to
 /// have anticipated — an external disk that is not mounted, a synced folder
-/// that went read-only, or, in a sandboxed build, a grant that did not survive
-/// the last launch. None of those is a reason to have no snapshots at all:
+/// that went read-only, a grant that did not survive the last launch in a
+/// sandboxed build, or another app (or another copy of this one) pointed at the
+/// same folder holding it. None of those is a reason to have no snapshots at all:
 /// before this fallback, a sticky could not be created, so the startup window
 /// never opened and the app sat there with a menu bar and nothing else. The
 /// default folder is inside the app's own data directory, which is the one
 /// place it is always allowed to write.
 ///
 /// The setting is deliberately left as the user wrote it, so the folder is used
-/// again the moment it works. `fallback` records that this happened for the
-/// settings window to report.
+/// again the moment it works. `fallback` records what happened for the settings
+/// window to report.
 pub fn startup_snapshot_dir(
   app: &AppHandle,
   settings: &settings::AppSettings,
   fallback: &SnapshotFallback,
-) -> Result<PathBuf, String> {
+) -> Result<(PathBuf, Option<std::fs::File>), String> {
   let app_data = app.path().app_data_dir().map_err(|e| e.to_string())?;
   let default_dir = snapshot_dir_for(&app_data, None);
-  let Some(picked) = picked_snapshot_dir(settings) else {
-    return Ok(default_dir);
-  };
-  let dir = snapshot_dir_for(&app_data, Some(picked.as_path()));
-  if is_writable(&dir) {
-    return Ok(dir);
-  }
-  log::warn!(
-    "snapshot folder {} cannot be written to; using the default folder",
-    dir.display()
-  );
-  fallback.mark();
-  Ok(default_dir)
+  let chosen =
+    picked_snapshot_dir(settings).map(|picked| snapshot_dir_for(&app_data, Some(picked.as_path())));
+  // `is_writable` also creates the folder, which the lock file needs; the
+  // default folder gets the same treatment, as before.
+  let choice = decide_startup_dir(chosen, default_dir, is_writable, |dir| {
+    std::fs::create_dir_all(dir).map_err(|e| LockFailure {
+      kind: LockError::Other,
+      detail: e.to_string(),
+    })?;
+    snapshot_lock::try_lock(dir)
+  });
+  fallback.mark(choice.reason, choice.unlockable);
+  Ok((choice.dir, choice.lock))
 }
 
 /// The folder the settings choose, or `None` for the default. Prefers the
@@ -1031,29 +1315,26 @@ pub fn migrate_legacy_snapshot_location_setting(app: &AppHandle) {
 }
 
 /// Switch `store`'s active directory to `new_dir` (optionally moving the old
-/// directory's files into it first, resolving collisions per `policy`), then
-/// call `write_setting` to persist the choice. The setting is written only
-/// after a successful switch; if `write_setting` fails, the switch is rolled
-/// back (files moved back, active dir reverted) so files and setting never
-/// disagree. Split out of `apply_snapshot_dir` so this ordering guarantee is
-/// unit-testable against a real `NoteStore` without a running Tauri app.
+/// directory's files into it first, resolving collisions per `policy`), calling
+/// `write_setting` to persist the choice once the files are moved. The setting
+/// is written only after the move; if `write_setting` fails, the move is undone
+/// and the store keeps the old directory and its lock, so files and setting
+/// never disagree. Split out of `apply_snapshot_dir` so this ordering guarantee
+/// is unit-testable against a real `NoteStore` without a running Tauri app.
 fn switch_and_persist(
   store: &NoteStore,
   new_dir: PathBuf,
   move_files: bool,
   policy: CollisionPolicy,
   write_setting: impl FnOnce() -> Result<(), String>,
-) -> Result<(), String> {
-  let old_dir = store.current_dir();
-  store.set_dir(new_dir, move_files, policy)?;
-  if let Err(e) = write_setting() {
-    // The switch already happened but the setting didn't take; move back so
-    // the two never disagree about where the files live. Best-effort: the
-    // files just moved from old_dir win any collision moving back into it.
-    let _ = store.set_dir(old_dir, move_files, CollisionPolicy::Source);
-    return Err(e);
-  }
-  Ok(())
+) -> Result<DirSwitch, SetDirError> {
+  store.switch_dir(
+    new_dir,
+    move_files,
+    policy,
+    snapshot_lock::try_lock,
+    write_setting,
+  )
 }
 
 /// Validate the picked folder, then switch and persist via `switch_and_persist`.
@@ -1063,10 +1344,12 @@ pub fn apply_snapshot_dir(
   dir: Option<PathBuf>,
   move_files: bool,
   policy: CollisionPolicy,
-) -> Result<(), String> {
+) -> Result<DirSwitch, SetDirError> {
   if let Some(picked) = &dir {
     if !picked.is_dir() {
-      return Err("the chosen folder does not exist".to_string());
+      return Err(SetDirError::Other(
+        "the chosen folder does not exist".to_string(),
+      ));
     }
   }
   let new_dir = resolve_snapshot_dir(app, dir.as_deref())?;
@@ -1214,18 +1497,23 @@ pub fn preview_snapshot_dir_move(
   let new_dir = resolve_snapshot_dir(&app, dir.map(PathBuf::from).as_deref())?;
   Ok(store.preview_move(&new_dir))
 }
-
+/// Returns the state the settings window should show from now on.
 #[tauri::command]
 pub fn set_snapshot_dir(
   app: AppHandle,
   store: State<NoteStore>,
+  fallback: State<SnapshotFallback>,
   dir: Option<String>,
   move_files: bool,
   policy: CollisionPolicy,
-) -> Result<(), String> {
-  apply_snapshot_dir(&app, &store, dir.map(PathBuf::from), move_files, policy)?;
+) -> Result<SnapshotDirState, SetDirError> {
+  let switch = apply_snapshot_dir(&app, &store, dir.map(PathBuf::from), move_files, policy)?;
+  fallback.switched(match switch {
+    DirSwitch::Switched { unlockable } => Some(unlockable),
+    DirSwitch::Unchanged => None,
+  });
   emit_store_changed(&app, None);
-  Ok(())
+  Ok(fallback.state())
 }
 
 /// The currently resolved snapshots directory, for the settings UI to display.
@@ -1280,9 +1568,306 @@ mod tests {
   #[test]
   fn a_fallback_starts_unmarked_and_stays_marked() {
     let fallback = SnapshotFallback::default();
-    assert!(!fallback.in_use());
-    fallback.mark();
-    assert!(fallback.in_use());
+    assert_eq!(fallback.reason(), FallbackReason::None);
+    assert!(!fallback.reason().fell_back());
+    fallback.mark(FallbackReason::Unwritable, false);
+    assert_eq!(fallback.reason(), FallbackReason::Unwritable);
+  }
+
+  #[test]
+  fn each_fallback_reason_reports_only_its_own_flag() {
+    let fallback = SnapshotFallback::default();
+    let state = |reason, unlockable| {
+      fallback.mark(reason, unlockable);
+      fallback.state()
+    };
+    let none = state(FallbackReason::None, false);
+    assert!(!none.unavailable && !none.in_use && !none.unlockable);
+    let unwritable = state(FallbackReason::Unwritable, false);
+    assert!(unwritable.unavailable && !unwritable.in_use && !unwritable.unlockable);
+    let busy = state(FallbackReason::InUse, false);
+    assert!(!busy.unavailable && busy.in_use && !busy.unlockable);
+    let unlockable = state(FallbackReason::None, true);
+    assert!(!unlockable.unavailable && !unlockable.in_use && unlockable.unlockable);
+  }
+
+  #[test]
+  fn only_a_real_fallback_disables_pruning_not_a_missing_lock_support() {
+    assert!(FallbackReason::Unwritable.fell_back());
+    assert!(FallbackReason::InUse.fell_back());
+    assert!(!FallbackReason::None.fell_back());
+  }
+
+  #[test]
+  fn falling_back_because_the_folder_is_in_use_keeps_grants_from_being_pruned() {
+    let mut referencing = note("a");
+    referencing.file_path = Some("/only/in/the/chosen/folder.txt".into());
+    let notes = vec![referencing];
+    let report = Ok((settings::AppSettings::default(), Vec::new()));
+    let fallback = SnapshotFallback::default();
+    fallback.mark(FallbackReason::InUse, false);
+    assert!(
+      crate::grants::prune_set(true, fallback.reason().fell_back(), false, &report, &notes)
+        .is_none()
+    );
+    // No lock support is not a fallback: the chosen folder was read, so pruning is safe.
+    fallback.mark(FallbackReason::None, true);
+    let kept =
+      crate::grants::prune_set(true, fallback.reason().fell_back(), false, &report, &notes)
+        .unwrap();
+    assert!(kept.contains("/only/in/the/chosen/folder.txt"));
+  }
+
+  #[test]
+  fn a_switch_from_the_settings_window_ends_the_startup_fallback() {
+    let fallback = SnapshotFallback::default();
+    fallback.mark(FallbackReason::InUse, false);
+    fallback.switched(Some(true));
+    assert_eq!(fallback.reason(), FallbackReason::None);
+    assert!(fallback.state().unlockable);
+    // Switching to a lockable folder clears the flag again.
+    fallback.switched(Some(false));
+    assert!(!fallback.state().unlockable);
+    // Already on that folder: the flag stays as it was.
+    fallback.mark(FallbackReason::InUse, true);
+    fallback.switched(None);
+    assert_eq!(fallback.reason(), FallbackReason::None);
+    assert!(fallback.state().unlockable);
+  }
+
+  fn failure(kind: LockError) -> LockFailure {
+    LockFailure {
+      kind,
+      detail: "test".into(),
+    }
+  }
+
+  fn decide(
+    chosen: Option<&str>,
+    writable: bool,
+    chosen_lock: Result<(), LockError>,
+    default_lock: Result<(), LockError>,
+  ) -> StartupChoice {
+    decide_startup_dir(
+      chosen.map(PathBuf::from),
+      PathBuf::from("/default"),
+      |_| writable,
+      |dir| {
+        let outcome = if dir == Path::new("/default") {
+          default_lock
+        } else {
+          chosen_lock
+        };
+        outcome
+          .map(|()| tempfile::tempfile().unwrap())
+          .map_err(failure)
+      },
+    )
+  }
+
+  #[test]
+  fn a_writable_lockable_chosen_folder_is_used_and_locked() {
+    let c = decide(Some("/picked"), true, Ok(()), Ok(()));
+    assert_eq!(c.dir, PathBuf::from("/picked"));
+    assert!(c.lock.is_some());
+    assert_eq!(c.reason, FallbackReason::None);
+    assert!(!c.unlockable);
+  }
+
+  #[test]
+  fn an_unwritable_chosen_folder_falls_back_to_the_locked_default() {
+    let c = decide(Some("/picked"), false, Ok(()), Ok(()));
+    assert_eq!(c.dir, PathBuf::from("/default"));
+    assert!(c.lock.is_some());
+    assert_eq!(c.reason, FallbackReason::Unwritable);
+    assert!(!c.unlockable);
+  }
+
+  #[test]
+  fn a_chosen_folder_locked_by_another_app_falls_back_to_the_default() {
+    let c = decide(Some("/picked"), true, Err(LockError::Busy), Ok(()));
+    assert_eq!(c.dir, PathBuf::from("/default"));
+    assert!(c.lock.is_some());
+    assert_eq!(c.reason, FallbackReason::InUse);
+    assert!(!c.unlockable);
+  }
+
+  #[test]
+  fn a_chosen_folder_without_lock_support_is_used_unlocked_and_flagged() {
+    let c = decide(Some("/picked"), true, Err(LockError::Unsupported), Ok(()));
+    assert_eq!(c.dir, PathBuf::from("/picked"));
+    assert!(c.lock.is_none());
+    assert_eq!(c.reason, FallbackReason::None);
+    assert!(c.unlockable);
+  }
+
+  #[test]
+  fn a_lock_that_fails_for_another_reason_counts_as_an_unusable_folder() {
+    let c = decide(Some("/picked"), true, Err(LockError::Other), Ok(()));
+    assert_eq!(c.dir, PathBuf::from("/default"));
+    assert_eq!(c.reason, FallbackReason::Unwritable);
+  }
+
+  #[test]
+  fn startup_never_fails_when_even_the_default_folder_cannot_be_locked() {
+    for kind in [LockError::Busy, LockError::Unsupported, LockError::Other] {
+      // After a fallback: the default folder is used unlocked, the reason stays.
+      let c = decide(Some("/picked"), true, Err(LockError::Busy), Err(kind));
+      assert_eq!(c.dir, PathBuf::from("/default"));
+      assert!(c.lock.is_none());
+      assert_eq!(c.reason, FallbackReason::InUse);
+      assert_eq!(
+        c.unlockable,
+        kind == LockError::Unsupported,
+        "a notice only when the folder in use has no lock support"
+      );
+      // With nothing chosen.
+      let c = decide(None, true, Ok(()), Err(kind));
+      assert_eq!(c.dir, PathBuf::from("/default"));
+      assert!(c.lock.is_none());
+      assert_eq!(c.reason, FallbackReason::None);
+    }
+  }
+
+  #[test]
+  fn with_nothing_chosen_the_default_is_locked_and_lock_support_is_flagged() {
+    let c = decide(None, true, Ok(()), Ok(()));
+    assert_eq!(c.dir, PathBuf::from("/default"));
+    assert!(c.lock.is_some());
+    assert!(!c.unlockable);
+    let c = decide(None, true, Ok(()), Err(LockError::Unsupported));
+    assert!(c.unlockable);
+    let c = decide(None, true, Ok(()), Err(LockError::Busy));
+    assert!(!c.unlockable);
+  }
+
+  #[test]
+  fn a_fallback_default_folder_without_lock_support_is_flagged() {
+    let busy = decide(
+      Some("/picked"),
+      true,
+      Err(LockError::Busy),
+      Err(LockError::Unsupported),
+    );
+    assert_eq!(busy.reason, FallbackReason::InUse);
+    assert!(busy.unlockable);
+    let unwritable = decide(Some("/picked"), false, Ok(()), Err(LockError::Unsupported));
+    assert_eq!(unwritable.reason, FallbackReason::Unwritable);
+    assert!(unwritable.unlockable);
+  }
+
+  #[test]
+  fn the_lock_file_is_neither_loaded_nor_moved() {
+    let root = tempdir().unwrap();
+    let dir1 = root.path().join("local");
+    let dir2 = root.path().join("dst");
+    std::fs::create_dir_all(&dir2).unwrap();
+    let store = NoteStore::load(dir1.clone()).unwrap();
+    store.upsert(note("a")).unwrap();
+    let lock = snapshot_lock::try_lock(&dir1).unwrap();
+    assert!(dir1.join(snapshot_lock::LOCK_FILE_NAME).exists());
+    let loaded = load_dir(&dir1).unwrap();
+    assert_eq!(loaded.items.len(), 1);
+    assert!(
+      loaded.skipped.is_empty(),
+      "the lock file is not a skipped file"
+    );
+    move_snapshot_files(&dir1, &dir2, CollisionPolicy::Source).unwrap();
+    assert!(dir2.join("a.json").exists());
+    assert!(!dir2.join(snapshot_lock::LOCK_FILE_NAME).exists());
+    assert!(dir1.join(snapshot_lock::LOCK_FILE_NAME).exists());
+    drop(lock);
+  }
+
+  #[test]
+  fn switching_to_a_folder_in_use_fails_without_moving_or_unlocking_anything() {
+    let root = tempdir().unwrap();
+    let dir1 = root.path().join("local");
+    let dir2 = root.path().join("busy");
+    let store = NoteStore::load(dir1.clone()).unwrap();
+    store.upsert(note("a")).unwrap();
+    store.hold_lock(Some(snapshot_lock::try_lock(&dir1).unwrap()));
+    std::fs::create_dir_all(&dir2).unwrap();
+    let other_app = snapshot_lock::try_lock(&dir2).unwrap();
+    let result = store.set_dir(dir2.clone(), true, CollisionPolicy::Source);
+    assert_eq!(result, Err(SetDirError::InUse));
+    assert!(dir1.join("a.json").exists());
+    assert!(!dir2.join("a.json").exists());
+    assert_eq!(store.current_dir(), dir1);
+    assert_eq!(
+      snapshot_lock::try_lock(&dir1).unwrap_err().kind,
+      LockError::Busy,
+      "the old folder is still locked"
+    );
+    drop(other_app);
+  }
+
+  #[test]
+  fn a_successful_switch_locks_the_new_folder_and_releases_the_old_one() {
+    let root = tempdir().unwrap();
+    let dir1 = root.path().join("local");
+    let dir2 = root.path().join("cloud");
+    let store = NoteStore::load(dir1.clone()).unwrap();
+    store.upsert(note("a")).unwrap();
+    store.hold_lock(Some(snapshot_lock::try_lock(&dir1).unwrap()));
+    let result = store.set_dir(dir2.clone(), true, CollisionPolicy::Source);
+    assert_eq!(result, Ok(DirSwitch::Switched { unlockable: false }));
+    assert_eq!(
+      snapshot_lock::try_lock(&dir2).unwrap_err().kind,
+      LockError::Busy
+    );
+    assert!(snapshot_lock::try_lock(&dir1).is_ok());
+    assert_eq!(
+      store.set_dir(dir2, true, CollisionPolicy::Source),
+      Ok(DirSwitch::Unchanged)
+    );
+  }
+
+  #[test]
+  fn switching_to_a_folder_without_lock_support_works_and_is_flagged() {
+    let root = tempdir().unwrap();
+    let dir1 = root.path().join("local");
+    let dir2 = root.path().join("nas");
+    let store = NoteStore::load(dir1.clone()).unwrap();
+    store.upsert(note("a")).unwrap();
+    store.hold_lock(Some(snapshot_lock::try_lock(&dir1).unwrap()));
+    let result = store.set_dir_with(dir2.clone(), true, CollisionPolicy::Source, |_| {
+      Err(failure(LockError::Unsupported))
+    });
+    assert_eq!(result, Ok(DirSwitch::Switched { unlockable: true }));
+    assert_eq!(store.current_dir(), dir2);
+    assert!(dir2.join("a.json").exists());
+    assert!(
+      snapshot_lock::try_lock(&dir1).is_ok(),
+      "the old lock is released"
+    );
+  }
+
+  #[test]
+  fn switching_to_a_folder_whose_lock_fails_otherwise_is_an_error() {
+    let root = tempdir().unwrap();
+    let dir1 = root.path().join("local");
+    let dir2 = root.path().join("odd");
+    let store = NoteStore::load(dir1.clone()).unwrap();
+    store.upsert(note("a")).unwrap();
+    let result = store.set_dir_with(dir2, true, CollisionPolicy::Source, |_| {
+      Err(failure(LockError::Other))
+    });
+    assert_eq!(result, Err(SetDirError::Other("test".into())));
+    assert_eq!(store.current_dir(), dir1);
+    assert!(dir1.join("a.json").exists());
+  }
+
+  #[test]
+  fn the_switch_error_reaches_the_frontend_as_a_tagged_object() {
+    assert_eq!(
+      serde_json::to_value(SetDirError::InUse).unwrap(),
+      serde_json::json!({ "kind": "in_use" })
+    );
+    assert_eq!(
+      serde_json::to_value(SetDirError::Other("boom".into())).unwrap(),
+      serde_json::json!({ "kind": "other", "message": "boom" })
+    );
   }
 
   #[test]
@@ -1967,6 +2552,74 @@ mod tests {
   }
 
   #[test]
+  fn a_failed_setting_write_never_lets_another_app_take_the_old_folder() {
+    let root = tempdir().unwrap();
+    let dir1 = root.path().join("local");
+    let dir2 = root.path().join("cloud");
+    let store = NoteStore::load(dir1.clone()).unwrap();
+    store.upsert(note("a")).unwrap();
+    store.hold_lock(Some(snapshot_lock::try_lock(&dir1).unwrap()));
+    let persist_calls = std::cell::Cell::new(0);
+    let other_app = std::cell::RefCell::new(None);
+    let result = switch_and_persist(&store, dir2.clone(), true, CollisionPolicy::Source, || {
+      // Another app tries for the old folder at the moment the write fails.
+      *other_app.borrow_mut() = Some(snapshot_lock::try_lock(&dir1));
+      persist_calls.set(persist_calls.get() + 1);
+      Err("disk full".to_string())
+    });
+    assert!(result.is_err());
+    let other_app = other_app.into_inner().unwrap();
+    assert_eq!(
+      other_app.err().map(|failure| failure.kind),
+      Some(LockError::Busy),
+      "the old folder stays locked until the setting is written"
+    );
+    assert_eq!(
+      persist_calls.get(),
+      1,
+      "the write is attempted exactly once"
+    );
+    assert_eq!(store.current_dir(), dir1);
+    assert!(dir1.join("a.json").exists());
+    assert!(!dir2.join("a.json").exists());
+    assert_eq!(
+      snapshot_lock::try_lock(&dir1).unwrap_err().kind,
+      LockError::Busy,
+      "the store still holds the old lock"
+    );
+    assert!(
+      snapshot_lock::try_lock(&dir2).is_ok(),
+      "the new folder's lock was dropped"
+    );
+  }
+
+  #[test]
+  fn after_a_failed_setting_write_the_list_agrees_with_the_old_folder_on_disk() {
+    let root = tempdir().unwrap();
+    let dir1 = root.path().join("local");
+    let dir2 = root.path().join("cloud");
+    let store = NoteStore::load(dir1.clone()).unwrap();
+    store.upsert(note("a")).unwrap();
+    // The destination already holds a note the failed move drags back with it.
+    NoteStore::load(dir2.clone())
+      .unwrap()
+      .upsert(note("b"))
+      .unwrap();
+    let result = switch_and_persist(&store, dir2.clone(), true, CollisionPolicy::Source, || {
+      Err("disk full".to_string())
+    });
+    assert!(result.is_err());
+    let ids = |notes: Vec<NoteSnapshot>| {
+      let mut ids: Vec<String> = notes.into_iter().map(|n| n.id).collect();
+      ids.sort();
+      ids
+    };
+    assert_eq!(ids(load_dir(&dir1).unwrap().items), vec!["a", "b"]);
+    assert_eq!(ids(store.list()), ids(load_dir(&dir1).unwrap().items));
+    assert_eq!(store.current_dir(), dir1);
+  }
+
+  #[test]
   fn the_setting_is_only_written_after_a_successful_move() {
     // This ordering was documented but never tested.
     let root = tempdir().unwrap();
@@ -1974,18 +2627,17 @@ mod tests {
     let dir2 = root.path().join("cloud");
     let store = NoteStore::load(dir1.clone()).unwrap();
     store.upsert(note("a")).unwrap();
-    // Observed from *inside* the setting-write closure: proves the move (and
-    // the dir switch it implies) already happened before this callback ran,
-    // not just that it happened by the time the outer call returns.
-    let seen_before_write = std::sync::Mutex::new((false, PathBuf::new()));
+    // Observed from *inside* the setting-write closure: proves the move already
+    // happened before this callback ran, not just by the time the outer call
+    // returns. The store is locked there, so only the disk can be looked at.
+    let moved_before_write = std::cell::Cell::new(false);
     let result = switch_and_persist(&store, dir2.clone(), true, CollisionPolicy::Source, || {
-      *seen_before_write.lock().unwrap() = (dir2.join("a.json").exists(), store.current_dir());
+      moved_before_write.set(dir2.join("a.json").exists());
       Ok(())
     });
     assert!(result.is_ok());
-    let (moved_before_write, dir_before_write) = seen_before_write.into_inner().unwrap();
-    assert!(moved_before_write);
-    assert_eq!(dir_before_write, dir2);
+    assert!(moved_before_write.get());
+    assert_eq!(store.current_dir(), dir2);
   }
 
   #[test]
@@ -2139,14 +2791,14 @@ mod tests {
     assert_eq!(reloaded[0].range_trailing_break, Some(false));
   }
 
-  fn kept_large(id: &str, group: Option<&str>, tab_index: i64) -> NoteSnapshot {
+  fn large(id: &str, group: Option<&str>, tab_index: i64) -> NoteSnapshot {
     NoteSnapshot {
       large: Some(200 * 1024 * 1024),
       ..doc(id, group, tab_index)
     }
   }
 
-  fn kept_windowed(id: &str, group: Option<&str>, tab_index: i64) -> NoteSnapshot {
+  fn windowed(id: &str, group: Option<&str>, tab_index: i64) -> NoteSnapshot {
     NoteSnapshot {
       large: Some(200 * 1024 * 1024),
       windowed_index: Some(CheckpointIndex {
@@ -2157,47 +2809,113 @@ mod tests {
     }
   }
 
-  fn kept_range(id: &str, group: Option<&str>, tab_index: i64) -> NoteSnapshot {
+  fn old_range(id: &str, group: Option<&str>, tab_index: i64, dirty: bool) -> NoteSnapshot {
     NoteSnapshot {
       file_path: Some(String::new()),
       range_source: Some("/tmp/big.log".into()),
       range_start: Some(0),
       range_end: Some(10),
-      dirty: true,
-      content: "unsaved edit".into(),
+      dirty,
+      content: if dirty {
+        "unsaved edit".into()
+      } else {
+        String::new()
+      },
       ..doc(id, group, tab_index)
     }
   }
+  /// The ids of the document groups `plan_document_windows` opens, in order.
+  fn planned(notes: &[NoteSnapshot]) -> Vec<String> {
+    plan_document_windows(notes)
+      .into_iter()
+      .map(|p| p.group)
+      .collect()
+  }
 
   #[test]
-  fn a_tab_needing_a_removed_feature_is_a_kept_tab() {
-    assert!(needs_full_edition(&kept_large("a", None, 0)));
-    assert!(needs_full_edition(&kept_windowed("b", None, 0)));
-    assert!(needs_full_edition(&kept_range("c", None, 0)));
-    assert!(!needs_full_edition(&doc("d", None, 0)));
+  fn only_a_clean_document_range_record_is_a_clean_old_range_record() {
+    assert!(is_clean_range_record(&old_range("a", None, 0, false)));
+    assert!(!is_clean_range_record(&old_range("b", None, 0, true)));
+    assert!(!is_clean_range_record(&doc("c", None, 0)));
+    assert!(!is_clean_range_record(&large("d", None, 0)));
     // A sticky is never one, whatever its fields say.
-    assert!(!needs_full_edition(&NoteSnapshot {
-      large: Some(1),
+    assert!(!is_clean_range_record(&NoteSnapshot {
+      range_source: Some("/tmp/big.log".into()),
       ..note("s")
     }));
   }
 
   #[test]
-  fn lite_leaves_a_kept_tab_out_of_the_group_migration_and_full_does_not() {
-    for kept in [
-      kept_large("a", None, 0),
-      kept_windowed("b", None, 0),
-      kept_range("c", None, 0),
+  fn startup_deletes_clean_old_range_records_and_keeps_every_other_record() {
+    let dir = tempdir().unwrap();
+    let store = NoteStore::load(dir.path().to_path_buf()).unwrap();
+    for n in [
+      old_range("clean", Some("g1"), 0, false),
+      old_range("dirty", Some("g2"), 0, true),
+      doc("plain", Some("g1"), 1),
+      large("large", Some("g3"), 0),
+      windowed("windowed", Some("g4"), 0),
+      note("sticky"),
     ] {
-      assert!(!needs_group_migration(&kept, true), "{}", kept.id);
-      assert!(needs_group_migration(&kept, false), "{}", kept.id);
+      store.upsert(n).unwrap();
     }
-    // An ordinary group-less document migrates in both.
-    assert!(needs_group_migration(&doc("d", None, 0), true));
-    assert!(needs_group_migration(&doc("d", None, 0), false));
-    // One that already has a group, and a sticky, never do.
-    assert!(!needs_group_migration(&doc("e", Some("g"), 0), false));
-    assert!(!needs_group_migration(&note("s"), false));
+
+    drop_clean_range_records(&store);
+
+    let mut kept: Vec<String> = store.list().into_iter().map(|n| n.id).collect();
+    kept.sort();
+    assert_eq!(kept, ["dirty", "large", "plain", "sticky", "windowed"]);
+    // Gone from disk too, so the next launch does not find it again.
+    let reloaded = NoteStore::load(dir.path().to_path_buf()).unwrap();
+    assert!(reloaded.get("clean").is_none());
+    assert!(reloaded.get("dirty").is_some());
+  }
+
+  #[test]
+  fn a_group_made_only_of_clean_old_range_records_is_not_planned_as_a_window() {
+    let dir = tempdir().unwrap();
+    let store = NoteStore::load(dir.path().to_path_buf()).unwrap();
+    for n in [
+      old_range("only", Some("only-clean"), 0, false),
+      old_range("also", Some("only-clean"), 1, false),
+      old_range("c1", Some("mixed"), 0, false),
+      doc("p1", Some("mixed"), 1),
+      old_range("d1", Some("dirty"), 0, true),
+    ] {
+      store.upsert(n).unwrap();
+    }
+    assert_eq!(
+      planned(&store.list()),
+      ["only-clean", "mixed", "dirty"],
+      "the premise: before the purge every group is planned"
+    );
+
+    drop_clean_range_records(&store);
+
+    assert_eq!(planned(&store.list()), ["mixed", "dirty"]);
+  }
+
+  #[test]
+  fn a_group_with_large_windowed_and_range_tabs_is_one_window_at_its_lowest_tab() {
+    let notes = vec![
+      NoteSnapshot {
+        x: Some(500.0),
+        ..windowed("w", Some("g"), 2)
+      },
+      NoteSnapshot {
+        x: Some(10.0),
+        ..large("l", Some("g"), 0)
+      },
+      NoteSnapshot {
+        x: Some(900.0),
+        ..old_range("r", Some("g"), 1, true)
+      },
+    ];
+    let plans = plan_document_windows(&notes);
+    assert_eq!(plans.len(), 1);
+    assert_eq!(plans[0].group, "g");
+    // The large record is the lowest tab: no edition makes another one win.
+    assert_eq!(plans[0].x, Some(10.0));
   }
 
   /// The bytes of every `*.json` in `dir`, by name.
@@ -2216,11 +2934,10 @@ mod tests {
   }
 
   #[test]
-  fn lite_startup_never_rewrites_or_drops_a_kept_tab_record() {
+  fn startup_gives_every_group_less_document_its_own_group() {
     let dir = tempdir().unwrap();
-    // Hand-written, deliberately not what this build would serialize, so any
-    // rewrite changes the bytes. Group-less: the one record the startup
-    // migration would otherwise touch.
+    // Hand-written, deliberately not what this build would serialize, so a
+    // migration changes the bytes.
     let legacy = |id: &str, extra: &str| {
       format!(
         "{{\"id\":\"{id}\",\"content\":\"unsaved edit\",\"file_path\":\"\",\"kind\":\"document\",\"dirty\":true,{extra}}}"
@@ -2249,112 +2966,17 @@ mod tests {
     let notes = store.list();
     assert_eq!(notes.len(), 3);
 
-    migrate_group_less_documents(&store, &notes, true);
+    migrate_group_less_documents(&store, &notes);
 
     let after = file_bytes(dir.path());
-    assert_eq!(
-      after.keys().collect::<Vec<_>>(),
-      before.keys().collect::<Vec<_>>()
-    );
-    assert_eq!(after["range.json"], before["range.json"]);
-    assert_eq!(after["large.json"], before["large.json"]);
-    // The ordinary one is migrated as always, so the check above is not vacuous.
-    assert_ne!(after["plain.json"], before["plain.json"]);
-    // Still in the store, and still planned into a window each.
-    let kept: Vec<_> = store
-      .list()
-      .into_iter()
-      .filter(needs_full_edition)
-      .collect();
-    assert_eq!(kept.len(), 2);
-    assert_eq!(plan_document_windows(&store.list(), true).len(), 3);
-    // Full: they migrate like any other.
-    migrate_group_less_documents(&store, &notes, false);
-    let full = file_bytes(dir.path());
-    assert_ne!(full["range.json"], before["range.json"]);
-    assert_ne!(full["large.json"], before["large.json"]);
-  }
-
-  fn held(groups: &[&str]) -> std::collections::HashSet<String> {
-    groups.iter().map(|g| g.to_string()).collect()
-  }
-
-  #[test]
-  fn only_held_groups_holding_a_kept_tab_and_without_a_window_reopen() {
-    let notes = vec![
-      doc("a1", Some("plain"), 0),
-      kept_large("b1", Some("kept-closed"), 0),
-      doc("b2", Some("kept-closed"), 1),
-      kept_range("c1", Some("kept-open"), 0),
-      kept_windowed("d1", None, 0),
-      kept_range("e1", Some("user-closed"), 0),
-      note("sticky"),
-    ];
-    let live = |group: &str| group == "kept-open";
-    let all = held(&["plain", "kept-closed", "kept-open", "d1"]);
-    let groups: Vec<String> = groups_to_reopen(&notes, &all, live)
-      .into_iter()
-      .map(|p| p.group)
-      .collect();
-    // A group-less kept tab is its own group, keyed by its id. The group the
-    // user closed is not held, so it stays closed; a plain group has nothing
-    // to bring back; a live group is not duplicated.
-    assert_eq!(groups, vec!["kept-closed", "d1"]);
-    assert!(groups_to_reopen(&notes, &all, |_| true).is_empty());
-    assert!(groups_to_reopen(&notes, &held(&[]), |_| false).is_empty());
-  }
-
-  #[test]
-  fn a_group_closed_by_the_user_in_full_is_not_reopened_when_the_edition_returns() {
-    let notes = vec![kept_range("c1", Some("closed-in-full"), 0)];
-    assert!(groups_to_reopen(&notes, &held(&[]), |_| false).is_empty());
-    // The same group, once the app held it back for the trial, is.
-    let groups = groups_to_reopen(&notes, &held(&["closed-in-full"]), |_| false);
-    assert_eq!(groups.len(), 1);
-    assert_eq!(groups[0].group, "closed-in-full");
-  }
-
-  #[test]
-  fn held_back_groups_are_taken_once_and_the_set_is_left_empty() {
-    let state = HeldBackGroups::default();
-    assert!(state.take_all().is_empty());
-    state.hold("a".to_string());
-    state.hold("b".to_string());
-    state.hold("a".to_string());
-    assert_eq!(state.take_all(), held(&["a", "b"]));
-    assert!(state.take_all().is_empty());
-  }
-
-  fn at(mut note: NoteSnapshot, x: f64) -> NoteSnapshot {
-    note.x = Some(x);
-    note
-  }
-
-  #[test]
-  fn lite_takes_window_bounds_from_a_shown_tab_not_a_kept_one() {
-    // The kept record has the lowest tab_index but its bounds are stale.
-    let notes = vec![
-      at(kept_range("k", Some("g"), 0), 10.0),
-      at(doc("s", Some("g"), 1), 900.0),
-    ];
-    assert_eq!(plan_document_windows(&notes, true)[0].x, Some(900.0));
-    assert_eq!(plan_document_windows(&notes, false)[0].x, Some(10.0));
-    // Among shown tabs the lowest tab_index still wins.
-    let more = vec![
-      at(kept_range("k", Some("g"), 0), 10.0),
-      at(doc("s2", Some("g"), 3), 700.0),
-      at(doc("s1", Some("g"), 1), 900.0),
-    ];
-    assert_eq!(plan_document_windows(&more, true)[0].x, Some(900.0));
-  }
-
-  #[test]
-  fn lite_falls_back_to_the_lowest_kept_tab_when_a_group_holds_only_kept_ones() {
-    let notes = vec![
-      at(kept_large("k2", Some("g"), 2), 500.0),
-      at(kept_range("k1", Some("g"), 1), 10.0),
-    ];
-    assert_eq!(plan_document_windows(&notes, true)[0].x, Some(10.0));
+    for name in ["range.json", "large.json", "plain.json"] {
+      assert_ne!(after[name], before[name], "{name}");
+    }
+    assert_eq!(planned(&store.list()).len(), 3);
+    // One that already has a group is left alone.
+    let grouped = store.list();
+    migrate_group_less_documents(&store, &grouped);
+    assert_eq!(file_bytes(dir.path()), after);
   }
 
   #[test]
@@ -2402,6 +3024,231 @@ mod tests {
     assert_eq!(reloaded, vec![d]);
   }
 
+  fn doc_in(id: &str, group: &str, project: Option<&str>) -> NoteSnapshot {
+    NoteSnapshot {
+      project: project.map(str::to_string),
+      ..doc(id, Some(group), 0)
+    }
+  }
+
+  #[test]
+  fn rebind_project_rewrites_only_the_matching_project() {
+    let dir = tempdir().unwrap();
+    let store = NoteStore::load(dir.path().to_path_buf()).unwrap();
+    store.upsert(doc_in("a", "g1", Some("/x/y"))).unwrap();
+    // A group whose window is closed is still a stored record.
+    store.upsert(doc_in("b", "g2", Some("/x/y"))).unwrap();
+    store.upsert(doc_in("c", "g3", Some("/x/other"))).unwrap();
+    store.upsert(doc_in("d", "g4", None)).unwrap();
+    store.upsert(note("s")).unwrap();
+    assert_eq!(store.rebind_project("/x/y", "/x").unwrap(), 2);
+    let project_of = |id: &str| store.get(id).unwrap().project;
+    assert_eq!(project_of("a").as_deref(), Some("/x"));
+    assert_eq!(project_of("b").as_deref(), Some("/x"));
+    assert_eq!(project_of("c").as_deref(), Some("/x/other"));
+    assert_eq!(project_of("d"), None);
+    assert_eq!(project_of("s"), None);
+    // The rewrite reached the disk, not just the in-memory list.
+    let reloaded = NoteStore::load(dir.path().to_path_buf()).unwrap();
+    assert_eq!(reloaded.get("b").unwrap().project.as_deref(), Some("/x"));
+  }
+
+  #[test]
+  fn ordered_write_that_arrives_after_a_rebind_keeps_the_new_project() {
+    let dir = tempdir().unwrap();
+    let store = NoteStore::load(dir.path().to_path_buf()).unwrap();
+    store
+      .upsert_ordered(doc_in("a", "g1", Some("/x/y")), 4)
+      .unwrap();
+    store.rebind_project("/x/y", "/x").unwrap();
+    // Sent before the rebind with the same seq, delivered after it.
+    assert!(store
+      .upsert_ordered(doc_in("a", "g1", Some("/x/y")), 4)
+      .unwrap());
+    assert_eq!(store.get("a").unwrap().project.as_deref(), Some("/x"));
+    let reloaded = NoteStore::load(dir.path().to_path_buf()).unwrap();
+    assert_eq!(reloaded.get("a").unwrap().project.as_deref(), Some("/x"));
+    // The plain upsert path is covered too, and a first write is re-tagged.
+    store.upsert(doc_in("a", "g1", Some("/x/y"))).unwrap();
+    assert_eq!(store.get("a").unwrap().project.as_deref(), Some("/x"));
+    store
+      .upsert_ordered(doc_in("new", "g1", Some("/x/y")), 1)
+      .unwrap();
+    assert_eq!(store.get("new").unwrap().project.as_deref(), Some("/x"));
+    // Other projects are left alone.
+    store
+      .upsert_ordered(doc_in("c", "g3", Some("/x/other")), 1)
+      .unwrap();
+    assert_eq!(store.get("c").unwrap().project.as_deref(), Some("/x/other"));
+  }
+
+  #[test]
+  fn chained_rebinds_resolve_to_the_last_project() {
+    let dir = tempdir().unwrap();
+    let store = NoteStore::load(dir.path().to_path_buf()).unwrap();
+    store.upsert(doc_in("a", "g1", Some("/x/y/z"))).unwrap();
+    store.upsert(doc_in("b", "g2", Some("/x/y"))).unwrap();
+    store.rebind_project("/x/y/z", "/x/y").unwrap();
+    store.rebind_project("/x/y", "/x").unwrap();
+    assert_eq!(store.get("a").unwrap().project.as_deref(), Some("/x"));
+    assert_eq!(store.get("b").unwrap().project.as_deref(), Some("/x"));
+    // A write still tagged with the first or the second project lands on the last.
+    store.upsert(doc_in("a", "g1", Some("/x/y/z"))).unwrap();
+    assert_eq!(store.get("a").unwrap().project.as_deref(), Some("/x"));
+    store.upsert(doc_in("b", "g2", Some("/x/y"))).unwrap();
+    assert_eq!(store.get("b").unwrap().project.as_deref(), Some("/x"));
+  }
+
+  #[test]
+  fn a_forgotten_rebind_leaves_later_writes_on_their_project() {
+    let dir = tempdir().unwrap();
+    let store = NoteStore::load(dir.path().to_path_buf()).unwrap();
+    store.upsert(doc_in("a", "g1", Some("/x/y"))).unwrap();
+    store.rebind_project("/x/y", "/x").unwrap();
+    // The folded project is added again as a project of its own.
+    store.forget_rebind("/x/y");
+    store.upsert(doc_in("a", "g1", Some("/x/y"))).unwrap();
+    assert_eq!(store.get("a").unwrap().project.as_deref(), Some("/x/y"));
+    store
+      .upsert_ordered(doc_in("b", "g2", Some("/x/y")), 1)
+      .unwrap();
+    assert_eq!(store.get("b").unwrap().project.as_deref(), Some("/x/y"));
+    // Forgetting a project that was never folded changes nothing.
+    store.forget_rebind("/never");
+  }
+
+  #[test]
+  fn a_chain_stops_at_the_project_that_was_forgotten() {
+    let dir = tempdir().unwrap();
+    let store = NoteStore::load(dir.path().to_path_buf()).unwrap();
+    store.rebind_project("/x/y/z", "/x/y").unwrap();
+    store.rebind_project("/x/y", "/x").unwrap();
+    store.forget_rebind("/x/y");
+    // `/x/y` is its own project again; `/x/y/z` still folds into it.
+    store.upsert(doc_in("a", "g1", Some("/x/y"))).unwrap();
+    assert_eq!(store.get("a").unwrap().project.as_deref(), Some("/x/y"));
+    store.upsert(doc_in("b", "g2", Some("/x/y/z"))).unwrap();
+    assert_eq!(store.get("b").unwrap().project.as_deref(), Some("/x/y"));
+    // The rebind further up is untouched for any other project.
+    store.rebind_project("/q", "/x").unwrap();
+    store.upsert(doc_in("c", "g3", Some("/q"))).unwrap();
+    assert_eq!(store.get("c").unwrap().project.as_deref(), Some("/x"));
+  }
+
+  #[test]
+  fn rebinding_a_project_to_itself_changes_nothing() {
+    let dir = tempdir().unwrap();
+    let store = NoteStore::load(dir.path().to_path_buf()).unwrap();
+    store.upsert(doc_in("a", "g1", Some("/x"))).unwrap();
+    assert_eq!(store.rebind_project("/x", "/x").unwrap(), 0);
+    store.upsert(doc_in("a", "g1", Some("/x"))).unwrap();
+    assert_eq!(store.get("a").unwrap().project.as_deref(), Some("/x"));
+  }
+
+  fn doc_at(id: &str, group: &str, file: Option<&str>, range: Option<&str>) -> NoteSnapshot {
+    NoteSnapshot {
+      file_path: file.map(str::to_string),
+      range_source: range.map(str::to_string),
+      ..doc(id, Some(group), 0)
+    }
+  }
+
+  #[test]
+  fn retarget_paths_rewrites_the_file_and_the_range_source() {
+    let dir = tempdir().unwrap();
+    let store = NoteStore::load(dir.path().to_path_buf()).unwrap();
+    store
+      .upsert(doc_at("a", "g1", Some("/x/f.txt"), None))
+      .unwrap();
+    // A group whose window is closed is still a stored record.
+    store
+      .upsert(doc_at("b", "g2", Some("/x/f.txt"), None))
+      .unwrap();
+    store
+      .upsert(doc_at("c", "g3", None, Some("/x/f.txt")))
+      .unwrap();
+    store
+      .upsert(doc_at("d", "g4", Some("/x/other.txt"), None))
+      .unwrap();
+    store.upsert(doc_at("e", "g5", None, None)).unwrap();
+    store.upsert(note("s")).unwrap();
+    assert_eq!(store.retarget_paths("/x/f.txt", "/x/g.txt").unwrap(), 3);
+    let file_of = |id: &str| store.get(id).unwrap().file_path;
+    assert_eq!(file_of("a").as_deref(), Some("/x/g.txt"));
+    assert_eq!(file_of("b").as_deref(), Some("/x/g.txt"));
+    assert_eq!(
+      store.get("c").unwrap().range_source.as_deref(),
+      Some("/x/g.txt")
+    );
+    assert_eq!(file_of("d").as_deref(), Some("/x/other.txt"));
+    assert_eq!(file_of("e"), None);
+    assert_eq!(file_of("s"), None);
+    // The rewrite reached the disk, not just the in-memory list.
+    let reloaded = NoteStore::load(dir.path().to_path_buf()).unwrap();
+    assert_eq!(
+      reloaded.get("b").unwrap().file_path.as_deref(),
+      Some("/x/g.txt")
+    );
+  }
+
+  #[test]
+  fn renaming_a_folder_moves_every_record_below_it() {
+    let dir = tempdir().unwrap();
+    let store = NoteStore::load(dir.path().to_path_buf()).unwrap();
+    store
+      .upsert(doc_at("a", "g1", Some("/x/y/f.txt"), None))
+      .unwrap();
+    store
+      .upsert(doc_at("b", "g1", Some("/x/y/deep/g.txt"), None))
+      .unwrap();
+    store
+      .upsert(doc_at("c", "g2", Some("/x/y2/f.txt"), None))
+      .unwrap();
+    store
+      .upsert(doc_at("d", "g2", None, Some("/x/y/big.log")))
+      .unwrap();
+    assert_eq!(store.retarget_paths("/x/y", "/x/z").unwrap(), 3);
+    let file_of = |id: &str| store.get(id).unwrap().file_path;
+    assert_eq!(file_of("a").as_deref(), Some("/x/z/f.txt"));
+    assert_eq!(file_of("b").as_deref(), Some("/x/z/deep/g.txt"));
+    // `/x/y2` is a different folder, not something below `/x/y`.
+    assert_eq!(file_of("c").as_deref(), Some("/x/y2/f.txt"));
+    assert_eq!(
+      store.get("d").unwrap().range_source.as_deref(),
+      Some("/x/z/big.log")
+    );
+  }
+
+  #[test]
+  fn a_write_from_before_a_rename_never_wins_over_the_newer_one() {
+    let dir = tempdir().unwrap();
+    let store = NoteStore::load(dir.path().to_path_buf()).unwrap();
+    let old = || doc_at("a", "g1", Some("/x/f.txt"), None);
+    let moved = || doc_at("a", "g1", Some("/x/g.txt"), None);
+    // Sent before the rename and applied.
+    assert!(store.upsert_ordered(old(), 7).unwrap());
+    store.retarget_paths("/x/f.txt", "/x/g.txt").unwrap();
+    assert_eq!(
+      store.get("a").unwrap().file_path.as_deref(),
+      Some("/x/g.txt")
+    );
+    // The window writes the tab again with the new path and a newer seq.
+    assert!(store.upsert_ordered(moved(), 8).unwrap());
+    // The old write, sent before the rename with seq 7, arrives only now.
+    assert!(!store.upsert_ordered(old(), 7).unwrap());
+    assert_eq!(
+      store.get("a").unwrap().file_path.as_deref(),
+      Some("/x/g.txt")
+    );
+    // A write after the rename is applied as usual.
+    assert!(store.upsert_ordered(moved(), 9).unwrap());
+    let reloaded = NoteStore::load(dir.path().to_path_buf()).unwrap();
+    assert_eq!(
+      reloaded.get("a").unwrap().file_path.as_deref(),
+      Some("/x/g.txt")
+    );
+  }
+
   #[test]
   fn plan_groups_tabs_and_ignores_stickies() {
     let notes = vec![
@@ -2410,7 +3257,7 @@ mod tests {
       doc("b", Some("g1"), 0),
       doc("c", Some("g2"), 0),
     ];
-    let plans = plan_document_windows(&notes, false);
+    let plans = plan_document_windows(&notes);
     assert_eq!(plans.len(), 2);
     // g1 keeps first-appearance order; its bounds come from the lowest tab_index (b).
     assert_eq!(plans[0].group, "g1");
@@ -2421,7 +3268,7 @@ mod tests {
   #[test]
   fn plan_treats_group_none_as_solo_group_by_id() {
     let notes = vec![doc("solo1", None, 0), doc("solo2", None, 0)];
-    let plans = plan_document_windows(&notes, false);
+    let plans = plan_document_windows(&notes);
     assert_eq!(plans.len(), 2);
     assert_eq!(plans[0].group, "solo1");
     assert_eq!(plans[1].group, "solo2");

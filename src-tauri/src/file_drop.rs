@@ -542,7 +542,14 @@ mod tests {
 
   #[test]
   fn other_windows_ignore_drops() {
-    for label in ["settings", "about", "privacy", "edition"] {
+    for label in [
+      "settings",
+      "about",
+      "load-problems",
+      "acknowledgements",
+      "privacy",
+      "edition",
+    ] {
       assert_eq!(drop_route(label, "tab", Some("doc-b")), DropRoute::Ignore);
     }
   }

@@ -24,16 +24,8 @@ use std::os::unix::fs::DirBuilderExt;
 use std::path::{Path, PathBuf};
 use std::sync::{mpsc, OnceLock};
 use std::time::{Duration, Instant};
-/// `identifier` in tauri.conf.json.
+/// `identifier` in tauri.conf.json, which also names the app data directory.
 const IDENTIFIER_FULL: &str = "net.lonshaus.note-n-pad";
-/// `identifier` in tauri.lite.conf.json.
-const IDENTIFIER_LITE: &str = "net.lonshaus.note-n-pad-lite";
-/// The bundle identifier, which also names the app data directory.
-const IDENTIFIER: &str = if cfg!(feature = "lite") {
-  IDENTIFIER_LITE
-} else {
-  IDENTIFIER_FULL
-};
 const LOCK_NAME: &CStr = c".instance.lock";
 /// Exists while the lock holder runs its quit handshake.
 const QUITTING_NAME: &CStr = c".quitting";
@@ -149,7 +141,7 @@ pub fn clear_quitting() {
 /// The app data directory by the rule Tauri's `app_data_dir` uses on macOS,
 /// so the lock always sits beside the data it protects.
 fn data_dir() -> Option<PathBuf> {
-  dirs::data_dir().map(|dir| dir.join(IDENTIFIER))
+  dirs::data_dir().map(|dir| dir.join(IDENTIFIER_FULL))
 }
 
 fn start_in(dir: &Path) -> Result<(Fds, Decision), String> {
@@ -406,7 +398,7 @@ fn choose(candidates: &[Candidate], own_pid: i32, own_bundle: Option<&str>) -> O
 fn find_target() -> Option<Retained<NSURL>> {
   autoreleasepool(|_| {
     let apps = NSRunningApplication::runningApplicationsWithBundleIdentifier(&NSString::from_str(
-      IDENTIFIER,
+      IDENTIFIER_FULL,
     ));
     let own_bundle = NSBundle::mainBundle()
       .bundleURL()
@@ -492,18 +484,14 @@ mod tests {
   #[test]
   fn identifiers_match_the_conf_files() {
     assert_eq!(IDENTIFIER_FULL, conf_identifier("tauri.conf.json"));
-    assert_eq!(IDENTIFIER_LITE, conf_identifier("tauri.lite.conf.json"));
-    let expected = if cfg!(feature = "lite") {
-      IDENTIFIER_LITE
-    } else {
-      IDENTIFIER_FULL
-    };
-    assert_eq!(IDENTIFIER, expected);
   }
 
   #[test]
   fn data_dir_follows_the_tauri_rule() {
-    assert_eq!(data_dir(), Some(dirs::data_dir().unwrap().join(IDENTIFIER)));
+    assert_eq!(
+      data_dir(),
+      Some(dirs::data_dir().unwrap().join(IDENTIFIER_FULL))
+    );
   }
 
   #[test]

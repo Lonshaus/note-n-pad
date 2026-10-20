@@ -265,8 +265,7 @@ pub fn splice_file(
 
 #[tauri::command(async)]
 pub fn read_range(path: String, start: u64, end: u64) -> Result<ReadRange, String> {
-  // Slicing out a new range tab is the removed feature; saving one back
-  // (`splice_file`, `copy_range`) works on a tab that already exists.
+  // Slicing a range out for editing is the removed feature.
   crate::edition::require_full("range editing")?;
   read_range_at(Path::new(&path), start, end)
 }

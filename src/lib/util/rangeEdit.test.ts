@@ -4,34 +4,11 @@
 import { describe, expect, it } from 'vitest';
 import {
   RANGE_EDIT_MAX,
-  replacementByteLength,
   resolveByteRange,
   rangeWithinLimit,
   rangeWriteText,
   sliceEndsWithBreak,
 } from './rangeEdit';
-
-describe('replacementByteLength', () => {
-  it('counts LF bytes for an LF tab', () => {
-    // "ab\ncd" → 5 bytes.
-    expect(replacementByteLength('ab\ncd', 'LF')).toBe(5);
-  });
-
-  it('counts the extra CR byte per line for a CRLF tab', () => {
-    // The LF buffer "ab\ncd" writes back as "ab\r\ncd" → 6 bytes.
-    expect(replacementByteLength('ab\ncd', 'CRLF')).toBe(6);
-  });
-
-  it('counts multi-byte UTF-8 characters by their byte length', () => {
-    // "é" is 2 bytes; "日" is 3 bytes.
-    expect(replacementByteLength('é日', 'LF')).toBe(5);
-  });
-
-  it('adds one byte per newline when restoring CRLF on many lines', () => {
-    // Three newlines → three extra CR bytes over the LF length (6 chars + 3).
-    expect(replacementByteLength('a\nb\nc\nd', 'CRLF')).toBe(10);
-  });
-});
 
 describe('resolveByteRange', () => {
   it('uses the after-last-line offset as the exclusive end', () => {

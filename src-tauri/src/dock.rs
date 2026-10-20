@@ -85,7 +85,6 @@ unsafe fn build_menu(
     .iter()
     .find(|(_, win)| win.is_focused().unwrap_or(false))
     .map(|(label, _)| label.clone());
-  #[cfg(not(feature = "lite"))]
   {
     // Workspace: a plain action button whose click opens the workspace. Shown
     // only while the workspace window is not visible — a visible one already sits
@@ -209,7 +208,6 @@ extern "C-unwind" fn dock_menu(
 }
 
 /// `-[delegate noteNPadOpenWorkspace:]`: the workspace item's action.
-#[cfg(not(feature = "lite"))]
 extern "C-unwind" fn open_workspace(_this: *mut AnyObject, _cmd: Sel, _sender: *mut AnyObject) {
   if let Some(app) = APP.get() {
     let _ = crate::windows::show_workspace(app);
@@ -291,7 +289,6 @@ pub fn install(app: &tauri::AppHandle) {
     let dock_imp: Imp = std::mem::transmute(
       dock_menu as extern "C-unwind" fn(*mut AnyObject, Sel, *mut AnyObject) -> *mut NSMenu,
     );
-    #[cfg(not(feature = "lite"))]
     let ws_imp: Imp = std::mem::transmute(
       open_workspace as extern "C-unwind" fn(*mut AnyObject, Sel, *mut AnyObject),
     );
@@ -300,11 +297,8 @@ pub fn install(app: &tauri::AppHandle) {
     let focus_doc_imp: Imp =
       std::mem::transmute(focus_doc as extern "C-unwind" fn(*mut AnyObject, Sel, *mut AnyObject));
     let ok_menu = class_addMethod(cls, sel!(applicationDockMenu:), dock_imp, c"@@:@".as_ptr());
-    #[cfg(not(feature = "lite"))]
     let ok_ws =
       class_addMethod(cls, sel!(noteNPadOpenWorkspace:), ws_imp, c"v@:@".as_ptr()).as_bool();
-    #[cfg(feature = "lite")]
-    let ok_ws = true;
     let ok_focus = class_addMethod(cls, sel!(noteNPadFocusNote:), focus_imp, c"v@:@".as_ptr());
     let ok_focus_doc = class_addMethod(
       cls,

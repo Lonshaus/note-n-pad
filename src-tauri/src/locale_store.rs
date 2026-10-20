@@ -559,7 +559,6 @@ pub fn delete_locale(app: AppHandle, id: String) -> Result<(), String> {
   Ok(())
 }
 
-#[cfg(not(feature = "lite"))]
 #[tauri::command]
 pub fn import_locale(app: AppHandle, path: String) -> Result<LocaleData, String> {
   crate::edition::require_full("importing a language")?;
@@ -576,7 +575,6 @@ pub fn import_locale(app: AppHandle, path: String) -> Result<LocaleData, String>
 /// Read and validate a locale file *without* installing it — the source for
 /// "update from JSON", where the caller merges the file's strings into the
 /// locale currently open in the editor instead of adding a new language.
-#[cfg(not(feature = "lite"))]
 #[tauri::command]
 pub fn read_locale_file(path: String) -> Result<LocaleData, String> {
   crate::edition::require_full("importing a language")?;
@@ -586,7 +584,6 @@ pub fn read_locale_file(path: String) -> Result<LocaleData, String> {
   Ok(locale)
 }
 
-#[cfg(not(feature = "lite"))]
 #[tauri::command]
 pub fn export_locale(locale: LocaleData, path: String) -> Result<(), String> {
   crate::edition::require_full("exporting a language")?;

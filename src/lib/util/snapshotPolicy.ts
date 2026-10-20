@@ -5,8 +5,8 @@
  *  - 'full': the tab is dirty and within the ceiling, so serialize the whole
  *    buffer — restoring it is the only way its edits survive a quit.
  *  - 'empty': the tab is clean (any size), so persist an empty string; the
- *    restore path re-reads a clean tab from disk (or, for a range tab, from the
- *    source slice) anyway, and storing megabytes is wasted IPC.
+ *    restore path re-reads a clean tab from disk anyway, and storing megabytes
+ *    is wasted IPC.
  *  - 'skip': the tab is dirty and over the ceiling, so its buffer is too big to
  *    ride along in a snapshot. The debounced auto-persist skips it (paying the
  *    IPC cost on every keystroke pause is the main large-file editing stall),
@@ -67,20 +67,4 @@ export function debounceContentPolicy(
     return 'skip';
   }
   return snapshotContentPolicy(dirty, length);
-}
-
-/** The content to restore into a range tab. A tab left dirty restores its
- *  stored (edited) buffer; a clean range tab defers to the current on-disk
- *  source slice, falling back to the stored buffer only when the source is gone
- *  (`diskSlice` null) — where a clean tab's stored buffer is itself empty,
- *  matching an ordinary tab whose file has vanished. */
-export function restoredRangeContent(
-  dirty: boolean,
-  storedContent: string,
-  diskSlice: string | null,
-): string {
-  if (dirty) {
-    return storedContent;
-  }
-  return diskSlice ?? storedContent;
 }

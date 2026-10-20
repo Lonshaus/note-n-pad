@@ -1,13 +1,11 @@
 // Copyright © 2026 Lonshaus
 // SPDX-License-Identifier: GPL-3.0-only
 
-#[cfg(not(feature = "lite"))]
 mod altgr;
 mod app_watch;
 #[cfg(debug_assertions)]
 mod automation;
 mod cmdline;
-#[cfg(not(feature = "lite"))]
 mod ctx_menu;
 mod data_files;
 mod default_apps;
@@ -26,7 +24,6 @@ mod grants;
 mod i18n;
 #[cfg(target_os = "windows")]
 mod jumplist;
-#[cfg(not(feature = "lite"))]
 mod large_file;
 mod launch_windows;
 mod licenses;
@@ -40,28 +37,31 @@ mod navigation;
 mod note_store;
 mod path_guard;
 mod pending_opens;
-#[cfg(not(feature = "lite"))]
 mod piece_table;
 mod platform;
 mod preview_img;
 mod privacy;
-#[cfg(not(feature = "lite"))]
 mod project;
-#[cfg(not(feature = "lite"))]
 mod range_edit;
-#[cfg(not(feature = "lite"))]
 mod replace_layer;
 mod settings;
 mod shortcut;
 mod shortcuts;
+mod snapshot_lock;
+#[cfg_attr(not(all(target_os = "macos", feature = "storekit")), allow(dead_code))]
+mod store_state;
+#[cfg(all(target_os = "macos", feature = "storekit"))]
+mod storekit;
 mod theme_store;
+mod transfer;
 mod webview2_runtime;
 mod win_menu_gray;
-#[cfg(not(feature = "lite"))]
 mod windowed;
-#[cfg(not(feature = "lite"))]
 mod windowed_scan;
 mod windows;
+
+#[cfg(all(feature = "storekit", not(target_os = "macos")))]
+compile_error!("the `storekit` feature is the sandboxed store build, which is macOS only");
 
 use flush::{FlushGate, FlushOutcome};
 use note_store::NoteStore;
@@ -689,6 +689,23 @@ fn track_last_doc_window(window: &tauri::Window, event: &tauri::WindowEvent) {
     _ => {}
   }
 }
+/// The labels among `labels` that belong to document windows.
+fn doc_window_labels<'a>(labels: impl Iterator<Item = &'a String>) -> Vec<&'a String> {
+  labels.filter(|label| label.starts_with("doc-")).collect()
+}
+/// Tell every document window that the app came to the front. Any window of the
+/// app gaining focus counts, so a document window learns of it when the user
+/// returns through the workspace or another document window as well.
+fn announce_app_focus(window: &tauri::Window, event: &tauri::WindowEvent) {
+  if !matches!(event, tauri::WindowEvent::Focused(true)) {
+    return;
+  }
+  let app = window.app_handle();
+  let windows = app.webview_windows();
+  for label in doc_window_labels(windows.keys()) {
+    let _ = app.emit_to(label.as_str(), "app-focused", ());
+  }
+}
 
 /// The tracked document window, if it is still open. Checking with the app
 /// handle rather than trusting the stored label alone covers the window being
@@ -860,6 +877,7 @@ pub(crate) fn apply_app_theme(app: &tauri::AppHandle, mode: &str) {
 fn handle_window_event(window: &tauri::Window, event: &tauri::WindowEvent) {
   sync_menu_focus(window, event);
   track_last_doc_window(window, event);
+  announce_app_focus(window, event);
   // muda caches a menu's light/dark colours per-HWND when the menu is attached
   // and never re-reads them, so a live app-mode switch leaves the native menu
   // bar stale while the title bar follows. `set_theme` re-pushes muda's Auto
@@ -1047,13 +1065,14 @@ pub(crate) fn escape_menu_label(label: &str) -> String {
 }
 
 /// The Help menu's items in order, by menu id and label. "Full Version Features"
-/// sits between Report an Issue and Acknowledgements and exists only in lite.
-fn help_menu_entries(lite: bool) -> Vec<(&'static str, i18n::Key)> {
+/// sits between Report an Issue and Acknowledgements and exists only in a build
+/// with editions.
+fn help_menu_entries(editions: bool) -> Vec<(&'static str, i18n::Key)> {
   let mut entries = vec![
     ("help-documentation", i18n::Key::Documentation),
     ("help-report-issue", i18n::Key::ReportIssue),
   ];
-  if lite {
+  if editions {
     entries.push(("help-full-features", i18n::Key::FullFeatures));
   }
   entries.push(("help-acknowledgements", i18n::Key::Acknowledgements));
@@ -1090,7 +1109,6 @@ fn build_menu(
     accel("settings"),
   )?;
   // Brand name; not localized (macOS shows the app name as the first submenu).
-  // "Note&Pad Lite" in the Lite build.
   let app_menu = Submenu::with_items(
     app,
     escape_menu_label(edition::app_name()),
@@ -1408,7 +1426,6 @@ fn build_menu(
     ],
   )?;
   // View menu: the Workspace (moved here from Window) and the Line Numbers toggle.
-  #[cfg(not(feature = "lite"))]
   let workspace = MenuItem::with_id(
     app,
     "workspace",
@@ -1425,7 +1442,6 @@ fn build_menu(
     accel("line-numbers"),
   )?;
   let view_menu = Submenu::new(app, tr(i18n::Key::ViewMenu), true)?;
-  #[cfg(not(feature = "lite"))]
   if edition::workspace_enabled(edition::is_lite()) {
     view_menu.append(&workspace)?;
   }
@@ -1474,9 +1490,10 @@ fn build_menu(
   let _ = window_menu.set_as_windows_menu_for_nsapp();
   // Help menu: Documentation and Report an Issue open the browser (routed to
   // `tauri_plugin_opener` in the menu-event handler); Full Version Features
-  // (Lite only), Acknowledgements and Privacy Policy each open our own window.
+  // (builds with editions only), Acknowledgements and Privacy Policy each open
+  // our own window.
   let help_menu = Submenu::new(app, tr(i18n::Key::HelpMenu), true)?;
-  for (id, key) in help_menu_entries(edition::is_lite()) {
+  for (id, key) in help_menu_entries(edition::editions_exist()) {
     help_menu.append(&MenuItem::with_id(app, id, tr(key), true, accel(id))?)?;
   }
   // On macOS this also gets the system-inserted menu search field; Windows and
@@ -1615,7 +1632,6 @@ fn handle_menu_id(app: &tauri::AppHandle, id: &str) {
     "line-numbers" => toggle_line_numbers(app),
     "always-on-top" => toggle_always_on_top(app),
     "recent-clear" => clear_recent(app),
-    #[cfg(not(feature = "lite"))]
     "workspace" => {
       let _ = windows::show_workspace(app);
     }
@@ -1651,7 +1667,6 @@ fn handle_menu_id(app: &tauri::AppHandle, id: &str) {
       emit_to_focused(app, "menu-action", format!("set-language:{}", &id[5..]));
     }
     _ if id.starts_with("recent:") => open_recent(app, id),
-    #[cfg(not(feature = "lite"))]
     _ if id.starts_with("ctx:") => ctx_menu::route_ctx_event(app, id),
     _ => {}
   }
@@ -1974,6 +1989,22 @@ pub(crate) fn record_recent(app: &tauri::AppHandle, path: &str) {
     Err(e) => log::warn!("failed to record recent file: {e}"),
   }
 }
+/// A file or folder in the recent list was renamed: follow it and repopulate the
+/// submenu.
+pub(crate) fn retarget_recent(app: &tauri::AppHandle, from: &str, to: &str) {
+  match settings::retarget_recent_files(app, from, to) {
+    // This runs on a worker thread, and the menu is held while the platform
+    // answers menu calls on the main thread, which takes the same lock.
+    Ok(Some(recent)) => {
+      let on_main = app.clone();
+      if let Err(e) = app.run_on_main_thread(move || refresh_recent_menu(&on_main, &recent)) {
+        log::warn!("failed to refresh the recent menu: {e}");
+      }
+    }
+    Ok(None) => {}
+    Err(e) => log::warn!("failed to follow a rename in the recent files: {e}"),
+  }
+}
 
 /// Repopulate the live Open Recent submenu from `recent`. No-op if the menu has
 /// not been built yet.
@@ -2038,15 +2069,15 @@ mod help_menu_tests {
   use super::{accelerator_enabled, help_menu_entries, FocusKind};
   use crate::i18n::Key;
 
-  fn ids(lite: bool) -> Vec<&'static str> {
-    help_menu_entries(lite)
+  fn ids(editions: bool) -> Vec<&'static str> {
+    help_menu_entries(editions)
       .into_iter()
       .map(|(id, _)| id)
       .collect()
   }
 
   #[test]
-  fn lite_has_full_version_features_between_report_an_issue_and_acknowledgements() {
+  fn editions_have_full_version_features_between_report_an_issue_and_acknowledgements() {
     assert_eq!(
       ids(true),
       vec![
@@ -2061,7 +2092,7 @@ mod help_menu_tests {
   }
 
   #[test]
-  fn full_never_has_it() {
+  fn a_build_without_editions_never_has_it() {
     assert_eq!(
       ids(false),
       vec![
@@ -2092,7 +2123,9 @@ mod help_menu_tests {
     let source = include_str!("lib.rs");
     let at = source.find("fn build_menu(").unwrap();
     let body = &source[at..];
-    assert!(body[..body.find("\n}\n").unwrap()].contains("help_menu_entries(edition::is_lite())"));
+    assert!(
+      body[..body.find("\n}\n").unwrap()].contains("help_menu_entries(edition::editions_exist())")
+    );
   }
 }
 
@@ -2346,7 +2379,6 @@ fn build_tray_menu(
     true,
     None::<&str>,
   )?;
-  #[cfg(not(feature = "lite"))]
   let workspace_item = MenuItem::with_id(
     app,
     "workspace",
@@ -2368,7 +2400,6 @@ fn build_tray_menu(
   let menu = Menu::new(app)?;
   menu.append(&new_item)?;
   menu.append(&show_item)?;
-  #[cfg(not(feature = "lite"))]
   if edition::workspace_enabled(edition::is_lite()) {
     menu.append(&workspace_item)?;
   }
@@ -2408,7 +2439,6 @@ fn build_tray(
         let _ = windows::new_sticky(app, &store);
       }
       "show_all" => show_all_notes(app),
-      #[cfg(not(feature = "lite"))]
       "workspace" => {
         let _ = windows::show_workspace(app);
       }
@@ -2474,7 +2504,6 @@ fn activate_existing(app: &tauri::AppHandle) {
 /// The workspace holds no document of its own, so Open there is the same
 /// situation as a file arriving from Finder: it honours the tab-or-window
 /// setting and reuses the last document window when that setting says tabs.
-#[cfg(not(feature = "lite"))]
 #[tauri::command]
 fn open_picked_files(app: tauri::AppHandle, paths: Vec<String>) {
   open_shell_paths(&app, paths);
@@ -2533,12 +2562,9 @@ fn apply_launch_action(app: &tauri::AppHandle, action: cmdline::Action) {
       let store = app.state::<NoteStore>();
       let _ = windows::new_sticky(app, &store);
     }
-    #[cfg(not(feature = "lite"))]
     cmdline::Action::Workspace => {
       let _ = windows::show_workspace(app);
     }
-    #[cfg(feature = "lite")]
-    cmdline::Action::Workspace => {}
     cmdline::Action::Note(id) => {
       let store = app.state::<NoteStore>();
       let _ = windows::focus_note_window(app.clone(), store, id);
@@ -2589,6 +2615,97 @@ fn launch_carries_files_at_startup() -> bool {
 #[cfg(target_os = "macos")]
 fn launch_carries_files_at_startup() -> bool {
   launch_windows::opened_any()
+}
+
+/// The purchase part of the "Full Version Features" window: whether this build
+/// sells the full version, its price, and whether the store has answered about
+/// the version first installed.
+#[tauri::command(async)]
+fn store_info() -> store_state::StoreInfo {
+  #[cfg(all(target_os = "macos", feature = "storekit"))]
+  {
+    storekit::info()
+  }
+  #[cfg(not(all(target_os = "macos", feature = "storekit")))]
+  {
+    store_state::StoreInfo::unavailable()
+  }
+}
+
+/// Buy the full version: "purchased", "cancelled", "pending" or "failed".
+/// The purchase sheet can stay open indefinitely, so it waits on the blocking
+/// pool instead of holding an async worker.
+#[tauri::command]
+async fn store_purchase(app: tauri::AppHandle, window: tauri::WebviewWindow) -> &'static str {
+  #[cfg(all(target_os = "macos", feature = "storekit"))]
+  {
+    if !store_state::store_caller_allowed(window.label()) {
+      return "failed";
+    }
+    tauri::async_runtime::spawn_blocking(move || storekit::purchase(&app, &window))
+      .await
+      .unwrap_or("failed")
+  }
+  #[cfg(not(all(target_os = "macos", feature = "storekit")))]
+  {
+    let _ = (app, window);
+    "failed"
+  }
+}
+
+/// Restore an earlier purchase: "restored", "nothing", "cancelled" or "failed".
+/// The sign-in prompt can stay open indefinitely; see `store_purchase`.
+#[tauri::command]
+async fn store_restore(app: tauri::AppHandle, window: tauri::WebviewWindow) -> &'static str {
+  #[cfg(all(target_os = "macos", feature = "storekit"))]
+  {
+    if !store_state::store_caller_allowed(window.label()) {
+      return "failed";
+    }
+    tauri::async_runtime::spawn_blocking(move || storekit::restore(&app))
+      .await
+      .unwrap_or("failed")
+  }
+  #[cfg(not(all(target_os = "macos", feature = "storekit")))]
+  {
+    let _ = (app, window);
+    "failed"
+  }
+}
+
+/// Ask the store again about the version first installed: "known" or
+/// "unknown", or "failed" when not allowed. The sign-in prompt can stay open
+/// indefinitely; see `store_purchase`.
+#[tauri::command]
+async fn store_refresh_original(
+  app: tauri::AppHandle,
+  window: tauri::WebviewWindow,
+) -> &'static str {
+  #[cfg(all(target_os = "macos", feature = "storekit"))]
+  {
+    if !store_state::store_caller_allowed(window.label()) {
+      return "failed";
+    }
+    tauri::async_runtime::spawn_blocking(move || storekit::refresh(&app))
+      .await
+      .unwrap_or("failed")
+  }
+  #[cfg(not(all(target_os = "macos", feature = "storekit")))]
+  {
+    let _ = (app, window);
+    "failed"
+  }
+}
+
+#[cfg(all(test, not(feature = "storekit")))]
+mod store_command_tests {
+  #[test]
+  fn a_build_without_the_store_has_no_store_controls() {
+    let info = super::store_info();
+    assert!(!info.available);
+    assert_eq!(info.price, None);
+    assert!(info.original_known);
+  }
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -2701,9 +2818,9 @@ pub fn run() {
       // resolve the active snapshots dir from settings.
       note_store::migrate_legacy_snapshot_location_setting(handle);
       let fallback = note_store::SnapshotFallback::default();
-      let dir =
+      let (dir, dir_lock) =
         note_store::startup_snapshot_dir(handle, &settings::app_settings(handle), &fallback)?;
-      let fallback_active = fallback.in_use();
+      let fallback_active = fallback.reason().fell_back();
       app.manage(fallback);
       // `NoteStore::load` only fails when `dir` exists but cannot be listed
       // (e.g. permissions). Falling back to an empty store for the same `dir`
@@ -2716,13 +2833,15 @@ pub fn run() {
           (NoteStore::empty(dir), Vec::new(), false)
         }
       };
+      store.hold_lock(dir_lock);
+      // A clean range tab of an earlier version has nothing to restore.
+      note_store::drop_clean_range_records(&store);
       let notes = store.list();
       app.manage(store);
       // Snapshots are loaded before any window exists, so anything skipped is
       // held here until the report window asks for it.
       let had_snapshot_skips = !snapshot_skips.is_empty();
       app.manage(note_store::StartupSkips::holding(snapshot_skips));
-      app.manage(note_store::HeldBackGroups::default());
       // Grants must be live before any window reads a restored path.
       match handle.path().app_data_dir() {
         Ok(app_data) => {
@@ -2737,13 +2856,11 @@ pub fn run() {
           );
           grants::restore_all(&app_data, keep.as_ref());
           // Change lists of replace-alls from an earlier run are of no use.
-          #[cfg(not(feature = "lite"))]
           replace_layer::cleanup_tmp(&app_data.join(replace_layer::TMP_DIR));
         }
         Err(e) => log::warn!("grants: no app data dir: {e}"),
       }
       app.manage(FlushGate::default());
-      #[cfg(not(feature = "lite"))]
       {
         app.manage(ctx_menu::CtxPending::default());
         app.manage(large_file::LargeFileState::default());
@@ -2756,10 +2873,9 @@ pub fn run() {
       let store = app.state::<NoteStore>();
       // The edition decides which features exist, so it is settled before the
       // first window, menu or Jump List is built (and a window's first
-      // `edition_info` can never read the lite initial value), and before the
-      // snapshot migration below, which must leave a lite-kept tab alone.
+      // `edition_info` can never read the lite initial value).
       edition::init(handle);
-      note_store::migrate_group_less_documents(&store, &notes, edition::is_lite());
+      note_store::migrate_group_less_documents(&store, &notes);
       // Restore windows: one per sticky, one per document group. Nothing in here
       // may propagate: this runs inside `setup`, whose error is unwrapped by the
       // `.expect` on `build()` below, so one window that refuses to build would
@@ -2775,7 +2891,7 @@ pub fn run() {
         }
       }
       let mut restored_docs: Vec<String> = Vec::new();
-      for plan in note_store::plan_document_windows(&notes, edition::is_lite()) {
+      for plan in note_store::plan_document_windows(&notes) {
         match windows::create_document_window(handle, &plan, None) {
           Ok(()) => {
             opened += 1;
@@ -2849,8 +2965,18 @@ pub fn run() {
       // and document window is restored, so the workspace opens on top of them
       // rather than being buried; as the explicitly requested window it does
       // take focus, which is the expected behavior for this opt-in.
-      #[cfg(not(feature = "lite"))]
-      if startup.open_workspace_on_startup && edition::workspace_enabled(edition::is_lite()) {
+      // The store build may still turn full after this check; the token lets
+      // exactly one of the two open the workspace.
+      #[cfg(all(target_os = "macos", feature = "storekit"))]
+      let open_workspace = {
+        edition::STARTUP_WORKSPACE_TOKEN.store(startup.open_workspace_on_startup, Ordering::SeqCst);
+        edition::workspace_enabled(edition::is_lite())
+          && edition::STARTUP_WORKSPACE_TOKEN.swap(false, Ordering::SeqCst)
+      };
+      #[cfg(not(all(target_os = "macos", feature = "storekit")))]
+      let open_workspace =
+        startup.open_workspace_on_startup && edition::workspace_enabled(edition::is_lite());
+      if open_workspace {
         if launch_has_files {
           launch_windows::focus_launch_window_after_workspace();
         }
@@ -2883,7 +3009,6 @@ pub fn run() {
       encoding::write_file_encoded,
       note_store::list_notes,
       note_store::take_startup_skips,
-      note_store::hold_back_group,
       windows::show_load_problems_window,
       data_files::delete_data_file,
       data_files::reveal_data_file,
@@ -2898,24 +3023,16 @@ pub fn run() {
       settings::save_settings,
       settings::ack_unset_defaults,
       theme_store::list_themes,
-      #[cfg(not(feature = "lite"))]
       theme_store::save_theme,
-      #[cfg(not(feature = "lite"))]
       theme_store::delete_theme,
-      #[cfg(not(feature = "lite"))]
       theme_store::import_theme,
-      #[cfg(not(feature = "lite"))]
       theme_store::export_theme,
-      #[cfg(not(feature = "lite"))]
       theme_store::restore_default_theme,
       locale_store::list_locales,
       locale_store::save_locale,
       locale_store::delete_locale,
-      #[cfg(not(feature = "lite"))]
       locale_store::import_locale,
-      #[cfg(not(feature = "lite"))]
       locale_store::read_locale_file,
-      #[cfg(not(feature = "lite"))]
       locale_store::export_locale,
       locale_store::restore_default_locale,
       licenses::list_acknowledgements,
@@ -2930,7 +3047,6 @@ pub fn run() {
       windows::set_window_opacity,
       windows::reveal_self,
       pending_opens::doc_window_ready,
-      #[cfg(not(feature = "lite"))]
       windows::show_workspace_window,
       windows::show_settings_window,
       windows::show_about_window,
@@ -2947,84 +3063,59 @@ pub fn run() {
       windows::focus_note_window,
       windows::focus_doc_tab,
       windows::report_doc_tabs,
-      #[cfg(not(feature = "lite"))]
       windows::close_doc_tab,
       windows::live_doc_groups,
-      #[cfg(not(feature = "lite"))]
       windows::sticky_row_action,
-      #[cfg(not(feature = "lite"))]
       ctx_menu::popup_row_menu,
-      #[cfg(not(feature = "lite"))]
       large_file::stat_file,
-      #[cfg(not(feature = "lite"))]
       large_file::read_chunk,
-      #[cfg(not(feature = "lite"))]
       large_file::start_line_index,
-      #[cfg(not(feature = "lite"))]
       large_file::line_to_offset,
-      #[cfg(not(feature = "lite"))]
       large_file::index_line_count,
-      #[cfg(not(feature = "lite"))]
       large_file::drop_line_index,
-      #[cfg(not(feature = "lite"))]
       large_file::stream_search,
-      #[cfg(not(feature = "lite"))]
       large_file::cancel_search,
-      #[cfg(not(feature = "lite"))]
       range_edit::file_fingerprint,
-      #[cfg(not(feature = "lite"))]
       range_edit::splice_file,
-      #[cfg(not(feature = "lite"))]
       range_edit::read_range,
-      #[cfg(not(feature = "lite"))]
       range_edit::copy_range,
-      #[cfg(not(feature = "lite"))]
       windowed::windowed_open,
-      #[cfg(not(feature = "lite"))]
       windowed::windowed_reopen,
-      #[cfg(not(feature = "lite"))]
       windowed::windowed_index,
-      #[cfg(not(feature = "lite"))]
       windowed::windowed_read,
-      #[cfg(not(feature = "lite"))]
       windowed::windowed_apply,
-      #[cfg(not(feature = "lite"))]
       windowed::windowed_undo,
-      #[cfg(not(feature = "lite"))]
       windowed::windowed_redo,
-      #[cfg(not(feature = "lite"))]
       windowed::windowed_save,
-      #[cfg(not(feature = "lite"))]
+      windowed::windowed_set_path,
       windowed::windowed_close,
-      #[cfg(not(feature = "lite"))]
       windowed::windowed_find,
-      #[cfg(not(feature = "lite"))]
       windowed::windowed_search,
-      #[cfg(not(feature = "lite"))]
       windowed::windowed_search_cancel,
-      #[cfg(not(feature = "lite"))]
       windowed::windowed_replace_all,
-      #[cfg(not(feature = "lite"))]
       file_ops::create_file,
-      #[cfg(not(feature = "lite"))]
       file_ops::create_folder,
-      #[cfg(not(feature = "lite"))]
       file_ops::rename_path,
-      #[cfg(not(feature = "lite"))]
       file_ops::trash_path,
+      transfer::move_path,
+      transfer::copy_path,
+      transfer::path_volume,
+      file_ops::missing_paths,
       file_ops::reveal_in_finder,
-      #[cfg(not(feature = "lite"))]
-      project::list_project_tree,
-      #[cfg(not(feature = "lite"))]
+      project::list_project_dir,
       project::open_project_file,
-      #[cfg(not(feature = "lite"))]
+      project::rebind_project,
+      project::forget_project_rebinds,
       open_picked_files,
       app_watch::list_running_apps,
       platform::platform_info,
       edition::edition_info,
       #[cfg(debug_assertions)]
       edition::debug_set_edition,
-      #[cfg(not(feature = "lite"))]
+      store_info,
+      store_purchase,
+      store_restore,
+      store_refresh_original,
       altgr::altgr_table,
       default_apps::default_apps_page_supported,
       default_apps::open_default_apps_page,
@@ -3653,5 +3744,51 @@ mod menu_focus_tests {
       ),
       (Some("workspace".to_string()), FocusKind::Workspace)
     );
+  }
+}
+
+#[cfg(test)]
+mod app_focus_tests {
+  use super::doc_window_labels;
+
+  #[test]
+  fn only_document_windows_are_told_the_app_came_to_the_front() {
+    let labels: Vec<String> = ["workspace", "doc-a", "note-b", "settings", "doc-c"]
+      .iter()
+      .map(|l| l.to_string())
+      .collect();
+    let told: Vec<&str> = doc_window_labels(labels.iter())
+      .into_iter()
+      .map(String::as_str)
+      .collect();
+    assert_eq!(told, vec!["doc-a", "doc-c"]);
+    assert!(doc_window_labels([].iter()).is_empty());
+  }
+
+  #[test]
+  fn every_window_event_reaches_the_app_focus_announcement() {
+    let source = include_str!("lib.rs");
+    let at = source.find("fn handle_window_event(").unwrap();
+    let body = &source[at..];
+    let body = &body[..body.find("\n}\n").unwrap()];
+    assert!(body.contains("announce_app_focus(window, event)"));
+    let at = source.find("fn announce_app_focus(").unwrap();
+    let body = &source[at..];
+    let body = &body[..body.find("\n}\n").unwrap()];
+    assert!(body.contains("WindowEvent::Focused(true)"));
+    assert!(body.contains("\"app-focused\""));
+  }
+}
+
+#[cfg(test)]
+mod recent_menu_threading_tests {
+  #[test]
+  fn following_a_rename_refreshes_the_menu_on_the_main_thread() {
+    let source = include_str!("lib.rs");
+    let at = source.find("pub(crate) fn retarget_recent(").unwrap();
+    let body = &source[at..];
+    let body = &body[..body.find("\n}\n").unwrap()];
+    assert!(body.contains("run_on_main_thread"));
+    assert!(!body.contains("=> refresh_recent_menu("));
   }
 }

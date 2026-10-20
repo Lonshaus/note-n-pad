@@ -36,17 +36,6 @@ export class UnreadableRestore extends Error {
   }
 }
 
-/** Thrown by `loadTab` for a stored tab that needs a removed feature and whose
- *  restore found the edition lite (it turned lite while the restore was running,
- *  so the core refused the read). The tab is kept: its record is neither
- *  deleted nor reported as unreadable, and it opens once the edition is full. */
-export class KeptRestore extends Error {
-  constructor() {
-    super('kept restore');
-    this.name = 'KeptRestore';
-  }
-}
-
 /** Array position of the tab to activate once some restored entries were
  *  dropped. Positions index the tabs actually opened, so the requested stored
  *  index is resolved against the survivors only; a dropped request falls back

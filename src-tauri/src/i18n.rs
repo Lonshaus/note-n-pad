@@ -93,7 +93,7 @@ pub enum Key {
   // Privacy Policy labels both the menu item and its window title, the same
   // way Acknowledgements does for its own window.
   PrivacyPolicy,
-  // Help > Full Version Features (Lite only) and that window's title
+  // Help > Full Version Features (builds with editions only) and that window's title
   FullFeatures,
   // Section heading and names of the shortcut registry rows that have no menu
   // item (tab switching, go to line).
@@ -174,7 +174,6 @@ pub enum Key {
   // lint honest there without silencing it for the rest of the enum.
   // Action item that opens the workspace; shown only while the workspace window
   // is not visible (a visible one is already in the system window list).
-  #[cfg(not(feature = "lite"))]
   #[cfg_attr(not(any(target_os = "macos", target_os = "windows")), allow(dead_code))]
   DockOpenWorkspace,
   // Fallback label for a blank sticky listed in the Dock menu.
@@ -199,22 +198,14 @@ pub enum Key {
   TrayShowAll,
   TrayQuit,
   // Context menus (Close is reused from File)
-  #[cfg(not(feature = "lite"))]
   CtxOpen,
-  #[cfg(not(feature = "lite"))]
   CtxOpenSelected,
-  #[cfg(not(feature = "lite"))]
   CtxNewFile,
-  #[cfg(not(feature = "lite"))]
   CtxNewFolder,
   CtxShowInFinder,
-  #[cfg(not(feature = "lite"))]
   CtxRename,
-  #[cfg(not(feature = "lite"))]
   CtxDelete,
-  #[cfg(not(feature = "lite"))]
   CtxSaveAsDoc,
-  #[cfg(not(feature = "lite"))]
   CtxCloseTab,
   // Fatal startup message shown in a native message box on Windows when the
   // WebView2 Runtime is absent (see `webview2_runtime`). No webview can exist at
@@ -964,9 +955,9 @@ fn strings(key: Key) -> [&'static str; 15] {
       "Chính sách quyền riêng tư",
     ],
     Key::FullFeatures => [
-      "正式版功能",
-      "正式版功能",
-      "製品版の機能",
+      "完整版功能",
+      "完整版功能",
+      "完全版の機能",
       "Full Version Features",
       "Функции полной версии",
       "Funciones de la versión completa",
@@ -2068,7 +2059,6 @@ fn strings(key: Key) -> [&'static str; 15] {
       "สลับตัวอักษร",
       "Hoán đổi chữ cái",
     ],
-    #[cfg(not(feature = "lite"))]
     Key::DockOpenWorkspace => [
       "開啟工作區",
       "打开工作区",
@@ -2222,7 +2212,6 @@ fn strings(key: Key) -> [&'static str; 15] {
       "ออก",
       "Thoát",
     ],
-    #[cfg(not(feature = "lite"))]
     Key::CtxOpen => [
       "開啟",
       "打开",
@@ -2240,7 +2229,6 @@ fn strings(key: Key) -> [&'static str; 15] {
       "เปิด",
       "Mở",
     ],
-    #[cfg(not(feature = "lite"))]
     Key::CtxOpenSelected => [
       "開啟選取的檔案",
       "打开选中的文件",
@@ -2258,7 +2246,6 @@ fn strings(key: Key) -> [&'static str; 15] {
       "เปิดไฟล์ที่เลือก",
       "Mở các tệp đã chọn",
     ],
-    #[cfg(not(feature = "lite"))]
     Key::CtxNewFile => [
       "新增檔案",
       "新建文件",
@@ -2276,7 +2263,6 @@ fn strings(key: Key) -> [&'static str; 15] {
       "ไฟล์ใหม่",
       "Tệp mới",
     ],
-    #[cfg(not(feature = "lite"))]
     Key::CtxNewFolder => [
       "新增資料夾",
       "新建文件夹",
@@ -2295,7 +2281,6 @@ fn strings(key: Key) -> [&'static str; 15] {
       "Thư mục mới",
     ],
     Key::CtxShowInFinder => show_in_file_browser_strings(),
-    #[cfg(not(feature = "lite"))]
     Key::CtxRename => [
       "重新命名",
       "重命名",
@@ -2313,7 +2298,6 @@ fn strings(key: Key) -> [&'static str; 15] {
       "เปลี่ยนชื่อ",
       "Đổi tên",
     ],
-    #[cfg(not(feature = "lite"))]
     Key::CtxDelete => [
       "刪除",
       "删除",
@@ -2331,7 +2315,6 @@ fn strings(key: Key) -> [&'static str; 15] {
       "ลบ",
       "Xóa",
     ],
-    #[cfg(not(feature = "lite"))]
     Key::CtxSaveAsDoc => [
       "另存為文件",
       "另存为文档",
@@ -2349,7 +2332,6 @@ fn strings(key: Key) -> [&'static str; 15] {
       "บันทึกเป็นเอกสาร",
       "Lưu thành tài liệu",
     ],
-    #[cfg(not(feature = "lite"))]
     Key::CtxCloseTab => [
       "關閉分頁",
       "关闭标签页",
@@ -2492,90 +2474,7 @@ pub fn tr(locale: Locale, key: Key) -> &'static str {
     Locale::Th => 13,
     Locale::Vi => 14,
   };
-  branded(s[idx])
-}
-
-/// Turkish case suffixes that follow the brand after an apostrophe, mapped to
-/// the form that follows "Lite" instead: it is read /layt/, ends in a voiceless
-/// "t" after a back vowel, so "Note&Pad’ten" becomes "Note&Pad Lite’tan". No
-/// other language writes a suffix after an apostrophe on the name (checked over
-/// every locale), so this applies to all of them.
-const LITE_SUFFIXES: [(&str, &str); 10] = [
-  ("ten", "tan"),
-  ("den", "tan"),
-  ("te", "ta"),
-  ("de", "ta"),
-  ("nin", "ın"),
-  ("in", "ın"),
-  ("le", "la"),
-  ("la", "la"),
-  ("i", "ı"),
-  ("e", "a"),
-];
-
-/// The apostrophe-and-suffix at the start of `after`, as (bytes covered,
-/// apostrophe, replacement suffix); None when `after` does not start with one
-/// of `LITE_SUFFIXES` as a whole word.
-fn lite_suffix(after: &str) -> Option<(usize, char, &'static str)> {
-  let mut chars = after.chars();
-  let apostrophe = chars.next().filter(|c| matches!(c, '’' | '\''))?;
-  let word: String = chars.take_while(|c| c.is_alphabetic()).collect();
-  let (_, mapped) = LITE_SUFFIXES.iter().find(|(from, _)| *from == word)?;
-  Some((apostrophe.len_utf8() + word.len(), apostrophe, mapped))
-}
-
-#[cfg_attr(not(any(feature = "lite", test)), allow(dead_code))]
-/// `template` with every "Note&Pad" turned into `name` ("Note&Pad Lite" in the
-/// Lite build). Applied to a template, before any argument is formatted into
-/// it, so a file name or path that happens to hold "Note&Pad" is never
-/// touched. Idempotent: a "Note&Pad" that already reads `name` is left alone.
-/// A Turkish suffix on the name follows the new last word (`LITE_SUFFIXES`).
-pub fn with_app_name(template: &str, name: &str) -> String {
-  const BASE: &str = "Note&Pad";
-  let Some(suffix) = name.strip_prefix(BASE).filter(|s| !s.is_empty()) else {
-    return template.to_string();
-  };
-  let mut out = String::with_capacity(template.len() + 8);
-  let mut rest = template;
-  while let Some(at) = rest.find(BASE) {
-    let after = &rest[at + BASE.len()..];
-    out.push_str(&rest[..at]);
-    out.push_str(BASE);
-    rest = after;
-    if after.starts_with(suffix) {
-      continue;
-    }
-    out.push_str(suffix);
-    if let Some((covered, apostrophe, mapped)) = lite_suffix(after) {
-      out.push(apostrophe);
-      out.push_str(mapped);
-      rest = &after[covered..];
-    }
-  }
-  out.push_str(rest);
-  out
-}
-
-/// The template as this build shows it. Only the Lite build changes anything;
-/// the few strings that name the app are rewritten once and kept for the life of
-/// the process, which is what lets `tr` keep returning `&'static str`.
-#[cfg(not(feature = "lite"))]
-fn branded(template: &'static str) -> &'static str {
-  template
-}
-
-#[cfg(feature = "lite")]
-fn branded(template: &'static str) -> &'static str {
-  use std::collections::HashMap;
-  use std::sync::{Mutex, OnceLock};
-  static CACHE: OnceLock<Mutex<HashMap<&'static str, &'static str>>> = OnceLock::new();
-  if !template.contains("Note&Pad") {
-    return template;
-  }
-  let mut cache = CACHE.get_or_init(Default::default).lock().unwrap();
-  cache.entry(template).or_insert_with(|| {
-    Box::leak(with_app_name(template, crate::edition::app_name()).into_boxed_str())
-  })
+  s[idx]
 }
 
 /// Resolve a stored `language` preference into a concrete locale. Mirrors the
@@ -2681,109 +2580,10 @@ mod tests {
   ];
 
   #[test]
-  fn the_lite_name_replaces_every_occurrence_once() {
-    assert_eq!(
-      with_app_name("About Note&Pad", "Note&Pad Lite"),
-      "About Note&Pad Lite"
-    );
-    assert_eq!(
-      with_app_name("Note&Pad and Note&Pad", "Note&Pad Lite"),
-      "Note&Pad Lite and Note&Pad Lite"
-    );
-    assert_eq!(
-      with_app_name("no name here", "Note&Pad Lite"),
-      "no name here"
-    );
-  }
-
-  #[test]
-  fn replacing_twice_changes_nothing_more() {
-    let once = with_app_name("Quit Note&Pad", "Note&Pad Lite");
-    assert_eq!(with_app_name(&once, "Note&Pad Lite"), once);
-    assert_eq!(
-      with_app_name("Note&Pad Lite Help", "Note&Pad Lite"),
-      "Note&Pad Lite Help"
-    );
-  }
-
-  #[test]
-  fn a_turkish_suffix_follows_the_new_last_word() {
-    for (before, after) in [
-      ("Note&Pad’ten Çık", "Note&Pad Lite’tan Çık"),
-      ("Note&Pad'den", "Note&Pad Lite'tan"),
-      ("Note&Pad'de görünmez", "Note&Pad Lite'ta görünmez"),
-      ("Note&Pad’te", "Note&Pad Lite’ta"),
-      ("Note&Pad’i yeniden", "Note&Pad Lite’ı yeniden"),
-      ("Note&Pad’e", "Note&Pad Lite’a"),
-      ("Note&Pad’in", "Note&Pad Lite’ın"),
-      ("Note&Pad’nin", "Note&Pad Lite’ın"),
-      ("Note&Pad’le", "Note&Pad Lite’la"),
-      ("Note&Pad'la", "Note&Pad Lite'la"),
-    ] {
-      assert_eq!(with_app_name(before, "Note&Pad Lite"), after, "{before}");
-    }
-  }
-
-  #[test]
-  fn only_a_whole_known_suffix_is_remapped() {
-    // Not a suffix, or a longer word: the name changes and the rest stays.
-    for (before, after) in [
-      ("Note&Pad’s", "Note&Pad Lite’s"),
-      ("Note&Pad’dene", "Note&Pad Lite’dene"),
-      ("Note&Pad’", "Note&Pad Lite’"),
-      ("Note&Pad de", "Note&Pad Lite de"),
-    ] {
-      assert_eq!(with_app_name(before, "Note&Pad Lite"), after, "{before}");
-    }
-  }
-
-  #[test]
-  fn a_remapped_suffix_is_stable_when_replaced_again() {
-    let once = with_app_name("Quit Note&Pad’ten", "Note&Pad Lite");
-    assert_eq!(with_app_name(&once, "Note&Pad Lite"), once);
-    assert_eq!(once, "Quit Note&Pad Lite’tan");
-  }
-
-  #[test]
-  fn the_full_name_leaves_a_suffix_alone() {
-    assert_eq!(with_app_name("Note&Pad’ten", "Note&Pad"), "Note&Pad’ten");
-  }
-
-  #[cfg(feature = "lite")]
-  #[test]
-  fn the_lite_build_says_quit_in_turkish_with_the_right_suffix() {
-    assert_eq!(tr(Locale::Tr, Key::Quit), "Note&Pad Lite’tan Çık");
-    assert!(tr(Locale::Tr, Key::WebView2MissingBody).contains("Note&Pad Lite’ı yeniden"));
-  }
-
-  #[cfg(not(feature = "lite"))]
-  #[test]
   fn the_full_build_says_quit_in_turkish_as_before() {
     assert_eq!(tr(Locale::Tr, Key::Quit), "Note&Pad’ten Çık");
   }
 
-  #[test]
-  fn the_full_name_leaves_the_template_alone() {
-    assert_eq!(with_app_name("Note&Pad Help", "Note&Pad"), "Note&Pad Help");
-  }
-
-  #[cfg(feature = "lite")]
-  #[test]
-  fn the_lite_build_names_itself_exactly_once_in_every_language() {
-    for locale in LOCALES {
-      for key in NAMED {
-        let text = tr(locale, key);
-        assert_eq!(
-          text.matches("Note&Pad Lite").count(),
-          1,
-          "{locale:?} {key:?}"
-        );
-        assert_eq!(text.matches("Note&Pad").count(), 1, "{locale:?} {key:?}");
-      }
-    }
-  }
-
-  #[cfg(not(feature = "lite"))]
   #[test]
   fn the_full_build_never_says_lite() {
     for locale in LOCALES {
@@ -2816,7 +2616,6 @@ mod tests {
     );
     #[cfg(not(any(target_os = "macos", target_os = "windows")))]
     assert_eq!(tr(Locale::En, Key::CtxShowInFinder), "Show in File Manager");
-    #[cfg(not(feature = "lite"))]
     {
       assert_eq!(tr(Locale::ZhTw, Key::CtxOpen), "開啟");
       assert_eq!(
@@ -2842,20 +2641,14 @@ mod tests {
     assert_eq!(tr(Locale::Ru, Key::Save), "Сохранить");
     assert_eq!(tr(Locale::Es, Key::EditMenu), "Edición");
     assert_eq!(tr(Locale::PtBr, Key::EditMenu), "Editar");
-    #[cfg(not(feature = "lite"))]
     assert_eq!(tr(Locale::De, Key::CtxNewFolder), "Neuer Ordner");
     assert_eq!(tr(Locale::Ko, Key::TrayQuit), "종료");
     assert_eq!(tr(Locale::Pl, Key::SelectAll), "Zaznacz wszystko");
     assert_eq!(tr(Locale::It, Key::WindowMenu), "Finestra");
     assert_eq!(tr(Locale::Th, Key::Close), "ปิด");
-    #[cfg(not(feature = "lite"))]
     assert_eq!(tr(Locale::Vi, Key::CtxOpen), "Mở");
     // Turkish apostrophe (U+2019) and French apostrophe are preserved verbatim.
-    // Preserved verbatim in the full build; the Lite build's form is tested below.
-    if !cfg!(feature = "lite") {
-      assert_eq!(tr(Locale::Tr, Key::Quit), "Note&Pad’ten Çık");
-    }
-    #[cfg(not(feature = "lite"))]
+    assert_eq!(tr(Locale::Tr, Key::Quit), "Note&Pad’ten Çık");
     assert_eq!(tr(Locale::Fr, Key::CtxCloseTab), "Fermer l’onglet");
   }
 
