@@ -1,11 +1,17 @@
 // Copyright © 2026 Lonshaus
 // SPDX-License-Identifier: GPL-3.0-only
 
+import { gotoLine as gotoLineCommand } from '@codemirror/search';
 import { activeView } from './editorRegistry';
 import { settingsState, type LargeOpenMode } from '../state/settings.svelte';
 import type { LineEnding } from '../util/text';
 import type { Language } from '../i18n/locale';
 import type { ViewMode } from '../util/viewModes';
+import {
+  heldWindowedResults,
+  holdWindowedResults,
+  releaseWindowedResults,
+} from './windowedHold';
 
 // DEV-only automation surface reached by the Rust harness via `eval`. Installed
 // on `window.__auto` only under `import.meta.env.DEV`; because every caller sits
@@ -53,6 +59,10 @@ export interface DocumentHooks {
   getTitle: () => string;
   getTabs: () => unknown;
   switchTab: (index: number) => void;
+  /** Make tab `index` the active one at once, without the settle-and-drain
+   *  `switchTab` does first: reproduces an editor whose result lands after
+   *  another tab became active. */
+  switchTabNow: (index: number) => void;
   openTab: (path: string) => void;
   /** The same open, handing back the promise so a test can observe a
    *  rejection. `openTab` stays void on purpose: the automation wrapper
@@ -138,18 +148,21 @@ export interface DocumentHooks {
   largeGetRange: () => { startLine: number; endLine: number } | null;
   largeRangeEdit: () => void;
   largeRangeSaveAs: (path: string) => Promise<boolean>;
-  isRangeTab: () => boolean;
-  rangeInfo: () => {
+  /** The range edit box over the large-file tab: opened by `largeRangeEdit`,
+   *  typed into with `typeText`, then saved or cancelled. */
+  rangeBoxVisible: () => boolean;
+  rangeBoxInfo: () => {
     sourcePath: string;
     startByte: number;
     endByte: number;
   } | null;
-  rangeSave: () => Promise<'ok' | 'mismatch' | 'error'>;
+  rangeBoxDirty: () => boolean;
+  rangeBoxSave: () => Promise<'ok' | 'mismatch' | 'error'>;
+  rangeBoxCancel: () => void;
   rangeConflictVisible: () => boolean;
   rangeConflictForce: () => Promise<'ok' | 'mismatch' | 'error'>;
   rangeConflictSaveAs: (path: string) => Promise<boolean>;
   rangeConflictCancel: () => void;
-  rangeSaveAsBytes: (path: string) => Promise<boolean>;
   oversizedGateVisible: () => boolean;
   oversizedGateSave: () => Promise<void>;
   oversizedGateDiscard: () => Promise<void>;
@@ -184,6 +197,17 @@ export interface DocumentHooks {
   // Drives the same handoff the Tauri window-focus event triggers, so E2E can
   // exercise the focus-reclaim path without a real OS focus change.
   windowFocusGained: () => void;
+  /** File name shown by the missing-file dialog now up, or null. */
+  missingVisible: () => string | null;
+  /** Labels of the buttons drawn in that dialog, or null when it is not up. */
+  missingButtons: () => string[] | null;
+  /** Its "save as new" button, with the target given instead of the dialog. */
+  missingSaveAs: (path: string) => Promise<boolean>;
+  /** Its "discard changes" button. */
+  missingDiscard: () => Promise<void>;
+  /** Labels of the buttons drawn in the write-back conflict dialog now up (the
+   *  range box's or the windowed tab's), or null when neither is. */
+  conflictButtons: () => string[] | null;
 }
 
 /** Whether the active editor's content DOM currently holds keyboard focus. */
@@ -212,6 +236,73 @@ function getEditorState(): {
     lineNumbers: view.dom.querySelector('.cm-lineNumbers') !== null,
   };
 }
+/** Runs the go-to-line command and submits its panel like a user would. */
+function gotoLine(n: number): boolean {
+  const view = activeView();
+  if (view === null) {
+    return false;
+  }
+  gotoLineCommand(view);
+  const input = view.dom.querySelector<HTMLInputElement>(
+    '.cm-panel input[name="line"]',
+  );
+  const form = input?.form;
+  if (input === null || input === undefined || !form) {
+    return false;
+  }
+  input.value = String(n);
+  form.requestSubmit();
+  return true;
+}
+/** Distance of the cursor row's middle from the scroller's middle, plus the
+ *  numbers needed to judge it. */
+function lineCenterOffset(n: number): {
+  offset: number;
+  lineHeight: number;
+  defaultLineHeight: number;
+  scrollTop: number;
+  maxScrollTop: number;
+  inView: boolean;
+} | null {
+  const view = activeView();
+  if (view === null || n < 1 || n > view.state.doc.lines) {
+    return null;
+  }
+  const line = view.state.doc.line(n);
+  const top = view.coordsAtPos(line.from);
+  const bottom = view.coordsAtPos(line.to, -1);
+  if (top === null || bottom === null) {
+    return null;
+  }
+  const scroller = view.scrollDOM;
+  const rect = scroller.getBoundingClientRect();
+  return {
+    offset: (top.top + top.bottom) / 2 - (rect.top + scroller.clientHeight / 2),
+    lineHeight: bottom.bottom - top.top,
+    defaultLineHeight: view.defaultLineHeight,
+    scrollTop: scroller.scrollTop,
+    maxScrollTop: scroller.scrollHeight - scroller.clientHeight,
+    inView:
+      top.top >= rect.top && top.bottom <= rect.top + scroller.clientHeight,
+  };
+}
+
+let warnings: string[] | null = null;
+/** Messages passed to console.warn since the previous call; the first call
+ *  starts collecting. */
+function consoleWarnings(): string[] {
+  if (warnings === null) {
+    const collected: string[] = [];
+    warnings = collected;
+    const original = console.warn.bind(console);
+    console.warn = (...args: unknown[]): void => {
+      collected.push(args.map(String).join(' '));
+      original(...args);
+    };
+    return [];
+  }
+  return warnings.splice(0);
+}
 
 export function installDocumentAuto(hooks: DocumentHooks): void {
   (window as unknown as { __auto: unknown }).__auto = {
@@ -219,8 +310,15 @@ export function installDocumentAuto(hooks: DocumentHooks): void {
     getContent,
     getEditorState,
     editorFocused,
+    gotoLine,
+    lineCenterOffset,
+    consoleWarnings,
+    setWordWrap: (on: boolean) => settingsState.setWordWrap(on),
     getLanguage: () => settingsState.language,
     setLanguage: (l: Language) => settingsState.setLanguage(l),
+    holdWindowedResults,
+    heldWindowedResults,
+    releaseWindowedResults,
     ...hooks,
   };
 }
@@ -287,6 +385,10 @@ export interface WorkspaceHooks {
   clearProject: () => Promise<void>;
   getTreeRows: () => unknown;
   toggleFolder: (path: string) => void;
+  getProjectRoots: () => string[];
+  getExpandedPaths: () => string[];
+  getListDirCalls: () => number;
+  treeIdle: () => Promise<void>;
   clickFile: (path: string) => void;
   ctxCreateFile: (
     parentPath: string,
@@ -298,6 +400,18 @@ export interface WorkspaceHooks {
   ctxTrash: (path: string) => Promise<void>;
   ctxRevealSupported: () => boolean;
   inlineEditorOpen: () => boolean;
+  getSelectedPaths: () => string[];
+  /** The folder a drag would drop into and the cursor shown, or null when no
+   *  drag is under way. */
+  dragState: () => { target: string | null; cursor: string; op: string } | null;
+  /** The dialog on screen: its message, listed items and button labels. */
+  dialogState: () => {
+    message: string;
+    items: { label: string; detail: string }[];
+    buttons: string[];
+  } | null;
+  /** Press the button with this label; false when there is none. */
+  dialogPress: (label: string) => Promise<boolean>;
   folderQuickAdd: (path: string, kind: 'file' | 'folder') => void;
 }
 

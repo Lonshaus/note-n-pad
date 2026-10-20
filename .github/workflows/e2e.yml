@@ -26,6 +26,7 @@ on:
           - e2e-table
           - e2e-view-mode
           - e2e-windowed
+          - e2e-windowed-two-tabs
       runners:
         # A failure on one platform is far cheaper to reproduce than one that
         # needs all three.

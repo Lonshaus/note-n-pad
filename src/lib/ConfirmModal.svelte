@@ -51,8 +51,11 @@
   import { onMount } from 'svelte';
   import { modalActsOnEscape } from './util/popupEscape';
 
-  interface Props {
+  interface BaseProps {
     message: string;
+    // Names listed under the message, each with an optional reason. The list
+    // scrolls when it is long.
+    items?: { label: string; detail?: string | undefined }[] | undefined;
     // Optional, so a dialog that only reports something renders one button
     // rather than offering an action it does not have.
     primaryLabel?: string | undefined;
@@ -62,7 +65,6 @@
     // A tertiary button is optional too, rendered between secondary and cancel
     // (a third choice, e.g. the open dialog's "soft-wrap and open").
     tertiaryLabel?: string | undefined;
-    cancelLabel: string;
     // Widened so an async handler's returned promise is visible here rather
     // than discarded: a bare `() => void` parameter also accepts an
     // `async () => Promise<void>` argument (TypeScript never checks return-type
@@ -73,11 +75,22 @@
     onprimary?: (() => void | Promise<void>) | undefined;
     onsecondary?: (() => void | Promise<void>) | undefined;
     ontertiary?: (() => void | Promise<void>) | undefined;
-    oncancel: () => void;
   }
+  // A dialog can be dismissed (a Cancel button and Esc) or, with `dismissable`
+  // false, only answered through its other buttons.
+  type Props = BaseProps &
+    (
+      | { dismissable?: true; cancelLabel: string; oncancel: () => void }
+      | {
+          dismissable: false;
+          cancelLabel?: string | undefined;
+          oncancel?: (() => void) | undefined;
+        }
+    );
 
   let {
     message,
+    items,
     primaryLabel,
     secondaryLabel,
     tertiaryLabel,
@@ -86,6 +99,7 @@
     onsecondary,
     ontertiary,
     oncancel,
+    dismissable = true,
   }: Props = $props();
 
   let root: HTMLElement;
@@ -148,8 +162,8 @@
       }
       e.preventDefault();
       e.stopPropagation();
-      if (isTop) {
-        oncancel();
+      if (isTop && dismissable) {
+        oncancel?.();
       }
     } else if (e.key === 'Tab') {
       // Focus never leaves the dialog: Tab cycles through its own buttons.
@@ -187,6 +201,18 @@
 >
   <div class="modal" role="dialog" aria-modal="true" tabindex="-1" {onkeydown}>
     <p>{message}</p>
+    {#if items !== undefined && items.length > 0}
+      <ul class="modal-items">
+        {#each items as item, i (i)}
+          <li>
+            <span class="item-label">{item.label}</span>
+            {#if item.detail}
+              <span class="item-detail">{item.detail}</span>
+            {/if}
+          </li>
+        {/each}
+      </ul>
+    {/if}
     <div class="modal-actions">
       {#if primaryLabel !== undefined && onprimary !== undefined}
         <button class="btn primary" onclick={() => fire(onprimary)}
@@ -203,7 +229,10 @@
           >{tertiaryLabel}</button
         >
       {/if}
-      <button class="btn" data-cancel onclick={oncancel}>{cancelLabel}</button>
+      {#if dismissable}
+        <button class="btn" data-cancel onclick={oncancel}>{cancelLabel}</button
+        >
+      {/if}
     </div>
   </div>
 </div>
@@ -232,6 +261,29 @@
   .modal p {
     margin: 0 0 0.8rem;
     font-size: 13px;
+  }
+  .modal-items {
+    max-height: 9rem;
+    margin: 0 0 0.8rem;
+    padding: 0.3rem 0.5rem;
+    overflow-y: auto;
+    list-style: none;
+    text-align: left;
+    font-size: 12px;
+    border: 1px solid var(--modal-border);
+    border-radius: 5px;
+  }
+  .modal-items li {
+    display: flex;
+    flex-direction: column;
+    padding: 0.15rem 0;
+  }
+  .item-label {
+    overflow-wrap: anywhere;
+  }
+  .item-detail {
+    opacity: 0.65;
+    overflow-wrap: anywhere;
   }
   .modal-actions {
     display: flex;

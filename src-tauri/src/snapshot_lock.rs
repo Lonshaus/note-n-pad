@@ -1,7 +1,7 @@
 // Copyright © 2026 Lonshaus
 // SPDX-License-Identifier: GPL-3.0-only
-//! Exclusive lock on a snapshots folder, so two apps pointed at the same folder
-//! (the full edition and Lite, say) cannot both write to it. The lock lives on
+//! Exclusive lock on a snapshots folder, so two apps (or two copies of this
+//! app) pointed at the same folder cannot both write to it. The lock lives on
 //! a hidden file inside the folder and is held for as long as the returned
 //! `File` is alive; the OS drops it when the process dies.
 

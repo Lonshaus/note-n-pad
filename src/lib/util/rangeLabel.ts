@@ -6,7 +6,7 @@ import { t } from '../i18n';
 export function sourceBaseName(path: string): string {
   return path.split(/[/\\]/).pop() || path;
 }
-/** The label of a range tab: "{name} (lines X–Y)" in the UI language. */
+/** The label of a range: "{name} (lines X–Y)" in the UI language. */
 export function rangeLabel(
   sourcePath: string,
   startLine: number,

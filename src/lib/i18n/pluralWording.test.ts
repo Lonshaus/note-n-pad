@@ -45,8 +45,17 @@ const COUNT_KEYS = {
   res: 'large.search.results',
   idx: 'status.indexing',
   ln: 'status.lines',
+  dropMany: 'workspace.drop.confirmMoveMany',
+  dropPartMv: 'workspace.drop.partialMove',
+  dropPartCp: 'workspace.drop.partialCopy',
+  dropRestMv: 'workspace.drop.moveRest',
+  dropRestCp: 'workspace.drop.copyRest',
+  dropHalfMv: 'workspace.drop.halfMove',
+  dropHalfCp: 'workspace.drop.halfCopy',
+  dropFailMv: 'workspace.drop.failedManyMove',
+  dropFailCp: 'workspace.drop.failedManyCopy',
 } as const;
-const NINE = Object.values(COUNT_KEYS);
+const ALL_COUNT_KEYS = Object.values(COUNT_KEYS);
 // The pairs this rewording changes.
 const CHANGED: Record<string, (keyof typeof COUNT_KEYS)[]> = {
   en: ['skH', 'skS', 'mv', 'col', 'rng', 'res', 'idx', 'ln'],
@@ -62,6 +71,11 @@ const LOCALES = Object.keys(CHANGED);
 // Words that read correctly after a number for every count.
 const AFTER_COUNT: Record<string, string[]> = {
   en: [
+    'of',
+    'item(s)',
+    'Item(s)',
+    'moved',
+    'copied',
     'file(s)',
     'snapshot(s)',
     'sticky note(s)',
@@ -71,19 +85,18 @@ const AFTER_COUNT: Record<string, string[]> = {
     'sticky or document snapshot(s)',
     'matching snapshot(s)',
   ],
-  de: ['gefunden', 'Notizzettel'],
-  fr: ['trouvé(s)', 'pense-bête(s)'],
-  es: ['nota(s) adhesiva(s)'],
-  it: ['file', 'post-it'],
-  'pt-BR': ['nota(s) adesiva(s)'],
+  de: ['gefunden', 'Notizzettel', 'von', 'Element(e)'],
+  fr: ['trouvé(s)', 'pense-bête(s)', 'élément(s)'],
+  es: ['nota(s) adhesiva(s)', 'de', 'elemento(s)'],
+  it: ['file', 'post-it', 'di', 'elemento/i'],
+  'pt-BR': ['nota(s) adesiva(s)', 'de', 'item(ns)'],
+  ru: ['из'],
+  pl: ['z'],
 };
-
-function countIsNumberNeutral(locale: string, template: string): boolean {
-  const at = template.indexOf('{count}');
-  if (at < 0) {
-    return false;
-  }
-  const rest = template.slice(at + '{count}'.length);
+// Every number placeholder a count string may carry.
+const COUNT_PLACEHOLDERS = ['{count}', '{total}', '{done}', '{rest}'];
+/** True when what follows one number reads correctly for every count. */
+function readsRightAfterNumber(locale: string, rest: string): boolean {
   if (rest === '' || /^[),.…]/.test(rest)) {
     return true;
   }
@@ -94,6 +107,24 @@ function countIsNumberNeutral(locale: string, template: string): boolean {
     const next = rest.slice(word.length + 1, word.length + 2);
     return next === '' || !/[\p{L}(]/u.test(next);
   });
+}
+
+function countIsNumberNeutral(locale: string, template: string): boolean {
+  const numbers = COUNT_PLACEHOLDERS.flatMap((placeholder) => {
+    const rests: string[] = [];
+    for (
+      let at = template.indexOf(placeholder);
+      at >= 0;
+      at = template.indexOf(placeholder, at + placeholder.length)
+    ) {
+      rests.push(template.slice(at + placeholder.length));
+    }
+    return rests;
+  });
+  return (
+    numbers.length > 0 &&
+    numbers.every((rest) => readsRightAfterNumber(locale, rest))
+  );
 }
 
 function preSlice(locale: string, key: string): string {
@@ -119,7 +150,9 @@ describe('count strings read correctly for every count', () => {
 
   it('the old-values table covers exactly the changed pairs', () => {
     for (const locale of LOCALES) {
-      const covered = NINE.filter((key) => OLD_SHIPPED[locale]?.[key]);
+      const covered = ALL_COUNT_KEYS.filter(
+        (key) => OLD_SHIPPED[locale]?.[key],
+      );
       const expected = (CHANGED[locale] ?? []).map((n) => COUNT_KEYS[n]);
       expect(covered.sort(), locale).toEqual([...expected].sort());
     }
