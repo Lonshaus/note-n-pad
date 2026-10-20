@@ -4,10 +4,10 @@
 import { invoke } from '@tauri-apps/api/core';
 import { listen } from '@tauri-apps/api/event';
 
-/** Whether this is the Lite edition (the Store build while its license
- *  is a trial). The Rust core owns the answer
- *  (`edition::is_lite`); this mirrors it: read once through `edition_info`,
- *  then following `edition-changed`. Starts lite (fail-safe), but `ready()`
+/** Whether this is the Lite edition (the MSIX package while its license is a
+ *  trial, or the sandboxed store build until the full version is bought).
+ *  The Rust core owns the answer (`edition::is_lite`); this mirrors it: read
+ *  once through `edition_info`, then following `edition-changed`. Starts lite (fail-safe), but `ready()`
  *  settles it, so anything that restores or opens documents awaits that first. */
 export class EditionState {
   lite = $state(true);

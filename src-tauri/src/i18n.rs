@@ -93,7 +93,7 @@ pub enum Key {
   // Privacy Policy labels both the menu item and its window title, the same
   // way Acknowledgements does for its own window.
   PrivacyPolicy,
-  // Help > Full Version Features (Lite only) and that window's title
+  // Help > Full Version Features (builds with editions only) and that window's title
   FullFeatures,
   // Section heading and names of the shortcut registry rows that have no menu
   // item (tab switching, go to line).
@@ -955,9 +955,9 @@ fn strings(key: Key) -> [&'static str; 15] {
       "Chính sách quyền riêng tư",
     ],
     Key::FullFeatures => [
-      "正式版功能",
-      "正式版功能",
-      "製品版の機能",
+      "完整版功能",
+      "完整版功能",
+      "完全版の機能",
       "Full Version Features",
       "Функции полной версии",
       "Funciones de la versión completa",
