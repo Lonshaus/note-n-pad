@@ -64,6 +64,13 @@ fn now() -> u64 {
 pub fn remember(path: &str) {
   remember_in(&GRANTS, sandboxed(), path, now(), mac_bookmark_encode);
 }
+/// A file or folder was renamed: its grant, and the grants of everything below
+/// it, move to the new path. The bookmark itself keeps pointing at the item.
+pub fn rekey(from: &str, to: &str) {
+  if sandboxed() {
+    GRANTS.rekey_with(from, to);
+  }
+}
 
 /// Resolve the stored grants once per process, dropping entries outside `prune`
 /// when it is given. Must run before any window can read a restored path.
@@ -227,6 +234,32 @@ impl Grants {
     }
   }
 
+  fn rekey_with(&self, from: &str, to: &str) {
+    use crate::file_ops::retarget_path;
+    let mut state = self.lock();
+    if state.file.is_none() {
+      return;
+    }
+    let moved: Vec<(String, String)> = state
+      .map
+      .keys()
+      .map(|key| (key.clone(), retarget_path(key, from, to)))
+      .filter(|(key, new)| key != new)
+      .collect();
+    if moved.is_empty() {
+      return;
+    }
+    for (key, new) in moved {
+      if let Some(entry) = state.map.remove(&key) {
+        state.map.insert(new.clone(), entry);
+      }
+      if state.failed.remove(&key) {
+        state.failed.insert(new);
+      }
+    }
+    persist(&state);
+  }
+
   fn restore_with(
     &self,
     file: PathBuf,
@@ -324,6 +357,50 @@ mod tests {
     assert_eq!(reloaded.get("/a.txt"), Some(&entry("bm:/a.txt", 10)));
     assert_eq!(reloaded.get("/b"), Some(&entry("bm:/b", 20)));
     assert_eq!(reloaded.len(), 2);
+  }
+
+  #[test]
+  fn a_renamed_file_keeps_its_grant_under_the_new_path() {
+    let dir = tempdir().unwrap();
+    let file = dir.path().join(FILE_NAME);
+    let grants = restored(&file);
+    grants.remember_with("/x/f.txt", 10, ok_encode);
+    grants.remember_with("/x/other.txt", 20, ok_encode);
+    grants.rekey_with("/x/f.txt", "/x/g.txt");
+    let reloaded = load(&file).unwrap();
+    assert_eq!(reloaded.get("/x/g.txt"), Some(&entry("bm:/x/f.txt", 10)));
+    assert_eq!(reloaded.get("/x/f.txt"), None);
+    assert_eq!(
+      reloaded.get("/x/other.txt"),
+      Some(&entry("bm:/x/other.txt", 20))
+    );
+    assert_eq!(reloaded.len(), 2);
+  }
+
+  #[test]
+  fn a_renamed_folder_moves_the_grants_below_it() {
+    let dir = tempdir().unwrap();
+    let file = dir.path().join(FILE_NAME);
+    let grants = restored(&file);
+    grants.remember_with("/x/y", 1, ok_encode);
+    grants.remember_with("/x/y/a.txt", 2, ok_encode);
+    grants.remember_with("/x/y2/b.txt", 3, ok_encode);
+    grants.rekey_with("/x/y", "/x/z");
+    let keys: Vec<String> = load(&file).unwrap().keys().cloned().collect();
+    assert_eq!(keys, vec!["/x/y2/b.txt", "/x/z", "/x/z/a.txt"]);
+  }
+
+  #[test]
+  fn a_rename_without_a_matching_grant_leaves_the_file_alone() {
+    let dir = tempdir().unwrap();
+    let file = dir.path().join(FILE_NAME);
+    let grants = restored(&file);
+    grants.remember_with("/x/f.txt", 10, ok_encode);
+    let before = std::fs::read_to_string(&file).unwrap();
+    grants.rekey_with("/q", "/r");
+    assert_eq!(std::fs::read_to_string(&file).unwrap(), before);
+    // Before the grants are restored there is no file to write to.
+    Grants::new().rekey_with("/x/f.txt", "/x/g.txt");
   }
 
   #[cfg(unix)]

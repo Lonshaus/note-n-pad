@@ -22,12 +22,6 @@ import { fileURLToPath, pathToFileURL } from 'node:url';
 const SCRIPT_DIR = path.dirname(fileURLToPath(import.meta.url));
 const REPO_ROOT = path.join(SCRIPT_DIR, '..');
 const OUT_DIR = path.join(REPO_ROOT, 'src-tauri', 'resources', 'privacy');
-const LITE_OUT_DIR = path.join(
-  REPO_ROOT,
-  'src-tauri',
-  'resources',
-  'privacy-lite',
-);
 
 /** Root file to bundled name. The bundled names are the locale ids the Rust
  *  side resolves against; every other interface language reads `en`. */
@@ -35,15 +29,6 @@ export const DOCUMENTS = [
   ['PRIVACY.md', 'en.md'],
   ['PRIVACY.zh-TW.md', 'zh-TW.md'],
   ['PRIVACY.ja.md', 'ja.md'],
-];
-
-/** The same for the Lite app, which has a policy of its own (not the full one
- *  with the name replaced): bundled by `tauri.lite.conf.json` as `privacy-lite/`
- *  and read instead of `privacy/` by a build with the `lite` feature. */
-export const LITE_DOCUMENTS = [
-  ['PRIVACY-Lite.md', 'en.md'],
-  ['PRIVACY-Lite.zh-TW.md', 'zh-TW.md'],
-  ['PRIVACY-Lite.ja.md', 'ja.md'],
 ];
 
 /** The document without its language-switching line. That line is the second
@@ -82,7 +67,6 @@ function copyAll(documents, outDir) {
 
 function main() {
   copyAll(DOCUMENTS, OUT_DIR);
-  copyAll(LITE_DOCUMENTS, LITE_OUT_DIR);
 }
 
 // Only generate when run as a script, so the freshness test can import the

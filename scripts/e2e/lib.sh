@@ -245,7 +245,7 @@ e2e_read() {
     # A thrown eval comes back as the object automation.rs answers on its catch
     # path, which jq prints over four lines and `check` then compares as if it
     # were a value: a read that never ran reads exactly like one that did. Reads
-    # that legitimately return objects (largeInfo, rangeInfo, windowedInfo) carry
+    # that legitimately return objects (largeInfo, rangeBoxInfo, windowedInfo) carry
     # no `error` key, so keying on it leaves them alone.
     err="$(printf '%s' "$result" | jq -r 'select(type == "object" and has("error")) | .error' 2>/dev/null)"
     if [ -n "$err" ]; then

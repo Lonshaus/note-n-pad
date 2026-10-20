@@ -180,6 +180,12 @@ export const ja = {
   'doc.oversized.message':
     'このタブの未保存の内容は大きすぎてスナップショットを保持できません。閉じる前に処理が必要です。',
   'doc.oversized.discard': '変更を破棄',
+  'doc.missing.message':
+    '「{name}」が見つかりません。ファイルが移動または削除された可能性があります。未保存の内容はタブに残っています。',
+  'doc.missing.saveAs': '別名で保存',
+  'doc.missing.discard': '変更を破棄',
+  'doc.rangeBox.unsaved':
+    '範囲の編集ボックスに未保存の変更があります。閉じる前に処理が必要です。',
   'doc.snapshotFailed.message':
     'このタブの未保存の内容を復元用スナップショットに保存できませんでした。閉じる前に処理が必要です。',
   'sticky.snapshotFailed.message':
@@ -298,6 +304,40 @@ export const ja = {
   'workspace.tree.newFileAria': 'このフォルダーに新規ファイル',
   'workspace.tree.newFolder': '新規フォルダー',
   'workspace.tree.newFolderAria': 'このフォルダーにサブフォルダーを作成',
+  'workspace.drop.move': '移動',
+  'workspace.drop.confirmMoveFile': '「{name}」を「{folder}」に移動しますか？',
+  'workspace.drop.confirmMoveFolder':
+    '「{name}」とその中身をすべて「{folder}」に移動しますか？',
+  'workspace.drop.confirmMoveMany':
+    '{count} 件の項目を「{folder}」に移動しますか？',
+  'workspace.drop.refuseMoveProject': '別のプロジェクトには移動できません。',
+  'workspace.drop.refuseMoveVolume': '別のディスクには移動できません。',
+  'workspace.drop.refuseCopyProject': '別のプロジェクトにはコピーできません。',
+  'workspace.drop.refuseCopyVolume': '別のディスクにはコピーできません。',
+  'workspace.drop.partialMove':
+    '{total} 件中 {count} 件は「{folder}」に移動できません：',
+  'workspace.drop.partialCopy':
+    '{total} 件中 {count} 件は「{folder}」にコピーできません：',
+  'workspace.drop.moveRest': '残りの {rest} 件だけ移動',
+  'workspace.drop.copyRest': '残りの {rest} 件だけコピー',
+  'workspace.drop.abandonAll': 'すべて中止',
+  'workspace.drop.reasonSameName': '対象フォルダーに同じ名前の項目があります',
+  'workspace.drop.reasonIntoSelfMove':
+    '自分自身やそのサブフォルダーには移動できません',
+  'workspace.drop.reasonIntoSelfCopy':
+    '自分自身やそのサブフォルダーにはコピーできません',
+  'workspace.drop.halfMove':
+    '{total} 件中 {done} 件を移動しました。残りは完了していません：',
+  'workspace.drop.halfCopy':
+    '{total} 件中 {done} 件をコピーしました。残りは完了していません：',
+  'workspace.drop.failedOneMove': '「{name}」を移動できません：{reason}',
+  'workspace.drop.failedOneCopy': '「{name}」をコピーできません：{reason}',
+  'workspace.drop.failedManyMove': '{count} 件の項目を移動できません：',
+  'workspace.drop.failedManyCopy': '{count} 件の項目をコピーできません：',
+  'workspace.drop.linksSkipped':
+    'コピーしましたが、次のリンクは作成できなかったためコピーされていません：',
+  'workspace.drop.reasonSymlinkPrivilege':
+    'シンボリックリンクを作成する権限がありません',
   // Long-line handling
   'status.longLine.worker':
     '長い行：シンタックスハイライトをバックグラウンドスレッドで実行',
@@ -308,16 +348,25 @@ export const ja = {
     '「{name}」を開けません。ファイルが移動・削除されたか、ファイル名にこのアプリが対応していない文字が含まれている可能性があります。',
   'doc.restoreUnreadable':
     '{names} を読み込めませんでした。ファイルをもう一度開いてください。',
-  'doc.keptTabs':
-    'このバージョンでは対応していないタブが {count} 個あるため、開いていません。',
   'edition.col.feature': '機能',
-  'edition.col.lite': 'このバージョン',
-  'edition.col.full': '製品版',
+  'edition.col.lite': '無料版',
+  'edition.col.full': '完全版',
   'edition.mark.yes': '含まれる',
   'edition.mark.no': '含まれない',
+  'edition.status.free': '現在のバージョン：無料版',
+  'edition.status.full': '現在のバージョン：完全版',
+  'edition.store.buy': '完全版を購入',
+  'edition.store.buyPrice': '完全版を購入（{price}）',
+  'edition.store.restore': '購入を復元',
+  'edition.store.retry': '再試行',
+  'edition.store.unreachable': 'App Store に接続できませんでした。',
+  'edition.store.pending': '承認を待っています。',
+  'edition.store.nothing': '購入が見つかりませんでした。',
+  'edition.store.failed':
+    'App Store に接続できませんでした。もう一度お試しください。',
   'edition.row.largeFiles': '大容量ファイルの閲覧と編集',
   'edition.row.largeFilesNote':
-    'このバージョンでは、100 MB を超えるファイルも通常のエディタで開きます。',
+    '無料版では、100 MB を超えるファイルも通常のエディタで開きます。',
   'edition.row.syntax': '構文ハイライト',
   'edition.row.treeViews': 'JSON と XML のツリー表示',
   'edition.row.themes': 'テーマ（選択・編集・読み込み・書き出し・削除）',

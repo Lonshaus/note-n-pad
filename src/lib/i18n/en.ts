@@ -182,6 +182,12 @@ export const en = {
   'doc.oversized.message':
     'This tab’s unsaved content is too large to snapshot and must be handled before closing.',
   'doc.oversized.discard': 'Discard Changes',
+  'doc.missing.message':
+    'Couldn’t find “{name}”. The file may have been moved or deleted. Unsaved changes are still in the tab.',
+  'doc.missing.saveAs': 'Save As New',
+  'doc.missing.discard': 'Discard Changes',
+  'doc.rangeBox.unsaved':
+    'The range edit box has unsaved changes and must be handled before closing.',
   'doc.snapshotFailed.message':
     'This tab’s unsaved content could not be saved to the recovery snapshot and must be handled before closing.',
   'sticky.snapshotFailed.message':
@@ -300,6 +306,40 @@ export const en = {
   'workspace.tree.newFileAria': 'New file in this folder',
   'workspace.tree.newFolder': 'New folder',
   'workspace.tree.newFolderAria': 'New subfolder in this folder',
+  'workspace.drop.move': 'Move',
+  'workspace.drop.confirmMoveFile': 'Move “{name}” to “{folder}”?',
+  'workspace.drop.confirmMoveFolder':
+    'Move “{name}” and everything in it to “{folder}”?',
+  'workspace.drop.confirmMoveMany': 'Move {count} item(s) to “{folder}”?',
+  'workspace.drop.refuseMoveProject': 'Can’t move to another project.',
+  'workspace.drop.refuseMoveVolume': 'Can’t move to another disk.',
+  'workspace.drop.refuseCopyProject': 'Can’t copy to another project.',
+  'workspace.drop.refuseCopyVolume': 'Can’t copy to another disk.',
+  'workspace.drop.partialMove':
+    '{count} of {total} item(s) can’t be moved to “{folder}”:',
+  'workspace.drop.partialCopy':
+    '{count} of {total} item(s) can’t be copied to “{folder}”:',
+  'workspace.drop.moveRest': 'Move Only the Other {rest} Item(s)',
+  'workspace.drop.copyRest': 'Copy Only the Other {rest} Item(s)',
+  'workspace.drop.abandonAll': 'Abandon All',
+  'workspace.drop.reasonSameName':
+    'The destination already has an item with that name',
+  'workspace.drop.reasonIntoSelfMove':
+    'Can’t move an item into itself or its own subfolder',
+  'workspace.drop.reasonIntoSelfCopy':
+    'Can’t copy an item into itself or its own subfolder',
+  'workspace.drop.halfMove':
+    'Of {total} item(s), {done} moved; the rest were not completed:',
+  'workspace.drop.halfCopy':
+    'Of {total} item(s), {done} copied; the rest were not completed:',
+  'workspace.drop.failedOneMove': 'Couldn’t move “{name}”: {reason}',
+  'workspace.drop.failedOneCopy': 'Couldn’t copy “{name}”: {reason}',
+  'workspace.drop.failedManyMove': 'Couldn’t move {count} item(s):',
+  'workspace.drop.failedManyCopy': 'Couldn’t copy {count} item(s):',
+  'workspace.drop.linksSkipped':
+    'Copied, but these links couldn’t be created and were not copied:',
+  'workspace.drop.reasonSymlinkPrivilege':
+    'No permission to create symbolic links',
   // Long-line handling
   'status.longLine.worker':
     'Long lines: syntax highlighting moved to a background thread',
@@ -310,15 +350,24 @@ export const en = {
     'Couldn’t open “{name}”. The file may have been moved or deleted, or its name may contain characters this app doesn’t support.',
   'doc.restoreUnreadable':
     'Couldn’t read: {names}. Open the file(s) again to continue.',
-  'doc.keptTabs': 'Not opened: {count} tab(s) not supported in this version.',
   'edition.col.feature': 'Feature',
-  'edition.col.lite': 'This version',
+  'edition.col.lite': 'Free version',
   'edition.col.full': 'Full version',
   'edition.mark.yes': 'Included',
   'edition.mark.no': 'Not included',
+  'edition.status.free': 'Current version: Free',
+  'edition.status.full': 'Current version: Full',
+  'edition.store.buy': 'Buy the Full Version',
+  'edition.store.buyPrice': 'Buy the Full Version ({price})',
+  'edition.store.restore': 'Restore Purchases',
+  'edition.store.retry': 'Retry',
+  'edition.store.unreachable': 'Couldn’t reach the App Store.',
+  'edition.store.pending': 'Waiting for approval.',
+  'edition.store.nothing': 'No purchase was found.',
+  'edition.store.failed': 'Couldn’t reach the App Store. Try again.',
   'edition.row.largeFiles': 'Large-file viewing and editing',
   'edition.row.largeFilesNote':
-    'In this version, files over 100 MB open in the ordinary editor.',
+    'In the free version, files over 100 MB open in the ordinary editor.',
   'edition.row.syntax': 'Syntax highlighting',
   'edition.row.treeViews': 'JSON and XML tree views',
   'edition.row.themes': 'Themes (choose, edit, import, export, delete)',

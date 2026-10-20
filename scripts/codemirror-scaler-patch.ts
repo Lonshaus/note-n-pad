@@ -9,6 +9,8 @@
 // With a BigScaler each viewport change maps the same scrollTop to a different
 // height, so the scroll anchor is corrected in every measure iteration that
 // changes the viewport, not only in the ones that do not.
+// Upstream reads the scroll offset before the scroll target is applied, so the
+// next anchor is picked away from the target and a centered jump drifts.
 const E1_OLD = `        if (viewportChange) {
             if (result & 2 /* UpdateFlag.Height */)
                 result |= this.updateScaler();
@@ -89,6 +91,18 @@ export const REPLACEMENTS: Replacement[] = [
                     }
                 }
                 if (!update.viewportChanged && this.measureRequests.length == 0) {
+`,
+  },
+  {
+    name: 'scroll offset refresh after scroll target',
+    old: `                            this.docView.scrollIntoView(this.viewState.scrollTarget);
+                            this.viewState.scrollTarget = null;
+                            scrollAnchorHeight = -1;
+`,
+    new: `                            this.docView.scrollIntoView(this.viewState.scrollTarget);
+                            this.viewState.scrollTarget = null;
+                            scrollAnchorHeight = -1;
+                            scrollOffset = this.viewState.getScrollOffset();
 `,
   },
 ];

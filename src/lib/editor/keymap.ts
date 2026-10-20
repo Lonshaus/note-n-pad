@@ -27,7 +27,6 @@ import {
   indentMore,
   indentSelection,
   insertBlankLine,
-  insertTab,
   lineComment,
   lineUncomment,
   moveLineDown,
@@ -185,9 +184,30 @@ export function toCodeMirrorKeys(accel: string, os: string): string[] {
   }
   return keys;
 }
-/** Tab: a tab character at an empty caret, otherwise indent the lines. Not
- *  `indentMore` itself, so it is never taken for the rebindable Indent. */
-export const tabKey: Command = (view) => insertTab(view);
+/** Tab: indent the lines when any range spans more than one line, otherwise
+ *  replace each range (a caret included) with a tab character. A whole line
+ *  selected without its line break is still one line. Not `indentMore`
+ *  itself, so it is never taken for the rebindable Indent. */
+export const tabKey: Command = (view) => {
+  const { state } = view;
+  if (state.readOnly) {
+    return false;
+  }
+  const doc = state.doc;
+  const multiLine = state.selection.ranges.some(
+    (r) => doc.lineAt(r.from).number !== doc.lineAt(r.to).number,
+  );
+  if (multiLine) {
+    return indentMore(view);
+  }
+  view.dispatch(
+    state.update(state.replaceSelection('\t'), {
+      scrollIntoView: true,
+      userEvent: 'input',
+    }),
+  );
+  return true;
+};
 /** Shift-Tab: outdent the lines. Not `indentLess` itself, for the same reason. */
 export const shiftTabKey: Command = (view) => indentLess(view);
 /** A copy of `binding` without its Shift variant. */

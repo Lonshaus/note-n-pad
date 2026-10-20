@@ -78,9 +78,9 @@ pub struct NoteSnapshot {
   /// straight in the large-file view without re-stat. None for ordinary tabs.
   #[serde(default)]
   pub large: Option<u64>,
-  /// Source file a range-edit tab was sliced from. Its presence marks the tab
-  /// as a range tab on restore; the byte span and fingerprint below rebuild the
-  /// splice write-back baseline. None for every non-range tab.
+  /// The range_* fields are only read, from records an earlier version wrote
+  /// when a range opened as a tab of its own; every record written now has them
+  /// None. Source file the range tab was sliced from.
   #[serde(default)]
   pub range_source: Option<String>,
   /// Byte span `[range_start, range_end)` of the slice within `range_source`.
@@ -88,34 +88,23 @@ pub struct NoteSnapshot {
   pub range_start: Option<u64>,
   #[serde(default)]
   pub range_end: Option<u64>,
-  /// Source fingerprint captured at slice/last-splice time, restored as the
-  /// conflict baseline so an out-of-band edit still triggers the mismatch flow.
+  /// Source fingerprint captured at slice/last-splice time.
   #[serde(default)]
   pub range_fp_size: Option<u64>,
   #[serde(default)]
   pub range_fp_mtime: Option<u64>,
-  /// 1-based line number of the range's first line, fixed at extraction time
-  /// (nothing before this tab's content can shift while it stays open). The
-  /// label is formatted from this and `range_end_line` when it is shown, so it
-  /// follows a language change. None for a non-range tab, and for a range tab
-  /// restored from an older snapshot, which persisted a formatted label
-  /// (`range_label`, removed) instead of a line number; the frontend falls
-  /// back to the bare file name for such a tab rather than reconstructing a
-  /// line span from the old string.
+  /// 1-based line number of the range's first line, fixed at extraction time.
+  /// None for a record from before this field (it persisted a formatted
+  /// `range_label`, removed, which is not read back).
   #[serde(default)]
   pub range_start_line: Option<i64>,
-  /// 1-based line number of the range's last line, kept in step with the live
-  /// content on every write (so it also follows edits and saves, and is stored
-  /// when `content` is empty). Lets a view that never opens the tab, such as
-  /// the workspace list, label the range. None for a non-range tab and for a
-  /// record written before this field existed.
+  /// 1-based line number of the range's last line, so a view that never opens
+  /// the tab (the workspace list) can label it. None for a record from before
+  /// this field.
   #[serde(default)]
   pub range_end_line: Option<u64>,
-  /// Whether the source slice ended with a line break. The buffer keeps that
-  /// break; on write-back one is added only if the slice ended with one and
-  /// the non-empty buffer no longer does. None for a non-range tab and for a
-  /// record written before this field existed; restore then derives it from the
-  /// source slice.
+  /// Whether the source slice ended with a line break. None for a record from
+  /// before this field.
   #[serde(default)]
   pub range_trailing_break: Option<bool>,
   /// Sparse line-checkpoint index of a windowed-editing tab (see
@@ -395,18 +384,16 @@ pub struct DocWindowPlan {
 
 /// A document note's effective group id: its window_group, or its own id when
 /// None (a legacy/solo document becomes its own single-tab window).
-fn resolved_group(note: &NoteSnapshot) -> &str {
+pub(crate) fn resolved_group(note: &NoteSnapshot) -> &str {
   note.window_group.as_deref().unwrap_or(&note.id)
 }
 
 /// Plan one document window per group from stored notes. Stickies are ignored.
 /// Groups keep first-appearance order; each window inherits the bounds of its
-/// lowest-tab_index tab. In lite a kept tab is not shown and nothing writes its
-/// record, so its bounds go stale: the lowest shown tab is preferred, and only a
-/// group of kept tabs alone falls back to the lowest overall.
-pub fn plan_document_windows(notes: &[NoteSnapshot], lite: bool) -> Vec<DocWindowPlan> {
+/// lowest-tab_index tab.
+pub fn plan_document_windows(notes: &[NoteSnapshot]) -> Vec<DocWindowPlan> {
   let mut order: Vec<String> = Vec::new();
-  let mut plans: std::collections::HashMap<String, ((bool, i64), DocWindowPlan)> =
+  let mut plans: std::collections::HashMap<String, (i64, DocWindowPlan)> =
     std::collections::HashMap::new();
   for note in notes {
     if note.kind != "document" {
@@ -420,17 +407,16 @@ pub fn plan_document_windows(notes: &[NoteSnapshot], lite: bool) -> Vec<DocWindo
       width: note.width,
       height: note.height,
     };
-    let rank = (lite && needs_full_edition(note), note.tab_index);
     match plans.get_mut(&group) {
       Some((best, plan)) => {
-        if rank < *best {
-          *best = rank;
+        if note.tab_index < *best {
+          *best = note.tab_index;
           *plan = candidate;
         }
       }
       None => {
         order.push(group.clone());
-        plans.insert(group, (rank, candidate));
+        plans.insert(group, (note.tab_index, candidate));
       }
     }
   }
@@ -440,28 +426,12 @@ pub fn plan_document_windows(notes: &[NoteSnapshot], lite: bool) -> Vec<DocWindo
     .collect()
 }
 
-/// Whether restoring `note` needs a feature the Lite edition removes: the
-/// large-file viewer (`large`), windowed editing (`windowed_index`) or a range
-/// tab (`range_source`). In lite such a record is a kept tab: never opened,
-/// never rewritten, never dropped, and restored as usual once the edition is
-/// full again.
-pub fn needs_full_edition(note: &NoteSnapshot) -> bool {
-  note.kind == "document"
-    && (note.large.is_some() || note.windowed_index.is_some() || note.range_source.is_some())
-}
-
-/// Whether startup should rewrite a group-less document into its own solo
-/// group. Never a kept tab in lite: its record stays byte for byte as it is.
-pub fn needs_group_migration(note: &NoteSnapshot, lite: bool) -> bool {
-  note.kind == "document" && note.window_group.is_none() && !(lite && needs_full_edition(note))
-}
-
 /// Migrate every group-less document in `notes` to its own solo group (keyed by
 /// its id) so future restores keep it grouped. A store that cannot be written to
 /// (read-only dir, full disk) only loses the migration, never the launch.
-pub fn migrate_group_less_documents(store: &NoteStore, notes: &[NoteSnapshot], lite: bool) {
+pub fn migrate_group_less_documents(store: &NoteStore, notes: &[NoteSnapshot]) {
   for note in notes {
-    if needs_group_migration(note, lite) {
+    if note.kind == "document" && note.window_group.is_none() {
       let mut migrated = note.clone();
       migrated.window_group = Some(note.id.clone());
       if let Err(e) = store.upsert(migrated) {
@@ -473,49 +443,23 @@ pub fn migrate_group_less_documents(store: &NoteStore, notes: &[NoteSnapshot], l
     }
   }
 }
-/// Document groups whose window the app closed for the trial: the user
-/// dismissed the kept-tabs notice of a window that held nothing else. Only the
-/// frontend's `dismissKeptTabsAndHoldBack` adds to it. Held in memory only, and
-/// emptied when the edition turns full.
-#[derive(Default)]
-pub struct HeldBackGroups(Mutex<std::collections::HashSet<String>>);
-
-impl HeldBackGroups {
-  pub fn hold(&self, group: String) {
-    self.0.lock().unwrap().insert(group);
-  }
-  /// Every held group; the set is empty afterwards.
-  pub fn take_all(&self) -> std::collections::HashSet<String> {
-    std::mem::take(&mut *self.0.lock().unwrap())
-  }
+/// Whether `note` is a range tab from an earlier version with nothing unsaved.
+/// A range tab is now an edit box that is never persisted, so there is nothing
+/// to restore for it.
+pub fn is_clean_range_record(note: &NoteSnapshot) -> bool {
+  note.kind == "document" && note.range_source.is_some() && !note.dirty
 }
-/// Remember that the app closed the window of `group` for the trial, so it
-/// returns when the edition is full again.
-#[tauri::command]
-pub fn hold_back_group(state: State<HeldBackGroups>, group: String) {
-  state.hold(group);
-}
-/// The windows to open when the edition turns full: every group in `held` that
-/// holds a tab lite kept and whose window is not open (`is_live`), planned
-/// exactly as a startup restore would. A group missing from `held` is one the
-/// user closed, so its kept tabs wait for the next launch.
-pub fn groups_to_reopen(
-  notes: &[NoteSnapshot],
-  held: &std::collections::HashSet<String>,
-  is_live: impl Fn(&str) -> bool,
-) -> Vec<DocWindowPlan> {
-  let kept: std::collections::HashSet<&str> = notes
-    .iter()
-    .filter(|n| needs_full_edition(n))
-    .map(resolved_group)
-    .collect();
-  // Only called once the edition is full, when every tab is shown.
-  plan_document_windows(notes, false)
-    .into_iter()
-    .filter(|plan| {
-      held.contains(&plan.group) && kept.contains(plan.group.as_str()) && !is_live(&plan.group)
-    })
-    .collect()
+/// Delete every clean old range record from `store`, before any window is
+/// planned, so a group made only of them opens no empty window. A record that
+/// cannot be deleted stays and is deleted again by the window that restores it.
+pub fn drop_clean_range_records(store: &NoteStore) {
+  for note in store.list() {
+    if is_clean_range_record(&note) {
+      if let Err(e) = store.delete(&note.id) {
+        log::warn!("failed to drop the old range record {}: {e}", note.id);
+      }
+    }
+  }
 }
 
 /// The snapshot files that could not be loaded at startup, held until a window
@@ -556,6 +500,25 @@ struct Inner {
   notes: Vec<NoteSnapshot>,
   dir: PathBuf,
   seqs: std::collections::HashMap<String, u64>,
+  /// Project rebinds made during this run (`from -> to`, one edge per rebind). A
+  /// snapshot write still tagged with a `from` project is re-tagged on arrival,
+  /// following the edges until a project with none.
+  rebinds: std::collections::HashMap<String, String>,
+}
+/// The project a write tagged `project` ends up with once this run's rebinds
+/// are applied. The step cap only guards against a cyclic map.
+fn rebound_project(
+  rebinds: &std::collections::HashMap<String, String>,
+  project: Option<String>,
+) -> Option<String> {
+  let mut current = project?;
+  for _ in 0..=rebinds.len() {
+    match rebinds.get(&current) {
+      Some(next) => current = next.clone(),
+      None => break,
+    }
+  }
+  Some(current)
 }
 
 /// The single owner of note snapshots: an in-memory Vec guarded by a Mutex,
@@ -584,6 +547,7 @@ impl NoteStore {
           notes: loaded.items,
           dir,
           seqs: std::collections::HashMap::new(),
+          rebinds: std::collections::HashMap::new(),
         }),
       },
       loaded.skipped,
@@ -600,6 +564,7 @@ impl NoteStore {
         notes: Vec::new(),
         dir,
         seqs: std::collections::HashMap::new(),
+        rebinds: std::collections::HashMap::new(),
       }),
     }
   }
@@ -619,8 +584,9 @@ impl NoteStore {
       .cloned()
   }
 
-  pub fn upsert(&self, note: NoteSnapshot) -> Result<(), String> {
+  pub fn upsert(&self, mut note: NoteSnapshot) -> Result<(), String> {
     let mut inner = self.inner.lock().unwrap();
+    note.project = rebound_project(&inner.rebinds, note.project.take());
     save_note(&inner.dir, &note)?;
     upsert(&mut inner.notes, note);
     Ok(())
@@ -634,18 +600,79 @@ impl NoteStore {
   /// though `upsert_note` runs `(async)` and worker-pool scheduling gives no
   /// such guarantee on its own. Returns whether the write was applied, so the
   /// caller can skip broadcasting `store-changed` for a dropped write.
-  pub fn upsert_ordered(&self, note: NoteSnapshot, seq: u64) -> Result<bool, String> {
+  pub fn upsert_ordered(&self, mut note: NoteSnapshot, seq: u64) -> Result<bool, String> {
     let mut inner = self.inner.lock().unwrap();
     if let Some(&last) = inner.seqs.get(&note.id) {
       if seq < last {
         return Ok(false);
       }
     }
+    note.project = rebound_project(&inner.rebinds, note.project.take());
     let id = note.id.clone();
     save_note(&inner.dir, &note)?;
     inner.seqs.insert(id, seq);
     upsert(&mut inner.notes, note);
     Ok(true)
+  }
+  /// Move every stored note tagged `from` (closed window groups included) to
+  /// project `to`, and remember the rebind so a write still tagged `from` that
+  /// arrives later is re-tagged too. Returns how many notes were rewritten.
+  pub fn rebind_project(&self, from: &str, to: &str) -> Result<usize, String> {
+    let mut inner = self.inner.lock().unwrap();
+    let edge = to;
+    let to = rebound_project(&inner.rebinds, Some(to.to_string())).unwrap_or_default();
+    if from == to {
+      return Ok(0);
+    }
+    inner.rebinds.insert(from.to_string(), edge.to_string());
+    let mut rewritten = 0;
+    for index in 0..inner.notes.len() {
+      if inner.notes[index].project.as_deref() != Some(from) {
+        continue;
+      }
+      let mut note = inner.notes[index].clone();
+      note.project = Some(to.clone());
+      save_note(&inner.dir, &note)?;
+      inner.notes[index] = note;
+      rewritten += 1;
+    }
+    Ok(rewritten)
+  }
+  /// Point every stored note that names the file or folder `from` (as its file or
+  /// as its range source, closed window groups included) at `to` instead, for
+  /// notes under `from` too. Returns how many notes were rewritten. Sequence
+  /// numbers stay as they are: a window re-sends its tabs with newer ones.
+  pub fn retarget_paths(&self, from: &str, to: &str) -> Result<usize, String> {
+    use crate::file_ops::retarget_path;
+    let mut inner = self.inner.lock().unwrap();
+    let mut rewritten = 0;
+    for index in 0..inner.notes.len() {
+      let note = &inner.notes[index];
+      let file = note
+        .file_path
+        .as_deref()
+        .map(|p| retarget_path(p, from, to));
+      let source = note
+        .range_source
+        .as_deref()
+        .map(|p| retarget_path(p, from, to));
+      if file == note.file_path && source == note.range_source {
+        continue;
+      }
+      let mut moved = note.clone();
+      moved.file_path = file;
+      moved.range_source = source;
+      save_note(&inner.dir, &moved)?;
+      inner.notes[index] = moved;
+      rewritten += 1;
+    }
+    Ok(rewritten)
+  }
+  /// `root` is a project of its own again: drop the rebind that folded it into
+  /// another project, so a later write tagged `root` stays on it. A chain that
+  /// runs through `root` stops there.
+  pub fn forget_rebind(&self, root: &str) {
+    self.inner.lock().unwrap().rebinds.remove(root);
   }
 
   pub fn delete(&self, id: &str) -> Result<(), String> {
@@ -2139,14 +2166,14 @@ mod tests {
     assert_eq!(reloaded[0].range_trailing_break, Some(false));
   }
 
-  fn kept_large(id: &str, group: Option<&str>, tab_index: i64) -> NoteSnapshot {
+  fn large(id: &str, group: Option<&str>, tab_index: i64) -> NoteSnapshot {
     NoteSnapshot {
       large: Some(200 * 1024 * 1024),
       ..doc(id, group, tab_index)
     }
   }
 
-  fn kept_windowed(id: &str, group: Option<&str>, tab_index: i64) -> NoteSnapshot {
+  fn windowed(id: &str, group: Option<&str>, tab_index: i64) -> NoteSnapshot {
     NoteSnapshot {
       large: Some(200 * 1024 * 1024),
       windowed_index: Some(CheckpointIndex {
@@ -2157,47 +2184,113 @@ mod tests {
     }
   }
 
-  fn kept_range(id: &str, group: Option<&str>, tab_index: i64) -> NoteSnapshot {
+  fn old_range(id: &str, group: Option<&str>, tab_index: i64, dirty: bool) -> NoteSnapshot {
     NoteSnapshot {
       file_path: Some(String::new()),
       range_source: Some("/tmp/big.log".into()),
       range_start: Some(0),
       range_end: Some(10),
-      dirty: true,
-      content: "unsaved edit".into(),
+      dirty,
+      content: if dirty {
+        "unsaved edit".into()
+      } else {
+        String::new()
+      },
       ..doc(id, group, tab_index)
     }
   }
+  /// The ids of the document groups `plan_document_windows` opens, in order.
+  fn planned(notes: &[NoteSnapshot]) -> Vec<String> {
+    plan_document_windows(notes)
+      .into_iter()
+      .map(|p| p.group)
+      .collect()
+  }
 
   #[test]
-  fn a_tab_needing_a_removed_feature_is_a_kept_tab() {
-    assert!(needs_full_edition(&kept_large("a", None, 0)));
-    assert!(needs_full_edition(&kept_windowed("b", None, 0)));
-    assert!(needs_full_edition(&kept_range("c", None, 0)));
-    assert!(!needs_full_edition(&doc("d", None, 0)));
+  fn only_a_clean_document_range_record_is_a_clean_old_range_record() {
+    assert!(is_clean_range_record(&old_range("a", None, 0, false)));
+    assert!(!is_clean_range_record(&old_range("b", None, 0, true)));
+    assert!(!is_clean_range_record(&doc("c", None, 0)));
+    assert!(!is_clean_range_record(&large("d", None, 0)));
     // A sticky is never one, whatever its fields say.
-    assert!(!needs_full_edition(&NoteSnapshot {
-      large: Some(1),
+    assert!(!is_clean_range_record(&NoteSnapshot {
+      range_source: Some("/tmp/big.log".into()),
       ..note("s")
     }));
   }
 
   #[test]
-  fn lite_leaves_a_kept_tab_out_of_the_group_migration_and_full_does_not() {
-    for kept in [
-      kept_large("a", None, 0),
-      kept_windowed("b", None, 0),
-      kept_range("c", None, 0),
+  fn startup_deletes_clean_old_range_records_and_keeps_every_other_record() {
+    let dir = tempdir().unwrap();
+    let store = NoteStore::load(dir.path().to_path_buf()).unwrap();
+    for n in [
+      old_range("clean", Some("g1"), 0, false),
+      old_range("dirty", Some("g2"), 0, true),
+      doc("plain", Some("g1"), 1),
+      large("large", Some("g3"), 0),
+      windowed("windowed", Some("g4"), 0),
+      note("sticky"),
     ] {
-      assert!(!needs_group_migration(&kept, true), "{}", kept.id);
-      assert!(needs_group_migration(&kept, false), "{}", kept.id);
+      store.upsert(n).unwrap();
     }
-    // An ordinary group-less document migrates in both.
-    assert!(needs_group_migration(&doc("d", None, 0), true));
-    assert!(needs_group_migration(&doc("d", None, 0), false));
-    // One that already has a group, and a sticky, never do.
-    assert!(!needs_group_migration(&doc("e", Some("g"), 0), false));
-    assert!(!needs_group_migration(&note("s"), false));
+
+    drop_clean_range_records(&store);
+
+    let mut kept: Vec<String> = store.list().into_iter().map(|n| n.id).collect();
+    kept.sort();
+    assert_eq!(kept, ["dirty", "large", "plain", "sticky", "windowed"]);
+    // Gone from disk too, so the next launch does not find it again.
+    let reloaded = NoteStore::load(dir.path().to_path_buf()).unwrap();
+    assert!(reloaded.get("clean").is_none());
+    assert!(reloaded.get("dirty").is_some());
+  }
+
+  #[test]
+  fn a_group_made_only_of_clean_old_range_records_is_not_planned_as_a_window() {
+    let dir = tempdir().unwrap();
+    let store = NoteStore::load(dir.path().to_path_buf()).unwrap();
+    for n in [
+      old_range("only", Some("only-clean"), 0, false),
+      old_range("also", Some("only-clean"), 1, false),
+      old_range("c1", Some("mixed"), 0, false),
+      doc("p1", Some("mixed"), 1),
+      old_range("d1", Some("dirty"), 0, true),
+    ] {
+      store.upsert(n).unwrap();
+    }
+    assert_eq!(
+      planned(&store.list()),
+      ["only-clean", "mixed", "dirty"],
+      "the premise: before the purge every group is planned"
+    );
+
+    drop_clean_range_records(&store);
+
+    assert_eq!(planned(&store.list()), ["mixed", "dirty"]);
+  }
+
+  #[test]
+  fn a_group_with_large_windowed_and_range_tabs_is_one_window_at_its_lowest_tab() {
+    let notes = vec![
+      NoteSnapshot {
+        x: Some(500.0),
+        ..windowed("w", Some("g"), 2)
+      },
+      NoteSnapshot {
+        x: Some(10.0),
+        ..large("l", Some("g"), 0)
+      },
+      NoteSnapshot {
+        x: Some(900.0),
+        ..old_range("r", Some("g"), 1, true)
+      },
+    ];
+    let plans = plan_document_windows(&notes);
+    assert_eq!(plans.len(), 1);
+    assert_eq!(plans[0].group, "g");
+    // The large record is the lowest tab: no edition makes another one win.
+    assert_eq!(plans[0].x, Some(10.0));
   }
 
   /// The bytes of every `*.json` in `dir`, by name.
@@ -2216,11 +2309,10 @@ mod tests {
   }
 
   #[test]
-  fn lite_startup_never_rewrites_or_drops_a_kept_tab_record() {
+  fn startup_gives_every_group_less_document_its_own_group() {
     let dir = tempdir().unwrap();
-    // Hand-written, deliberately not what this build would serialize, so any
-    // rewrite changes the bytes. Group-less: the one record the startup
-    // migration would otherwise touch.
+    // Hand-written, deliberately not what this build would serialize, so a
+    // migration changes the bytes.
     let legacy = |id: &str, extra: &str| {
       format!(
         "{{\"id\":\"{id}\",\"content\":\"unsaved edit\",\"file_path\":\"\",\"kind\":\"document\",\"dirty\":true,{extra}}}"
@@ -2249,112 +2341,17 @@ mod tests {
     let notes = store.list();
     assert_eq!(notes.len(), 3);
 
-    migrate_group_less_documents(&store, &notes, true);
+    migrate_group_less_documents(&store, &notes);
 
     let after = file_bytes(dir.path());
-    assert_eq!(
-      after.keys().collect::<Vec<_>>(),
-      before.keys().collect::<Vec<_>>()
-    );
-    assert_eq!(after["range.json"], before["range.json"]);
-    assert_eq!(after["large.json"], before["large.json"]);
-    // The ordinary one is migrated as always, so the check above is not vacuous.
-    assert_ne!(after["plain.json"], before["plain.json"]);
-    // Still in the store, and still planned into a window each.
-    let kept: Vec<_> = store
-      .list()
-      .into_iter()
-      .filter(needs_full_edition)
-      .collect();
-    assert_eq!(kept.len(), 2);
-    assert_eq!(plan_document_windows(&store.list(), true).len(), 3);
-    // Full: they migrate like any other.
-    migrate_group_less_documents(&store, &notes, false);
-    let full = file_bytes(dir.path());
-    assert_ne!(full["range.json"], before["range.json"]);
-    assert_ne!(full["large.json"], before["large.json"]);
-  }
-
-  fn held(groups: &[&str]) -> std::collections::HashSet<String> {
-    groups.iter().map(|g| g.to_string()).collect()
-  }
-
-  #[test]
-  fn only_held_groups_holding_a_kept_tab_and_without_a_window_reopen() {
-    let notes = vec![
-      doc("a1", Some("plain"), 0),
-      kept_large("b1", Some("kept-closed"), 0),
-      doc("b2", Some("kept-closed"), 1),
-      kept_range("c1", Some("kept-open"), 0),
-      kept_windowed("d1", None, 0),
-      kept_range("e1", Some("user-closed"), 0),
-      note("sticky"),
-    ];
-    let live = |group: &str| group == "kept-open";
-    let all = held(&["plain", "kept-closed", "kept-open", "d1"]);
-    let groups: Vec<String> = groups_to_reopen(&notes, &all, live)
-      .into_iter()
-      .map(|p| p.group)
-      .collect();
-    // A group-less kept tab is its own group, keyed by its id. The group the
-    // user closed is not held, so it stays closed; a plain group has nothing
-    // to bring back; a live group is not duplicated.
-    assert_eq!(groups, vec!["kept-closed", "d1"]);
-    assert!(groups_to_reopen(&notes, &all, |_| true).is_empty());
-    assert!(groups_to_reopen(&notes, &held(&[]), |_| false).is_empty());
-  }
-
-  #[test]
-  fn a_group_closed_by_the_user_in_full_is_not_reopened_when_the_edition_returns() {
-    let notes = vec![kept_range("c1", Some("closed-in-full"), 0)];
-    assert!(groups_to_reopen(&notes, &held(&[]), |_| false).is_empty());
-    // The same group, once the app held it back for the trial, is.
-    let groups = groups_to_reopen(&notes, &held(&["closed-in-full"]), |_| false);
-    assert_eq!(groups.len(), 1);
-    assert_eq!(groups[0].group, "closed-in-full");
-  }
-
-  #[test]
-  fn held_back_groups_are_taken_once_and_the_set_is_left_empty() {
-    let state = HeldBackGroups::default();
-    assert!(state.take_all().is_empty());
-    state.hold("a".to_string());
-    state.hold("b".to_string());
-    state.hold("a".to_string());
-    assert_eq!(state.take_all(), held(&["a", "b"]));
-    assert!(state.take_all().is_empty());
-  }
-
-  fn at(mut note: NoteSnapshot, x: f64) -> NoteSnapshot {
-    note.x = Some(x);
-    note
-  }
-
-  #[test]
-  fn lite_takes_window_bounds_from_a_shown_tab_not_a_kept_one() {
-    // The kept record has the lowest tab_index but its bounds are stale.
-    let notes = vec![
-      at(kept_range("k", Some("g"), 0), 10.0),
-      at(doc("s", Some("g"), 1), 900.0),
-    ];
-    assert_eq!(plan_document_windows(&notes, true)[0].x, Some(900.0));
-    assert_eq!(plan_document_windows(&notes, false)[0].x, Some(10.0));
-    // Among shown tabs the lowest tab_index still wins.
-    let more = vec![
-      at(kept_range("k", Some("g"), 0), 10.0),
-      at(doc("s2", Some("g"), 3), 700.0),
-      at(doc("s1", Some("g"), 1), 900.0),
-    ];
-    assert_eq!(plan_document_windows(&more, true)[0].x, Some(900.0));
-  }
-
-  #[test]
-  fn lite_falls_back_to_the_lowest_kept_tab_when_a_group_holds_only_kept_ones() {
-    let notes = vec![
-      at(kept_large("k2", Some("g"), 2), 500.0),
-      at(kept_range("k1", Some("g"), 1), 10.0),
-    ];
-    assert_eq!(plan_document_windows(&notes, true)[0].x, Some(10.0));
+    for name in ["range.json", "large.json", "plain.json"] {
+      assert_ne!(after[name], before[name], "{name}");
+    }
+    assert_eq!(planned(&store.list()).len(), 3);
+    // One that already has a group is left alone.
+    let grouped = store.list();
+    migrate_group_less_documents(&store, &grouped);
+    assert_eq!(file_bytes(dir.path()), after);
   }
 
   #[test]
@@ -2402,6 +2399,231 @@ mod tests {
     assert_eq!(reloaded, vec![d]);
   }
 
+  fn doc_in(id: &str, group: &str, project: Option<&str>) -> NoteSnapshot {
+    NoteSnapshot {
+      project: project.map(str::to_string),
+      ..doc(id, Some(group), 0)
+    }
+  }
+
+  #[test]
+  fn rebind_project_rewrites_only_the_matching_project() {
+    let dir = tempdir().unwrap();
+    let store = NoteStore::load(dir.path().to_path_buf()).unwrap();
+    store.upsert(doc_in("a", "g1", Some("/x/y"))).unwrap();
+    // A group whose window is closed is still a stored record.
+    store.upsert(doc_in("b", "g2", Some("/x/y"))).unwrap();
+    store.upsert(doc_in("c", "g3", Some("/x/other"))).unwrap();
+    store.upsert(doc_in("d", "g4", None)).unwrap();
+    store.upsert(note("s")).unwrap();
+    assert_eq!(store.rebind_project("/x/y", "/x").unwrap(), 2);
+    let project_of = |id: &str| store.get(id).unwrap().project;
+    assert_eq!(project_of("a").as_deref(), Some("/x"));
+    assert_eq!(project_of("b").as_deref(), Some("/x"));
+    assert_eq!(project_of("c").as_deref(), Some("/x/other"));
+    assert_eq!(project_of("d"), None);
+    assert_eq!(project_of("s"), None);
+    // The rewrite reached the disk, not just the in-memory list.
+    let reloaded = NoteStore::load(dir.path().to_path_buf()).unwrap();
+    assert_eq!(reloaded.get("b").unwrap().project.as_deref(), Some("/x"));
+  }
+
+  #[test]
+  fn ordered_write_that_arrives_after_a_rebind_keeps_the_new_project() {
+    let dir = tempdir().unwrap();
+    let store = NoteStore::load(dir.path().to_path_buf()).unwrap();
+    store
+      .upsert_ordered(doc_in("a", "g1", Some("/x/y")), 4)
+      .unwrap();
+    store.rebind_project("/x/y", "/x").unwrap();
+    // Sent before the rebind with the same seq, delivered after it.
+    assert!(store
+      .upsert_ordered(doc_in("a", "g1", Some("/x/y")), 4)
+      .unwrap());
+    assert_eq!(store.get("a").unwrap().project.as_deref(), Some("/x"));
+    let reloaded = NoteStore::load(dir.path().to_path_buf()).unwrap();
+    assert_eq!(reloaded.get("a").unwrap().project.as_deref(), Some("/x"));
+    // The plain upsert path is covered too, and a first write is re-tagged.
+    store.upsert(doc_in("a", "g1", Some("/x/y"))).unwrap();
+    assert_eq!(store.get("a").unwrap().project.as_deref(), Some("/x"));
+    store
+      .upsert_ordered(doc_in("new", "g1", Some("/x/y")), 1)
+      .unwrap();
+    assert_eq!(store.get("new").unwrap().project.as_deref(), Some("/x"));
+    // Other projects are left alone.
+    store
+      .upsert_ordered(doc_in("c", "g3", Some("/x/other")), 1)
+      .unwrap();
+    assert_eq!(store.get("c").unwrap().project.as_deref(), Some("/x/other"));
+  }
+
+  #[test]
+  fn chained_rebinds_resolve_to_the_last_project() {
+    let dir = tempdir().unwrap();
+    let store = NoteStore::load(dir.path().to_path_buf()).unwrap();
+    store.upsert(doc_in("a", "g1", Some("/x/y/z"))).unwrap();
+    store.upsert(doc_in("b", "g2", Some("/x/y"))).unwrap();
+    store.rebind_project("/x/y/z", "/x/y").unwrap();
+    store.rebind_project("/x/y", "/x").unwrap();
+    assert_eq!(store.get("a").unwrap().project.as_deref(), Some("/x"));
+    assert_eq!(store.get("b").unwrap().project.as_deref(), Some("/x"));
+    // A write still tagged with the first or the second project lands on the last.
+    store.upsert(doc_in("a", "g1", Some("/x/y/z"))).unwrap();
+    assert_eq!(store.get("a").unwrap().project.as_deref(), Some("/x"));
+    store.upsert(doc_in("b", "g2", Some("/x/y"))).unwrap();
+    assert_eq!(store.get("b").unwrap().project.as_deref(), Some("/x"));
+  }
+
+  #[test]
+  fn a_forgotten_rebind_leaves_later_writes_on_their_project() {
+    let dir = tempdir().unwrap();
+    let store = NoteStore::load(dir.path().to_path_buf()).unwrap();
+    store.upsert(doc_in("a", "g1", Some("/x/y"))).unwrap();
+    store.rebind_project("/x/y", "/x").unwrap();
+    // The folded project is added again as a project of its own.
+    store.forget_rebind("/x/y");
+    store.upsert(doc_in("a", "g1", Some("/x/y"))).unwrap();
+    assert_eq!(store.get("a").unwrap().project.as_deref(), Some("/x/y"));
+    store
+      .upsert_ordered(doc_in("b", "g2", Some("/x/y")), 1)
+      .unwrap();
+    assert_eq!(store.get("b").unwrap().project.as_deref(), Some("/x/y"));
+    // Forgetting a project that was never folded changes nothing.
+    store.forget_rebind("/never");
+  }
+
+  #[test]
+  fn a_chain_stops_at_the_project_that_was_forgotten() {
+    let dir = tempdir().unwrap();
+    let store = NoteStore::load(dir.path().to_path_buf()).unwrap();
+    store.rebind_project("/x/y/z", "/x/y").unwrap();
+    store.rebind_project("/x/y", "/x").unwrap();
+    store.forget_rebind("/x/y");
+    // `/x/y` is its own project again; `/x/y/z` still folds into it.
+    store.upsert(doc_in("a", "g1", Some("/x/y"))).unwrap();
+    assert_eq!(store.get("a").unwrap().project.as_deref(), Some("/x/y"));
+    store.upsert(doc_in("b", "g2", Some("/x/y/z"))).unwrap();
+    assert_eq!(store.get("b").unwrap().project.as_deref(), Some("/x/y"));
+    // The rebind further up is untouched for any other project.
+    store.rebind_project("/q", "/x").unwrap();
+    store.upsert(doc_in("c", "g3", Some("/q"))).unwrap();
+    assert_eq!(store.get("c").unwrap().project.as_deref(), Some("/x"));
+  }
+
+  #[test]
+  fn rebinding_a_project_to_itself_changes_nothing() {
+    let dir = tempdir().unwrap();
+    let store = NoteStore::load(dir.path().to_path_buf()).unwrap();
+    store.upsert(doc_in("a", "g1", Some("/x"))).unwrap();
+    assert_eq!(store.rebind_project("/x", "/x").unwrap(), 0);
+    store.upsert(doc_in("a", "g1", Some("/x"))).unwrap();
+    assert_eq!(store.get("a").unwrap().project.as_deref(), Some("/x"));
+  }
+
+  fn doc_at(id: &str, group: &str, file: Option<&str>, range: Option<&str>) -> NoteSnapshot {
+    NoteSnapshot {
+      file_path: file.map(str::to_string),
+      range_source: range.map(str::to_string),
+      ..doc(id, Some(group), 0)
+    }
+  }
+
+  #[test]
+  fn retarget_paths_rewrites_the_file_and_the_range_source() {
+    let dir = tempdir().unwrap();
+    let store = NoteStore::load(dir.path().to_path_buf()).unwrap();
+    store
+      .upsert(doc_at("a", "g1", Some("/x/f.txt"), None))
+      .unwrap();
+    // A group whose window is closed is still a stored record.
+    store
+      .upsert(doc_at("b", "g2", Some("/x/f.txt"), None))
+      .unwrap();
+    store
+      .upsert(doc_at("c", "g3", None, Some("/x/f.txt")))
+      .unwrap();
+    store
+      .upsert(doc_at("d", "g4", Some("/x/other.txt"), None))
+      .unwrap();
+    store.upsert(doc_at("e", "g5", None, None)).unwrap();
+    store.upsert(note("s")).unwrap();
+    assert_eq!(store.retarget_paths("/x/f.txt", "/x/g.txt").unwrap(), 3);
+    let file_of = |id: &str| store.get(id).unwrap().file_path;
+    assert_eq!(file_of("a").as_deref(), Some("/x/g.txt"));
+    assert_eq!(file_of("b").as_deref(), Some("/x/g.txt"));
+    assert_eq!(
+      store.get("c").unwrap().range_source.as_deref(),
+      Some("/x/g.txt")
+    );
+    assert_eq!(file_of("d").as_deref(), Some("/x/other.txt"));
+    assert_eq!(file_of("e"), None);
+    assert_eq!(file_of("s"), None);
+    // The rewrite reached the disk, not just the in-memory list.
+    let reloaded = NoteStore::load(dir.path().to_path_buf()).unwrap();
+    assert_eq!(
+      reloaded.get("b").unwrap().file_path.as_deref(),
+      Some("/x/g.txt")
+    );
+  }
+
+  #[test]
+  fn renaming_a_folder_moves_every_record_below_it() {
+    let dir = tempdir().unwrap();
+    let store = NoteStore::load(dir.path().to_path_buf()).unwrap();
+    store
+      .upsert(doc_at("a", "g1", Some("/x/y/f.txt"), None))
+      .unwrap();
+    store
+      .upsert(doc_at("b", "g1", Some("/x/y/deep/g.txt"), None))
+      .unwrap();
+    store
+      .upsert(doc_at("c", "g2", Some("/x/y2/f.txt"), None))
+      .unwrap();
+    store
+      .upsert(doc_at("d", "g2", None, Some("/x/y/big.log")))
+      .unwrap();
+    assert_eq!(store.retarget_paths("/x/y", "/x/z").unwrap(), 3);
+    let file_of = |id: &str| store.get(id).unwrap().file_path;
+    assert_eq!(file_of("a").as_deref(), Some("/x/z/f.txt"));
+    assert_eq!(file_of("b").as_deref(), Some("/x/z/deep/g.txt"));
+    // `/x/y2` is a different folder, not something below `/x/y`.
+    assert_eq!(file_of("c").as_deref(), Some("/x/y2/f.txt"));
+    assert_eq!(
+      store.get("d").unwrap().range_source.as_deref(),
+      Some("/x/z/big.log")
+    );
+  }
+
+  #[test]
+  fn a_write_from_before_a_rename_never_wins_over_the_newer_one() {
+    let dir = tempdir().unwrap();
+    let store = NoteStore::load(dir.path().to_path_buf()).unwrap();
+    let old = || doc_at("a", "g1", Some("/x/f.txt"), None);
+    let moved = || doc_at("a", "g1", Some("/x/g.txt"), None);
+    // Sent before the rename and applied.
+    assert!(store.upsert_ordered(old(), 7).unwrap());
+    store.retarget_paths("/x/f.txt", "/x/g.txt").unwrap();
+    assert_eq!(
+      store.get("a").unwrap().file_path.as_deref(),
+      Some("/x/g.txt")
+    );
+    // The window writes the tab again with the new path and a newer seq.
+    assert!(store.upsert_ordered(moved(), 8).unwrap());
+    // The old write, sent before the rename with seq 7, arrives only now.
+    assert!(!store.upsert_ordered(old(), 7).unwrap());
+    assert_eq!(
+      store.get("a").unwrap().file_path.as_deref(),
+      Some("/x/g.txt")
+    );
+    // A write after the rename is applied as usual.
+    assert!(store.upsert_ordered(moved(), 9).unwrap());
+    let reloaded = NoteStore::load(dir.path().to_path_buf()).unwrap();
+    assert_eq!(
+      reloaded.get("a").unwrap().file_path.as_deref(),
+      Some("/x/g.txt")
+    );
+  }
+
   #[test]
   fn plan_groups_tabs_and_ignores_stickies() {
     let notes = vec![
@@ -2410,7 +2632,7 @@ mod tests {
       doc("b", Some("g1"), 0),
       doc("c", Some("g2"), 0),
     ];
-    let plans = plan_document_windows(&notes, false);
+    let plans = plan_document_windows(&notes);
     assert_eq!(plans.len(), 2);
     // g1 keeps first-appearance order; its bounds come from the lowest tab_index (b).
     assert_eq!(plans[0].group, "g1");
@@ -2421,7 +2643,7 @@ mod tests {
   #[test]
   fn plan_treats_group_none_as_solo_group_by_id() {
     let notes = vec![doc("solo1", None, 0), doc("solo2", None, 0)];
-    let plans = plan_document_windows(&notes, false);
+    let plans = plan_document_windows(&notes);
     assert_eq!(plans.len(), 2);
     assert_eq!(plans[0].group, "solo1");
     assert_eq!(plans[1].group, "solo2");

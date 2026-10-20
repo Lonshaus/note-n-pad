@@ -41,29 +41,26 @@ export interface NoteSnapshot {
   /** File size of a read-only large-file tab, so restore reopens it in the
    *  large-file view without re-stat. null for ordinary tabs. */
   large: number | null;
-  /** Source file a range-edit tab was sliced from; its presence marks the tab as
-   *  a range tab on restore. null for every non-range tab. */
+  /** The range_* fields are only read, from records an earlier version wrote
+   *  when a range opened as a tab of its own; every record written now has them
+   *  null. Source file the range tab was sliced from. */
   range_source: string | null;
   /** Byte span [range_start, range_end) of the slice within range_source. */
   range_start: number | null;
   range_end: number | null;
-  /** Source fingerprint (size + mtime) captured at slice/last-splice time,
-   *  restored as the write-back conflict baseline. null for non-range tabs. */
+  /** Source fingerprint (size + mtime) captured at slice/last-splice time. */
   range_fp_size: number | null;
   range_fp_mtime: number | null;
   /** 1-based line number of the range's first line, fixed at extraction time;
-   *  the end line is `range_end_line` (see `rangeDisplayName`). null for a
-   *  non-range tab, and for a range tab restored from an older snapshot (its
-   *  old `range_label` isn't read back). */
+   *  the end line is `range_end_line`. null for a record from before this field
+   *  (its old `range_label` isn't read back). */
   range_start_line: number | null;
-  /** 1-based line number of the range's last line, kept in step with the live
-   *  content on every write so a view that never opens the tab can label it.
-   *  null for a non-range tab and for a record written before this field. */
+  /** 1-based line number of the range's last line, so a view that never opens
+   *  the tab (the workspace list) can label it. null for a record from before
+   *  this field. */
   range_end_line: number | null;
-  /** Whether the source slice ended with a line break. The buffer keeps that
-   *  break; on write-back one is added only if the slice ended with one and the
-   *  non-empty buffer no longer does. null for a non-range tab and for a record
-   *  written before this field; restore derives it then. */
+  /** Whether the source slice ended with a line break. null for a record from
+   *  before this field. */
   range_trailing_break: boolean | null;
   /** Sparse line-checkpoint index of a windowed-editing tab. Its presence is
    *  what marks the tab as "was unlocked" on restore — there is deliberately

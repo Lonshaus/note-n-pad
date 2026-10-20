@@ -68,6 +68,15 @@ describe('patchViewScaler', () => {
     ).toBe(1);
   });
 
+  it('refreshes the scroll offset right after the scroll target is applied', () => {
+    const patched = patchViewScaler(VIEW_SOURCE);
+    const refresh = `                            scrollAnchorHeight = -1;
+                            scrollOffset = this.viewState.getScrollOffset();
+                            continue;
+`;
+    expect(patched.split(refresh).length - 1).toBe(1);
+  });
+
   it('uses the fixed viewport constants', () => {
     const patched = patchViewScaler(VIEW_SOURCE);
     expect(patched).toContain('top <= visibleTop - 600');

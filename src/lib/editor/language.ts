@@ -5,18 +5,18 @@ import type { Extension, Text } from '@codemirror/state';
 import type { LanguageDescription } from '@codemirror/language';
 import { languages } from '@codemirror/language-data';
 import { isLite } from '../state/edition.svelte';
-import { LITE_LANGUAGES, type LanguageInfo } from './liteLanguages';
-
-/** The metadata detection and the save dialog read. The Lite build reads the
- *  static table, so `@codemirror/language-data` and its parsers stay out of it. */
-export const languageInfos: readonly LanguageInfo[] = __LITE__
-  ? LITE_LANGUAGES
-  : languages;
-
-/** The languages that can be loaded for highlighting; none in the Lite build. */
-const loadableLanguages: readonly LanguageDescription[] = __LITE__
-  ? []
-  : languages;
+/** What language detection and the save dialog read of a language: the same
+ *  fields as CodeMirror's `LanguageDescription`, without its loader. */
+export interface LanguageInfo {
+  name: string;
+  alias: readonly string[];
+  extensions: readonly string[];
+  filename?: RegExp | undefined;
+}
+/** The metadata detection and the save dialog read. */
+export const languageInfos: readonly LanguageInfo[] = languages;
+/** The languages that can be loaded for highlighting. */
+const loadableLanguages: readonly LanguageDescription[] = languages;
 
 /**
  * Above this content size highlighting is forced off. Compares
@@ -89,7 +89,7 @@ export const languageNames: string[] = [
  *  there is no syntax highlighting and Plain Text is the only choice (the
  *  pickers always add Plain Text themselves). */
 export function availableLanguageNames(lite: boolean = isLite()): string[] {
-  return __LITE__ || lite ? [] : languageNames;
+  return lite ? [] : languageNames;
 }
 
 /** The language a tab is shown and colored with. Lite has none: a tab keeps the
@@ -271,7 +271,7 @@ export async function loadLanguage(
   name: string,
   lite: boolean = isLite(),
 ): Promise<Extension | null> {
-  if (__LITE__ || lite) {
+  if (lite) {
     return null;
   }
   const desc = loadableLanguages.find((l) => l.name === name);
