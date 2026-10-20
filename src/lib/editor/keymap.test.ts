@@ -544,7 +544,11 @@ describe('Tab key', () => {
     doc: string,
     selection: EditorSelection,
   ): string {
-    let state = EditorState.create({ doc, selection });
+    let state = EditorState.create({
+      doc,
+      selection,
+      extensions: EditorState.allowMultipleSelections.of(true),
+    });
     const view = {
       get state() {
         return state;
@@ -561,10 +565,44 @@ describe('Tab key', () => {
     expect(run(tabKey, 'abcd', EditorSelection.single(2))).toBe('ab\tcd');
   });
 
+  it('replaces a selection within one line with one tab character', () => {
+    expect(run(tabKey, 'abcd', EditorSelection.single(1, 3))).toBe('a\td');
+  });
+
+  it('replaces a whole line selected without its break with a tab', () => {
+    expect(run(tabKey, 'ab\ncd', EditorSelection.single(0, 2))).toBe('\t\ncd');
+  });
+
+  it('inserts a tab at every empty caret', () => {
+    const carets = EditorSelection.create([
+      EditorSelection.cursor(1),
+      EditorSelection.cursor(4),
+    ]);
+    expect(run(tabKey, 'ab\ncd', carets)).toBe('a\tb\nc\td');
+  });
+
   it('indents every selected line by the indent unit', () => {
     expect(run(tabKey, 'a\nb\nc', EditorSelection.single(0, 3))).toBe(
       '  a\n  b\nc',
     );
+  });
+
+  it('indents the lines when any one of several ranges spans lines', () => {
+    const ranges = EditorSelection.create([
+      EditorSelection.range(0, 1),
+      EditorSelection.range(4, 7),
+    ]);
+    expect(run(tabKey, 'ab\ncd\nef', ranges)).toBe('  ab\n  cd\n  ef');
+  });
+
+  it('does nothing in a read-only editor', () => {
+    const state = EditorState.create({
+      doc: 'abcd',
+      selection: EditorSelection.single(1, 3),
+      extensions: EditorState.readOnly.of(true),
+    });
+    const view = { state, dispatch: () => {} } as unknown as EditorView;
+    expect(tabKey(view)).toBe(false);
   });
 
   it('outdents by one indent unit with Shift-Tab', () => {
