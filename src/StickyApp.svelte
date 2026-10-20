@@ -19,6 +19,7 @@
   import { shouldFloatOnTop } from './lib/util/pinFloat';
   import { matchStickyShortcut } from './lib/util/stickyShortcut';
   import { revealWhenThemed } from './lib/util/reveal';
+  import { onFileDragOver, onFileDrop } from './lib/util/fileDrop';
   import { nextSeq } from './lib/util/seq';
   import { applyTheme, applyChrome } from './lib/theme/applyTheme';
   import { themeRegistry } from './lib/theme/themeRegistry.svelte';
@@ -509,6 +510,7 @@
   });
 </script>
 
+<svelte:window ondragovercapture={onFileDragOver} ondropcapture={onFileDrop} />
 <div class="sticky paper-{paper}">
   <div
     class="toolbar"

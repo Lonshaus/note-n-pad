@@ -25,15 +25,16 @@ or `{"id": <u64>, "ok": false, "error": "<message>"}`
 
 ## Commands
 
-| cmd             | params        | data                                             |
-| --------------- | ------------- | ------------------------------------------------ |
-| `list_windows`  | —             | `[{label, title, focused}, ...]`                 |
-| `store_list`    | —             | the NoteStore contents (array of note snapshots) |
-| `new_sticky`    | —             | the created note snapshot                        |
-| `focus`         | `label`       | `null`                                           |
-| `window_number` | `label`       | macOS NSWindow number (i64); errors elsewhere    |
-| `eval`          | `label`, `js` | the completion value of `js` run in that window  |
-| `quit`          | —             | `null` (triggers the flush-then-exit handshake)  |
+| cmd             | params           | data                                             |
+| --------------- | ---------------- | ------------------------------------------------ |
+| `list_windows`  | —                | `[{label, title, focused}, ...]`                 |
+| `store_list`    | —                | the NoteStore contents (array of note snapshots) |
+| `new_sticky`    | —                | the created note snapshot                        |
+| `focus`         | `label`          | `null`                                           |
+| `window_number` | `label`          | macOS NSWindow number (i64); errors elsewhere    |
+| `eval`          | `label`, `js`    | the completion value of `js` run in that window  |
+| `simulate_drop` | `label`, `paths` | `null` (drops the `paths` array on that window)  |
+| `quit`          | —                | `null` (triggers the flush-then-exit handshake)  |
 
 `eval` runs the source with `eval()` (expressions and statement lists both work),
 awaits a promise result, and reports the value back through an internal

@@ -8,6 +8,7 @@
   import { open } from '@tauri-apps/plugin-dialog';
   import { settingsState } from './lib/state/settings.svelte';
   import { revealWhenThemed } from './lib/util/reveal';
+  import { onFileDragOver, onFileDrop } from './lib/util/fileDrop';
   import { applyTheme, applyChrome } from './lib/theme/applyTheme';
   import { themeRegistry } from './lib/theme/themeRegistry.svelte';
   import { localeRegistry } from './lib/i18n/localeRegistry.svelte';
@@ -722,6 +723,7 @@
   });
 </script>
 
+<svelte:window ondragovercapture={onFileDragOver} ondropcapture={onFileDrop} />
 <div class="workspace">
   <div class="content">
     {#if inlineError !== null && inlineEdit === null}

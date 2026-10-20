@@ -30,6 +30,7 @@
     type LargeOpenMode,
   } from './lib/state/settings.svelte';
   import { revealWhenThemed } from './lib/util/reveal';
+  import { onFileDragOver, onFileDrop } from './lib/util/fileDrop';
   import { applyTheme, applyChrome } from './lib/theme/applyTheme';
   import { themeRegistry } from './lib/theme/themeRegistry.svelte';
   import { localeRegistry } from './lib/i18n/localeRegistry.svelte';
@@ -1766,7 +1767,11 @@
   });
 </script>
 
-<svelte:window onkeydown={onWindowKeydown} />
+<svelte:window
+  ondragovercapture={onFileDragOver}
+  ondropcapture={onFileDrop}
+  onkeydown={onWindowKeydown}
+/>
 <div class="app">
   <div class="tabbar" role="tablist">
     {#each documentWindow.tabs as tab, i (tab.id)}

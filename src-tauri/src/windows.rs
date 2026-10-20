@@ -612,7 +612,11 @@ pub fn create_sticky_window(app: &AppHandle, note: &NoteSnapshot) -> Result<(), 
     _ => cascade_position(app),
   };
   builder = builder.position(x, y);
+  // The page hands dropped files over itself, see `file_drop`.
+  #[cfg(windows)]
+  let builder = builder.disable_drag_drop_handler();
   let window = builder.build().map_err(|e| e.to_string())?;
+  crate::file_drop::attach(&window);
   // Never `?` here: the window is built and still hidden, so returning strands
   // it invisible with its label taken until the app restarts.
   #[cfg(target_os = "macos")]
@@ -695,7 +699,11 @@ fn build_document_window(
   if let (Some(x), Some(y)) = (x, y) {
     builder = builder.position(x, y);
   }
+  // The page hands dropped files over itself, see `file_drop`.
+  #[cfg(windows)]
+  let builder = builder.disable_drag_drop_handler();
   let window = builder.build().map_err(|e| e.to_string())?;
+  crate::file_drop::attach(&window);
   fix_inner_size(&window, (width, height));
   show_after_grace(window);
   Ok(())
@@ -995,7 +1003,11 @@ pub fn show_workspace(app: &AppHandle) -> Result<(), String> {
   if let (Some(x), Some(y)) = (s.workspace_x, s.workspace_y) {
     builder = builder.position(x, y);
   }
+  // The page hands dropped files over itself, see `file_drop`.
+  #[cfg(windows)]
+  let builder = builder.disable_drag_drop_handler();
   let window = builder.build().map_err(|e| e.to_string())?;
+  crate::file_drop::attach(&window);
   // Never let the *default* width be one the menu bar wraps in. Only the
   // untouched default is widened: any other stored width is one the user chose,
   // and narrowing the panel until the bar wraps is their call to make.
