@@ -84,6 +84,8 @@
   } from '../util/replayKeys';
   import { focusEditorIfIdle } from '../util/editorFocus';
   import { readCspNonce } from '../util/cspNonce';
+  import type { OnApplied } from '../util/windowedApplied';
+  import { parkWindowedResult } from '../dev/windowedHold';
   import { parseGotoRange, moveResultCursor } from '../util/largeSearch';
   import {
     endOfMatch,
@@ -110,10 +112,13 @@
     total_bytes: number;
   }
 
-  /** Result of a Rust `windowed_apply`: the live file totals after the edit. */
+  /** Result of a Rust `windowed_apply`: the live file totals after the edit,
+   *  whether the content equals the last save, and the content generation. */
   interface ApplyResult {
     total_bytes: number;
     total_lines: number;
+    clean: boolean;
+    generation: number;
   }
 
   /** Result of a Rust `windowed_undo`/`windowed_redo`: the global-byte edits just
@@ -126,17 +131,23 @@
     total_bytes: number;
     total_lines: number;
     reload_only: boolean;
+    clean: boolean;
+    generation: number;
   }
   /** Result of a Rust `windowed_replace_all`. */
   interface ReplaceAllResult {
     count: number;
     total_bytes: number;
     total_lines: number;
+    clean: boolean;
+    generation: number;
   }
   /** What a whole-file operation reports back. */
   interface OpTotals {
     total_bytes: number;
     total_lines: number;
+    clean: boolean;
+    generation: number;
   }
   /** A results-list row streamed by the Rust `windowed_search`. `line` is
    *  0-based and `col` counts UTF-16 units. */
@@ -184,9 +195,10 @@
     ondetectending: (
       style: ReturnType<typeof detectBreakStyle>,
     ) => '\r\n' | '\n';
-    // Fired after each successful apply so the state layer marks the tab dirty and
-    // records the fresh totals.
-    onapplied: (totalBytes: number, totalLines: number) => void;
+    // Fired after each successful apply, undo or redo so the state layer records
+    // the fresh totals and sets the tab's dirty flag. It names this editor's own
+    // session: the active tab may be another one by the time a result arrives.
+    onapplied: OnApplied;
     // Global cursor position, total line count, and the current window's
     // top-of-viewport line, mirrored into the status bar and (the last one)
     // persisted so a restart restores the same scroll position.
@@ -682,6 +694,9 @@
     edits: { start: number; end: number; text: string }[],
     newGroup: boolean,
   ): void {
+    // The prop reads the host's current tab, which is another one by the time a
+    // result arrives after a tab switch.
+    const owner = sessionId;
     applyChain = applyChain.then(async () => {
       if (locked) {
         return;
@@ -695,7 +710,7 @@
       let res: ApplyResult;
       try {
         res = await invoke<ApplyResult>('windowed_apply', {
-          sessionId,
+          sessionId: owner,
           edits,
           newGroup,
         });
@@ -703,9 +718,21 @@
         lock(t('editor.locked.write', { detail: String(e) }));
         return;
       }
+      if (import.meta.env.DEV) {
+        const parked = parkWindowedResult();
+        if (parked !== null) {
+          await parked;
+        }
+      }
       totalBytes = res.total_bytes;
       totalLines = res.total_lines;
-      onapplied(res.total_bytes, res.total_lines);
+      onapplied(
+        owner,
+        res.total_bytes,
+        res.total_lines,
+        res.clean,
+        res.generation,
+      );
       reportSelection();
     });
   }
@@ -721,6 +748,8 @@
     // Input typed from here to the end of the undo is queued: it replays at
     // the caret the undo leaves, instead of landing on content about to change.
     const release = hold(true);
+    // Same as `enqueueApply`: the session this undo was asked of.
+    const owner = sessionId;
     applyChain = applyChain.then(async () => {
       try {
         if (locked || view === undefined) {
@@ -729,11 +758,11 @@
         let res: UndoResult;
         try {
           res = await runop(
-            sessionId,
+            owner,
             () =>
               invoke<UndoResult>(
                 dir === 'undo' ? 'windowed_undo' : 'windowed_redo',
-                { sessionId },
+                { sessionId: owner },
               ),
             (r) => r.reload_only,
           );
@@ -747,6 +776,16 @@
           }
           lock(t('editor.locked.undo', { detail: msg }));
           return;
+        }
+        if (!res.reload_only) {
+          // Records the fresh totals and sets the tab's dirty flag.
+          onapplied(
+            owner,
+            res.total_bytes,
+            res.total_lines,
+            res.clean,
+            res.generation,
+          );
         }
         applyUndoResult(res);
       } finally {
@@ -773,9 +812,6 @@
       void reloadWindow();
       return;
     }
-    // Marks the tab dirty and records the fresh totals (v1: an undo back to the
-    // saved state also stays dirty — the accepted trade-off).
-    onapplied(res.total_bytes, res.total_lines);
     // The edits arrive in sequential frames; track the window end as each shifts
     // it to test containment without partially dispatching.
     let end = windowEndOffset;
@@ -1868,6 +1904,7 @@
   // read-only from here until the window has been read again, and nothing typed
   // meanwhile is queued.
   async function replaceAll(): Promise<void> {
+    const owner = sessionId;
     const query = findQuery;
     if (query === '') {
       openFind();
@@ -1880,10 +1917,10 @@
     try {
       const res = await behindApplies(() =>
         runop(
-          sessionId,
+          owner,
           () =>
             invoke<ReplaceAllResult>('windowed_replace_all', {
-              sessionId,
+              sessionId: owner,
               query,
               caseSensitive: findCase,
               replacement: replaceText,

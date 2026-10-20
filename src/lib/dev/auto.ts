@@ -7,6 +7,11 @@ import { settingsState, type LargeOpenMode } from '../state/settings.svelte';
 import type { LineEnding } from '../util/text';
 import type { Language } from '../i18n/locale';
 import type { ViewMode } from '../util/viewModes';
+import {
+  heldWindowedResults,
+  holdWindowedResults,
+  releaseWindowedResults,
+} from './windowedHold';
 
 // DEV-only automation surface reached by the Rust harness via `eval`. Installed
 // on `window.__auto` only under `import.meta.env.DEV`; because every caller sits
@@ -54,6 +59,10 @@ export interface DocumentHooks {
   getTitle: () => string;
   getTabs: () => unknown;
   switchTab: (index: number) => void;
+  /** Make tab `index` the active one at once, without the settle-and-drain
+   *  `switchTab` does first: reproduces an editor whose result lands after
+   *  another tab became active. */
+  switchTabNow: (index: number) => void;
   openTab: (path: string) => void;
   /** The same open, handing back the promise so a test can observe a
    *  rejection. `openTab` stays void on purpose: the automation wrapper
@@ -307,6 +316,9 @@ export function installDocumentAuto(hooks: DocumentHooks): void {
     setWordWrap: (on: boolean) => settingsState.setWordWrap(on),
     getLanguage: () => settingsState.language,
     setLanguage: (l: Language) => settingsState.setLanguage(l),
+    holdWindowedResults,
+    heldWindowedResults,
+    releaseWindowedResults,
     ...hooks,
   };
 }
