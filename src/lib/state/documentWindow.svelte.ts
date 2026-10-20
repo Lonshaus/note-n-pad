@@ -200,18 +200,15 @@ interface WindowedIndexSnapshot {
   /** Decimal string, not a number — see `NoteSnapshot.windowed_digest`. */
   digest: string;
 }
-
 /** Result of a range edit box write-back: written, refused for a conflict (the
  *  conflict modal is now up), or failed for another reason. */
 export type SpliceResult = 'ok' | 'mismatch' | 'error';
-
 /** What `spliceRange` found: the source rewritten (with its new fingerprint),
  *  changed since `expected` was taken, or refused for another reason. */
 export type SpliceOutcome =
   | { status: 'ok'; fingerprint: Fingerprint }
   | { status: 'mismatch' }
   | { status: 'error'; error: string };
-
 /** Replace `[startByte, endByte)` of `sourcePath` with `replacement`, and
  *  tell every window so a large viewer of the file rebuilds its stale line
  *  index. `expected` is the conflict baseline; null writes past the check. Not
@@ -586,6 +583,8 @@ export class DocumentWindowState {
    *  mid-restore (switch away and back) never starts a second reopen. Plain
    *  (non-reactive) Set: it is a dedupe guard, not render state. */
   private restoringWindowedIds = new Set<string>();
+  /** Per tab id, the tail of its in-flight operation chain (see `runTabOp`). */
+  private tabOps = new Map<string, Promise<void>>();
   /** `rescanned` from the most recently completed `windowed_reopen` call, or
    *  null before any restore has completed. E2E-only: the fast/slow-path
    *  outcome isn't otherwise observable from the automation surface (a poll on
@@ -1150,7 +1149,24 @@ export class DocumentWindowState {
     await this.lastSave;
     this.activeIndex = index;
   }
-
+  /** Run `op` once every earlier operation on `tab` has settled, so a tab does
+   *  one thing at a time: a restore, an unlock or a view-mode copy. Starts at
+   *  once when the tab is idle. A failed earlier operation does not block it. */
+  private runTabOp<T>(tab: DocTab, op: () => Promise<T>): Promise<T> {
+    const prev = this.tabOps.get(tab.id);
+    const run = prev === undefined ? op() : prev.then(op);
+    const tail = run.then(
+      () => {},
+      () => {},
+    );
+    this.tabOps.set(tab.id, tail);
+    void tail.then(() => {
+      if (this.tabOps.get(tab.id) === tail) {
+        this.tabOps.delete(tab.id);
+      }
+    });
+    return run;
+  }
   /** Kick off `beginWindowedRestore` for `tab` if it is a restored-but-not-yet-
    *  reopened windowed tab and no restore is already in flight for it (switching
    *  away and back must not scan or re-open anything). No-op otherwise. Fire-
@@ -1188,12 +1204,20 @@ export class DocumentWindowState {
    *    read-only viewer with the reason surfaced via `unlockRefused`, the same
    *    way `unlockLargeTab` surfaces one — a failed restore never leaves the
    *    tab broken or blank. */
-  private async beginWindowedRestore(tab: DocTab): Promise<void> {
-    const wr = tab.windowedRestore;
-    if (__LITE__ || wr === undefined) {
-      return;
+  private beginWindowedRestore(tab: DocTab): Promise<void> {
+    if (__LITE__ || tab.windowedRestore === undefined) {
+      return Promise.resolve();
     }
     this.restoringWindowedIds.add(tab.id);
+    return this.runTabOp(tab, () => this.reopenWindowed(tab));
+  }
+
+  private async reopenWindowed(tab: DocTab): Promise<void> {
+    const wr = tab.windowedRestore;
+    if (wr === undefined) {
+      this.restoringWindowedIds.delete(tab.id);
+      return;
+    }
     const graceTimer = window.setTimeout(() => {
       if (tab.windowedRestore !== undefined && tab.windowed === undefined) {
         tab.large = { size: wr.size };
@@ -1597,6 +1621,18 @@ export class DocumentWindowState {
     if (__LITE__ || isLite()) {
       return null;
     }
+    return this.runTabOp(tab, () => this.unlockTabNow(tab, topLine));
+  }
+
+  private async unlockTabNow(
+    tab: DocTab,
+    topLine: number,
+  ): Promise<string | null> {
+    // An earlier operation (a restore) may already have left the viewer, or
+    // the tab was closed while queued; nothing would close a session opened now.
+    if (tab.large === undefined || !this.tabs.includes(tab)) {
+      return null;
+    }
     let open: WindowedOpen;
     try {
       open = await invoke<WindowedOpen>('windowed_open', { path: tab.path });
@@ -1610,6 +1646,11 @@ export class DocumentWindowState {
         tab.large.unlockRefused = reason;
       }
       return reason;
+    }
+    // Closed during the open: drop the session rather than bring the tab back.
+    if (!this.tabs.includes(tab)) {
+      void invoke('windowed_close', { sessionId: open.session_id });
+      return null;
     }
     delete tab.large;
     this.releaseTabView(tab.id);
@@ -1689,7 +1730,8 @@ export class DocumentWindowState {
 
   /** Save the active tab. An untitled tab (empty path) first asks for a target
    *  via the native save dialog; `pathOverride` skips it (automation/E2E).
-   *  Returns false when the dialog was cancelled (no side effects). */
+   *  Returns false when the dialog was cancelled (no side effects), and for a
+   *  large-file viewer, which has nothing to write. */
   async saveActive(pathOverride?: string): Promise<boolean> {
     const tab = this.activeTab;
     if (tab === null) {
@@ -1699,6 +1741,11 @@ export class DocumentWindowState {
     // clean write counts as saved (a conflict raises the modal).
     if (tab.windowed !== undefined) {
       return (await this.saveWindowed(tab, false)) === 'ok';
+    }
+    // A viewer, or a tab still restoring its session, has no changes to write;
+    // the generic path below would overwrite the file with its empty buffer.
+    if (isLargeKind(tab)) {
+      return false;
     }
     if (tab.path === '') {
       const chosen =
@@ -1743,6 +1790,7 @@ export class DocumentWindowState {
   /** File > Save As: always prompt for a new path and write the active tab's
    *  buffer there, turning the tab into an ordinary saved document at that path.
    *  A windowed tab is written by its Rust session and retargeted to the new path.
+   *  A viewer tab's file is copied, after any restore or unlock in flight ends.
    *  `pathOverride` skips the dialog (automation/E2E). Returns false on cancel. */
   async saveAs(pathOverride?: string): Promise<boolean> {
     const tab = this.activeTab;
@@ -1755,10 +1803,25 @@ export class DocumentWindowState {
     if (chosen === null) {
       return false;
     }
+    return this.runTabOp(tab, () => this.saveAsNow(tab, chosen));
+  }
+  /** `saveAs` once the tab is idle, acting on the mode it ended up in. */
+  private async saveAsNow(tab: DocTab, chosen: string): Promise<boolean> {
+    // Closed while queued: writing its record now would bring the tab back.
+    if (!this.tabs.includes(tab)) {
+      return false;
+    }
     // A windowed tab's buffer lives in the Rust core, not this rope: Rust
     // writes the chosen path and retargets its session.
     if (tab.windowed !== undefined) {
       return this.windowedSaveTo(tab, chosen);
+    }
+    if (tab.large !== undefined) {
+      return this.copyViewerTo(tab, tab.large, chosen);
+    }
+    // Neither mode: nothing safe to write (see `saveActive`).
+    if (isLargeKind(tab)) {
+      return false;
     }
     // Flush point: materialize the rope for the save-as write.
     const out = applyLineEnding(tab.content.toString(), tab.lineEnding);
@@ -1785,7 +1848,46 @@ export class DocumentWindowState {
     void invoke('add_recent_file', { path: chosen });
     return true;
   }
-
+  /** Save As for a viewer tab: copy the file's current bytes to `chosen` and
+   *  retarget the tab to it. The size is read now, not taken from `large.size`,
+   *  which is the size at open time. Choosing the file itself is a no-op. */
+  private async copyViewerTo(
+    tab: DocTab,
+    large: { size: number },
+    chosen: string,
+  ): Promise<boolean> {
+    if (__LITE__) {
+      return false;
+    }
+    if (chosen === tab.path) {
+      return true;
+    }
+    let size: number;
+    try {
+      size = (await invoke<FileStat>('stat_file', { path: tab.path })).size;
+      await invoke('copy_range', {
+        path: tab.path,
+        start: 0,
+        end: size,
+        dest: chosen,
+      });
+    } catch (e) {
+      this.saveFailed = { path: chosen, error: String(e) };
+      return false;
+    }
+    // Closed during the copy: the copy stands, but its record stays deleted.
+    if (!this.tabs.includes(tab)) {
+      return true;
+    }
+    tab.path = chosen;
+    if (!tab.explicit) {
+      tab.language = detectByFilename(chosen);
+    }
+    large.size = size;
+    await this.upsertTab(tab);
+    void invoke('add_recent_file', { path: chosen });
+    return true;
+  }
   /** Open the range edit box over `tab`, a large-file viewer tab, on the byte
    *  slice `info` of its file. The byte offsets are resolved by the caller (the
    *  large-file view, which owns the line index); this reads the slice and
@@ -1839,17 +1941,14 @@ export class DocumentWindowState {
     });
     return null;
   }
-
   /** The editor of the open box changed its document. */
   rangeBoxEdited(content: Text): void {
     this.rangeBox = nextRangeBox(this.rangeBox, { kind: 'edit', content });
   }
-
   /** Whether the open box holds changes that were not written back. */
   rangeBoxDirty(): boolean {
     return this.rangeBox !== null && isRangeBoxDirty(this.rangeBox);
   }
-
   /** Write the open box back into its source. `force` skips the conflict check.
    *  Success closes the box; a changed source raises the conflict modal and
    *  keeps it; any other failure is reported and keeps it too. */
@@ -1890,22 +1989,18 @@ export class DocumentWindowState {
     }
     return 'ok';
   }
-
   /** Box 儲存: write back with the conflict check. */
   rangeBoxSave(): Promise<SpliceResult> {
     return this.writeBack(false);
   }
-
   /** Whether the write-back conflict modal is up (DEV/E2E surface). */
   rangeConflictVisible(): boolean {
     return this.rangeBox?.conflict === true;
   }
-
   /** Conflict choice: write back anyway, ignoring the changed source. */
   rangeConflictForce(): Promise<SpliceResult> {
     return this.writeBack(true);
   }
-
   /** Conflict choice: abandon the write-back and save the edited buffer as a
    *  new file, opened as a new tab. The box closes and the source is untouched. */
   async rangeConflictSaveAs(pathOverride?: string): Promise<boolean> {
@@ -1938,12 +2033,10 @@ export class DocumentWindowState {
     await this.openTab(chosen);
     return true;
   }
-
   /** Conflict choice: dismiss the modal, back to the box with its text. */
   rangeConflictCancel(): void {
     this.rangeBox = nextRangeBox(this.rangeBox, { kind: 'conflict-dismissed' });
   }
-
   /** Box 取消: drop the text and close. */
   rangeBoxCancel(): void {
     this.rangeBox = nextRangeBox(this.rangeBox, { kind: 'cancel' });
@@ -1964,7 +2057,6 @@ export class DocumentWindowState {
       this.largeReloadSeq += 1;
     }
   }
-
   /** Read a byte slice of `sourcePath` and save it straight to a new file, then
    *  open that file as a new tab (the "save range" lightweight path).
    *  `pathOverride` skips the save dialog (automation/E2E).
@@ -2005,7 +2097,6 @@ export class DocumentWindowState {
     await this.openTab(chosen);
     return true;
   }
-
   /** The open box's source and byte span, or null (DEV/E2E surface). */
   rangeBoxInfo(): {
     sourcePath: string;
@@ -2314,7 +2405,6 @@ export class DocumentWindowState {
   windowedRestoreRescanned(): boolean | null {
     return this.lastWindowedRestoreRescanned;
   }
-
   /** Conflict choice: write back anyway, ignoring the changed source. */
   async windowedConflictForce(): Promise<WindowedSaveResult> {
     const tab = this.windowedConflict;
@@ -2476,7 +2566,6 @@ export class DocumentWindowState {
         t.windowed === undefined && this.isDirty(t) && t.writeFailed === true,
     );
   }
-
   /** The viewer tab holding an edit box with changes, if any: the box is what
    *  the quit, window-close and tab-close gates must ask about first. */
   rangeBoxBlocking(): {
