@@ -4,10 +4,10 @@
 import { invoke } from '@tauri-apps/api/core';
 import { listen } from '@tauri-apps/api/event';
 
-/** Whether this is the Lite edition (the macOS Lite build, or the Store build
- *  while its license is a trial). The Rust core owns the answer
- *  (`edition::is_lite`); this mirrors it: read once through `edition_info`,
- *  then following `edition-changed`. Starts lite (fail-safe), but `ready()`
+/** Whether this is the Lite edition (the MSIX package while its license is a
+ *  trial, or the sandboxed store build until the full version is bought).
+ *  The Rust core owns the answer (`edition::is_lite`); this mirrors it: read
+ *  once through `edition_info`, then following `edition-changed`. Starts lite (fail-safe), but `ready()`
  *  settles it, so anything that restores or opens documents awaits that first. */
 export class EditionState {
   lite = $state(true);
@@ -50,21 +50,14 @@ export class EditionState {
       // Stays lite: the fail-safe value.
       console.error('edition: could not read the edition', e);
     }
-    if (__LITE__ && !this.lite) {
-      console.error(
-        'edition: this frontend was built for Lite (NOTENPAD_LITE=1) but the Rust core reports the full edition; build both with the same setting',
-      );
-    }
   }
 }
 
 export const editionState = new EditionState();
 
-/** Whether the Lite edition's cuts apply right now: always in the Lite build,
- *  elsewhere the runtime value, which a license change can flip without a
- *  restart. Reactive through `editionState.lite` when read inside `$derived`,
- *  `$effect` or a template. Calling this never removes code from the Lite
- *  build; code that build must not ship is guarded by `__LITE__` itself. */
+/** Whether the Lite edition's cuts apply right now: the runtime value, which a
+ *  license change can flip without a restart. Reactive through
+ *  `editionState.lite` when read inside `$derived`, `$effect` or a template. */
 export function isLite(): boolean {
-  return __LITE__ || editionState.lite;
+  return editionState.lite;
 }

@@ -187,6 +187,13 @@ enum JournalEntry {
   Edits(EditGroup),
   Replace(ReplaceEntry),
 }
+/// A journal entry with the content states around it: undoing it returns the
+/// session to `before`, redoing it to `after`. Coalesced typing moves `after`.
+struct Step {
+  entry: JournalEntry,
+  before: u64,
+  after: u64,
+}
 
 /// A live editing session: the piece table over the file, the path it was opened
 /// from (updated on save-as), the file's fingerprint at open / last save, the
@@ -206,13 +213,23 @@ struct Session {
   digest: u64,
   /// Undo entries, oldest first; each undoes one coalesced edit step or one
   /// replace-all.
-  undo_stack: Vec<JournalEntry>,
+  undo_stack: Vec<Step>,
   /// Redo entries, populated by undo and cleared by any fresh apply.
-  redo_stack: Vec<JournalEntry>,
+  redo_stack: Vec<Step>,
   /// Bumped by every change of the content: apply, undo, redo, replace-all and
   /// the save that retargets the session. A scan records it when it starts and
   /// checks it at every chunk.
   generation: u64,
+  /// Id of the content state the session is in. Every change that is not an
+  /// undo or redo takes a fresh id, so an id names one content for good.
+  state_id: u64,
+  /// The `state_id` that was last written to disk (or opened).
+  saved_state_id: u64,
+  /// The next unused state id.
+  next_state_id: u64,
+  /// Set by a save: the next edit opens an undo step of its own, so undoing it
+  /// can land exactly on the saved state.
+  seal_group: bool,
   /// True while a replace-all pass runs. The commands that read or change the
   /// session wait for it to clear (see `WindowedState::lock_idle`).
   busy: bool,
@@ -235,8 +252,16 @@ impl Session {
       undo_stack: Vec::new(),
       redo_stack: Vec::new(),
       generation: 0,
+      state_id: 0,
+      saved_state_id: 0,
+      next_state_id: 1,
+      seal_group: false,
       busy: false,
     }
+  }
+  /// Whether the content equals what was last saved.
+  fn clean(&self) -> bool {
+    self.state_id == self.saved_state_id
   }
 }
 
@@ -355,6 +380,11 @@ pub struct WindowResult {
 pub struct DocStats {
   pub total_bytes: u64,
   pub total_lines: u64,
+  /// True when the content equals what was last saved.
+  pub clean: bool,
+  /// The session's content generation after this result; a result with a lower
+  /// one than another already seen is stale.
+  pub generation: u64,
 }
 
 /// Result of a successful save: the rewritten file's fingerprint plus the current
@@ -364,6 +394,8 @@ pub struct SaveResult {
   pub fingerprint: Fingerprint,
   pub total_bytes: u64,
   pub total_lines: u64,
+  pub clean: bool,
+  pub generation: u64,
 }
 
 /// A single replace expressed in global byte coordinates of the pre-apply
@@ -397,6 +429,8 @@ pub struct UndoResult {
   /// True for a replace-all undone or redone: `edits` is empty and the
   /// frontend reloads its window instead of mirroring edits.
   pub reload_only: bool,
+  pub clean: bool,
+  pub generation: u64,
 }
 
 /// Modification time in milliseconds since the Unix epoch, degrading to 0 when the
@@ -641,10 +675,7 @@ impl Session {
     }
     // Empty batches carry no reversible effect; skip journaling entirely.
     if edits.is_empty() {
-      return Ok(DocStats {
-        total_bytes: self.table.len(),
-        total_lines: self.table.line_count(),
-      });
+      return Ok(self.stats());
     }
     // Build the inverse group in post-apply coordinates before any mutation.
     // `removed` is the text currently under each edit (valid UTF-8 by the
@@ -674,19 +705,54 @@ impl Session {
       self.table.insert(edit.start, edit.text.as_bytes())?;
     }
     self.generation += 1;
-    // Only a group of typing edits can take more; a replace-all stays alone.
+    let before = self.state_id;
+    let after = self.take_state_id();
+    // Only a group of typing edits can take more; a replace-all stays alone, and
+    // so does a first edit after a save.
     let coalesce = !new_group
-      && matches!(self.undo_stack.last(), Some(JournalEntry::Edits(_)))
+      && !self.seal_group
+      && matches!(
+        self.undo_stack.last(),
+        Some(Step {
+          entry: JournalEntry::Edits(_),
+          ..
+        })
+      )
       && self.redo_stack.is_empty();
     self.redo_stack.clear();
+    self.seal_group = false;
     match self.undo_stack.last_mut() {
-      Some(JournalEntry::Edits(group)) if coalesce => group.extend(inverses),
-      _ => self.push_undo(JournalEntry::Edits(inverses)),
+      Some(Step {
+        entry: JournalEntry::Edits(group),
+        after: top_after,
+        ..
+      }) if coalesce => {
+        group.extend(inverses);
+        *top_after = after;
+      }
+      _ => self.push_undo(Step {
+        entry: JournalEntry::Edits(inverses),
+        before,
+        after,
+      }),
     }
-    Ok(DocStats {
+    self.state_id = after;
+    Ok(self.stats())
+  }
+  /// Document statistics plus the clean flag and generation, for a result.
+  fn stats(&self) -> DocStats {
+    DocStats {
       total_bytes: self.table.len(),
       total_lines: self.table.line_count(),
-    })
+      clean: self.clean(),
+      generation: self.generation,
+    }
+  }
+  /// A state id nothing has used yet.
+  fn take_state_id(&mut self) -> u64 {
+    let id = self.next_state_id;
+    self.next_state_id += 1;
+    id
   }
 
   /// Apply one group's inverse edits in reverse storage order, each in the
@@ -722,7 +788,7 @@ impl Session {
   /// Push an undo entry, dropping the oldest past `UNDO_LIMIT`. Dropping a
   /// replace-all entry does not delete its change list while a layer in the
   /// table still reads it: the list is shared and goes with its last holder.
-  fn push_undo(&mut self, entry: JournalEntry) {
+  fn push_undo(&mut self, entry: Step) {
     self.undo_stack.push(entry);
     if self.undo_stack.len() > UNDO_LIMIT {
       self.undo_stack.remove(0);
@@ -731,24 +797,35 @@ impl Session {
   /// Pop and apply the newest undo entry, pushing its opposite onto the redo
   /// stack. Errors with `NOTHING_TO_UNDO` when the stack is empty.
   fn undo(&mut self) -> Result<UndoResult, String> {
-    let entry = self
+    let step = self
       .undo_stack
       .pop()
       .ok_or_else(|| NOTHING_TO_UNDO.to_string())?;
-    match entry {
+    let (before, after) = (step.before, step.after);
+    match step.entry {
       JournalEntry::Edits(group) => {
         let (applied, opposite) = self.apply_inverse_group(group)?;
-        self.redo_stack.push(JournalEntry::Edits(opposite));
+        self.redo_stack.push(Step {
+          entry: JournalEntry::Edits(opposite),
+          before,
+          after,
+        });
         self.generation += 1;
+        self.state_id = before;
         Ok(self.outcome(applied))
       }
       JournalEntry::Replace(entry) => {
         self.take_back_replace(&entry)?;
+        self.state_id = before;
         let result = self.reload_outcome(&entry.list)?;
-        self.redo_stack.push(JournalEntry::Replace(ReplaceEntry {
-          list: entry.list,
-          layer_id: None,
-        }));
+        self.redo_stack.push(Step {
+          entry: JournalEntry::Replace(ReplaceEntry {
+            list: entry.list,
+            layer_id: None,
+          }),
+          before,
+          after,
+        });
         Ok(result)
       }
     }
@@ -756,24 +833,35 @@ impl Session {
   /// Pop and apply the newest redo entry, pushing its opposite back onto the undo
   /// stack. Errors with `NOTHING_TO_REDO` when the stack is empty.
   fn redo(&mut self) -> Result<UndoResult, String> {
-    let entry = self
+    let step = self
       .redo_stack
       .pop()
       .ok_or_else(|| NOTHING_TO_REDO.to_string())?;
-    match entry {
+    let (before, after) = (step.before, step.after);
+    match step.entry {
       JournalEntry::Edits(group) => {
         let (applied, opposite) = self.apply_inverse_group(group)?;
-        self.undo_stack.push(JournalEntry::Edits(opposite));
+        self.undo_stack.push(Step {
+          entry: JournalEntry::Edits(opposite),
+          before,
+          after,
+        });
         self.generation += 1;
+        self.state_id = after;
         Ok(self.outcome(applied))
       }
       JournalEntry::Replace(entry) => {
         let layer_id = self.stack_layer(Dir::Forward, entry.list.clone());
+        self.state_id = after;
         let result = self.reload_outcome(&entry.list)?;
-        self.undo_stack.push(JournalEntry::Replace(ReplaceEntry {
-          list: entry.list,
-          layer_id: Some(layer_id),
-        }));
+        self.undo_stack.push(Step {
+          entry: JournalEntry::Replace(ReplaceEntry {
+            list: entry.list,
+            layer_id: Some(layer_id),
+          }),
+          before,
+          after,
+        });
         Ok(result)
       }
     }
@@ -792,10 +880,18 @@ impl Session {
   fn install_replace(&mut self, list: Arc<ChangeList>) {
     let layer_id = self.stack_layer(Dir::Forward, list.clone());
     self.redo_stack.clear();
-    self.push_undo(JournalEntry::Replace(ReplaceEntry {
-      list,
-      layer_id: Some(layer_id),
-    }));
+    let before = self.state_id;
+    let after = self.take_state_id();
+    self.push_undo(Step {
+      entry: JournalEntry::Replace(ReplaceEntry {
+        list,
+        layer_id: Some(layer_id),
+      }),
+      before,
+      after,
+    });
+    self.state_id = after;
+    self.seal_group = false;
   }
   /// Revert the replace-all `entry` records. Undo is last-in-first-out: every
   /// later edit is already undone, so the content is exactly what the replace
@@ -831,6 +927,8 @@ impl Session {
       total_bytes: self.table.len(),
       total_lines: self.table.line_count(),
       reload_only: true,
+      clean: self.clean(),
+      generation: self.generation,
     })
   }
 
@@ -848,6 +946,8 @@ impl Session {
       total_bytes: self.table.len(),
       total_lines: self.table.line_count(),
       reload_only: false,
+      clean: self.clean(),
+      generation: self.generation,
     }
   }
 }
@@ -1164,10 +1264,14 @@ fn save_session(
   session.index = index;
   session.digest = digest;
   session.generation += 1;
+  session.saved_state_id = session.state_id;
+  session.seal_group = true;
   Ok(SaveResult {
     fingerprint,
     total_bytes,
     total_lines,
+    clean: true,
+    generation: session.generation,
   })
 }
 /// Core of `windowed_save`: waits for a running replace-all, then saves.
@@ -1197,6 +1301,27 @@ pub fn windowed_save(
     expected,
     path_override.map(PathBuf::from),
   )
+}
+/// Core of `windowed_set_path`: waits for a running replace-all, then points the
+/// session at `path`. The file's bytes are the same, so its index, digest and
+/// fingerprint stay valid.
+fn set_path_core(state: &WindowedState, session_id: u64, path: PathBuf) -> Result<(), String> {
+  let mut map = state.lock_idle(session_id)?;
+  let session = map
+    .get_mut(&session_id)
+    .ok_or_else(|| UNKNOWN_SESSION.to_string())?;
+  session.path = path;
+  Ok(())
+}
+/// The file a session edits was renamed or moved: later saves and conflict
+/// checks go to `path`. Nothing is read or written.
+#[tauri::command(async)]
+pub fn windowed_set_path(
+  state: State<WindowedState>,
+  session_id: u64,
+  path: String,
+) -> Result<(), String> {
+  set_path_core(&state, session_id, PathBuf::from(path))
 }
 /// Core of `windowed_close`: waits for a running replace-all, then drops the
 /// session. Its layers and journal go with it, and with them every change-list
@@ -1688,6 +1813,8 @@ pub struct ReplaceAllOutcome {
   pub count: u64,
   pub total_bytes: u64,
   pub total_lines: u64,
+  pub clean: bool,
+  pub generation: u64,
 }
 /// Core of `windowed_replace_all`. One streaming pass over the current content
 /// finds every leftmost non-overlapping hit and writes the change list to
@@ -1773,6 +1900,8 @@ fn replace_all_core(
     count,
     total_bytes: session.table.len(),
     total_lines: session.table.line_count(),
+    clean: session.clean(),
+    generation: session.generation,
   })
 }
 /// Replace every occurrence of `query` in the session's current content with
@@ -2575,6 +2704,128 @@ mod tests {
     let mut s = session_with(&dir, b"abc");
     assert_eq!(s.undo().unwrap_err(), NOTHING_TO_UNDO);
     assert_eq!(s.redo().unwrap_err(), NOTHING_TO_REDO);
+  }
+  // --- the clean flag ----------------------------------------------------------
+
+  #[test]
+  fn a_freshly_opened_session_is_clean() {
+    let dir = tempdir().unwrap();
+    let s = session_with(&dir, b"abc");
+    assert!(s.clean());
+  }
+
+  #[test]
+  fn an_empty_batch_keeps_the_session_clean() {
+    let dir = tempdir().unwrap();
+    let mut s = session_with(&dir, b"abc");
+    let stats = s.apply(Vec::new(), true).unwrap();
+    assert!(stats.clean);
+    assert_eq!(stats.generation, 0);
+    s.apply(vec![edit(0, 0, "X")], true).unwrap();
+    save(&mut s);
+    assert!(s.apply(Vec::new(), true).unwrap().clean);
+  }
+
+  #[test]
+  fn an_edit_is_dirty_and_undoing_every_edit_is_clean_again() {
+    let dir = tempdir().unwrap();
+    let mut s = session_with(&dir, b"abc");
+    assert!(!s.apply(vec![edit(0, 0, "X")], true).unwrap().clean);
+    assert!(!s.apply(vec![edit(1, 1, "Y")], true).unwrap().clean);
+    assert!(!s.undo().unwrap().clean);
+    assert!(s.undo().unwrap().clean);
+    assert!(!s.redo().unwrap().clean);
+    assert!(!s.redo().unwrap().clean);
+    assert!(!s.undo().unwrap().clean);
+    assert!(s.undo().unwrap().clean);
+  }
+
+  #[test]
+  fn undoing_past_a_save_is_dirty_and_redoing_back_to_it_is_clean() {
+    let dir = tempdir().unwrap();
+    let mut s = session_with(&dir, b"abc");
+    s.apply(vec![edit(0, 0, "X")], true).unwrap();
+    save(&mut s);
+    assert!(s.clean());
+    assert!(!s.undo().unwrap().clean);
+    assert!(s.redo().unwrap().clean);
+  }
+
+  #[test]
+  fn typing_that_would_coalesce_after_a_save_still_undoes_to_the_saved_state() {
+    let dir = tempdir().unwrap();
+    let mut s = session_with(&dir, b"");
+    s.apply(vec![edit(0, 0, "a")], true).unwrap();
+    save(&mut s);
+    // Not a new group by the caller's rule, yet it must not join the saved one.
+    assert!(!s.apply(vec![edit(1, 1, "b")], false).unwrap().clean);
+    assert_eq!(s.undo_stack.len(), 2);
+    assert!(s.undo().unwrap().clean);
+    assert_eq!(whole(&s), b"a");
+    // The next typing after that coalesces again.
+    s.apply(vec![edit(1, 1, "c")], false).unwrap();
+    s.apply(vec![edit(2, 2, "d")], false).unwrap();
+    assert_eq!(s.undo_stack.len(), 2);
+    assert!(s.undo().unwrap().clean);
+    assert_eq!(whole(&s), b"a");
+  }
+
+  #[test]
+  fn typing_after_undoing_past_a_save_is_never_clean_before_the_next_save() {
+    let dir = tempdir().unwrap();
+    let mut s = session_with(&dir, b"");
+    s.apply(vec![edit(0, 0, "a")], true).unwrap();
+    save(&mut s);
+    assert!(!s.undo().unwrap().clean);
+    assert!(!s.apply(vec![edit(0, 0, "z")], false).unwrap().clean);
+    assert!(!s.undo().unwrap().clean);
+    assert!(!s.redo().unwrap().clean);
+    // The saved content ("a") is no state this session can reach again.
+    assert_eq!(whole(&s), b"z");
+    save(&mut s);
+    assert!(s.clean());
+  }
+
+  #[test]
+  fn undoing_all_of_more_than_the_journal_keeps_is_still_dirty() {
+    let dir = tempdir().unwrap();
+    let mut s = session_with(&dir, b"");
+    for _ in 0..(UNDO_LIMIT + 1) {
+      let at = s.table.len();
+      s.apply(vec![edit(at, at, "x")], true).unwrap();
+    }
+    let mut last = true;
+    for _ in 0..UNDO_LIMIT {
+      last = s.undo().unwrap().clean;
+    }
+    assert!(!last, "the evicted step's edit is still in the document");
+    assert_eq!(whole(&s), b"x");
+    assert!(!s.clean());
+  }
+
+  #[test]
+  fn save_as_makes_the_session_clean() {
+    let dir = tempdir().unwrap();
+    let mut s = session_with(&dir, b"abc");
+    s.apply(vec![edit(0, 0, "X")], true).unwrap();
+    assert!(!s.clean());
+    let saved = save_session(&mut s, None, Some(dir.path().join("other.txt"))).unwrap();
+    assert!(saved.clean);
+    assert!(s.clean());
+    assert!(!s.undo().unwrap().clean);
+    assert!(s.redo().unwrap().clean);
+  }
+
+  #[test]
+  fn results_carry_a_generation_that_only_grows() {
+    let dir = tempdir().unwrap();
+    let mut s = session_with(&dir, b"abc");
+    let a = s.apply(vec![edit(0, 0, "X")], true).unwrap().generation;
+    let b = s.apply(vec![edit(1, 1, "Y")], false).unwrap().generation;
+    let c = s.undo().unwrap().generation;
+    let d = s.redo().unwrap().generation;
+    let e = save_session(&mut s, None, None).unwrap().generation;
+    assert!(a < b && b < c && c < d && d < e, "{a} {b} {c} {d} {e}");
   }
 
   #[test]
@@ -3871,8 +4122,8 @@ mod replace_tests {
         2,
         "the edit did not coalesce into the replace-all"
       );
-      assert!(matches!(s.undo_stack[0], JournalEntry::Replace(_)));
-      assert!(matches!(s.undo_stack[1], JournalEntry::Edits(_)));
+      assert!(matches!(s.undo_stack[0].entry, JournalEntry::Replace(_)));
+      assert!(matches!(s.undo_stack[1].entry, JournalEntry::Edits(_)));
     });
     let r = fx.undo();
     assert!(!r.reload_only);
@@ -3884,6 +4135,25 @@ mod replace_tests {
     assert_eq!(fx.whole(), b"a X b X\nc\n");
     assert_eq!(fx.redo().edits.len(), 1);
     assert_eq!(fx.whole(), b"Qa X b X\nc\n");
+  }
+
+  #[test]
+  fn replace_all_is_dirty_and_its_undo_and_redo_follow_the_clean_flag() {
+    let fx = fixture(b"a tok b tok\nc\n");
+    let out = fx.replace("tok", "X");
+    assert!(!out.clean);
+    assert!(out.generation > 0);
+    assert!(fx.undo().clean);
+    assert!(!fx.redo().clean);
+    fx.save();
+    assert!(fx.with(|s| s.clean()));
+    assert!(!fx.undo().clean);
+    assert!(fx.redo().clean);
+    // A replace with no hit leaves the flag and the generation where they were.
+    let generation = fx.with(|s| s.generation);
+    let none = fx.replace("nothing", "X");
+    assert!(none.clean);
+    assert_eq!(none.generation, generation);
   }
 
   #[test]
@@ -4144,7 +4414,7 @@ mod replace_tests {
       assert!(s
         .undo_stack
         .iter()
-        .all(|e| matches!(e, JournalEntry::Edits(_))));
+        .all(|e| matches!(e.entry, JournalEntry::Edits(_))));
     });
     assert!(lists[0].exists(), "the layer still reads it");
     let mut want = vec![b'e'; UNDO_LIMIT + 1];
@@ -4267,6 +4537,48 @@ mod replace_tests {
     })
   }
 
+  fn fingerprint_of_session(fx: &Fixture) -> Fingerprint {
+    fx.with(|s| s.fingerprint.clone())
+  }
+
+  #[test]
+  fn a_save_after_set_path_writes_the_new_path_and_leaves_no_file_at_the_old_one() {
+    let fx = fixture(b"one\ntwo\n");
+    let moved = fx.dir.path().join("renamed.txt");
+    fs::rename(&fx.path, &moved).unwrap();
+    set_path_core(&fx.state, ID, moved.clone()).unwrap();
+    fx.edit(vec![ed(0, 3, "ONE")], true);
+    save_core(&fx.state, ID, None, None).unwrap();
+    assert_eq!(fs::read(&moved).unwrap(), b"ONE\ntwo\n");
+    assert!(!fx.path.exists(), "the old path must not come back");
+    assert_eq!(fx.with(|s| s.path.clone()), moved);
+  }
+
+  #[test]
+  fn the_conflict_check_after_set_path_reads_the_fingerprint_of_the_new_path() {
+    let fx = fixture(b"one\ntwo\n");
+    let before = fingerprint_of_session(&fx);
+    let moved = fx.dir.path().join("renamed.txt");
+    fs::rename(&fx.path, &moved).unwrap();
+    // Still aimed at the old path, the file looks gone and the save is refused.
+    let refused = save_core(&fx.state, ID, Some(before.clone()), None).unwrap_err();
+    assert_eq!(refused, FINGERPRINT_MISMATCH);
+    set_path_core(&fx.state, ID, moved.clone()).unwrap();
+    fx.edit(vec![ed(0, 3, "ONE")], true);
+    save_core(&fx.state, ID, Some(before), None).unwrap();
+    assert_eq!(fs::read(&moved).unwrap(), b"ONE\ntwo\n");
+    assert!(!fx.path.exists());
+  }
+
+  #[test]
+  fn set_path_on_an_unknown_session_is_refused() {
+    let fx = fixture(b"x");
+    assert_eq!(
+      set_path_core(&fx.state, ID + 1, fx.path.clone()).unwrap_err(),
+      UNKNOWN_SESSION
+    );
+  }
+
   fn tok_doc() -> Vec<u8> {
     "tok one\ntwo tok\nthree\nfour tok tok\nfive\n"
       .repeat(8)
@@ -4362,6 +4674,7 @@ mod heavy_io_command_threading_tests {
     "windowed_open",
     "windowed_reopen",
     "windowed_save",
+    "windowed_set_path",
     "windowed_read",
     "windowed_apply",
     "windowed_undo",
@@ -4410,6 +4723,7 @@ mod heavy_io_command_threading_tests {
     }
     for core in [
       "fn save_core",
+      "fn set_path_core",
       "fn close_core",
       "fn find_once",
       "fn search_core",

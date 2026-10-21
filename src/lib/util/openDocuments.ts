@@ -43,10 +43,11 @@ export function shouldCollapseEmptyWindow(
     !openFailed
   );
 }
-/** The workspace list's label for a document tab, in the UI language. A range
- *  tab (its file lives in `range_source`) reads like its tab bar label,
- *  "{name} (lines X–Y)"; a record without the stored end line shows the source
- *  name alone. A tab with no path is the translated "Untitled". */
+/** The workspace list's label for a document tab, in the UI language. A record
+ *  of a range tab an earlier version stored (its file lives in `range_source`)
+ *  reads "{name} (lines X–Y)" until it is restored; a record without the stored
+ *  end line shows the source name alone. A tab with no path is the translated
+ *  "Untitled". */
 export function docLabel(note: NoteSnapshot): string {
   if (note.range_source !== null) {
     if (note.range_start_line !== null && note.range_end_line !== null) {

@@ -11,7 +11,6 @@
   import { themeRegistry } from './lib/theme/themeRegistry.svelte';
   import { localeRegistry } from './lib/i18n/localeRegistry.svelte';
   import { t } from './lib/i18n';
-  import { appName } from './lib/i18n/brand';
   import { nativeSelectAll } from './lib/util/menuBar';
 
   let version = $state('');
@@ -54,7 +53,7 @@
 </script>
 
 <main class="about">
-  <h1 class="name">{appName()}</h1>
+  <h1 class="name">Note&Pad</h1>
   <p class="version">{t('about.version', { version })}</p>
   <p class="desc">{t('about.desc')}</p>
   <p class="license">

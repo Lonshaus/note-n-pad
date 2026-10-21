@@ -1,8 +1,11 @@
 // Copyright © 2026 Lonshaus
 // SPDX-License-Identifier: GPL-3.0-only
 
-import { fileExtension, languageInfos } from '../editor/language';
-import type { LanguageInfo } from '../editor/liteLanguages';
+import {
+  fileExtension,
+  languageInfos,
+  type LanguageInfo,
+} from '../editor/language';
 
 /** Extensions the CodeMirror registry does not give us correctly.
  *  CSV/TSV are display-only pseudo-languages with no CM mode of their own
@@ -36,8 +39,8 @@ export function extensionForLanguage(
 }
 
 /** The filename a save dialog should start from, given the path a tab already
- *  has. Empty (an untitled tab, or a range tab with no path of its own) falls
- *  back to a neutral name that `saveDialogOptions` then extends. */
+ *  has. Empty (an untitled tab) falls back to a neutral name that
+ *  `saveDialogOptions` then extends. */
 export function suggestedName(path: string): string {
   const base = path.split(/[/\\]/).pop() ?? '';
   return base === '' ? 'Untitled' : base;

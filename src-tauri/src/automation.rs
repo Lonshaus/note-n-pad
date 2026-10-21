@@ -25,6 +25,8 @@ struct Request {
   label: Option<String>,
   #[serde(default)]
   js: Option<String>,
+  #[serde(default)]
+  paths: Option<Vec<String>>,
 }
 
 /// One entry of the `list_windows` response.
@@ -120,6 +122,7 @@ fn dispatch(app: &AppHandle, req: &Request) -> Result<Value, String> {
       Ok(Value::Null)
     }
     "window_number" => window_number(app, req),
+    "simulate_drop" => simulate_drop(app, req),
     "eval" => eval(app, req),
     "quit" => {
       crate::flush_then_exit(app);
@@ -180,7 +183,30 @@ fn eval(app: &AppHandle, req: &Request) -> Result<Value, String> {
     .wait(req.id, EVAL_TIMEOUT)
     .ok_or_else(|| "eval timed out".to_string())
 }
-
+/// Drop `paths` onto window `label` as if from the file manager, skipping the
+/// native drag. The drop handling reads AppKit state on macOS, so it runs on the
+/// main thread.
+fn simulate_drop(app: &AppHandle, req: &Request) -> Result<Value, String> {
+  let label = window(app, req)?.label().to_string();
+  let paths: Vec<std::path::PathBuf> = req
+    .paths
+    .as_ref()
+    .ok_or("missing 'paths'")?
+    .iter()
+    .map(std::path::PathBuf::from)
+    .collect();
+  let (tx, rx) = std::sync::mpsc::channel();
+  let handle = app.clone();
+  app
+    .run_on_main_thread(move || {
+      crate::file_drop::handle_drop(&handle, &label, &paths);
+      let _ = tx.send(());
+    })
+    .map_err(|e| e.to_string())?;
+  rx.recv_timeout(Duration::from_secs(5))
+    .map_err(|e| e.to_string())?;
+  Ok(Value::Null)
+}
 /// macOS NSWindow windowNumber, for `screencapture -l <n>`. AppKit access must
 /// happen on the main thread, so we hop there and pass the value back.
 #[cfg(target_os = "macos")]
@@ -285,6 +311,7 @@ mod tests {
         cmd: "eval".into(),
         label: Some("note-1".into()),
         js: Some("1+1".into()),
+        paths: None,
       }
     );
   }

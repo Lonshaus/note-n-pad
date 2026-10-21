@@ -553,7 +553,7 @@ check "tab restored straight into windowed editing (fast-path reopen)" "$(e2e_re
 # silently rounding through the IPC boundary and permanently defeating the
 # fast path (see windowed.rs's `IndexSnapshot`/`parse_digest`).
 check "restart restore took the fast path, not a rescan" "$(e2e_read "$DL" "String(__auto.windowedRestoreRescanned())")" "false"
-check "tab restored, not range" "$(e2e_read "$DL" "String(__auto.isRangeTab())")" "false"
+check "tab restored with no edit box" "$(e2e_read "$DL" "String(__auto.rangeBoxVisible())")" "false"
 check "not left in the read-only large view" "$(e2e_read "$DL" "String(__auto.isLargeTab())")" "false"
 # The top-of-viewport line at last quit (reset to 0 by the discard just
 # above, which reopens a fresh session at the on-disk baseline) is persisted as

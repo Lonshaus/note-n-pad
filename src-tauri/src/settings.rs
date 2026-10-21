@@ -122,6 +122,11 @@ pub struct AppSettings {
   /// until the user adds one; each entry is a sibling top-level node.
   #[serde(default)]
   pub project_roots: Vec<String>,
+  /// Expanded folders of each project tree, by project root (the root itself
+  /// is listed when its node is open). A root with no entry has never been
+  /// expanded or collapsed by the user and opens expanded.
+  #[serde(default)]
+  pub project_expanded: BTreeMap<String, Vec<String>>,
   /// Whether the system tray / status-bar icon is shown. When off the icon is
   /// hidden (the app keeps running); its actions stay reachable from the menu
   /// bar, global shortcut, and Dock menu. Cross-platform.
@@ -278,6 +283,7 @@ impl Default for AppSettings {
       workspace_width: default_workspace_width(),
       workspace_height: default_workspace_height(),
       project_roots: Vec::new(),
+      project_expanded: BTreeMap::new(),
       show_tray_icon: default_show_tray_icon(),
       open_workspace_on_startup: default_open_workspace_on_startup(),
       recent_files: Vec::new(),
@@ -304,16 +310,55 @@ pub fn push_recent(current: &[String], path: &str) -> Vec<String> {
 /// A missing file falls back to defaults (first run); a genuine read failure on
 /// an existing file aborts instead of writing defaults back over it.
 pub fn push_recent_file(app: &AppHandle, path: &str) -> Result<Vec<String>, String> {
-  let file = settings_path(app)?;
-  let mut settings = load_or_default_for_write(&file)?;
+  push_recent_in(&settings_path(app)?, path)
+}
+
+fn push_recent_in(file: &Path, path: &str) -> Result<Vec<String>, String> {
+  let _guard = SETTINGS_WRITE_LOCK.lock().unwrap();
+  let mut settings = load_or_default_for_write(file)?;
   settings.recent_files = push_recent(&settings.recent_files, path);
-  save_to(&file, &settings)?;
+  save_to(file, &settings)?;
   Ok(settings.recent_files)
+}
+/// `recent` with every path at or below `from` moved to `to`. A path that ends up
+/// listed twice keeps its first place.
+pub fn retarget_recent(recent: &[String], from: &str, to: &str) -> Vec<String> {
+  let mut out: Vec<String> = Vec::with_capacity(recent.len());
+  for path in recent {
+    let moved = crate::file_ops::retarget_path(path, from, to);
+    if !out.contains(&moved) {
+      out.push(moved);
+    }
+  }
+  out
+}
+/// Move the recent files at or below `from` to `to` on disk. Returns the new
+/// list, or `None` when nothing in it changed. See `push_recent_file` for the
+/// read-failure handling.
+pub fn retarget_recent_files(
+  app: &AppHandle,
+  from: &str,
+  to: &str,
+) -> Result<Option<Vec<String>>, String> {
+  retarget_recent_in(&settings_path(app)?, from, to)
+}
+
+fn retarget_recent_in(file: &Path, from: &str, to: &str) -> Result<Option<Vec<String>>, String> {
+  let _guard = SETTINGS_WRITE_LOCK.lock().unwrap();
+  let mut settings = load_or_default_for_write(file)?;
+  let moved = retarget_recent(&settings.recent_files, from, to);
+  if moved == settings.recent_files {
+    return Ok(None);
+  }
+  settings.recent_files = moved.clone();
+  save_to(file, &settings)?;
+  Ok(Some(moved))
 }
 
 /// Clear the on-disk recent list. See `push_recent_file` for the read-failure
 /// handling.
 pub fn clear_recent_files(app: &AppHandle) -> Result<(), String> {
+  let _guard = SETTINGS_WRITE_LOCK.lock().unwrap();
   let file = settings_path(app)?;
   let mut settings = load_or_default_for_write(&file)?;
   settings.recent_files.clear();
@@ -384,6 +429,14 @@ fn migrate_custom_font(settings: &mut AppSettings) {
       settings.editor_extra_fonts.push(family);
     }
   }
+}
+/// Drop the expanded-folder lists of projects that are no longer in
+/// `project_roots`, so removing a project takes its saved state with it.
+fn prune_project_expanded(settings: &mut AppSettings) {
+  let roots = &settings.project_roots;
+  settings
+    .project_expanded
+    .retain(|root, _| roots.contains(root));
 }
 
 /// Reject an empty shortcut. `theme`, `language`, and `snapshot_dir` are not
@@ -715,6 +768,7 @@ fn tolerant_settings(
       &mut dropped,
     ),
     project_roots: field_or_default(obj, "project_roots", Vec::new, &mut dropped),
+    project_expanded: field_or_default(obj, "project_expanded", BTreeMap::new, &mut dropped),
     show_tray_icon: field_or_default(obj, "show_tray_icon", default_show_tray_icon, &mut dropped),
     open_workspace_on_startup: field_or_default(
       obj,
@@ -814,6 +868,12 @@ pub struct LoadedSettings {
   /// default one is in use instead. The setting itself is left alone, so the
   /// chosen folder is used again as soon as it works.
   pub snapshot_dir_unavailable: bool,
+  /// The chosen snapshot folder is in use by another app and the default one
+  /// is in use instead. The setting itself is left alone.
+  pub snapshot_dir_in_use: bool,
+  /// The snapshot folder in use has no lock support, so another app using it
+  /// at the same time cannot be detected.
+  pub snapshot_dir_unlockable: bool,
 }
 
 #[tauri::command]
@@ -824,13 +884,16 @@ pub fn load_settings(app: AppHandle) -> Result<LoadedSettings, String> {
     .filter_map(|field| field.strip_prefix("shortcut_defaults."))
     .map(str::to_string)
     .collect();
+  let dir_state = app
+    .try_state::<crate::note_store::SnapshotFallback>()
+    .map(|state| state.state());
   Ok(LoadedSettings {
     settings,
     repaired_fields,
     unset_defaults_to_notify,
-    snapshot_dir_unavailable: app
-      .try_state::<crate::note_store::SnapshotFallback>()
-      .is_some_and(|state| state.in_use()),
+    snapshot_dir_unavailable: dir_state.is_some_and(|state| state.unavailable),
+    snapshot_dir_in_use: dir_state.is_some_and(|state| state.in_use),
+    snapshot_dir_unlockable: dir_state.is_some_and(|state| state.unlockable),
   })
 }
 
@@ -901,6 +964,7 @@ pub fn save_settings(app: AppHandle, settings: serde_json::Value) -> Result<(), 
     let current = load_or_default_for_write(&path)?;
     let mut merged = merge_settings(&current, &settings)?;
     normalize_fonts(&mut merged);
+    prune_project_expanded(&mut merged);
     save_to(&path, &merged)?;
     (current, merged)
   };
@@ -1320,6 +1384,10 @@ mod tests {
       workspace_width: 320.0,
       workspace_height: 600.0,
       project_roots: vec!["/tmp/project".into(), "/tmp/other".into()],
+      project_expanded: BTreeMap::from([(
+        "/tmp/project".to_string(),
+        vec!["/tmp/project".to_string(), "/tmp/project/src".to_string()],
+      )]),
       show_tray_icon: false,
       open_workspace_on_startup: true,
       recent_files: vec!["/tmp/a.txt".into(), "/tmp/b.txt".into()],
@@ -1392,6 +1460,56 @@ mod tests {
     // A null patch leaves the field untouched.
     let untouched = merge_settings(&set, &serde_json::json!({ "project_roots": null })).unwrap();
     assert_eq!(untouched.project_roots, vec!["/tmp/a", "/tmp/b"]);
+  }
+
+  #[test]
+  fn project_expanded_defaults_to_empty_and_replaces_as_a_whole() {
+    assert!(AppSettings::default().project_expanded.is_empty());
+    assert!(load_json(r#"{"theme":"dark"}"#).project_expanded.is_empty());
+    let set = merge_settings(
+      &AppSettings::default(),
+      &serde_json::json!({ "project_expanded": { "/a": ["/a", "/a/b"], "/c": [] } }),
+    )
+    .unwrap();
+    assert_eq!(set.project_expanded["/a"], vec!["/a", "/a/b"]);
+    // An empty list is kept: a collapsed root is not the same as a new one.
+    assert_eq!(set.project_expanded["/c"], Vec::<String>::new());
+    // A patch replaces the whole map, and null leaves it alone.
+    let replaced = merge_settings(
+      &set,
+      &serde_json::json!({ "project_expanded": { "/a": ["/a"] } }),
+    )
+    .unwrap();
+    assert_eq!(replaced.project_expanded.len(), 1);
+    let untouched = merge_settings(&set, &serde_json::json!({ "project_expanded": null })).unwrap();
+    assert_eq!(untouched.project_expanded, set.project_expanded);
+  }
+
+  #[test]
+  fn wrong_typed_project_expanded_costs_only_that_field() {
+    let settings = load_json(r#"{"project_roots":["/a"],"project_expanded":["nope"]}"#);
+    assert!(settings.project_expanded.is_empty());
+    assert_eq!(settings.project_roots, vec!["/a"]);
+  }
+
+  #[test]
+  fn pruning_drops_the_expanded_state_of_removed_projects() {
+    let mut settings = AppSettings {
+      project_roots: vec!["/a".into(), "/c".into()],
+      project_expanded: BTreeMap::from([
+        ("/a".to_string(), vec!["/a".to_string()]),
+        ("/b".to_string(), vec!["/b".to_string()]),
+        ("/c".to_string(), Vec::new()),
+      ]),
+      ..AppSettings::default()
+    };
+    prune_project_expanded(&mut settings);
+    let kept: Vec<&str> = settings
+      .project_expanded
+      .keys()
+      .map(String::as_str)
+      .collect();
+    assert_eq!(kept, vec!["/a", "/c"]);
   }
 
   #[test]
@@ -1940,6 +2058,81 @@ mod tests {
     // Newest is at the front, and the oldest entries fell off.
     assert_eq!(list[0], format!("/f{}", RECENT_FILES_MAX + 4));
     assert!(!list.contains(&"/f0".to_string()));
+  }
+
+  #[test]
+  fn retarget_recent_moves_the_file_and_what_is_below_a_folder() {
+    let list: Vec<String> = ["/x/f.txt", "/x/y/a.txt", "/x/y/b/c.txt", "/x/y2/d.txt"]
+      .iter()
+      .map(|p| p.to_string())
+      .collect();
+    assert_eq!(
+      retarget_recent(&list, "/x/f.txt", "/x/g.txt"),
+      vec!["/x/g.txt", "/x/y/a.txt", "/x/y/b/c.txt", "/x/y2/d.txt"]
+    );
+    assert_eq!(
+      retarget_recent(&list, "/x/y", "/x/z"),
+      vec!["/x/f.txt", "/x/z/a.txt", "/x/z/b/c.txt", "/x/y2/d.txt"]
+    );
+    assert_eq!(retarget_recent(&list, "/q", "/r"), list);
+  }
+
+  #[test]
+  fn retarget_recent_writes_the_new_list_to_the_settings_file() {
+    let dir = tempdir().unwrap();
+    let file = dir.path().join("settings.json");
+    let settings = AppSettings {
+      recent_files: vec!["/x/f.txt".into(), "/x/h.txt".into()],
+      ..AppSettings::default()
+    };
+    save_to(&file, &settings).unwrap();
+    let moved = retarget_recent_in(&file, "/x/f.txt", "/x/g.txt").unwrap();
+    assert_eq!(moved, Some(vec!["/x/g.txt".into(), "/x/h.txt".into()]));
+    assert_eq!(
+      load_from(&file).unwrap().recent_files,
+      vec!["/x/g.txt", "/x/h.txt"]
+    );
+    // Nothing to move: the file is left alone and no new list is reported.
+    assert_eq!(retarget_recent_in(&file, "/q", "/r").unwrap(), None);
+  }
+  /// Whether `work` finishes while the settings write lock is held elsewhere.
+  fn finishes_under_the_write_lock<T: Send + 'static>(
+    work: impl FnOnce() -> T + Send + 'static,
+  ) -> bool {
+    let guard = SETTINGS_WRITE_LOCK.lock().unwrap();
+    let (tx, rx) = std::sync::mpsc::channel();
+    let worker = std::thread::spawn(move || {
+      work();
+      tx.send(()).unwrap();
+    });
+    let waited = rx.recv_timeout(std::time::Duration::from_millis(200));
+    let finished_under_lock = waited.is_ok();
+    drop(guard);
+    worker.join().unwrap();
+    finished_under_lock
+  }
+
+  #[test]
+  fn following_a_rename_waits_for_the_settings_write_lock() {
+    let dir = tempdir().unwrap();
+    let file = dir.path().join("settings.json");
+    let target = file.clone();
+    assert!(!finishes_under_the_write_lock(move || {
+      retarget_recent_in(&target, "/x/f.txt", "/x/g.txt").unwrap();
+    }));
+    // The same work goes through once nobody holds the lock.
+    retarget_recent_in(&file, "/x/f.txt", "/x/g.txt").unwrap();
+  }
+
+  #[test]
+  fn recording_a_recent_file_waits_for_the_settings_write_lock() {
+    let dir = tempdir().unwrap();
+    let file = dir.path().join("settings.json");
+    let target = file.clone();
+    assert!(!finishes_under_the_write_lock(move || {
+      push_recent_in(&target, "/x/f.txt").unwrap();
+    }));
+    assert_eq!(push_recent_in(&file, "/x/g.txt").unwrap().len(), 2);
   }
 
   #[test]

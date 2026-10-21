@@ -171,6 +171,11 @@ export const zhTW = {
   'doc.oversized.message':
     '此分頁的未儲存內容過大，無法保留快照，關閉前必須處理。',
   'doc.oversized.discard': '放棄變更',
+  'doc.missing.message':
+    '找不到「{name}」。檔案可能已被移動或刪除，未儲存的內容仍保留在分頁中。',
+  'doc.missing.saveAs': '另存新檔',
+  'doc.missing.discard': '放棄變更',
+  'doc.rangeBox.unsaved': '範圍編輯框有未儲存的修改，關閉前必須處理。',
   'doc.snapshotFailed.message':
     '此分頁的未儲存內容無法寫入還原快照，關閉前必須處理。',
   'sticky.snapshotFailed.message':
@@ -282,6 +287,33 @@ export const zhTW = {
   'workspace.tree.newFileAria': '在此資料夾新增檔案',
   'workspace.tree.newFolder': '新增資料夾',
   'workspace.tree.newFolderAria': '在此資料夾新增子資料夾',
+  'workspace.drop.move': '移動',
+  'workspace.drop.confirmMoveFile': '要把「{name}」移到「{folder}」嗎？',
+  'workspace.drop.confirmMoveFolder':
+    '要把「{name}」和裡面所有內容移到「{folder}」嗎？',
+  'workspace.drop.confirmMoveMany': '要把 {count} 個項目移到「{folder}」嗎？',
+  'workspace.drop.refuseMoveProject': '無法移到其他專案。',
+  'workspace.drop.refuseMoveVolume': '無法移到其他磁碟。',
+  'workspace.drop.refuseCopyProject': '無法複製到其他專案。',
+  'workspace.drop.refuseCopyVolume': '無法複製到其他磁碟。',
+  'workspace.drop.partialMove':
+    '{total} 個項目中有 {count} 個無法移到「{folder}」：',
+  'workspace.drop.partialCopy':
+    '{total} 個項目中有 {count} 個無法複製到「{folder}」：',
+  'workspace.drop.moveRest': '只移動其餘 {rest} 個',
+  'workspace.drop.copyRest': '只複製其餘 {rest} 個',
+  'workspace.drop.abandonAll': '全部放棄',
+  'workspace.drop.reasonSameName': '目的地已有同名項目',
+  'workspace.drop.reasonIntoSelfMove': '不能移到自己或自己的子資料夾',
+  'workspace.drop.reasonIntoSelfCopy': '不能複製到自己或自己的子資料夾',
+  'workspace.drop.halfMove': '{total} 個項目中，已移動 {done} 個，其餘未完成：',
+  'workspace.drop.halfCopy': '{total} 個項目中，已複製 {done} 個，其餘未完成：',
+  'workspace.drop.failedOneMove': '無法移動「{name}」：{reason}',
+  'workspace.drop.failedOneCopy': '無法複製「{name}」：{reason}',
+  'workspace.drop.failedManyMove': '無法移動 {count} 個項目：',
+  'workspace.drop.failedManyCopy': '無法複製 {count} 個項目：',
+  'workspace.drop.linksSkipped': '已複製，但下列連結無法建立，未複製：',
+  'workspace.drop.reasonSymlinkPrivilege': '沒有建立符號連結的權限',
   // Long-line handling
   'status.longLine.worker': '超長行：語法著色改走背景執行緒',
   'status.longLine.disabled': '超長行：語法著色已停用',
@@ -290,15 +322,24 @@ export const zhTW = {
   'doc.openFailed':
     '無法開啟「{name}」。這個檔案可能已被移動或刪除，或是檔案名稱含有這個應用程式不支援的字元。',
   'doc.restoreUnreadable': '無法讀取 {names}。請重新開啟檔案。',
-  'doc.keptTabs': '未開啟：此版本不支援的分頁 {count} 個。',
   'edition.col.feature': '功能',
-  'edition.col.lite': '此版本',
-  'edition.col.full': '正式版',
+  'edition.col.lite': '免費版',
+  'edition.col.full': '完整版',
   'edition.mark.yes': '包含',
   'edition.mark.no': '不包含',
+  'edition.status.free': '目前版本：免費版',
+  'edition.status.full': '目前版本：完整版',
+  'edition.store.buy': '購買完整版',
+  'edition.store.buyPrice': '購買完整版（{price}）',
+  'edition.store.restore': '回復購買項目',
+  'edition.store.retry': '重試',
+  'edition.store.unreachable': '無法連線至 App Store。',
+  'edition.store.pending': '正在等待核准。',
+  'edition.store.nothing': '找不到購買紀錄。',
+  'edition.store.failed': '無法連線至 App Store，請再試一次。',
   'edition.row.largeFiles': '大型檔案檢視與編輯',
   'edition.row.largeFilesNote':
-    '此版本中，超過 100 MB 的檔案會以一般編輯器開啟。',
+    '免費版中，超過 100 MB 的檔案會以一般編輯器開啟。',
   'edition.row.syntax': '語法著色',
   'edition.row.treeViews': 'JSON 與 XML 樹狀檢視',
   'edition.row.themes': '主題（選擇、編輯、匯入、匯出、刪除）',
@@ -328,6 +369,12 @@ export const zhTW = {
   'settings.loadRepaired': '部分設定值無法讀取，已重設為預設值。',
   'settings.snapshotDirUnavailable':
     '你選擇的快照資料夾無法使用，目前暫時改用預設資料夾。',
+  'settings.snapshotDirInUse':
+    '你選擇的快照資料夾正由另一個應用程式使用中，目前暫時改用預設資料夾。',
+  'settings.snapshotDirUnlockable':
+    '這個位置無法偵測是否有其他應用程式同時使用。',
+  'settings.snapshotDirInUseSwitch':
+    '這個資料夾正由另一個應用程式使用中，無法切換。',
   'doc.longLine.confirm': '「{name}」包含超長的行，可能拖慢編輯。要如何開啟？',
   'doc.longLine.openAsIs': '原樣開啟',
   'doc.longLine.format': '格式化後開啟',

@@ -5,7 +5,6 @@ import { describe, it, expect } from 'vitest';
 import {
   snapshotContentPolicy,
   debounceContentPolicy,
-  restoredRangeContent,
   SNAPSHOT_CONTENT_MAX,
   SNAPSHOT_DEBOUNCE_MAX,
 } from './snapshotPolicy';
@@ -64,23 +63,5 @@ describe('debounceContentPolicy', () => {
   it('skips an oversized dirty buffer, as the full policy also does', () => {
     expect(debounceContentPolicy(true, SNAPSHOT_CONTENT_MAX + 1)).toBe('skip');
     expect(snapshotContentPolicy(true, SNAPSHOT_CONTENT_MAX + 1)).toBe('skip');
-  });
-});
-
-describe('restoredRangeContent', () => {
-  it('restores the stored buffer for a dirty range tab', () => {
-    expect(restoredRangeContent(true, 'edited', 'disk')).toBe('edited');
-    // Even if the source is gone, a dirty tab keeps its unsaved edits.
-    expect(restoredRangeContent(true, 'edited', null)).toBe('edited');
-  });
-
-  it('restores the on-disk slice for a clean range tab', () => {
-    expect(restoredRangeContent(false, 'stored', 'disk')).toBe('disk');
-  });
-
-  it('falls back to the stored buffer when the source is gone', () => {
-    expect(restoredRangeContent(false, 'stored', null)).toBe('stored');
-    // Clean tabs persist empty content, so the fallback is typically empty.
-    expect(restoredRangeContent(false, '', null)).toBe('');
   });
 });

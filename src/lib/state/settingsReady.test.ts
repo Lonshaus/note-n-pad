@@ -8,7 +8,7 @@
 // methods (`ready` / `init()`) work fine under Vitest.
 import { describe, expect, it, vi } from 'vitest';
 import { invoke } from '@tauri-apps/api/core';
-import { SettingsState } from './settings.svelte';
+import { SettingsState, snapshotDirErrorText } from './settings.svelte';
 
 vi.mock('@tauri-apps/api/core', () => ({ invoke: vi.fn() }));
 vi.mock('@tauri-apps/api/event', () => ({ listen: vi.fn() }));
@@ -19,11 +19,14 @@ const mockInvoke = vi.mocked(invoke);
 function payload(fontSize: number): Record<string, unknown> {
   // `load_settings` returns the settings wrapped alongside the names of any
   // fields the tolerant loader had to repair, and whether the snapshot folder
-  // fell back to the default; the clean case is an empty list and false.
+  // fell back to the default, was in use, or has no lock support; the clean
+  // case is an empty list and false.
   return {
     settings: settingsPayload(fontSize),
     repaired_fields: [],
     snapshot_dir_unavailable: false,
+    snapshot_dir_in_use: false,
+    snapshot_dir_unlockable: false,
   };
 }
 
@@ -129,11 +132,90 @@ describe('settings readiness (real SettingsState)', () => {
       settings: settingsPayload(13),
       repaired_fields: ['editor_font_size'],
       snapshot_dir_unavailable: true,
+      snapshot_dir_in_use: false,
+      snapshot_dir_unlockable: false,
     });
     const s = new SettingsState();
     void s.init();
     await s.ready;
     expect(s.settingsRepaired).toBe(true);
     expect(s.snapshotDirUnavailable).toBe(true);
+    expect(s.snapshotDirInUse).toBe(false);
+    expect(s.snapshotDirUnlockable).toBe(false);
+  });
+
+  it.each([
+    ['snapshot_dir_unavailable', 'snapshotDirUnavailable'],
+    ['snapshot_dir_in_use', 'snapshotDirInUse'],
+    ['snapshot_dir_unlockable', 'snapshotDirUnlockable'],
+  ] as const)('maps %s to %s and to nothing else', async (field, state) => {
+    mockInvoke.mockReset();
+    mockInvoke.mockResolvedValue({ ...payload(13), [field]: true });
+    const s = new SettingsState();
+    void s.init();
+    await s.ready;
+    const flags = {
+      snapshot_dir_unavailable: s.snapshotDirUnavailable,
+      snapshot_dir_in_use: s.snapshotDirInUse,
+      snapshot_dir_unlockable: s.snapshotDirUnlockable,
+    };
+    expect(s[state]).toBe(true);
+    expect(Object.values(flags).filter(Boolean)).toHaveLength(1);
+  });
+
+  it('takes the notice state returned by set_snapshot_dir', async () => {
+    mockInvoke.mockReset();
+    mockInvoke.mockImplementation((cmd: string) => {
+      if (cmd === 'load_settings') {
+        return Promise.resolve({
+          ...payload(13),
+          snapshot_dir_in_use: true,
+        });
+      }
+      if (cmd === 'set_snapshot_dir') {
+        return Promise.resolve({
+          unavailable: false,
+          in_use: false,
+          unlockable: true,
+        });
+      }
+      return Promise.resolve('/resolved');
+    });
+    const s = new SettingsState();
+    void s.init();
+    await s.ready;
+    expect(s.snapshotDirInUse).toBe(true);
+    await s.setSnapshotDir('/nas', true, 'source');
+    expect(s.snapshotDirInUse).toBe(false);
+    expect(s.snapshotDirUnlockable).toBe(true);
+    // Switching to a lockable folder clears the flag again.
+    mockInvoke.mockImplementation((cmd: string) =>
+      Promise.resolve(
+        cmd === 'set_snapshot_dir'
+          ? { unavailable: false, in_use: false, unlockable: false }
+          : '/resolved',
+      ),
+    );
+    await s.setSnapshotDir('/local', true, 'source');
+    expect(s.snapshotDirUnlockable).toBe(false);
+  });
+});
+
+describe('snapshotDirErrorText', () => {
+  const translate = (key: string): string => `<${key}>`;
+
+  it('words an in-use refusal with the dedicated key, not the raw error', () => {
+    expect(snapshotDirErrorText({ kind: 'in_use' }, translate)).toBe(
+      '<settings.snapshotDirInUseSwitch>',
+    );
+  });
+
+  it('shows the core message for any other failure', () => {
+    expect(
+      snapshotDirErrorText({ kind: 'other', message: 'disk full' }, translate),
+    ).toBe('disk full');
+    expect(snapshotDirErrorText('plain string', translate)).toBe(
+      'plain string',
+    );
   });
 });

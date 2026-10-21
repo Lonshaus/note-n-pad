@@ -18,6 +18,8 @@ on:
           - all
           - e2e-close-flush
           - e2e-editor-focus
+          - e2e-file-drop
+          - e2e-goto
           - e2e-highlight
           - e2e-i18n
           - e2e-large
@@ -26,6 +28,7 @@ on:
           - e2e-table
           - e2e-view-mode
           - e2e-windowed
+          - e2e-windowed-two-tabs
       runners:
         # A failure on one platform is far cheaper to reproduce than one that
         # needs all three.
