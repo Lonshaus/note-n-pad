@@ -143,10 +143,13 @@ no_open_failure() {
 }
 # Drop the paths $2... onto window $1.
 drop() {
-  local label="$1" paths
+  local label="$1" paths req
   shift
   paths="$(printf '%s\n' "$@" | jq -R . | jq -sc .)"
-  check "simulate_drop on $label accepted" "$(auto "{\"id\":$(e2e_next_id),\"cmd\":\"simulate_drop\",\"label\":\"$label\",\"paths\":$paths}" | jq -r '.ok' | tr -d '\r')" "true"
+  # Built outside the "$(...)" argument: bash 3.2 (macOS /bin/bash) brace-expands
+  # a {...,...} written there and sends the request as four fragments.
+  req="{\"id\":$(e2e_next_id),\"cmd\":\"simulate_drop\",\"label\":\"$label\",\"paths\":$paths}"
+  check "simulate_drop on $label accepted" "$(auto "$req" | jq -r '.ok' | tr -d '\r')" "true"
 }
 launch() {
   e2e_require_clean_slate
