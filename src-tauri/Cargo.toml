@@ -107,6 +107,11 @@ windows = { version = "0.61", features = [
   "Foundation",
   "Services_Store",
 ] }
+# The web message that carries dropped files (`file_drop`) is read through
+# WebView2's COM interfaces. Both crates are wry's own dependencies, so the
+# versions have to stay the ones wry uses for the types to be the same.
+webview2-com = "0.39"
+windows-core = "0.62"
 
 # Single-instance guard for Windows and Linux. macOS uses `mac_single_instance`
 # instead: this plugin's macOS socket lives in /tmp, which a sandboxed build

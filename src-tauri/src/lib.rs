@@ -15,6 +15,7 @@ mod dock;
 mod dock_labels;
 mod edition;
 mod encoding;
+mod file_drop;
 mod file_ops;
 mod flush;
 mod fonts;
@@ -970,6 +971,11 @@ fn handle_window_event(window: &tauri::Window, event: &tauri::WindowEvent) {
         .get_or_insert_with(HashMap::new)
         .insert(window.label().to_string(), now);
     }
+  }
+  // Windows never gets this for the windows that take file drops: they are
+  // built without Tauri's drag-drop handler, see `file_drop`.
+  if let tauri::WindowEvent::DragDrop(tauri::DragDropEvent::Drop { paths, .. }) = event {
+    file_drop::handle_drop(window.app_handle(), window.label(), paths);
   }
   // Drop a destroyed document window's tracked always-on-top state so a later
   // window can't inherit a stale check mark.
