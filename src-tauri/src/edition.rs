@@ -773,6 +773,23 @@ mod gate_tests {
   }
 
   #[test]
+  fn retry_signs_in_before_rereading_the_original() {
+    let refresh = body_of(include_str!("storekit.rs"), "refresh");
+    let sync = refresh
+      .find("np_store_sync()")
+      .expect("Retry must sync to sign in");
+    let original = refresh
+      .find("refresh_original()")
+      .expect("Retry must re-read the original");
+    assert!(
+      sync < original,
+      "sync must come before the original re-read"
+    );
+    assert!(refresh.contains("if unsafe { np_store_sync() } == 1 {\n    reread_owned(app);\n  }"));
+    assert_eq!(refresh.matches("reread_owned(").count(), 1);
+  }
+
+  #[test]
   fn a_build_without_the_store_neither_reads_nor_shows_it() {
     let lib = include_str!("lib.rs");
     let info = body_of(lib, "store_info");
