@@ -448,3 +448,77 @@ describe('a prompt that another dialog holds back', () => {
     expect(sent()).not.toContain('request_exit');
   });
 });
+
+describe('input still on its way into a windowed editor', () => {
+  /** Pending input that a call of `endComposition` lands. */
+  function pendingInput(): { landed: () => void; ended: () => number } {
+    let pending = true;
+    let ended = 0;
+    win.windowedPending = () => pending;
+    win.endComposition = () => {
+      ended += 1;
+      pending = false;
+      return Promise.resolve();
+    };
+    return { landed: () => (pending = false), ended: () => ended };
+  }
+
+  it('lets a quit resume only after flush-cancelled, then exits on that one request', async () => {
+    win.tabs.push(viewer());
+    const input = pendingInput();
+    const quit = gate.onFlushRequest();
+    // endComposition resolves at once; the veto has not come back round yet.
+    await Promise.resolve();
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(sent()).toContain('flush_cancel');
+    expect(input.ended()).toBe(1);
+    expect(sent()).not.toContain('request_exit');
+    expect(sent()).not.toContain('flush_ack');
+    gate.onFlushCancelled();
+    await quit;
+    expect(sent()).toContain('request_exit');
+    const order = sent().filter((c) => /^(flush_cancel|request_exit)$/.test(c));
+    expect(order).toEqual(['flush_cancel', 'request_exit']);
+    expect(gate.visible).toBe(false);
+  });
+
+  it('asks about what the landed input left behind instead of exiting', async () => {
+    await withBox(true);
+    pendingInput();
+    const quit = gate.onFlushRequest();
+    await Promise.resolve();
+    gate.onFlushCancelled();
+    await quit;
+    expect(gate.visible).toBe(true);
+    expect(gate.reason).toBe('rangeBox');
+    expect(sent()).not.toContain('request_exit');
+  });
+
+  it('quits as before when nothing is pending', async () => {
+    win.tabs.push(viewer());
+    win.windowedPending = () => false;
+    win.endComposition = vi.fn(() => Promise.resolve());
+    await gate.onFlushRequest();
+    expect(sent()).toContain('flush_ack');
+    expect(sent()).not.toContain('flush_cancel');
+    expect(win.endComposition).not.toHaveBeenCalled();
+  });
+
+  it('lets a window close wait for the input before it looks at what blocks', async () => {
+    win.tabs.push(viewer());
+    const input = pendingInput();
+    await gate.onCloseFlushRequest();
+    expect(input.ended()).toBe(1);
+    expect(host.finishWindowClose).toHaveBeenCalledTimes(1);
+  });
+
+  it('ends no composition for a window close with nothing pending', async () => {
+    win.tabs.push(viewer());
+    win.windowedPending = () => false;
+    win.endComposition = vi.fn(() => Promise.resolve());
+    await gate.onCloseFlushRequest();
+    expect(win.endComposition).not.toHaveBeenCalled();
+    expect(host.finishWindowClose).toHaveBeenCalledTimes(1);
+  });
+});

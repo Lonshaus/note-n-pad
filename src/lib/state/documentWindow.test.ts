@@ -876,6 +876,55 @@ const SAVED_AS = {
   generation: 7,
 };
 
+describe('a save waits for what was typed into the windowed editor', () => {
+  it('writes only after the editor has flushed, for a save and for a save as', async () => {
+    pushWindowedTab();
+    mockSave.mockResolvedValue('/tmp/copy.txt');
+    const order: string[] = [];
+    let flushed: () => void = () => {};
+    documentWindow.windowedFlushed = () =>
+      new Promise<void>((resolve) => {
+        order.push('flush started');
+        flushed = () => {
+          order.push('flushed');
+          resolve();
+        };
+      });
+    mockInvoke.mockImplementation(((cmd: string) => {
+      order.push(cmd);
+      return Promise.resolve(cmd === 'windowed_save' ? SAVED_AS : null);
+    }) as typeof invoke);
+
+    try {
+      const saving = documentWindow.saveActive();
+      await Promise.resolve();
+      await Promise.resolve();
+      expect(order).toEqual(['flush started']);
+      flushed();
+      expect(await saving).toBe(true);
+      expect(order.slice(0, 3)).toEqual([
+        'flush started',
+        'flushed',
+        'windowed_save',
+      ]);
+
+      order.length = 0;
+      const savingAs = documentWindow.saveAs();
+      await new Promise((r) => setTimeout(r, 0));
+      expect(order).toEqual(['flush started']);
+      flushed();
+      expect(await savingAs).toBe(true);
+      expect(order.slice(0, 3)).toEqual([
+        'flush started',
+        'flushed',
+        'windowed_save',
+      ]);
+    } finally {
+      documentWindow.windowedFlushed = null;
+    }
+  });
+});
+
 describe('saveAs on a windowed tab', () => {
   it('asks the dialog and writes the chosen path with no expected fingerprint', async () => {
     const tab = pushWindowedTab();

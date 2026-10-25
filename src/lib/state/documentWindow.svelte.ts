@@ -219,7 +219,12 @@ export type SpliceOutcome =
  *  index. `expected` is the conflict baseline; null writes past the check. Not
  *  tied to a tab: the caller owns what a result means. */
 export async function spliceRange(
-  target: { sourcePath: string; startByte: number; endByte: number },
+  target: {
+    sourcePath: string;
+    startByte: number;
+    endByte: number;
+    lineEnding: LineEnding;
+  },
   replacement: string,
   expected: Fingerprint | null,
 ): Promise<SpliceOutcome> {
@@ -230,6 +235,8 @@ export async function spliceRange(
       start: target.startByte,
       end: target.endByte,
       replacement,
+      // What a lone CR the splice would join to a line feed is rewritten to.
+      insertSep: target.lineEnding === 'CRLF' ? '\r\n' : '\n',
       expected,
     });
   } catch (e) {
@@ -1171,6 +1178,14 @@ export class DocumentWindowState {
   /** Set by the window: ends an IME composition in the active editor and
    *  resolves once its text is in the tab. A switch waits for it. */
   endComposition: (() => Promise<void>) | null = null;
+  /** Set by the window: whether the active windowed editor holds input that
+   *  is not in the core yet (a composition, queued input, an apply in
+   *  flight). Closing then waits for `endComposition`. */
+  windowedPending: (() => boolean) | null = null;
+  /** Set by the window: resolves once everything typed into the active
+   *  windowed editor is in the core, leaving a composition open. A save waits
+   *  for it, so it writes what was typed. */
+  windowedFlushed: (() => Promise<void>) | null = null;
 
   /** Switch tabs, flushing the outgoing tab's pending upsert first. */
   async switchTo(index: number): Promise<void> {
@@ -2375,6 +2390,7 @@ export class DocumentWindowState {
     if (w === undefined) {
       return 'error';
     }
+    await this.flushWindowedInput(tab);
     let saved: WindowedSaved;
     try {
       saved = await invoke<WindowedSaved>('windowed_save', {
@@ -2479,6 +2495,14 @@ export class DocumentWindowState {
     };
   }
 
+  /** Wait until the active editor has handed what was typed to the core. Only
+   *  the active tab has an editor; a switch settles the others first. */
+  private async flushWindowedInput(tab: DocTab): Promise<void> {
+    if (tab === this.activeTab) {
+      await this.windowedFlushed?.();
+    }
+  }
+
   /** DEV/E2E: save the active windowed tab (fingerprint-checked). */
   async saveWindowedActive(): Promise<WindowedSaveResult> {
     const tab = this.activeTab;
@@ -2556,6 +2580,7 @@ export class DocumentWindowState {
     if (w === undefined) {
       return false;
     }
+    await this.flushWindowedInput(tab);
     let saved: WindowedSaved;
     try {
       saved = await invoke<WindowedSaved>('windowed_save', {

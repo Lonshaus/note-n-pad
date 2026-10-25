@@ -17,11 +17,19 @@ use tauri::{AppHandle, Emitter, Manager, State};
 /// Ascending offsets seeded with `(0, 0)`, each carrying the newline count
 /// strictly before it. Lives here, not in `windowed`, because a snapshot holds
 /// one in every build, including the one without windowed editing.
+///
+/// `line_rule` names the rule the counts follow (`LINE_RULE`); an index written
+/// before the rule changed has none (0) and is not trusted.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct CheckpointIndex {
   pub checkpoints: Vec<(u64, u64)>,
   pub total_newlines: u64,
+  #[serde(default)]
+  pub line_rule: u32,
 }
+/// The line rule the counts of a `CheckpointIndex` follow: 1 counts every `\n`
+/// and every `\r` not followed by `\n` (see `line_rule`).
+pub const LINE_RULE: u32 = 1;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct NoteSnapshot {
@@ -2719,6 +2727,7 @@ mod tests {
     d.windowed_index = Some(CheckpointIndex {
       checkpoints: vec![(0, 0), (1_048_576, 12)],
       total_newlines: 5000,
+      line_rule: LINE_RULE,
     });
     d.windowed_fp_size = Some(200 * 1024 * 1024);
     d.windowed_fp_mtime = Some(1_700_000_000_000);
@@ -2734,10 +2743,11 @@ mod tests {
 
   #[test]
   fn a_checkpoint_index_keeps_its_json_shape() {
-    let json = r#"{"checkpoints":[[0,0],[1048576,12]],"total_newlines":5000}"#;
+    let json = r#"{"checkpoints":[[0,0],[1048576,12]],"total_newlines":5000,"line_rule":1}"#;
     let index: CheckpointIndex = serde_json::from_str(json).unwrap();
     assert_eq!(index.checkpoints, vec![(0, 0), (1_048_576, 12)]);
     assert_eq!(index.total_newlines, 5000);
+    assert_eq!(index.line_rule, 1);
     assert_eq!(serde_json::to_string(&index).unwrap(), json);
   }
 
@@ -2750,12 +2760,13 @@ mod tests {
       Some(CheckpointIndex {
         checkpoints: vec![(0, 0)],
         total_newlines: 1,
+        line_rule: 0,
       })
     );
     let again = serde_json::to_value(&note).unwrap();
     assert_eq!(
       again["windowed_index"],
-      serde_json::json!({"checkpoints": [[0, 0]], "total_newlines": 1})
+      serde_json::json!({"checkpoints": [[0, 0]], "total_newlines": 1, "line_rule": 0})
     );
   }
 
@@ -2804,6 +2815,7 @@ mod tests {
       windowed_index: Some(CheckpointIndex {
         checkpoints: vec![(0, 0)],
         total_newlines: 1,
+        line_rule: LINE_RULE,
       }),
       ..doc(id, group, tab_index)
     }

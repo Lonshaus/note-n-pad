@@ -66,6 +66,131 @@ export function replayWanted(s: ReplayState): boolean {
   }
   return s.replayPending || s.queueHold || s.outside;
 }
+/** What `startReplaySwap` does: 'drop' the queue when nothing can ever replay it
+ *  (the editor is gone or locked), 'wait' while something else holds the view (a
+ *  window swap, an undo or redo, a composition no capture covers) because its
+ *  end carries on with the queue, or 'swap' back to the selection now. A
+ *  captured composition does not hold the swap back: the swap keeps the editor
+ *  open to it and the queue drains in a shadow meanwhile. */
+export function replayStartAction(s: {
+  gone: boolean;
+  locked: boolean;
+  swapping: boolean;
+  capturing: boolean;
+  /** A composition is open, captured or not. */
+  composing: boolean;
+  holds: number;
+}): 'drop' | 'wait' | 'swap' {
+  if (s.gone || s.locked) {
+    return 'drop';
+  }
+  if (s.swapping || s.holds > 0) {
+    return 'wait';
+  }
+  if (s.composing && !s.capturing) {
+    return 'wait';
+  }
+  return 'swap';
+}
+/** What an item of the replay queue is. */
+export type ReplayItemKind =
+  'text' | 'key' | 'copy' | 'cut' | 'select' | 'undo' | 'redo' | 'slot';
+/** Whether the item acts at the caret, so the window must hold the selection
+ *  and the view must show it. */
+export function needsCaret(kind: ReplayItemKind): boolean {
+  return (
+    kind !== 'select' && kind !== 'undo' && kind !== 'redo' && kind !== 'slot'
+  );
+}
+/** What the drain does next. 'run' an item at the caret, 'select' runs a
+ *  pointer selection whose mapping is done, 'map' waits for that mapping,
+ *  'undo' runs an undo or redo (the hold it takes resumes the drain), 'swap'
+ *  stops so the window is brought to the selection, 'wait' stops until
+ *  something that holds the queue ends (a swap, an undo, an open composition's
+ *  slot), 'done' ends the drain with the queue empty. */
+export function drainStep(s: {
+  swapping: boolean;
+  holds: number;
+  head: ReplayItemKind | null;
+  /** The head is a `select` item with a mapping under way. */
+  headMapping: boolean;
+  /** The window holds the selection the caret items act on. */
+  ready: boolean;
+}): 'run' | 'select' | 'map' | 'undo' | 'swap' | 'wait' | 'done' {
+  if (s.swapping || s.holds > 0) {
+    return 'wait';
+  }
+  if (s.head === null) {
+    return s.ready ? 'done' : 'swap';
+  }
+  if (s.head === 'slot') {
+    return 'wait';
+  }
+  if (s.head === 'select') {
+    return s.headMapping ? 'map' : 'select';
+  }
+  if (s.head === 'undo' || s.head === 'redo') {
+    return 'undo';
+  }
+  return s.ready ? 'run' : 'swap';
+}
+/** How `resumeReplay` carries on: 'swap' back to the selection when the head
+ *  needs the caret (or nothing is left and the selection is outside the
+ *  window), 'drain' otherwise: an undo, a redo, a pointer selection or a slot
+ *  at the head runs without the window on the caret. */
+export function resumeAction(
+  head: ReplayItemKind | null,
+  ready: boolean,
+): 'swap' | 'drain' {
+  if (head !== null && !needsCaret(head)) {
+    return 'drain';
+  }
+  return ready ? 'drain' : 'swap';
+}
+/** Pushes a pointer selection onto the queue; one directly behind another
+ *  pointer selection replaces it (a drag), a slot or any other item keeps them
+ *  apart. */
+export function pushSelect<T extends { kind: string }>(
+  queue: T[],
+  item: T,
+): void {
+  const last = queue[queue.length - 1];
+  if (last !== undefined && last.kind === 'select') {
+    queue[queue.length - 1] = item;
+  } else {
+    queue.push(item);
+  }
+}
+/** Which of the large-file profile's undo and redo bindings a keydown is, for
+ *  the swap back to the caret during which the editor's bindings are taken out. */
+export function parkedUndoKey(
+  bindings: readonly KeyBinding[],
+  e: KeyLike,
+  os: string,
+  undo: Command,
+  redo: Command,
+): 'undo' | 'redo' | null {
+  const chain = commandChain([bindings], e, os);
+  if (chain.includes(undo)) {
+    return 'undo';
+  }
+  return chain.includes(redo) ? 'redo' : null;
+}
+/** What the end of a window swap does for the queue: 'drain' it when the swap
+ *  was the one that brought the window back to the selection, 'resume' it when
+ *  another swap (a scroll's) ended first and the selection may still be outside
+ *  the window, 'none' when nothing is queued or a captured composition is still
+ *  open (its end carries on with the queue). */
+export function swapEndAction(s: {
+  replayPending: boolean;
+  replaySwap: boolean;
+  capturing: boolean;
+}): 'none' | 'drain' | 'resume' {
+  if (!s.replayPending || s.capturing) {
+    return 'none';
+  }
+  return s.replaySwap ? 'drain' : 'resume';
+}
 /** The keys' AltGr characters, by `KeyboardEvent.code`, as the Rust
  *  `altgr_table` command reports them. A code without an entry types nothing
  *  under Ctrl+Alt. */

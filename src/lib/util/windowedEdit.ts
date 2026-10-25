@@ -17,6 +17,9 @@ export const MARGIN_LINES = 500;
  *  window's top/bottom, the next window is loaded. Comfortably larger than a
  *  viewport so the swap completes before the user scrolls past the loaded text. */
 export const SWAP_THRESHOLD_LINES = 300;
+/** A swap leaves the viewport this many lines clear of the threshold behind it,
+ *  so the next scroll event cannot swap straight back. */
+export const SWAP_SLACK_LINES = 50;
 
 /** Edits made within this many milliseconds of the previous one coalesce into the
  *  same undo group (when the edit kind is unchanged), matching the typical
@@ -146,6 +149,223 @@ export function replaceBreaks(
     ...breaks.slice(before + removed),
   ];
 }
+/** `docBefore` with `changes` (ascending, non-overlapping) applied. */
+function applyChangesToDoc(
+  docBefore: string,
+  changes: readonly RawChange[],
+): string {
+  let out = '';
+  let prev = 0;
+  for (const c of changes) {
+    out += docBefore.slice(prev, c.fromA) + c.inserted;
+    prev = c.toA;
+  }
+  return out + docBefore.slice(prev);
+}
+/** Document indexes of every `\n` in `doc`: where the window's breaks sit. */
+function lfPositions(doc: string): number[] {
+  const out: number[] = [];
+  for (let i = doc.indexOf('\n'); i !== -1; i = doc.indexOf('\n', i + 1)) {
+    out.push(i);
+  }
+  return out;
+}
+/** For each break after `changes`, the index it had before them, or -1 for a
+ *  break the changes inserted. */
+function breakOrigins(
+  docBefore: string,
+  countBefore: number,
+  changes: readonly RawChange[],
+): number[] {
+  const out: number[] = [];
+  let next = 0;
+  let prevTo = 0;
+  for (const c of changes) {
+    const keep = countLf(docBefore, prevTo, c.fromA);
+    for (let k = 0; k < keep; k += 1) {
+      out.push(next + k);
+    }
+    next += keep + countLf(docBefore, c.fromA, c.toA);
+    for (let n = countLf(c.inserted, 0, c.inserted.length); n > 0; n -= 1) {
+      out.push(-1);
+    }
+    prevTo = c.toA;
+  }
+  for (let k = next; k < countBefore; k += 1) {
+    out.push(k);
+  }
+  return out;
+}
+/** One lone `\r` an edit would join to a `\n`, to be rewritten to the insert
+ *  separator in the same batch. `at` is its byte offset in the window before the
+ *  change; `whereBefore` is `'before'` (and `at` is -1) for the byte that sits
+ *  just ahead of the window. */
+export interface JunctionRewrite {
+  at: number;
+  whereBefore: 'inside' | 'before';
+}
+/** What `junctionRewrites` found: the rewrites, the window's breaks after the
+ *  change and the rewrites, how far the rewrite of the byte before the window
+ *  moves the window start, and whether that byte is still a lone `\r`. */
+export interface JunctionResult {
+  rewrites: JunctionRewrite[];
+  breaksAfter: string[];
+  startShift: number;
+  prevLoneCr: boolean;
+}
+/** The rewrites a change set needs so that no lone `\r` break becomes the first
+ *  half of a `\r\n`. After the change, a lone-`\r` break that is directly
+ *  followed by a break written as a bare `\n` (inside the window; or the byte
+ *  just before the window, `prevLoneCr`, with the window now opening on such a
+ *  break; or the window's last break with `nextIsLf` for the byte after it)
+ *  would be read back as one CRLF, one line short. Inserted text never holds a
+ *  lone `\r`, so every such `\r` is one the window already had. For an LF
+ *  separator the rewrite also takes the run of `\r` bytes before it (each would
+ *  meet the `\n` in turn): the run inside the window is set in `breaksAfter`, and
+ *  one that reaches the window start clears `prevLoneCr`, since the core
+ *  rewrites the bytes before the window too. */
+export function junctionRewrites(
+  docBefore: string,
+  breaksBefore: readonly string[],
+  changes: readonly RawChange[],
+  insertSep: string,
+  prevLoneCr: boolean,
+  nextIsLf: boolean,
+): JunctionResult {
+  const breaksAfter = applyBreaks(docBefore, breaksBefore, changes, insertSep);
+  if (!prevLoneCr && !breaksBefore.includes('\r')) {
+    return { rewrites: [], breaksAfter, startShift: 0, prevLoneCr };
+  }
+  const docAfter = applyChangesToDoc(docBefore, changes);
+  const lf = lfPositions(docAfter);
+  const rewrites: JunctionRewrite[] = [];
+  const found: number[] = [];
+  let startShift = 0;
+  let stillPrevCr = prevLoneCr;
+  if (prevLoneCr) {
+    const opensOnLf =
+      docAfter.length === 0
+        ? nextIsLf
+        : docAfter.charCodeAt(0) === 10 && breaksAfter[0] === '\n';
+    if (opensOnLf) {
+      rewrites.push({ at: -1, whereBefore: 'before' });
+      stillPrevCr = false;
+      startShift = insertSep.length - 1;
+    }
+  }
+  for (let i = 0; i < breaksAfter.length; i += 1) {
+    if (breaksAfter[i] !== '\r') {
+      continue;
+    }
+    const at = lf[i] as number;
+    const joins =
+      i + 1 < breaksAfter.length
+        ? lf[i + 1] === at + 1 && breaksAfter[i + 1] === '\n'
+        : at === docAfter.length - 1 && nextIsLf;
+    if (joins) {
+      found.push(i);
+    }
+  }
+  const out = [...breaksAfter];
+  if (found.length > 0) {
+    const origins = breakOrigins(docBefore, breaksBefore.length, changes);
+    const lfBefore = lfPositions(docBefore);
+    for (const i of found) {
+      const k = origins[i] as number;
+      rewrites.push({
+        at: charToByte(docBefore, breaksBefore, lfBefore[k] as number),
+        whereBefore: 'inside',
+      });
+      if (insertSep !== '\n') {
+        out[i] = insertSep;
+        continue;
+      }
+      let j = i;
+      out[j] = '\n';
+      while (
+        j > 0 &&
+        breaksAfter[j - 1] === '\r' &&
+        (lf[j - 1] as number) === (lf[j] as number) - 1
+      ) {
+        j -= 1;
+        out[j] = '\n';
+      }
+      if (j === 0 && lf[0] === 0 && stillPrevCr) {
+        stillPrevCr = false;
+      }
+    }
+  }
+  return { rewrites, breaksAfter: out, startShift, prevLoneCr: stillPrevCr };
+}
+/** A window's breaks after the core rewrote the bytes `[from, to)` (offsets in
+ *  the window's raw text) to the break byte `byte`: the break list changes,
+ *  the document text does not. */
+export function fillBreaks(
+  doc: string,
+  breaks: readonly string[],
+  from: number,
+  to: number,
+  byte: string,
+): string[] {
+  const out = [...breaks];
+  let bytes = 0;
+  let k = 0;
+  for (const ch of doc) {
+    if (bytes >= to) {
+      break;
+    }
+    if (ch === '\n') {
+      if (bytes >= from) {
+        out[k] = byte;
+      }
+      bytes += (breaks[k] ?? '\n').length;
+      k += 1;
+    } else {
+      bytes += byteLength(ch);
+    }
+  }
+  return out;
+}
+/** An edit of the core's undo or redo result, as `ByteEdit` without the flags
+ *  only a forward apply sends. */
+export type UndoEdit = Pick<ByteEdit, 'start' | 'end' | 'text'> &
+  Pick<ByteEdit, 'keep_start' | 'fill'>;
+/** How one undo/redo edit lands in a window holding `doc` with `breaks` that
+ *  starts at byte `windowStart`: the document change to dispatch (none for a
+ *  `fill` edit, which only turns break bytes into other break bytes) and the
+ *  break list after it. Null when a boundary falls inside a `\r\n`, which has
+ *  no document position. */
+export function mirrorStep(
+  doc: string,
+  breaks: readonly string[],
+  windowStart: number,
+  edit: UndoEdit,
+): {
+  change: { from: number; to: number; insert: string } | null;
+  breaks: string[];
+} | null {
+  if ((edit.fill ?? null) !== null) {
+    return {
+      change: null,
+      breaks: fillBreaks(
+        doc,
+        breaks,
+        edit.start - windowStart,
+        edit.end - windowStart,
+        edit.fill as string,
+      ),
+    };
+  }
+  const from = byteToChar(doc, breaks, edit.start - windowStart);
+  const to = byteToChar(doc, breaks, edit.end - windowStart);
+  if (from === null || to === null) {
+    return null;
+  }
+  return {
+    change: { from, to, insert: edit.text },
+    breaks: replaceBreaks(doc, breaks, from, to, scanBreaks(edit.text)),
+  };
+}
 /** The line-ending style of a raw text sample: `lineEnding` for display and
  *  `insert` (the separator typed line breaks get) both follow the majority of
  *  `\r\n` against lone `\n` (a tie is LF; lone `\r` is not counted). Null when
@@ -225,11 +445,18 @@ export interface RawChange {
 }
 
 /** A global-byte edit as the Rust `windowed_apply` expects: replace the source
- *  bytes `[start, end)` with `text` (UTF-8). */
+ *  bytes `[start, end)` with `text` (UTF-8). `keep_start` marks the rewrite of a
+ *  lone `\r` an edit would join to a `\n` (an offset at `start` stays there) and
+ *  `cascade` asks the core to rewrite the run of `\r` before it too. `fill`
+ *  (undo and redo results only) says the range's bytes became that break byte,
+ *  with `text` empty. */
 export interface ByteEdit {
   start: number;
   end: number;
   text: string;
+  keep_start?: boolean;
+  cascade?: boolean;
+  fill?: string | null;
 }
 
 /** Convert one transaction's changes into global byte edits. `docBefore` is the
@@ -256,7 +483,43 @@ export function mapChangesToEdits(
       insertSep === '\n' ? c.inserted : c.inserted.replaceAll('\n', insertSep),
   }));
 }
-
+/** A global byte offset after one edit: unchanged before the edit's start, moved
+ *  by the length change at or after its end, and put after the inserted text when
+ *  it lay inside the replaced range. A `fill` edit and a same-length `keep_start`
+ *  edit only change break bytes, so every offset stays; any `keep_start` edit
+ *  keeps an offset at its start there. */
+export function mapOffset(offset: number, edit: ByteEdit): number {
+  if (offset < edit.start || (edit.fill ?? null) !== null) {
+    return offset;
+  }
+  const inserted = byteLength(edit.text);
+  if (
+    edit.keep_start === true &&
+    (offset === edit.start || inserted === edit.end - edit.start)
+  ) {
+    return offset;
+  }
+  if (offset >= edit.end) {
+    return offset + inserted - (edit.end - edit.start);
+  }
+  return edit.start + inserted;
+}
+/** A global byte offset after edits applied one after another, each in the
+ *  frame the one before it left (the order the core applies them in). */
+export function mapThrough(offset: number, edits: readonly ByteEdit[]): number {
+  let mapped = offset;
+  for (const edit of edits) {
+    mapped = mapOffset(mapped, edit);
+  }
+  return mapped;
+}
+/** The edits of one forward apply in the order the core applies them: from the
+ *  highest `(start, end)` down, so every edit still sits where its coordinates
+ *  say. Of an insertion and a rewrite starting at the same byte, the rewrite
+ *  goes first and the inserted text lands before it. */
+export function inApplyOrder(edits: readonly ByteEdit[]): ByteEdit[] {
+  return [...edits].sort((a, b) => b.start - a.start || b.end - a.end);
+}
 /** The line range `[startLine, endLine)` (0-based, end exclusive) a window should
  *  cover to hold `targetLine`. The window is `windowLines` tall when the file
  *  allows, anchored `marginLines` above the target, and clamped so it never runs
@@ -271,6 +534,36 @@ export function nextWindow(
   const startLine = Math.min(Math.max(0, targetLine - marginLines), maxStart);
   const endLine = Math.min(totalLines, startLine + windowLines);
   return { startLine, endLine };
+}
+/** The target line to swap the window to (for `nextWindow`) when the viewport,
+ *  global lines `top` to `bottom`, nears the loaded window's start (checked
+ *  first) or end; null when it does not. Either way the new window holds the
+ *  viewport `SWAP_SLACK_LINES` clear of the threshold behind it, leaving the
+ *  same room ahead in both directions. A viewport too tall for that never
+ *  swaps. */
+export function swapTarget(
+  top: number,
+  bottom: number,
+  windowStartLine: number,
+  windowEndLine: number,
+  totalLines: number,
+): number | null {
+  const clear = SWAP_THRESHOLD_LINES + SWAP_SLACK_LINES;
+  if (bottom - top >= WINDOW_LINES - SWAP_THRESHOLD_LINES - clear) {
+    return null;
+  }
+  if (windowStartLine > 0 && top - windowStartLine < SWAP_THRESHOLD_LINES) {
+    // The window ends `clear` lines below the viewport.
+    return bottom + clear - WINDOW_LINES + MARGIN_LINES;
+  }
+  if (
+    windowEndLine < totalLines &&
+    windowEndLine - bottom < SWAP_THRESHOLD_LINES
+  ) {
+    // The window starts `clear` lines above the viewport.
+    return top - clear + MARGIN_LINES;
+  }
+  return null;
 }
 /** The document span from the first to the last line block lying fully inside
  *  the viewport (1 px tolerance). With no fully visible block, the first block
@@ -299,4 +592,16 @@ export function rejectDuringSwap(
   userEvent: string | undefined,
 ): boolean {
   return swapping && docChanged && userEvent !== undefined;
+}
+/** Whether a DOM-derived selection sync must be dropped during a window swap.
+ *  A composition captured in the swap back to the caret keeps its syncs:
+ *  dropping one makes CodeMirror write its own selection back into the DOM,
+ *  and WebKit ends the composition. */
+export function dropSwapSelect(
+  swapping: boolean,
+  docChanged: boolean,
+  userEvent: string | undefined,
+  composingKept: boolean,
+): boolean {
+  return swapping && !docChanged && userEvent === 'select' && !composingKept;
 }

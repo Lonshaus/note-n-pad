@@ -269,7 +269,7 @@ export const zhTW = {
   'sticky.pin.options': '釘選選項',
   'sticky.pin.alwaysOnTop': '總在最上層',
   'sticky.pin.toApp': '釘選至應用程式',
-  'sticky.paperColor': '便條紙顏色',
+  'sticky.paperColor': '便利貼顏色',
   'sticky.opacity': '透明度',
   // Workspace
   'workspace.section.stickies': '便利貼',

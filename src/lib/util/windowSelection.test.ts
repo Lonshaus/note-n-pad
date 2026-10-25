@@ -8,7 +8,10 @@ import {
   insideWindow,
   isEditingKey,
   isImeKey,
+  movedEnds,
+  queuedSelectEnds,
   replayKind,
+  replayReady,
   selectionAfterChange,
   selectionAfterSwap,
   toLiveSelection,
@@ -381,5 +384,54 @@ describe('isImeKey', () => {
     expect(isImeKey(key({ key: 'a', keyCode: 229 }))).toBe(true);
     expect(isImeKey(key({ key: 'a', isComposing: true }))).toBe(true);
     expect(isImeKey(key({ key: 'a', keyCode: 65 }))).toBe(false);
+  });
+});
+
+describe('replayReady', () => {
+  it('needs both ends of a selection that fits one window inside it', () => {
+    expect(replayReady(sel(5, 0, 6, 0), 0, 100)).toBe(true);
+    expect(replayReady(sel(5, 0, 150, 0), 0, 100)).toBe(false);
+    expect(replayReady(sel(150, 0, 150, 3), 0, 100)).toBe(false);
+  });
+  it('needs only the head inside for a selection no window holds', () => {
+    // 1500 lines apart does not fit a 2000-line window with margins.
+    expect(replayReady(sel(0, 0, 1500, 0), 1000, 2000)).toBe(true);
+    expect(replayReady(sel(0, 0, 1500, 0), 0, 1000)).toBe(false);
+    expect(replayReady(sel(1500, 0, 0, 0), 0, 1000)).toBe(true);
+  });
+});
+
+describe('queuedSelectEnds', () => {
+  const caret = { anchor: 900, head: 905 };
+  const convert = (pos: number) => 1000 + pos;
+  it('queues the converted position of both ends of a plain click', () => {
+    expect(
+      queuedSelectEnds(
+        { anchor: 5, head: 5 },
+        { anchor: 30, head: 30 },
+        convert,
+        caret,
+      ),
+    ).toEqual({ anchor: 1030, head: 1030 });
+  });
+  it('keeps the queued caret as the anchor of a shift-click', () => {
+    expect(
+      queuedSelectEnds(
+        { anchor: 5, head: 5 },
+        { anchor: 5, head: 40 },
+        convert,
+        caret,
+      ),
+    ).toEqual({ anchor: 900, head: 1040 });
+  });
+  it('tells which ends moved', () => {
+    expect(movedEnds({ anchor: 1, head: 2 }, { anchor: 1, head: 3 })).toEqual({
+      anchor: false,
+      head: true,
+    });
+    expect(movedEnds({ anchor: 1, head: 2 }, { anchor: 4, head: 2 })).toEqual({
+      anchor: true,
+      head: false,
+    });
   });
 });

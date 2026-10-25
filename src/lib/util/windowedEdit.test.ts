@@ -10,12 +10,24 @@ import {
   COALESCE_MS,
   decideNewGroup,
   detectBreakStyle,
+  dropSwapSelect,
   fullyVisibleLineSpan,
+  fillBreaks,
+  inApplyOrder,
+  junctionRewrites,
   mapChangesToEdits,
+  mapOffset,
+  mapThrough,
+  mirrorStep,
   nextWindow,
   rejectDuringSwap,
   replaceBreaks,
   scanBreaks,
+  swapTarget,
+  SWAP_THRESHOLD_LINES,
+  MARGIN_LINES,
+  WINDOW_LINES,
+  type ByteEdit,
   type RawChange,
 } from './windowedEdit';
 
@@ -96,6 +108,68 @@ describe('mapChangesToEdits', () => {
       { start: 103, end: 103, text: '哈!' },
       { start: 107, end: 108, text: '€' },
     ]);
+  });
+});
+
+describe('swapTarget', () => {
+  const TOTAL = 100_000;
+  // The window `swapTarget` asks for, as `loadWindow` would load it.
+  const swap = (top: number, bottom: number, start: number) => {
+    const end = Math.min(TOTAL, start + WINDOW_LINES);
+    const target = swapTarget(top, bottom, start, end, TOTAL);
+    return target === null
+      ? null
+      : nextWindow(target, TOTAL, WINDOW_LINES, MARGIN_LINES);
+  };
+  // Whether a viewport in window `w` would swap again.
+  const triggers = (
+    top: number,
+    bottom: number,
+    w: { startLine: number; endLine: number },
+  ) => swapTarget(top, bottom, w.startLine, w.endLine, TOTAL) !== null;
+
+  it('stays put inside the window', () => {
+    expect(swapTarget(50_700, 50_730, 50_000, 52_000, TOTAL)).toBeNull();
+  });
+
+  it('has no upward swap at the file start or downward swap at its end', () => {
+    expect(swapTarget(10, 40, 0, 2000, TOTAL)).toBeNull();
+    expect(swapTarget(99_960, 99_990, 98_000, TOTAL, TOTAL)).toBeNull();
+  });
+
+  it('never swaps a viewport too tall to clear both thresholds', () => {
+    expect(swapTarget(50_100, 51_450, 50_000, 52_000, TOTAL)).toBeNull();
+  });
+
+  for (const h of [1, 30, 199, 250, 700, 1349]) {
+    it(`leaves a ${h}-line viewport clear of both thresholds, going down`, () => {
+      const start = 50_000;
+      const bottom = start + WINDOW_LINES - SWAP_THRESHOLD_LINES + 10;
+      const top = bottom - h;
+      const w = swap(top, bottom, start);
+      expect(w).not.toBeNull();
+      expect(triggers(top, bottom, w!)).toBe(false);
+      expect(w!.endLine - SWAP_THRESHOLD_LINES - bottom).toBe(1350 - h);
+    });
+
+    it(`leaves a ${h}-line viewport clear of both thresholds, going up`, () => {
+      const start = 50_000;
+      const top = start + SWAP_THRESHOLD_LINES - 10;
+      const bottom = top + h;
+      const w = swap(top, bottom, start);
+      expect(w).not.toBeNull();
+      expect(triggers(top, bottom, w!)).toBe(false);
+      expect(top - (w!.startLine + SWAP_THRESHOLD_LINES)).toBe(1350 - h);
+    });
+  }
+
+  it('cannot start a loop when the new window is clamped to a file end', () => {
+    const up = swap(400, 430, 200);
+    expect(up).toEqual({ startLine: 0, endLine: 2000 });
+    expect(triggers(400, 430, up!)).toBe(false);
+    const down = swap(99_700, 99_730, 97_900);
+    expect(down).toEqual({ startLine: 98_000, endLine: TOTAL });
+    expect(triggers(99_700, 99_730, down!)).toBe(false);
   });
 });
 
@@ -573,5 +647,665 @@ describe('rejectDuringSwap', () => {
 
   it('accepts our own document change without a userEvent', () => {
     expect(rejectDuringSwap(true, true, undefined)).toBe(false);
+  });
+});
+
+describe('dropSwapSelect', () => {
+  it('drops a DOM selection sync during a swap', () => {
+    expect(dropSwapSelect(true, false, 'select', false)).toBe(true);
+  });
+
+  it('keeps the selection syncs of a captured composition', () => {
+    expect(dropSwapSelect(true, false, 'select', true)).toBe(false);
+  });
+
+  it('keeps everything when not swapping', () => {
+    expect(dropSwapSelect(false, false, 'select', false)).toBe(false);
+  });
+
+  it('keeps a pointer selection, our own dispatch and a document change', () => {
+    expect(dropSwapSelect(true, false, 'select.pointer', false)).toBe(false);
+    expect(dropSwapSelect(true, false, undefined, false)).toBe(false);
+    expect(dropSwapSelect(true, true, 'select', false)).toBe(false);
+  });
+});
+
+describe('mapOffset', () => {
+  const insert = { start: 10, end: 10, text: 'abc' };
+  const remove = { start: 10, end: 14, text: '' };
+  const replace = { start: 10, end: 14, text: 'xy' };
+  it('leaves an offset before the edit alone', () => {
+    expect(mapOffset(9, insert)).toBe(9);
+    expect(mapOffset(9, remove)).toBe(9);
+    expect(mapOffset(10, replace)).toBe(12);
+    expect(mapOffset(0, replace)).toBe(0);
+  });
+  it('moves an offset at or after the end of an insertion by its length', () => {
+    expect(mapOffset(10, insert)).toBe(13);
+    expect(mapOffset(11, insert)).toBe(14);
+  });
+  it('moves an offset after a deletion or replacement by the length change', () => {
+    expect(mapOffset(14, remove)).toBe(10);
+    expect(mapOffset(20, remove)).toBe(16);
+    expect(mapOffset(14, replace)).toBe(12);
+    expect(mapOffset(20, replace)).toBe(18);
+  });
+  it('puts an offset inside the replaced range after the inserted text', () => {
+    expect(mapOffset(12, remove)).toBe(10);
+    expect(mapOffset(11, replace)).toBe(12);
+    expect(mapOffset(13, { start: 10, end: 14, text: 'wxyz!' })).toBe(15);
+  });
+  it('counts the inserted text in bytes', () => {
+    expect(mapOffset(30, { start: 10, end: 10, text: 'にほん' })).toBe(39);
+    expect(mapOffset(11, { start: 10, end: 12, text: 'é' })).toBe(12);
+  });
+  it('shifts an old window offset by an edit made before the window', () => {
+    // Window starts at byte 5000; the edit sits at the top of the file.
+    expect(mapOffset(5000 + 120, { start: 3, end: 8, text: '' })).toBe(5115);
+    expect(mapOffset(5000 + 120, { start: 3, end: 3, text: 'a\nb\n' })).toBe(
+      5124,
+    );
+  });
+});
+
+describe('mapThrough', () => {
+  it('applies the edits one after another, each in the frame the last left', () => {
+    // Insert 4 at 0, then delete [10, 12) of the result.
+    const edits = [
+      { start: 0, end: 0, text: 'abcd' },
+      { start: 10, end: 12, text: '' },
+    ];
+    expect(mapThrough(8, edits)).toBe(10);
+    expect(mapThrough(20, edits)).toBe(22);
+    expect(mapThrough(8, [])).toBe(8);
+  });
+  it('keeps the end of line 11 through a three-line indent (lines 10 to 12)', () => {
+    // Lines of 9 characters plus the break; indent each of lines 10..12 by 2.
+    const lineStart = (n: number) => (n - 1) * 10;
+    const endOfLine11 = lineStart(11) + 9;
+    const indent = [12, 11, 10].map((n) => ({
+      start: lineStart(n),
+      end: lineStart(n),
+      text: '  ',
+    }));
+    const ascending = [...indent].reverse();
+    expect(inApplyOrder(ascending)).toEqual(indent);
+    // Two indents sit before the end of line 11, so it moves by four.
+    expect(mapThrough(endOfLine11, inApplyOrder(ascending))).toBe(
+      endOfLine11 + 4,
+    );
+    // Mapping them in ascending order against one table would be wrong:
+    // the second edit's start has moved by then.
+    expect(mapThrough(endOfLine11, ascending)).not.toBe(endOfLine11 + 4);
+  });
+});
+
+describe('the click conversion', () => {
+  const cases: { name: string; raw: string }[] = [
+    { name: 'LF', raw: 'one\ntwo\nthree' },
+    { name: 'CRLF', raw: 'one\r\ntwo\r\nthree' },
+    { name: 'a lone CR', raw: 'one\rtwo\nthree' },
+    { name: 'multi-byte text', raw: 'にほん\nｋé\nthree' },
+    { name: 'mixed breaks', raw: 'a\r\nb\rc\nd' },
+  ];
+  for (const { name, raw } of cases) {
+    it(`goes to bytes and back to the same position for ${name}`, () => {
+      const breaks = scanBreaks(raw);
+      const doc = raw.replace(/\r\n|\r/g, '\n');
+      let byte = 0;
+      for (let pos = 0; pos <= doc.length; pos += 1) {
+        if (doc[pos - 1] !== undefined && doc.codePointAt(pos - 1)! > 0xffff) {
+          continue;
+        }
+        const offset = 5000 + charToByte(doc, breaks, pos);
+        expect(offset).toBeGreaterThanOrEqual(5000 + byte);
+        byte = offset - 5000;
+        expect(byteToChar(doc, breaks, offset - 5000)).toBe(pos);
+      }
+    });
+  }
+  it('has no position for an offset between the CR and the LF of a break', () => {
+    const raw = 'ab\r\ncd';
+    expect(byteToChar('ab\ncd', scanBreaks(raw), 3)).toBeNull();
+    expect(byteToChar('ab\ncd', scanBreaks(raw), 2)).toBe(2);
+    expect(byteToChar('ab\ncd', scanBreaks(raw), 4)).toBe(3);
+  });
+});
+// --- Junctions: a lone CR an edit would join to a LF ---------------------------
+/** Every break of `text` (CRLF, LF or a lone CR) as one `\n`: the line rule. */
+const byRule = (text: string): string => text.replace(/\r\n|\r|\n/g, '\n');
+/** What a window holds: the file around it and the flags a read reports. */
+interface Frame {
+  prefix: string;
+  raw: string;
+  suffix: string;
+}
+const frameFlags = (f: Frame) => ({
+  prevLoneCr: f.prefix.endsWith('\r'),
+  nextIsLf: f.suffix.startsWith('\n'),
+});
+const changesOf = (doc: string, cuts: [number, number, string][]) =>
+  cuts.map(([fromA, toA, inserted]) => ({ fromA, toA, inserted }));
+/** The file after a batch of byte edits, as the Rust core applies them: edits
+ *  in descending `(start, end)` order, then every LF rewrite that asks for a
+ *  cascade takes the run of CR bytes before it. Rewrite bytes are tracked by
+ *  tag. Returns the bytes. */
+function coreApply(file: string, edits: ByteEdit[]): string {
+  const enc = new TextEncoder();
+  const bytes: [number, boolean][] = [...enc.encode(file)].map((b) => [
+    b,
+    false,
+  ]);
+  for (const e of inApplyOrder(edits)) {
+    const tagged = e.cascade === true && e.text === '\n';
+    bytes.splice(
+      e.start,
+      e.end - e.start,
+      ...[...enc.encode(e.text)].map((b): [number, boolean] => [b, tagged]),
+    );
+  }
+  for (let i = 0; i < bytes.length; i += 1) {
+    if ((bytes[i] as [number, boolean])[1]) {
+      let from = i;
+      while (from > 0 && (bytes[from - 1] as [number, boolean])[0] === 13) {
+        from -= 1;
+      }
+      for (let k = from; k < i; k += 1) {
+        (bytes[k] as [number, boolean])[0] = 10;
+      }
+    }
+  }
+  return new TextDecoder().decode(new Uint8Array(bytes.map((b) => b[0])));
+}
+/** Run one change set through `junctionRewrites` the way `convertUpdate` does
+ *  and apply it to `f`'s file; returns what the window and the file look like. */
+function runJunction(
+  f: Frame,
+  changes: RawChange[],
+  sep: string,
+): {
+  post: string;
+  docAfter: string;
+  res: ReturnType<typeof junctionRewrites>;
+  start: number;
+} {
+  const enc = new TextEncoder();
+  const start = enc.encode(f.prefix).length;
+  const doc = byRule(f.raw);
+  const breaks = scanBreaks(f.raw);
+  const flags = frameFlags(f);
+  const edits = mapChangesToEdits(start, doc, breaks, sep, changes);
+  const res = junctionRewrites(
+    doc,
+    breaks,
+    changes,
+    sep,
+    flags.prevLoneCr,
+    flags.nextIsLf,
+  );
+  for (const r of res.rewrites) {
+    edits.push({
+      start: start + r.at,
+      end: start + r.at + 1,
+      text: sep,
+      keep_start: true,
+      cascade: true,
+    });
+  }
+  let docAfter = '';
+  let prev = 0;
+  for (const c of changes) {
+    docAfter += doc.slice(prev, c.fromA) + c.inserted;
+    prev = c.toA;
+  }
+  docAfter += doc.slice(prev);
+  return {
+    post: coreApply(f.prefix + f.raw + f.suffix, edits),
+    docAfter,
+    res,
+    start: start + res.startShift,
+  };
+}
+/** The window after a change must read back from the file as the editor
+ *  expects it, and no line may have been lost to a CRLF. */
+function expectConsistent(f: Frame, changes: RawChange[], sep: string): void {
+  const { post, docAfter, res, start } = runJunction(f, changes, sep);
+  expect(byRule(post)).toBe(byRule(f.prefix) + docAfter + byRule(f.suffix));
+  // The window's bytes are where the geometry says, with the breaks it keeps.
+  const enc = new TextEncoder();
+  const end = start + charToByte(docAfter, res.breaksAfter, docAfter.length);
+  const window = new TextDecoder().decode(enc.encode(post).slice(start, end));
+  expect(scanBreaks(window)).toEqual(res.breaksAfter);
+  expect(byRule(window)).toBe(docAfter);
+  const before = post.slice(
+    0,
+    new TextEncoder().encode(post).slice(0, start).length,
+  );
+  void before;
+  const byteBefore = start > 0 ? enc.encode(post)[start - 1] : undefined;
+  expect(res.prevLoneCr).toBe(byteBefore === 13);
+}
+
+describe('junctionRewrites', () => {
+  const none = (f: Frame, changes: RawChange[], sep: string) =>
+    runJunction(f, changes, sep).res.rewrites;
+
+  it('J1: Enter at the line start after a lone CR rewrites that CR (LF style)', () => {
+    const f: Frame = { prefix: '', raw: 'x\ry', suffix: '' };
+    // CodeMirror holds `x\ny`; Enter at the start of `y` is position 2.
+    const res = junctionRewrites(
+      'x\ny',
+      ['\r'],
+      [{ fromA: 2, toA: 2, inserted: '\n' }],
+      '\n',
+      false,
+      false,
+    );
+    expect(res.rewrites).toEqual([{ at: 1, whereBefore: 'inside' }]);
+    expect(res.breaksAfter).toEqual(['\n', '\n']);
+    expect(res.startShift).toBe(0);
+    expectConsistent(f, [{ fromA: 2, toA: 2, inserted: '\n' }], '\n');
+    // CRLF style: the typed break starts with a CR, so nothing joins.
+    expect(none(f, [{ fromA: 2, toA: 2, inserted: '\n' }], '\r\n')).toEqual([]);
+    expectConsistent(f, [{ fromA: 2, toA: 2, inserted: '\n' }], '\r\n');
+  });
+
+  it('J2: deleting a line between a lone CR and an LF rewrites the CR, in both styles', () => {
+    const f: Frame = { prefix: 'p\n', raw: 'x\rmid\nt', suffix: '' };
+    // `mid` is doc positions 2..5.
+    const del = [{ fromA: 2, toA: 5, inserted: '' }];
+    for (const sep of ['\n', '\r\n']) {
+      const rewrites = none(f, del, sep);
+      expect(rewrites).toEqual([{ at: 1, whereBefore: 'inside' }]);
+      expectConsistent(f, del, sep);
+    }
+    const lf = junctionRewrites(
+      'x\nmid\nt',
+      ['\r', '\n'],
+      del,
+      '\n',
+      false,
+      false,
+    );
+    expect(lf.breaksAfter).toEqual(['\n', '\n']);
+    const crlf = junctionRewrites(
+      'x\nmid\nt',
+      ['\r', '\n'],
+      del,
+      '\r\n',
+      false,
+      false,
+    );
+    expect(crlf.breaksAfter).toEqual(['\r\n', '\n']);
+  });
+
+  it('J3: at the first position, the CR is the byte before the window', () => {
+    // Window `\nrest` (an empty first line) after a lone CR is impossible to
+    // read, so the window opens on `a\nb`; deleting `a` leaves a `\n` first.
+    const f: Frame = { prefix: 'q\r', raw: 'a\nb', suffix: '' };
+    const del = [{ fromA: 0, toA: 1, inserted: '' }];
+    for (const sep of ['\n', '\r\n']) {
+      const out = junctionRewrites('a\nb', ['\n'], del, sep, true, false);
+      expect(out.rewrites).toEqual([{ at: -1, whereBefore: 'before' }]);
+      expect(out.startShift).toBe(sep.length - 1);
+      expect(out.prevLoneCr).toBe(false);
+      expectConsistent(f, del, sep);
+    }
+    // Enter at the window's first position joins the CR before it too.
+    const enter = [{ fromA: 0, toA: 0, inserted: '\n' }];
+    for (const sep of ['\n']) {
+      expect(none(f, enter, sep)).toEqual([{ at: -1, whereBefore: 'before' }]);
+      expectConsistent(f, enter, sep);
+    }
+    expect(none(f, enter, '\r\n')).toEqual([]);
+  });
+
+  it('J4: deleting down to a lone CR at the window end, with an LF after it', () => {
+    const f: Frame = { prefix: '', raw: 'a\rb\n', suffix: '\nz' };
+    const del = [{ fromA: 2, toA: 4, inserted: '' }];
+    for (const sep of ['\n', '\r\n']) {
+      expect(none(f, del, sep)).toEqual([{ at: 1, whereBefore: 'inside' }]);
+      expectConsistent(f, del, sep);
+    }
+    // No LF after the window: nothing joins.
+    expect(none({ ...f, suffix: 'z' }, del, '\n')).toEqual([]);
+  });
+
+  it('J5: the whole window deleted between a lone CR and an LF', () => {
+    const f: Frame = { prefix: 'q\r', raw: 'a\nb\n', suffix: '\nz' };
+    const del = [{ fromA: 0, toA: 4, inserted: '' }];
+    for (const sep of ['\n', '\r\n']) {
+      const out = junctionRewrites(
+        'a\nb\n',
+        ['\n', '\n'],
+        del,
+        sep,
+        true,
+        true,
+      );
+      expect(out.rewrites).toEqual([{ at: -1, whereBefore: 'before' }]);
+      expect(out.startShift).toBe(sep.length - 1);
+      expectConsistent(f, del, sep);
+    }
+    expect(none({ ...f, suffix: 'z' }, del, '\n')).toEqual([]);
+    expect(none({ ...f, prefix: 'q\n' }, del, '\n')).toEqual([]);
+  });
+
+  it('covers every combination of where the CR and the LF are', () => {
+    // CR inside or before the window, LF inside or after it.
+    const cases: { f: Frame; changes: RawChange[]; at: number[] }[] = [
+      // CR inside, LF inside.
+      {
+        f: { prefix: '', raw: 'a\rb\nc', suffix: '' },
+        changes: [{ fromA: 2, toA: 3, inserted: '' }],
+        at: [1],
+      },
+      // CR before, LF inside.
+      {
+        f: { prefix: 'z\r', raw: 'b\nc', suffix: '' },
+        changes: [{ fromA: 0, toA: 1, inserted: '' }],
+        at: [-1],
+      },
+      // CR inside, LF after.
+      {
+        f: { prefix: '', raw: 'a\rb\n', suffix: '\nc' },
+        changes: [{ fromA: 2, toA: 4, inserted: '' }],
+        at: [1],
+      },
+      // CR before, LF after.
+      {
+        f: { prefix: 'z\r', raw: 'b\n', suffix: '\nc' },
+        changes: [{ fromA: 0, toA: 2, inserted: '' }],
+        at: [-1],
+      },
+    ];
+    for (const { f, changes, at } of cases) {
+      for (const sep of ['\n', '\r\n']) {
+        expect(none(f, changes, sep).map((r) => r.at)).toEqual(at);
+        expectConsistent(f, changes, sep);
+      }
+    }
+  });
+
+  it('leaves alone a CR that is half of a CRLF, one followed by something else, and CRLF-style J1', () => {
+    // `\r\n` is one break, deleting around it joins nothing new.
+    const crlf: Frame = { prefix: '', raw: 'a\r\nb\nc', suffix: '' };
+    expect(none(crlf, [{ fromA: 2, toA: 3, inserted: '' }], '\n')).toEqual([]);
+    expectConsistent(crlf, [{ fromA: 2, toA: 3, inserted: '' }], '\n');
+    // A lone CR whose next line stays non-empty.
+    const other: Frame = { prefix: '', raw: 'a\rbc\nd', suffix: '' };
+    expect(none(other, [{ fromA: 3, toA: 4, inserted: '' }], '\n')).toEqual([]);
+    // A lone CR followed by a CRLF line.
+    const next: Frame = { prefix: '', raw: 'a\rmid\r\nd', suffix: '' };
+    expect(none(next, [{ fromA: 2, toA: 5, inserted: '' }], '\n')).toEqual([]);
+    expectConsistent(next, [{ fromA: 2, toA: 5, inserted: '' }], '\n');
+  });
+
+  it('A16: the run of CR before a rewrite is marked in the window (length 1, 2, 3)', () => {
+    for (const run of [1, 2, 3]) {
+      const raw = 'x' + '\r'.repeat(run) + 'tail';
+      const f: Frame = { prefix: '', raw, suffix: '' };
+      const at = 1 + run;
+      const enter = [{ fromA: at, toA: at, inserted: '\n' }];
+      const res = junctionRewrites(
+        byRule(raw),
+        scanBreaks(raw),
+        enter,
+        '\n',
+        false,
+        false,
+      );
+      expect(res.rewrites).toEqual([{ at: run, whereBefore: 'inside' }]);
+      expect(res.breaksAfter).toEqual(Array(run + 1).fill('\n'));
+      expectConsistent(f, enter, '\n');
+      // CRLF style: Enter starts with a CR, so nothing joins at all; the
+      // deleting form rewrites the last CR only.
+      const del = [{ fromA: at, toA: at + 4, inserted: '' }];
+      const raw2 = raw + '\nend';
+      const f2: Frame = { prefix: '', raw: raw2, suffix: '' };
+      const crlf = junctionRewrites(
+        byRule(raw2),
+        scanBreaks(raw2),
+        del,
+        '\r\n',
+        false,
+        false,
+      );
+      expect(crlf.rewrites).toEqual([{ at: run, whereBefore: 'inside' }]);
+      expect(crlf.breaksAfter).toEqual(
+        [...Array(run - 1).fill('\r'), '\r\n', '\n'].slice(0, run + 1),
+      );
+      expectConsistent(f2, del, '\r\n');
+    }
+  });
+
+  it('A16: a run that reaches the window start clears prevLoneCr, so Enter there rewrites nothing', () => {
+    // File `\r` before the window, then a window of `\r\r` and a line: the
+    // run is the window's two breaks and the byte before it.
+    const f: Frame = { prefix: 'q\r', raw: '\r\rtail', suffix: '' };
+    const enter = [{ fromA: 2, toA: 2, inserted: '\n' }];
+    const res = junctionRewrites(
+      byRule(f.raw),
+      scanBreaks(f.raw),
+      enter,
+      '\n',
+      true,
+      false,
+    );
+    expect(res.rewrites).toEqual([{ at: 1, whereBefore: 'inside' }]);
+    expect(res.prevLoneCr).toBe(false);
+    expectConsistent(f, enter, '\n');
+    // The core rewrote the byte before the window as part of the run, so the
+    // next Enter at the window's first position joins nothing.
+    const again = junctionRewrites(
+      byRule('\n\n\ntail'),
+      res.breaksAfter,
+      [{ fromA: 0, toA: 0, inserted: '\n' }],
+      '\n',
+      res.prevLoneCr,
+      false,
+    );
+    expect(again.rewrites).toEqual([]);
+  });
+
+  it('A10: random windows and changes never lose a line to a CRLF, and the geometry reads back', () => {
+    const rand = rng(20261023);
+    const pick = <T>(xs: T[]): T => xs[Math.floor(rand() * xs.length)] as T;
+    const prefixes = [
+      '',
+      'ab\n',
+      'ab\r',
+      'x\r\r',
+      '\n',
+      'a\r\r\r',
+      'q\r\n',
+      '\r',
+      '\r\r\r\r',
+    ];
+    const suffixes = ['', '\nq', 'q', '\n\n', '\r', 'qq\n', '\n', '\r\nq'];
+    const lineTexts = ['', 'x', 'yz', 'é', ''];
+    const breaksPool = ['\n', '\r\n', '\r', '\r', '\n'];
+    const inserts = ['x', '\n', '\n\n', 'é\n', 'ab', '\nz'];
+    let junctions = 0;
+    let runs = 0;
+    for (let n = 0; n < 4000; n += 1) {
+      const prefix = pick(prefixes);
+      const suffix = pick(suffixes);
+      let raw = '';
+      for (let i = Math.floor(rand() * 6) + 1; i > 0; i -= 1) {
+        raw += pick(lineTexts) + pick(breaksPool);
+      }
+      if (suffix === '') {
+        raw = rand() < 0.5 ? raw : raw.replace(/(\r\n|\r|\n)$/, '');
+      }
+      // The window opens on a line start and closes on a line end.
+      if (prefix.endsWith('\r') && raw.startsWith('\n')) {
+        raw = 'k' + raw;
+      }
+      if (suffix.startsWith('\n') && raw.endsWith('\r')) {
+        raw = raw.slice(0, -1) + '\n';
+      }
+      const f: Frame = { prefix, raw, suffix };
+      const doc = byRule(raw);
+      for (const sep of ['\n', '\r\n']) {
+        // One to three ascending, non-overlapping changes.
+        const cuts = Array.from({ length: 6 }, () =>
+          Math.floor(rand() * (doc.length + 1)),
+        ).sort((a, b) => a - b);
+        const changes: RawChange[] = [];
+        for (let c = 0; c + 1 < cuts.length && changes.length < 3; c += 2) {
+          const fromA = cuts[c] as number;
+          const toA = rand() < 0.4 ? fromA : (cuts[c + 1] as number);
+          // CodeMirror merges changes that touch; its change sets never do.
+          const last = changes[changes.length - 1];
+          if (last !== undefined && fromA <= last.toA) {
+            continue;
+          }
+          changes.push({
+            fromA,
+            toA,
+            inserted: rand() < 0.5 ? '' : pick(inserts),
+          });
+        }
+        const out = runJunction(f, changes, sep);
+        junctions += out.res.rewrites.length;
+        if (
+          sep === '\n' &&
+          out.res.rewrites.some((r) => r.whereBefore === 'inside') &&
+          /\r\r/.test(raw)
+        ) {
+          runs += 1;
+        }
+        try {
+          expectConsistent(f, changes, sep);
+        } catch (e) {
+          throw new Error(
+            JSON.stringify({ f, changes, sep }) + ' ' + String(e),
+          );
+        }
+      }
+    }
+    // The draws reach both kinds of junction and runs of CR.
+    expect(junctions).toBeGreaterThan(100);
+    expect(runs).toBeGreaterThan(5);
+  });
+});
+
+describe('the rewrite edits in the map and the order of an apply', () => {
+  it('keep_start holds an offset at the start of the edit, other offsets behave as before', () => {
+    const rewrite = { start: 10, end: 11, text: '\n', keep_start: true };
+    // Same length: nothing moves, whatever side.
+    expect(mapOffset(10, rewrite)).toBe(10);
+    expect(mapOffset(11, rewrite)).toBe(11);
+    expect(mapOffset(30, rewrite)).toBe(30);
+    expect(mapOffset(9, rewrite)).toBe(9);
+    // Without the flag an offset at the start of a replacement goes after it.
+    expect(mapOffset(10, { start: 10, end: 11, text: '\n' })).toBe(11);
+    // A CRLF rewrite is one byte longer: the start stays, later offsets shift.
+    const crlf = { start: 10, end: 11, text: '\r\n', keep_start: true };
+    expect(mapOffset(10, crlf)).toBe(10);
+    expect(mapOffset(11, crlf)).toBe(12);
+    // The undo of it: two bytes back to one.
+    const undo = { start: 10, end: 12, text: '\r', keep_start: true };
+    expect(mapOffset(10, undo)).toBe(10);
+    expect(mapOffset(11, undo)).toBe(11);
+    expect(mapOffset(12, undo)).toBe(11);
+    // A fill edit changes no length at all.
+    const fill = { start: 4, end: 9, text: '', fill: '\r' };
+    for (const o of [0, 4, 6, 9, 20]) {
+      expect(mapOffset(o, fill)).toBe(o);
+    }
+  });
+
+  it('an insertion at the start of a rewrite is applied after it and lands before it', () => {
+    const ins = { start: 5, end: 5, text: 'b' };
+    const rewrite = {
+      start: 5,
+      end: 6,
+      text: '\n',
+      keep_start: true,
+      cascade: true,
+    };
+    const gone = { start: 6, end: 7, text: '' };
+    expect(inApplyOrder([ins, gone, rewrite])).toEqual([gone, rewrite, ins]);
+    expect(inApplyOrder([rewrite, ins])).toEqual([rewrite, ins]);
+    // An offset at 5 (the caret before the rewritten byte) ends after the text
+    // inserted there, and an offset after the deleted byte follows both.
+    const order = inApplyOrder([ins, gone, rewrite]);
+    expect(mapThrough(5, order)).toBe(6);
+    expect(mapThrough(7, order)).toBe(7);
+    expect(mapThrough(8, order)).toBe(8);
+  });
+});
+
+describe('mirroring the core fill edits', () => {
+  // The A12 case, as the core sends it: `x\r\r\ry` with an LF typed before `y`.
+  const undoJson = JSON.parse(
+    '[{"start":1,"end":3,"text":"","keep_start":false,"fill":"\\r"},' +
+      '{"start":4,"end":5,"text":"","keep_start":false,"fill":null},' +
+      '{"start":3,"end":4,"text":"\\r","keep_start":true,"fill":null}]',
+  ) as ByteEdit[];
+  const redoJson = JSON.parse(
+    '[{"start":3,"end":4,"text":"\\n","keep_start":true,"fill":null},' +
+      '{"start":4,"end":4,"text":"\\n","keep_start":false,"fill":null},' +
+      '{"start":1,"end":3,"text":"","keep_start":false,"fill":"\\n"}]',
+  ) as ByteEdit[];
+  /** Mirror `edits` into a window the way the editor does, one step at a time. */
+  function mirror(raw: string, edits: ByteEdit[], windowStart = 0) {
+    let doc = byRule(raw);
+    let breaks: string[] = scanBreaks(raw);
+    for (const e of edits) {
+      const step = mirrorStep(doc, breaks, windowStart, e);
+      expect(step).not.toBeNull();
+      if (step === null) {
+        break;
+      }
+      if (step.change !== null) {
+        doc =
+          doc.slice(0, step.change.from) +
+          byRule(step.change.insert) +
+          doc.slice(step.change.to);
+      }
+      breaks = step.breaks;
+    }
+    return { doc, breaks };
+  }
+
+  it('the window breaks follow the core bytes after an undo and after a redo', () => {
+    const typed = 'x\n\n\n\ny';
+    const afterUndo = mirror(typed, undoJson);
+    expect(afterUndo.doc).toBe('x\n\n\ny');
+    expect(afterUndo.breaks).toEqual(scanBreaks('x\r\r\ry'));
+    const afterRedo = mirror('x\r\r\ry', redoJson);
+    expect(afterRedo.doc).toBe('x\n\n\n\ny');
+    expect(afterRedo.breaks).toEqual(scanBreaks(typed));
+  });
+
+  it('fillBreaks sets only the breaks whose bytes lie in the range', () => {
+    const doc = 'a\n\nb\n';
+    expect(fillBreaks(doc, ['\r', '\r', '\n'], 1, 3, '\n')).toEqual([
+      '\n',
+      '\n',
+      '\n',
+    ]);
+    expect(fillBreaks(doc, ['\r', '\r', '\n'], 2, 3, '\n')).toEqual([
+      '\r',
+      '\n',
+      '\n',
+    ]);
+    expect(fillBreaks(doc, ['\r', '\r', '\n'], 0, 1, '\n')).toEqual([
+      '\r',
+      '\r',
+      '\n',
+    ]);
+  });
+
+  it('an edit boundary inside a CRLF has no document position', () => {
+    expect(
+      mirrorStep('a\nb', ['\r\n'], 0, { start: 2, end: 2, text: 'x' }),
+    ).toBeNull();
+    expect(
+      mirrorStep('a\nb', ['\r\n'], 0, { start: 1, end: 3, text: '\r' }),
+    ).not.toBeNull();
   });
 });

@@ -269,6 +269,8 @@
     endComposition: () => Promise<void>;
     isComposing: () => boolean;
     applied: () => Promise<void>;
+    pendingInput: () => boolean;
+    flushed: () => Promise<void>;
     openFind: () => void;
     openFindReplace: () => void;
     findNext: () => void;
@@ -1360,8 +1362,9 @@
         const windowed = windowedRef;
         if (windowed !== null && windowed.isComposing()) {
           e.preventDefault();
-          // The edits typed so far must be in the Rust buffer before it is saved.
-          void windowed.applied().then(() => documentWindow.saveActive());
+          // What was typed so far must be in the Rust buffer before it is saved;
+          // the composition stays open.
+          void windowed.flushed().then(() => documentWindow.saveActive());
           return;
         }
       }
@@ -1510,6 +1513,10 @@
       }
       return windowedRef?.endComposition() ?? Promise.resolve();
     };
+    documentWindow.windowedPending = (): boolean =>
+      windowedRef?.pendingInput() ?? false;
+    documentWindow.windowedFlushed = (): Promise<void> =>
+      windowedRef?.flushed() ?? Promise.resolve();
     // DEV-only automation hook; dynamic import keeps it out of production.
     if (import.meta.env.DEV) {
       void import('./lib/dev/auto').then((m) =>
@@ -1719,6 +1726,8 @@
     return () => {
       window.removeEventListener('keydown', onKeydown);
       documentWindow.endComposition = null;
+      documentWindow.windowedPending = null;
+      documentWindow.windowedFlushed = null;
       offEdition();
       unlistenTheme();
       void unlistenChanges.then((u) => u());

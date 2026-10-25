@@ -1,6 +1,7 @@
 // Copyright © 2026 Lonshaus
 // SPDX-License-Identifier: GPL-3.0-only
 
+use crate::line_rule::{breaks_before, BreakCounter};
 use serde::Serialize;
 use std::collections::HashMap;
 use std::fs::File;
@@ -191,14 +192,15 @@ fn read_chunk_at(path: &Path, offset: u64, len: u32) -> Result<Chunk, String> {
 /// Scan a reader into a line index, invoking `progress(lines, bytes)` after each
 /// buffer so the caller can throttle progress reporting. Returns the checkpoints
 /// (seeded with `(0, 0)`) and the total line count. Line count follows split
-/// semantics: newline count plus one for a non-empty file, zero for an empty one.
+/// semantics: break count (see `line_rule`) plus one for a non-empty file, zero
+/// for an empty one.
 fn build_index<R: Read>(
   mut reader: R,
   interval: u32,
   mut progress: impl FnMut(u64, u64),
 ) -> Result<(Vec<(u64, u64)>, u64), String> {
   let mut checkpoints = vec![(0u64, 0u64)];
-  let mut line = 0u64;
+  let mut breaks = BreakCounter::new();
   let mut pos = 0u64;
   let mut any = false;
   let mut buf = [0u8; 256 * 1024];
@@ -209,16 +211,24 @@ fn build_index<R: Read>(
     }
     any = true;
     for &b in &buf[..n] {
-      pos += 1;
-      if b == b'\n' {
-        line += 1;
-        // `pos` is now one past the newline: the start of the next line.
-        if interval != 0 && line % interval as u64 == 0 {
-          checkpoints.push((line, pos));
+      let before = breaks.count();
+      breaks.step(b);
+      if breaks.count() != before {
+        // A `\n` ends its line, so the next line starts one past it; a `\r`
+        // is only settled by the byte after it, which starts the next line.
+        let start = if b == b'\n' { pos + 1 } else { pos };
+        if interval != 0 && breaks.count() % interval as u64 == 0 {
+          checkpoints.push((breaks.count(), start));
         }
       }
+      pos += 1;
     }
-    progress(line, pos);
+    progress(breaks.count(), pos);
+  }
+  // A `\r` that ends the file settles here and starts an empty last line.
+  let line = breaks.finish();
+  if breaks.pending_cr() && interval != 0 && line % interval as u64 == 0 {
+    checkpoints.push((line, pos));
   }
   let total = if any { line + 1 } else { 0 };
   Ok((checkpoints, total))
@@ -249,21 +259,29 @@ fn offset_of_line<R: Read>(
     return Ok(start_offset);
   }
   let mut pos = start_offset;
+  let mut breaks = BreakCounter::new();
   let mut buf = [0u8; 64 * 1024];
   loop {
     let n = reader.read(&mut buf).map_err(|e| e.to_string())?;
     if n == 0 {
+      // A `\r` that ends the file starts an empty last line.
+      if breaks.pending_cr() && need == 1 {
+        return Ok(pos);
+      }
       return Err(LINE_OUT_OF_RANGE.to_string());
     }
     for &b in &buf[..n] {
-      pos += 1;
-      if b == b'\n' {
+      let before = breaks.count();
+      breaks.step(b);
+      if breaks.count() != before {
         need -= 1;
         if need == 0 {
-          // `pos` is one past the newline: the start of `target`.
-          return Ok(pos);
+          // One past a `\n`, or at the byte after a `\r`: the start of
+          // `target`.
+          return Ok(if b == b'\n' { pos + 1 } else { pos });
         }
       }
+      pos += 1;
     }
   }
 }
@@ -302,11 +320,6 @@ pub(crate) fn find_sub(hay: &[u8], needle: &[u8], case_sensitive: bool) -> Optio
   }
 }
 
-/// Count newline bytes in a slice.
-pub(crate) fn count_newlines(b: &[u8]) -> u64 {
-  b.iter().filter(|&&c| c == b'\n').count() as u64
-}
-
 /// Truncate a string to at most `max` characters (not bytes).
 fn truncate_chars(s: &str, max: usize) -> String {
   match s.char_indices().nth(max) {
@@ -314,19 +327,25 @@ fn truncate_chars(s: &str, max: usize) -> String {
     None => s.to_string(),
   }
 }
-
-/// Preview of the line containing the match at `idx` within `buf`, bounded to the
-/// surrounding newlines and truncated to `PREVIEW_CHARS`. The line may be clipped
-/// when it crosses a read boundary, which is acceptable for a preview.
+/// Preview of the line containing the match at `idx` within `buf`, from after the
+/// last `\r` or `\n` before `idx` to the first one at or after it, truncated to
+/// `PREVIEW_CHARS`. A match starting at the `\n` of a `\r\n` is on the line that
+/// `\r\n` ends, so that line is shown. The line may be clipped when it crosses a
+/// read boundary, which is acceptable for a preview.
 pub(crate) fn preview_at(buf: &[u8], idx: usize) -> String {
+  let idx = if idx > 0 && buf[idx] == b'\n' && buf[idx - 1] == b'\r' {
+    idx - 1
+  } else {
+    idx
+  };
   let start = buf[..idx]
     .iter()
-    .rposition(|&b| b == b'\n')
+    .rposition(|&b| b == b'\n' || b == b'\r')
     .map(|p| p + 1)
     .unwrap_or(0);
   let end = buf[idx..]
     .iter()
-    .position(|&b| b == b'\n')
+    .position(|&b| b == b'\n' || b == b'\r')
     .map(|p| idx + p)
     .unwrap_or(buf.len());
   let line = String::from_utf8_lossy(&buf[start..end]);
@@ -350,9 +369,10 @@ fn search_stream<R: Read>(
   let m = query.len();
   let overlap = m - 1;
   let mut carry: Vec<u8> = Vec::new();
-  // Absolute offset and line index of the first byte of `combined`.
+  // Absolute offset of the first byte of `combined`, and the breaks in all the
+  // text before it (a final `\r` there waits for the first byte of `combined`).
   let mut base_offset: u64 = 0;
-  let mut line_at_base: u64 = 0;
+  let mut before_base = BreakCounter::new();
   let mut hits = 0u64;
   let mut buf = vec![0u8; chunk_size];
   loop {
@@ -372,7 +392,7 @@ fn search_stream<R: Read>(
       let idx = from + rel;
       on_hit(Hit {
         offset: base_offset + idx as u64,
-        line: line_at_base + count_newlines(&combined[..idx]),
+        line: before_base.count_before_next(combined[0]) + breaks_before(&combined, idx),
         preview: preview_at(&combined, idx),
       });
       hits += 1;
@@ -390,7 +410,7 @@ fn search_stream<R: Read>(
     // Keep the last `overlap` bytes as carry; advance base/line past the rest.
     let keep = overlap.min(combined.len());
     let consumed = combined.len() - keep;
-    line_at_base += count_newlines(&combined[..consumed]);
+    before_base.feed(&combined[..consumed]);
     base_offset += consumed as u64;
     carry = combined[consumed..].to_vec();
   }
@@ -982,5 +1002,167 @@ mod tests {
     // `done(hits, truncated, false)` — the two are no longer the same signal.
     let cancel = AtomicBool::new(false);
     assert!(search_stream(FailingReader, b"x", true, 100, 64, &cancel, |_| {}).is_err());
+  }
+  // --- The line rule: `\n`, and `\r` not followed by `\n` ---------------------
+  /// Line starts of `c` by the line rule, written out directly.
+  fn rule_starts(c: &[u8]) -> Vec<u64> {
+    let mut starts = vec![0u64];
+    for i in 0..c.len() {
+      if c[i] == b'\n' || (c[i] == b'\r' && c.get(i + 1) != Some(&b'\n')) {
+        starts.push(i as u64 + 1);
+      }
+    }
+    starts
+  }
+  /// A reader that hands out one byte per read.
+  struct OneByte<'a>(&'a [u8]);
+  impl Read for OneByte<'_> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+      match self.0.split_first() {
+        Some((&b, rest)) if !buf.is_empty() => {
+          buf[0] = b;
+          self.0 = rest;
+          Ok(1)
+        }
+        _ => Ok(0),
+      }
+    }
+  }
+
+  const CR_CONTENTS: [&str; 7] = [
+    "a\rb\r\nc\r\r\n\rd\r",
+    "\r",
+    "\r\r\r",
+    "\r\n\r\n",
+    "x\ny\rz\r\n",
+    "line\r",
+    "é\rè\r\n",
+  ];
+
+  #[test]
+  fn index_follows_the_line_rule_for_any_read_size() {
+    for text in CR_CONTENTS {
+      let bytes = text.as_bytes();
+      let starts = rule_starts(bytes);
+      for interval in [1u32, 2, 3] {
+        let want: Vec<(u64, u64)> = std::iter::once((0, 0))
+          .chain(
+            (1..starts.len() as u64)
+              .filter(|line| line % interval as u64 == 0)
+              .map(|line| (line, starts[line as usize])),
+          )
+          .collect();
+        let whole = build_index(Cursor::new(bytes), interval, |_, _| {}).unwrap();
+        let single = build_index(OneByte(bytes), interval, |_, _| {}).unwrap();
+        assert_eq!(whole, (want.clone(), starts.len() as u64), "{text:?}");
+        assert_eq!(single, whole, "{text:?}");
+      }
+    }
+    assert_eq!(
+      build_index(Cursor::new(""), 1, |_, _| {}).unwrap(),
+      (vec![(0, 0)], 0)
+    );
+  }
+
+  #[test]
+  fn index_keeps_a_crlf_whole_across_the_read_buffer() {
+    // The CR is the last byte of the first 256 KiB read, the LF the first of the
+    // next: one break, not two.
+    let mut bytes = vec![b'a'; 256 * 1024 - 1];
+    bytes.extend_from_slice(b"\r\nb\rc");
+    let (cp, total) = build_index(Cursor::new(&bytes), 1, |_, _| {}).unwrap();
+    assert_eq!(total, 3);
+    assert_eq!(cp, vec![(0, 0), (1, 256 * 1024 + 1), (2, 256 * 1024 + 3)]);
+  }
+
+  #[test]
+  fn offset_of_line_follows_the_line_rule() {
+    for text in CR_CONTENTS {
+      let bytes = text.as_bytes();
+      let starts = rule_starts(bytes);
+      let (cp, total) = build_index(Cursor::new(bytes), 2, |_, _| {}).unwrap();
+      assert_eq!(total, starts.len() as u64);
+      for line in 0..total {
+        let c = nearest_checkpoint(&cp, line);
+        for reader in [
+          Box::new(Cursor::new(&bytes[c.1 as usize..])) as Box<dyn Read>,
+          Box::new(OneByte(&bytes[c.1 as usize..])),
+        ] {
+          assert_eq!(
+            offset_of_line(reader, c.1, c.0, line).unwrap(),
+            starts[line as usize],
+            "line {line} of {text:?}"
+          );
+        }
+      }
+      let c = nearest_checkpoint(&cp, total);
+      let err = offset_of_line(Cursor::new(&bytes[c.1 as usize..]), c.1, c.0, total).unwrap_err();
+      assert_eq!(err, LINE_OUT_OF_RANGE, "past the end of {text:?}");
+    }
+  }
+
+  #[test]
+  fn offset_of_line_keeps_a_crlf_whole_across_the_read_buffer() {
+    let mut bytes = vec![b'a'; 64 * 1024 - 1];
+    bytes.extend_from_slice(b"\r\nb\rc");
+    let at = |line: u64| offset_of_line(Cursor::new(&bytes), 0, 0, line).unwrap();
+    assert_eq!(at(1), 64 * 1024 + 1);
+    assert_eq!(at(2), 64 * 1024 + 3);
+    assert!(offset_of_line(Cursor::new(&bytes), 0, 0, 3).is_err());
+  }
+
+  #[test]
+  fn search_lines_follow_the_line_rule_for_any_read_size() {
+    let cancel = AtomicBool::new(false);
+    for text in CR_CONTENTS {
+      let bytes = text.as_bytes();
+      let starts = rule_starts(bytes);
+      for needle in ["b", "\n", "\r", "\r\n", "\nb", "c\r", "\rd", "é", "z"] {
+        let mut want = Vec::new();
+        let mut from = 0usize;
+        while let Some(rel) = find_sub(&bytes[from..], needle.as_bytes(), true) {
+          let at = (from + rel) as u64;
+          want.push((at, starts.partition_point(|&s| s <= at) as u64 - 1));
+          from += rel + needle.len();
+        }
+        for chunk in [1usize, 2, 3, 5, 64] {
+          let mut got = Vec::new();
+          search_stream(
+            Cursor::new(bytes),
+            needle.as_bytes(),
+            true,
+            u32::MAX,
+            chunk,
+            &cancel,
+            |h| got.push((h.offset, h.line)),
+          )
+          .unwrap();
+          assert_eq!(got, want, "{needle:?} in {text:?} / chunk {chunk}");
+        }
+      }
+    }
+  }
+
+  #[test]
+  fn a_preview_runs_between_the_nearest_breaks() {
+    assert_eq!(preview_at(b"ab\rcd\nef", 3), "cd");
+    assert_eq!(preview_at(b"ab\rcd\nef", 0), "ab");
+    assert_eq!(preview_at(b"x\r\ny", 3), "y");
+    assert_eq!(preview_at(b"x\r\ny\r", 0), "x");
+    // A match starting at the LF of a CRLF shows the line that CRLF ends.
+    assert_eq!(preview_at(b"x\r\nb", 2), "x");
+    assert_eq!(preview_at(b"a\rx\r\nb", 4), "x");
+    assert_eq!(preview_at(b"\r\nb", 1), "");
+  }
+
+  #[test]
+  fn a_hit_at_the_lf_of_a_crlf_previews_its_own_line() {
+    let cancel = AtomicBool::new(false);
+    let mut hits = Vec::new();
+    search_stream(Cursor::new("x\r\nb"), b"\nb", true, 100, 64, &cancel, |h| {
+      hits.push((h.line, h.preview))
+    })
+    .unwrap();
+    assert_eq!(hits, vec![(0, "x".to_string())]);
   }
 }

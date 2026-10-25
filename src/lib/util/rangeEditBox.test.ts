@@ -166,3 +166,21 @@ describe('rangeBoxWriteText', () => {
     expect(rangeBoxWriteText(edited('a\nb\n', ''))).toBe('');
   });
 });
+
+describe('the breaks of a mixed slice', () => {
+  it('opens with the separator of every break of the slice', () => {
+    const box = openRangeBox(init({ text: 'a\rb\nc\r\nd' }));
+    expect(box.breaks).toEqual(['\r', '\n', '\r\n']);
+  });
+
+  it('writes an untouched buffer back byte for byte and keeps the other lines’ breaks', () => {
+    const slice = 'a\rb\nc\r\nd\r';
+    const open = (): RangeBox => openRangeBox(init({ text: slice }));
+    expect(rangeBoxWriteText(open())).toBe(slice);
+    const edited = nextRangeBox(open(), {
+      kind: 'edit',
+      content: text('a\nb\nc\nXd\n'),
+    })!;
+    expect(rangeBoxWriteText(edited)).toBe('a\rb\nc\r\nXd\n');
+  });
+});

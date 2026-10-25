@@ -10,8 +10,9 @@
 //! (`windowed_close`). Byte coordinates and split-style line counting match the
 //! piece table and `large_file`.
 
-use crate::large_file::{count_newlines, preview_at};
-use crate::note_store::CheckpointIndex;
+use crate::large_file::preview_at;
+use crate::line_rule::BreakCounter;
+use crate::note_store::{CheckpointIndex, LINE_RULE};
 use crate::piece_table::{OriginalIndex, OriginalSource, PieceTable};
 use crate::range_edit::{Fingerprint, FINGERPRINT_MISMATCH};
 use crate::replace_layer::{self, Builder, ChangeList, Dir, Src, Table};
@@ -52,6 +53,8 @@ const SCAN_CHUNK: usize = 256 * 1024;
 /// frontend keys silent no-ops off these exact values.
 const NOTHING_TO_UNDO: &str = "nothing-to-undo";
 const NOTHING_TO_REDO: &str = "nothing-to-redo";
+/// A replace-all token the session does not hold.
+const UNKNOWN_TOKEN: &str = "unknown-token";
 
 /// Protocol error string returned by `windowed_open` / `windowed_reopen` for a
 /// file at or above `LARGE_EDIT_MAX`. A single constant so the frontend can key
@@ -158,6 +161,9 @@ fn sample_digest(path: &Path, total_bytes: u64, checkpoints: &[(u64, u64)]) -> R
 // common "many small edits" growth; switch to a byte budget if pathological single
 // edits ever dominate memory.
 const UNDO_LIMIT: usize = 512;
+/// Bytes read per step when a cascade looks backwards for the start of a run of
+/// `\r`.
+const CASCADE_READ: u64 = 64 * 1024;
 
 /// One reversible replace in global byte coordinates: replace `[start, end)` with
 /// `text`. Stored inverses undo a forward apply; applied in the frame current when
@@ -166,6 +172,13 @@ struct InverseEdit {
   start: u64,
   end: u64,
   text: String,
+  /// Copied from the forward edit: an offset at `start` stays put when the
+  /// frontend maps it through this edit.
+  keep_start: bool,
+  /// For a run of break bytes rewritten in place: the byte the range holds
+  /// once this edit is applied, with `text` empty. The run itself is never
+  /// copied into the journal.
+  fill: Option<u8>,
 }
 
 /// The inverse edits of one coalesced undo step, in the order the forward edits
@@ -233,6 +246,12 @@ struct Session {
   /// True while a replace-all pass runs. The commands that read or change the
   /// session wait for it to clear (see `WindowedState::lock_idle`).
   busy: bool,
+  /// Change lists of replace-alls (done, undone or redone) whose offsets the
+  /// frontend may still map, by token, with the direction of the change that
+  /// produced the token. Holding the `Arc` keeps the list and its file alive
+  /// after the journal and the layers have dropped theirs.
+  replace_tokens: HashMap<u64, (Arc<ChangeList>, Dir)>,
+  next_token: u64,
 }
 
 impl Session {
@@ -257,7 +276,24 @@ impl Session {
       next_state_id: 1,
       seal_group: false,
       busy: false,
+      replace_tokens: HashMap::new(),
+      next_token: 1,
     }
+  }
+  /// Register a change list under a fresh token, mapping offsets in `dir`.
+  fn register_token(&mut self, list: Arc<ChangeList>, dir: Dir) -> u64 {
+    let token = self.next_token;
+    self.next_token += 1;
+    self.replace_tokens.insert(token, (list, dir));
+    token
+  }
+  /// Map `offsets` through the replace-all behind `token`.
+  fn map_replace(&self, token: u64, offsets: &[u64]) -> Result<Vec<u64>, String> {
+    let (list, dir) = self
+      .replace_tokens
+      .get(&token)
+      .ok_or_else(|| UNKNOWN_TOKEN.to_string())?;
+    offsets.iter().map(|&o| list.map_offset(*dir, o)).collect()
   }
   /// Whether the content equals what was last saved.
   fn clean(&self) -> bool {
@@ -373,6 +409,11 @@ pub struct WindowResult {
   pub start_line: u64,
   pub total_lines: u64,
   pub total_bytes: u64,
+  /// The window does not start the file and the byte before it is a `\r`
+  /// (a window starts at a line start, so that `\r` is a break of its own).
+  pub prev_lone_cr: bool,
+  /// The window does not end the file and the byte at its end is a `\n`.
+  pub next_is_lf: bool,
 }
 
 /// Current global document statistics after a mutating command.
@@ -400,20 +441,33 @@ pub struct SaveResult {
 
 /// A single replace expressed in global byte coordinates of the pre-apply
 /// document: replace `[start, end)` with `text`.
+///
+/// `keep_start` marks the rewrite of a lone `\r` that an edit would otherwise
+/// join to a `\n`: an offset at `start` is kept at `start`. `cascade` (always
+/// with `keep_start`, over exactly one `\r`) also rewrites, for a `\n` text, the
+/// run of `\r` bytes directly before it once the batch is applied.
 #[derive(serde::Deserialize)]
 pub struct Edit {
   pub start: u64,
   pub end: u64,
   pub text: String,
+  #[serde(default)]
+  pub keep_start: bool,
+  #[serde(default)]
+  pub cascade: bool,
 }
 
 /// One global-byte edit an undo/redo just applied: replace `[start, end)` with
-/// `text`, in the document frame current when the frontend receives it.
+/// `text`, in the document frame current when the frontend receives it. A
+/// `fill` edit rewrites a run of break bytes to that byte (`"\r"` or `"\n"`)
+/// in place, with `text` empty and the document text unchanged.
 #[derive(Serialize, Debug)]
 pub struct AppliedEdit {
   pub start: u64,
   pub end: u64,
   pub text: String,
+  pub keep_start: bool,
+  pub fill: Option<String>,
 }
 
 /// Result of a successful undo/redo: the edits just applied (in application order),
@@ -431,6 +485,9 @@ pub struct UndoResult {
   pub reload_only: bool,
   pub clean: bool,
   pub generation: u64,
+  /// For a `reload_only` result: the token of the replace-all's change list, to
+  /// map offsets with `windowed_map_replace` until `windowed_release_replace`.
+  pub token: Option<u64>,
 }
 
 /// Modification time in milliseconds since the Unix epoch, degrading to 0 when the
@@ -455,8 +512,8 @@ fn fingerprint_of(path: &Path) -> Result<Fingerprint, String> {
     mtime_ms: mtime_ms(&meta),
   })
 }
-
-/// A scan pass's `(total_bytes, checkpoints, total_newlines)` result.
+/// A scan pass's `(total_bytes, checkpoints, total_newlines)` result, counted
+/// by the line rule (see `line_rule`).
 type ScanResult = (u64, Vec<(u64, u64)>, u64);
 
 /// Single streaming pass over `reader`: builds the sparse line-checkpoint index
@@ -466,10 +523,18 @@ type ScanResult = (u64, Vec<(u64, u64)>, u64);
 /// carries one `(offset, newlines_before_offset)` entry per `CHECKPOINT_INTERVAL`
 /// bytes (see `OriginalIndex`). Any invalid byte, or a stream that ends
 /// mid-character, returns the `NOT_UTF8` protocol error.
-fn scan_reader<R: Read>(mut reader: R, buf_size: usize) -> Result<ScanResult, String> {
+fn scan_reader<R: Read>(reader: R, buf_size: usize) -> Result<ScanResult, String> {
+  scan_reader_at(reader, buf_size, CHECKPOINT_INTERVAL)
+}
+/// `scan_reader` with the checkpoint spacing given, so tests can use a small one.
+fn scan_reader_at<R: Read>(
+  mut reader: R,
+  buf_size: usize,
+  interval: u64,
+) -> Result<ScanResult, String> {
   let mut checkpoints: Vec<(u64, u64)> = vec![(0, 0)];
   let mut last_checkpoint: u64 = 0;
-  let mut newlines: u64 = 0;
+  let mut breaks = BreakCounter::new();
   let mut buf = vec![0u8; buf_size.max(1)];
   let mut pos: u64 = 0;
   // Incomplete trailing UTF-8 sequence carried from the previous chunk (<= 3 B).
@@ -480,19 +545,19 @@ fn scan_reader<R: Read>(mut reader: R, buf_size: usize) -> Result<ScanResult, St
       break;
     }
     let chunk = &buf[..n];
-    // Newline scan runs on the raw chunk: a carried byte is always a UTF-8
-    // lead or continuation byte, never 0x0A, so it cannot hide a line break.
+    // Break scan runs on the raw chunk: a carried byte is always a UTF-8
+    // lead or continuation byte, never 0x0A or 0x0D, so it cannot hide a line
+    // break.
     for (i, &b) in chunk.iter().enumerate() {
       let abs = pos + i as u64;
-      // Record a checkpoint when this byte opens a new interval; `newlines`
-      // is the count strictly before `abs`, matching the checkpoint contract.
-      if abs - last_checkpoint >= CHECKPOINT_INTERVAL {
-        checkpoints.push((abs, newlines));
+      // Record a checkpoint when this byte opens a new interval; the count is
+      // the markers strictly before `abs`, which this byte settles for a `\r`
+      // just before it.
+      if abs - last_checkpoint >= interval {
+        checkpoints.push((abs, breaks.count_before_next(b)));
         last_checkpoint = abs;
       }
-      if b == b'\n' {
-        newlines += 1;
-      }
+      breaks.step(b);
     }
     // Validate carry + chunk together so a character split across the boundary
     // is judged whole. Only prepend the carry (an allocation) when there is one.
@@ -522,7 +587,7 @@ fn scan_reader<R: Read>(mut reader: R, buf_size: usize) -> Result<ScanResult, St
   if !carry.is_empty() {
     return Err(NOT_UTF8.to_string());
   }
-  Ok((pos, checkpoints, newlines))
+  Ok((pos, checkpoints, breaks.finish()))
 }
 
 /// Scan a file on disk (see `scan_reader`) using the 1 MiB streaming buffer.
@@ -550,6 +615,7 @@ fn build_table(path: &Path) -> Result<(Table, u64, Fingerprint, CheckpointIndex,
   let checkpoint_index = CheckpointIndex {
     checkpoints,
     total_newlines,
+    line_rule: LINE_RULE,
   };
   Ok((table, total_bytes, fingerprint, checkpoint_index, digest))
 }
@@ -568,8 +634,10 @@ fn enforce_size_ceiling(len: u64) -> Result<(), String> {
 /// Validate a persisted `CheckpointIndex` against the file's actual current
 /// size before `windowed_reopen` trusts it verbatim: a malformed index would
 /// silently produce wrong line numbers, which is worse than a slow rescan.
-/// Rejects an empty index for a non-empty file, a first checkpoint other than
-/// the required `(0, 0)` seed, non-ascending offsets, any offset at or past
+/// Rejects an index counted under another line rule (`line_rule` differs from
+/// `LINE_RULE`, as in a snapshot written before the field existed), an empty
+/// index for a non-empty file, a first checkpoint other than the required
+/// `(0, 0)` seed, non-ascending offsets, any offset at or past
 /// the file's current length (the lone `(0, 0)` seed of an empty file is the
 /// one exception, since offset 0 there does not reach past anything), a gap
 /// between consecutive checkpoints other than exactly `CHECKPOINT_INTERVAL`
@@ -610,6 +678,10 @@ fn enforce_size_ceiling(len: u64) -> Result<(), String> {
 /// restart until the file changes on disk or the snapshot is deleted. No
 /// corruption, but a stuck tab rather than mislabeled text.
 fn valid_checkpoint_index(index: &CheckpointIndex, total_bytes: u64) -> bool {
+  // Counts made under another line rule are wrong for this one.
+  if index.line_rule != LINE_RULE {
+    return false;
+  }
   if index.checkpoints.is_empty() {
     return total_bytes == 0;
   }
@@ -672,6 +744,9 @@ impl Session {
       if edit.start > edit.end || edit.end > len {
         return Err("edit out of range".to_string());
       }
+      if edit.cascade && !self.is_cr_rewrite(edit)? {
+        return Err("cascade edit is not a rewrite of one CR".to_string());
+      }
     }
     // Empty batches carry no reversible effect; skip journaling entirely.
     if edits.is_empty() {
@@ -681,8 +756,11 @@ impl Session {
     // `removed` is the text currently under each edit (valid UTF-8 by the
     // caller's boundary contract); `pstart` tracks where the replacement lands
     // once every lower-offset edit's length change has shifted it.
+    // Edits are ordered by `(start, end)`, so an insertion and a rewrite that
+    // begin at the same byte come out in exactly reverse orders in the two
+    // passes below: the rewrite is applied first and the text lands before it.
     let mut ascending: Vec<&Edit> = edits.iter().collect();
-    ascending.sort_by_key(|a| a.start);
+    ascending.sort_by_key(|a| (a.start, a.end));
     let mut inverses: EditGroup = Vec::with_capacity(ascending.len());
     let mut cumshift: i64 = 0;
     for edit in &ascending {
@@ -694,15 +772,26 @@ impl Session {
         start: pstart,
         end: pstart + text_len,
         text: removed,
+        keep_start: edit.keep_start,
+        fill: None,
       });
       cumshift += text_len as i64 - (edit.end - edit.start) as i64;
     }
     // Apply back-to-front so a lower-offset edit's coordinates stay valid.
     let mut ordered: Vec<&Edit> = edits.iter().collect();
-    ordered.sort_by_key(|b| std::cmp::Reverse(b.start));
+    ordered.sort_by_key(|b| std::cmp::Reverse((b.start, b.end)));
     for edit in ordered {
       self.table.delete(edit.start, edit.end)?;
       self.table.insert(edit.start, edit.text.as_bytes())?;
+    }
+    // Each LF rewrite also turns the `\r` run before it into `\n`, read from
+    // the bytes the batch left, as a second step of the same undo group.
+    for edit in &edits {
+      if edit.cascade && edit.text == "\n" {
+        if let Some(fill) = self.cascade_run(edit, &edits)? {
+          inverses.push(fill);
+        }
+      }
     }
     self.generation += 1;
     let before = self.state_id;
@@ -739,6 +828,52 @@ impl Session {
     self.state_id = after;
     Ok(self.stats())
   }
+  /// Whether `edit` rewrites exactly one `\r` to a line separator.
+  fn is_cr_rewrite(&self, edit: &Edit) -> Result<bool, String> {
+    if edit.end != edit.start + 1 || (edit.text != "\n" && edit.text != "\r\n") {
+      return Ok(false);
+    }
+    Ok(self.table.read(edit.start, edit.end)? == b"\r")
+  }
+  /// After a batch with the LF rewrite `rewrite`: turn the maximal run of `\r`
+  /// bytes directly before the rewritten byte into `\n` (each would otherwise
+  /// be joined to the `\n` after it), and return the inverse of that step. The
+  /// run is found by reading backwards from the byte's place after the batch.
+  fn cascade_run(&mut self, rewrite: &Edit, batch: &[Edit]) -> Result<Option<InverseEdit>, String> {
+    // Where the rewritten byte sits now: every other edit that ends at or
+    // before it moved it, an insertion at its own start included.
+    let mut at = rewrite.start as i64;
+    for other in batch {
+      if !std::ptr::eq(other, rewrite) && other.end <= rewrite.start {
+        at += other.text.len() as i64 - (other.end - other.start) as i64;
+      }
+    }
+    let end = at as u64;
+    let mut start = end;
+    while start > 0 {
+      let from = start.saturating_sub(CASCADE_READ);
+      let chunk = self.table.read(from, start)?;
+      match chunk.iter().rposition(|&b| b != b'\r') {
+        Some(i) => {
+          start = from + i as u64 + 1;
+          break;
+        }
+        None => start = from,
+      }
+    }
+    if start == end {
+      return Ok(None);
+    }
+    self.table.delete(start, end)?;
+    self.table.insert_fill(start, b'\n', end - start)?;
+    Ok(Some(InverseEdit {
+      start,
+      end,
+      text: String::new(),
+      keep_start: false,
+      fill: Some(b'\r'),
+    }))
+  }
   /// Document statistics plus the clean flag and generation, for a result.
   fn stats(&self) -> DocStats {
     DocStats {
@@ -767,6 +902,30 @@ impl Session {
     let mut applied: Vec<AppliedEdit> = Vec::with_capacity(group.len());
     let mut opposite: EditGroup = Vec::with_capacity(group.len());
     for inv in group.iter().rev() {
+      if let Some(byte) = inv.fill {
+        // A run of break bytes rewritten to the other break byte: the range
+        // keeps its length and is never read or copied.
+        let other = if byte == b'\r' { b'\n' } else { b'\r' };
+        self.table.delete(inv.start, inv.end)?;
+        self
+          .table
+          .insert_fill(inv.start, byte, inv.end - inv.start)?;
+        opposite.push(InverseEdit {
+          start: inv.start,
+          end: inv.end,
+          text: String::new(),
+          keep_start: inv.keep_start,
+          fill: Some(other),
+        });
+        applied.push(AppliedEdit {
+          start: inv.start,
+          end: inv.end,
+          text: String::new(),
+          keep_start: inv.keep_start,
+          fill: Some((byte as char).to_string()),
+        });
+        continue;
+      }
       let removed = self.table.read(inv.start, inv.end)?;
       let removed = String::from_utf8(removed).map_err(|_| NOT_UTF8.to_string())?;
       let text_len = inv.text.len() as u64;
@@ -774,6 +933,8 @@ impl Session {
         start: inv.start,
         end: inv.start + text_len,
         text: removed,
+        keep_start: inv.keep_start,
+        fill: None,
       });
       self.table.delete(inv.start, inv.end)?;
       self.table.insert(inv.start, inv.text.as_bytes())?;
@@ -781,6 +942,8 @@ impl Session {
         start: inv.start,
         end: inv.end,
         text: inv.text.clone(),
+        keep_start: inv.keep_start,
+        fill: None,
       });
     }
     Ok((applied, opposite))
@@ -817,7 +980,8 @@ impl Session {
       JournalEntry::Replace(entry) => {
         self.take_back_replace(&entry)?;
         self.state_id = before;
-        let result = self.reload_outcome(&entry.list)?;
+        let mut result = self.reload_outcome(&entry.list)?;
+        result.token = Some(self.register_token(entry.list.clone(), Dir::Inverse));
         self.redo_stack.push(Step {
           entry: JournalEntry::Replace(ReplaceEntry {
             list: entry.list,
@@ -853,7 +1017,8 @@ impl Session {
       JournalEntry::Replace(entry) => {
         let layer_id = self.stack_layer(Dir::Forward, entry.list.clone());
         self.state_id = after;
-        let result = self.reload_outcome(&entry.list)?;
+        let mut result = self.reload_outcome(&entry.list)?;
+        result.token = Some(self.register_token(entry.list.clone(), Dir::Forward));
         self.undo_stack.push(Step {
           entry: JournalEntry::Replace(ReplaceEntry {
             list: entry.list,
@@ -929,6 +1094,7 @@ impl Session {
       reload_only: true,
       clean: self.clean(),
       generation: self.generation,
+      token: None,
     })
   }
 
@@ -948,6 +1114,7 @@ impl Session {
       reload_only: false,
       clean: self.clean(),
       generation: self.generation,
+      token: None,
     }
   }
 }
@@ -1130,7 +1297,14 @@ pub fn windowed_read(
   let session = map
     .get(&session_id)
     .ok_or_else(|| UNKNOWN_SESSION.to_string())?;
-  let table = &session.table;
+  read_window_result(&session.table, start_line, end_line)
+}
+/// The window `[start_line, end_line)` of `table`, clamped to its line range.
+fn read_window_result(
+  table: &Table,
+  start_line: u64,
+  end_line: u64,
+) -> Result<WindowResult, String> {
   let total_lines = table.line_count();
   let total_bytes = table.len();
   let start_line = start_line.min(total_lines);
@@ -1139,6 +1313,8 @@ pub fn windowed_read(
   let end_offset = line_offset(table, end_line)?;
   let bytes = table.read(start_offset, end_offset)?;
   let text = String::from_utf8(bytes).map_err(|_| NOT_UTF8.to_string())?;
+  let prev_lone_cr = start_offset > 0 && table.read(start_offset - 1, start_offset)? == b"\r";
+  let next_is_lf = end_offset < total_bytes && table.read(end_offset, end_offset + 1)? == b"\n";
   Ok(WindowResult {
     text,
     start_offset,
@@ -1146,6 +1322,8 @@ pub fn windowed_read(
     start_line,
     total_lines,
     total_bytes,
+    prev_lone_cr,
+    next_is_lf,
   })
 }
 
@@ -1338,6 +1516,68 @@ fn close_core(state: &WindowedState, session_id: u64) {
 #[tauri::command(async)]
 pub fn windowed_close(state: State<WindowedState>, session_id: u64) {
   close_core(&state, session_id);
+}
+
+/// Core of `windowed_map_replace`.
+fn map_replace_core(
+  state: &WindowedState,
+  session_id: u64,
+  token: u64,
+  offsets: &[u64],
+) -> Result<Vec<u64>, String> {
+  let map = state.lock_idle(session_id)?;
+  let session = map
+    .get(&session_id)
+    .ok_or_else(|| UNKNOWN_SESSION.to_string())?;
+  session.map_replace(token, offsets)
+}
+
+/// Map global byte `offsets` through the replace-all behind `token` (from an
+/// undo, redo or replace-all result): the offsets of the content before the
+/// change become offsets of the content after it.
+#[tauri::command(async)]
+pub fn windowed_map_replace(
+  state: State<WindowedState>,
+  session_id: u64,
+  token: u64,
+  offsets: Vec<u64>,
+) -> Result<Vec<u64>, String> {
+  map_replace_core(&state, session_id, token, &offsets)
+}
+
+/// Core of `windowed_release_replace`. A token or session already gone is not
+/// an error.
+fn release_replace_core(state: &WindowedState, session_id: u64, token: u64) {
+  if let Ok(mut map) = state.lock_idle(session_id) {
+    if let Some(session) = map.get_mut(&session_id) {
+      session.replace_tokens.remove(&token);
+    }
+  }
+}
+
+/// Drop a replace-all token.
+#[tauri::command(async)]
+pub fn windowed_release_replace(state: State<WindowedState>, session_id: u64, token: u64) {
+  release_replace_core(&state, session_id, token);
+}
+
+/// Core of `windowed_offset_line`.
+fn offset_line_core(state: &WindowedState, session_id: u64, offset: u64) -> Result<u64, String> {
+  let map = state.lock_idle(session_id)?;
+  let session = map
+    .get(&session_id)
+    .ok_or_else(|| UNKNOWN_SESSION.to_string())?;
+  session.table.offset_to_line(offset)
+}
+
+/// The 0-based line holding global byte `offset`, by the line rule (`line_rule`).
+#[tauri::command(async)]
+pub fn windowed_offset_line(
+  state: State<WindowedState>,
+  session_id: u64,
+  offset: u64,
+) -> Result<u64, String> {
+  offset_line_core(&state, session_id, offset)
 }
 /// Reads session content one chunk at a time. Each read takes the sessions lock
 /// for that chunk only and refuses once the content has changed since the scan
@@ -1604,11 +1844,25 @@ fn utf16_units(bytes: &[u8]) -> u64 {
     .sum()
 }
 /// The column after `bytes`, given the column before them: counting restarts
-/// after the last newline.
+/// after the last break. A final `\r` is one unit until the next byte shows it
+/// is a break (see `resolve_col`).
 fn advance_col(col: u64, bytes: &[u8]) -> u64 {
-  match bytes.iter().rposition(|&b| b == b'\n') {
+  let last_break = (0..bytes.len()).rposition(|i| {
+    bytes[i] == b'\n' || (bytes[i] == b'\r' && bytes.get(i + 1).is_some_and(|&n| n != b'\n'))
+  });
+  match last_break {
     Some(at) => utf16_units(&bytes[at + 1..]),
     None => col + utf16_units(bytes),
+  }
+}
+/// The column before a byte `next`, given the column after the bytes before it
+/// and whether they end in a `\r` still counted as a unit: that `\r` was a
+/// break unless `next` is `\n`.
+fn resolve_col(col: u64, pending_cr: bool, next: u8) -> u64 {
+  if pending_cr && next != b'\n' {
+    0
+  } else {
+    col
   }
 }
 /// How a whole-file search ended.
@@ -1648,7 +1902,6 @@ fn search_core(
     Err(_) => return SearchEnd::Failed,
   };
   let needle = query.as_bytes();
-  let nl_needle = count_newlines(needle);
   let reader = SessionReader {
     state,
     id: session_id,
@@ -1665,7 +1918,7 @@ fn search_core(
   };
   let mut hits = 0u64;
   let mut truncated = false;
-  let mut line = 0u64;
+  let mut breaks = BreakCounter::new();
   let mut col = 0u64;
   let result = scan_forward(
     0,
@@ -1677,19 +1930,24 @@ fn search_core(
     &mut |event| {
       match event {
         Event::Gap { bytes } => {
-          line += count_newlines(bytes);
+          if let Some(&first) = bytes.first() {
+            col = resolve_col(col, breaks.pending_cr(), first);
+          }
           col = advance_col(col, bytes);
+          breaks.feed(bytes);
         }
         Event::Hit { off, buf, idx } => {
+          let first = buf[idx];
+          col = resolve_col(col, breaks.pending_cr(), first);
           emit(ResultHit {
             offset: off,
-            line,
+            line: breaks.count_before_next(first),
             col,
             preview: preview_at(buf, idx),
           });
           hits += 1;
-          line += nl_needle;
           col = advance_col(col, needle);
+          breaks.feed(needle);
           if hits >= max_results as u64 {
             truncated = true;
             return Ok(Flow::Stop);
@@ -1815,6 +2073,9 @@ pub struct ReplaceAllOutcome {
   pub total_lines: u64,
   pub clean: bool,
   pub generation: u64,
+  /// The token of the change list when at least one hit was replaced (see
+  /// `UndoResult::token`).
+  pub token: Option<u64>,
 }
 /// Core of `windowed_replace_all`. One streaming pass over the current content
 /// finds every leftmost non-overlapping hit and writes the change list to
@@ -1829,6 +2090,7 @@ fn replace_all_core(
   query: &str,
   case_sensitive: bool,
   replacement: &str,
+  insert_sep: &str,
   chunk: usize,
   interval: u64,
   between: &mut dyn FnMut(usize),
@@ -1849,7 +2111,13 @@ fn replace_all_core(
     id: session_id,
   };
   let needle = query.as_bytes();
-  let mut builder = Builder::create(tmp_dir, needle, replacement.as_bytes(), interval)?;
+  let mut builder = Builder::create(
+    tmp_dir,
+    needle,
+    replacement.as_bytes(),
+    interval,
+    insert_sep,
+  )?;
   let reader = SessionReader {
     state,
     id: session_id,
@@ -1886,6 +2154,7 @@ fn replace_all_core(
   })?;
   let list = builder.finish(len)?;
   let count = list.hits();
+  let mut token = None;
   let mut map = state.sessions.lock().unwrap();
   let session = map
     .get_mut(&session_id)
@@ -1894,7 +2163,9 @@ fn replace_all_core(
     if session.generation != generation {
       return Err("replace-all aborted: the content changed during the pass".to_string());
     }
-    session.install_replace(Arc::new(list));
+    let list = Arc::new(list);
+    session.install_replace(list.clone());
+    token = Some(session.register_token(list, Dir::Forward));
   }
   Ok(ReplaceAllOutcome {
     count,
@@ -1902,11 +2173,14 @@ fn replace_all_core(
     total_lines: session.table.line_count(),
     clean: session.clean(),
     generation: session.generation,
+    token,
   })
 }
 /// Replace every occurrence of `query` in the session's current content with
-/// `replacement`, as one undoable step. Memory stays independent of the file
-/// size and the hit count: see `replace_layer`.
+/// `replacement`, as one undoable step. A lone `\r` the pass leaves directly
+/// before a `\n` is rewritten to `insert_sep` (`"\n"` or `"\r\n"`) in the same
+/// step. Memory stays independent of the file size and the hit count: see
+/// `replace_layer`.
 #[tauri::command(async)]
 pub fn windowed_replace_all(
   app: AppHandle,
@@ -1915,6 +2189,7 @@ pub fn windowed_replace_all(
   query: String,
   case_sensitive: bool,
   replacement: String,
+  insert_sep: String,
 ) -> Result<ReplaceAllOutcome, String> {
   let tmp_dir = app
     .path()
@@ -1928,6 +2203,7 @@ pub fn windowed_replace_all(
     &query,
     case_sensitive,
     &replacement,
+    &insert_sep,
     SCAN_CHUNK,
     CHECKPOINT_INTERVAL,
     &mut |_| {},
@@ -1991,6 +2267,8 @@ mod tests {
       start,
       end,
       text: text.to_string(),
+      keep_start: false,
+      cascade: false,
     }
   }
 
@@ -2859,6 +3137,7 @@ mod tests {
     let bogus = CheckpointIndex {
       checkpoints: real_index.checkpoints,
       total_newlines: 40,
+      line_rule: LINE_RULE,
     };
     let next_id = AtomicU64::new(0);
     let (_, session, result) =
@@ -2868,6 +3147,55 @@ mod tests {
       "a matching fingerprint and digest must skip the scan entirely"
     );
     assert_eq!(session.table.line_count(), 41);
+  }
+
+  #[test]
+  fn reopen_rescans_an_index_counted_under_another_line_rule() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("rule.txt");
+    // Breaks at bytes 1, 4 and 6: four lines, where `\n` alone gives two.
+    let content = b"a\rb\r\nc\r";
+    fs::write(&path, content).unwrap();
+    let fingerprint = fingerprint_of(&path).unwrap();
+    let (_, _, _, real_index, digest) = build_table(&path).unwrap();
+    assert_eq!(real_index.line_rule, LINE_RULE);
+    assert_eq!(real_index.total_newlines, 3);
+    // Only the rule differs from the real index: the checkpoints, fingerprint
+    // and digest all match, yet the index is not trusted.
+    let counted_before = CheckpointIndex {
+      line_rule: 0,
+      ..real_index.clone()
+    };
+    assert!(!valid_checkpoint_index(
+      &counted_before,
+      content.len() as u64
+    ));
+    // An index saved before the field existed reads back with rule 0.
+    let json = r#"{"checkpoints":[[0,0]],"total_newlines":1}"#;
+    let saved: CheckpointIndex = serde_json::from_str(json).unwrap();
+    assert_eq!(saved.line_rule, 0);
+    assert!(!valid_checkpoint_index(&saved, content.len() as u64));
+    let next_id = AtomicU64::new(0);
+    let (_, session, result) = reopen_session(
+      &next_id,
+      path.clone(),
+      counted_before,
+      fingerprint.clone(),
+      Some(digest),
+    )
+    .unwrap();
+    assert!(result.rescanned);
+    assert_eq!(session.table.line_count(), 4);
+    // A fresh index goes through JSON the way the frontend hands it back, and
+    // is trusted.
+    let json = serde_json::to_string(&real_index).unwrap();
+    assert!(json.contains(r#""line_rule":1"#), "{json}");
+    let handed_back: CheckpointIndex = serde_json::from_str(&json).unwrap();
+    assert!(valid_checkpoint_index(&handed_back, content.len() as u64));
+    let (_, session, result) =
+      reopen_session(&next_id, path, handed_back, fingerprint, Some(digest)).unwrap();
+    assert!(!result.rescanned);
+    assert_eq!(session.table.line_count(), 4);
   }
 
   #[test]
@@ -2883,6 +3211,7 @@ mod tests {
     let bogus = CheckpointIndex {
       checkpoints: vec![(0, 0)],
       total_newlines: 999,
+      line_rule: LINE_RULE,
     };
     let next_id = AtomicU64::new(0);
     // The fingerprint mismatch alone forces the fallback, so the digest value
@@ -3063,6 +3392,7 @@ mod tests {
       index: CheckpointIndex {
         checkpoints: vec![(0, 0)],
         total_newlines: 0,
+        line_rule: LINE_RULE,
       },
       fingerprint: Fingerprint {
         size: 0,
@@ -3130,6 +3460,7 @@ mod tests {
     let empty = CheckpointIndex {
       checkpoints: Vec::new(),
       total_newlines: 0,
+      line_rule: LINE_RULE,
     };
     // The digest matching what `sample_digest` actually computes over the
     // supplied (empty) checkpoint list, so a digest mismatch cannot be what
@@ -3155,6 +3486,7 @@ mod tests {
     let bad = CheckpointIndex {
       checkpoints: vec![(0, 0), (3, 1), (2, 2)],
       total_newlines: 3,
+      line_rule: LINE_RULE,
     };
     // Matches what `sample_digest` computes over these exact (bad) offsets, so
     // a digest mismatch cannot be what forces the rescan below. These offsets
@@ -3182,6 +3514,7 @@ mod tests {
     let bad = CheckpointIndex {
       checkpoints: vec![(0, 0), (100, 3)],
       total_newlines: 3,
+      line_rule: LINE_RULE,
     };
     // Matches what `sample_digest` computes over these exact (bad) offsets
     // (the offset past EOF is simply skipped, same as `sample_digest` does),
@@ -3212,6 +3545,7 @@ mod tests {
     let index = CheckpointIndex {
       checkpoints: vec![(0, 0), (CHECKPOINT_INTERVAL, 0), (5, 0)],
       total_newlines: 0,
+      line_rule: LINE_RULE,
     };
     assert!(!valid_checkpoint_index(&index, 3 * CHECKPOINT_INTERVAL));
   }
@@ -3227,6 +3561,7 @@ mod tests {
     let index = CheckpointIndex {
       checkpoints: vec![(5, 0), (CHECKPOINT_INTERVAL + 5, 1)],
       total_newlines: 1,
+      line_rule: LINE_RULE,
     };
     assert!(!valid_checkpoint_index(&index, 2 * CHECKPOINT_INTERVAL));
   }
@@ -3241,6 +3576,7 @@ mod tests {
     let index = CheckpointIndex {
       checkpoints: vec![(0, 0), (CHECKPOINT_INTERVAL, 0)],
       total_newlines: 0,
+      line_rule: LINE_RULE,
     };
     assert!(!valid_checkpoint_index(&index, CHECKPOINT_INTERVAL));
   }
@@ -3260,6 +3596,7 @@ mod tests {
     let bad = CheckpointIndex {
       checkpoints: vec![(0, 0)],
       total_newlines: 0,
+      line_rule: LINE_RULE,
     };
     let digest = sample_digest(&path, size as u64, &bad.checkpoints).unwrap();
     let next_id = AtomicU64::new(0);
@@ -3288,6 +3625,7 @@ mod tests {
     let bad = CheckpointIndex {
       checkpoints: vec![(0, 0), (3 * CHECKPOINT_INTERVAL, 0)],
       total_newlines: 0,
+      line_rule: LINE_RULE,
     };
     let digest = sample_digest(&path, size, &bad.checkpoints).unwrap();
     let next_id = AtomicU64::new(0);
@@ -3318,6 +3656,7 @@ mod tests {
         (2 * CHECKPOINT_INTERVAL, 2),
       ],
       total_newlines: 5,
+      line_rule: LINE_RULE,
     };
     let digest = sample_digest(&path, size, &bad.checkpoints).unwrap();
     let next_id = AtomicU64::new(0);
@@ -3352,6 +3691,7 @@ mod tests {
     let bad = CheckpointIndex {
       checkpoints: real_index.checkpoints.clone(),
       total_newlines: 0,
+      line_rule: LINE_RULE,
     };
     // Same checkpoint offsets/bytes as the real index, so the digest still
     // matches: only the tampered `total_newlines` differs.
@@ -3376,6 +3716,7 @@ mod tests {
     let placeholder = CheckpointIndex {
       checkpoints: vec![(0, 0)],
       total_newlines: 0,
+      line_rule: LINE_RULE,
     };
     let next_id = AtomicU64::new(0);
     let err = match reopen_session(&next_id, path, placeholder, mismatched, None) {
@@ -3406,6 +3747,7 @@ mod tests {
     let index = CheckpointIndex {
       checkpoints: vec![(0, 0)],
       total_newlines: 0,
+      line_rule: LINE_RULE,
     };
     let fingerprint = Fingerprint {
       size: LARGE_EDIT_MAX,
@@ -3451,6 +3793,7 @@ mod replace_tests {
   use super::*;
   use crate::large_file::find_sub;
   use crate::replace_layer::{layer_depth, list_paths, resident_units};
+  use std::io::Cursor;
   use std::sync::mpsc;
   use std::time::{Duration, Instant};
   use tempfile::{tempdir, TempDir};
@@ -3488,6 +3831,8 @@ mod replace_tests {
       start,
       end,
       text: text.to_string(),
+      keep_start: false,
+      cascade: false,
     }
   }
 
@@ -3513,6 +3858,18 @@ mod replace_tests {
       chunk: usize,
       interval: u64,
     ) -> ReplaceAllOutcome {
+      self.replace_with_sep(q, case, r, "\n", chunk, interval)
+    }
+
+    fn replace_with_sep(
+      &self,
+      q: &str,
+      case: bool,
+      r: &str,
+      insert_sep: &str,
+      chunk: usize,
+      interval: u64,
+    ) -> ReplaceAllOutcome {
       replace_all_core(
         &self.state,
         &self.tmp,
@@ -3520,6 +3877,7 @@ mod replace_tests {
         q,
         case,
         r,
+        insert_sep,
         chunk,
         interval,
         &mut |_| {},
@@ -3554,19 +3912,168 @@ mod replace_tests {
       self.with(|s| list_paths(&s.table))
     }
   }
-  /// A flat in-memory leftmost non-overlapping replace.
-  fn flat_replace(hay: &[u8], needle: &[u8], repl: &[u8], case: bool) -> (Vec<u8>, u64) {
-    let mut out = Vec::new();
-    let mut count = 0;
+  /// One hit of the model: its pre-replace offset, and whether the `\n` of a
+  /// CRLF junction is part of its output.
+  struct ModelHit {
+    pre: usize,
+    sep: bool,
+  }
+  /// The replace-all rule written out over whole buffers: the post bytes and the
+  /// hits with the inserted-byte attribution.
+  struct ReplaceModel {
+    post: Vec<u8>,
+    hits: Vec<ModelHit>,
+    junctions: usize,
+  }
+  /// Where a post-replace byte before the rewrite came from.
+  #[derive(Clone, Copy)]
+  enum Origin {
+    Gap(usize),
+    Hit(usize),
+  }
+  /// Replace `needle` by `repl` (leftmost, non-overlapping), then rewrite every
+  /// kept CR (a `\r` of the text between hits whose next byte is not `\n`) that
+  /// the replacement leaves directly before a `\n`: for `\r\n` an `\n` goes
+  /// right after it, for `\n` it and the run of `\r` before it become `\n`.
+  fn replace_model(
+    hay: &[u8],
+    needle: &[u8],
+    repl: &[u8],
+    case: bool,
+    insert_sep: &str,
+  ) -> ReplaceModel {
+    let mut hits = Vec::new();
+    let mut q0: Vec<(u8, Origin)> = Vec::new();
     let mut from = 0usize;
     while let Some(rel) = find_sub(&hay[from..], needle, case) {
-      out.extend_from_slice(&hay[from..from + rel]);
-      out.extend_from_slice(repl);
-      from += rel + needle.len();
-      count += 1;
+      for (i, &b) in hay[from..from + rel].iter().enumerate() {
+        q0.push((b, Origin::Gap(from + i)));
+      }
+      let at = from + rel;
+      q0.extend(repl.iter().map(|&b| (b, Origin::Hit(hits.len()))));
+      hits.push(ModelHit {
+        pre: at,
+        sep: false,
+      });
+      from = at + needle.len();
     }
-    out.extend_from_slice(&hay[from..]);
-    (out, count)
+    for (i, &b) in hay[from..].iter().enumerate() {
+      q0.push((b, Origin::Gap(from + i)));
+    }
+    let n = q0.len();
+    let mut to_lf = vec![false; n];
+    let mut insert_after = vec![false; n];
+    let mut junctions = 0;
+    for i in 0..n {
+      let (b, origin) = q0[i];
+      let Origin::Gap(at) = origin else {
+        continue;
+      };
+      let kept = b == b'\r' && hay.get(at + 1) != Some(&b'\n');
+      if !(kept && i + 1 < n && q0[i + 1].0 == b'\n') {
+        continue;
+      }
+      junctions += 1;
+      if insert_sep == "\n" {
+        let mut j = i;
+        loop {
+          to_lf[j] = true;
+          if j == 0 || q0[j - 1].0 != b'\r' {
+            break;
+          }
+          j -= 1;
+        }
+      } else {
+        insert_after[i] = true;
+        // The byte belongs to the hit that makes the `\n` follow the CR: the
+        // one whose replacement starts with it, else the last hit before the
+        // `\n` of the text between hits.
+        let owner = match q0[i + 1].1 {
+          Origin::Hit(h) => h,
+          Origin::Gap(next) => hits.partition_point(|h| h.pre < next) - 1,
+        };
+        hits[owner].sep = true;
+      }
+    }
+    let mut post = Vec::with_capacity(n);
+    for i in 0..n {
+      post.push(if to_lf[i] { b'\n' } else { q0[i].0 });
+      if insert_after[i] {
+        post.push(b'\n');
+      }
+    }
+    ReplaceModel {
+      post,
+      hits,
+      junctions,
+    }
+  }
+
+  impl ReplaceModel {
+    /// Where every pre offset `0..=pre_len` goes, and where every post offset
+    /// goes back to. An offset at or before a hit's start does not count the
+    /// hit; one inside it goes to the end of its output; one at its end counts
+    /// it. The inserted `\n` is the first byte of its hit's output.
+    fn maps(&self, pre_len: usize, m: usize, r: usize) -> (Vec<u64>, Vec<u64>) {
+      let mut forward = vec![0u64; pre_len + 1];
+      // (post start, output length) of every hit.
+      let mut spans: Vec<(usize, usize)> = Vec::new();
+      let (mut post, mut x, mut h) = (0usize, 0usize, 0usize);
+      while x <= pre_len {
+        if h < self.hits.len() && self.hits[h].pre == x {
+          let out_len = r + usize::from(self.hits[h].sep);
+          forward[x] = post as u64;
+          for k in 1..m {
+            forward[x + k] = (post + out_len) as u64;
+          }
+          spans.push((post, out_len));
+          post += out_len;
+          x += m;
+          h += 1;
+        } else {
+          forward[x] = post as u64;
+          post += 1;
+          x += 1;
+        }
+      }
+      let post_len = self.post.len();
+      let mut inverse = vec![0u64; post_len + 1];
+      let (mut y, mut p, mut h) = (0usize, 0usize, 0usize);
+      while y <= post_len {
+        // A hit with no output at this offset has been passed.
+        while h < spans.len() && spans[h].0 == y && spans[h].1 == 0 {
+          p += m;
+          h += 1;
+        }
+        if h < spans.len() && spans[h].0 == y {
+          inverse[y] = p as u64;
+          for k in 1..spans[h].1 {
+            inverse[y + k] = (p + m) as u64;
+          }
+          p += m;
+          y += spans[h].1;
+          h += 1;
+        } else {
+          inverse[y] = p as u64;
+          p += 1;
+          y += 1;
+        }
+      }
+      (forward, inverse)
+    }
+  }
+  /// A flat in-memory leftmost non-overlapping replace, with the junction
+  /// rewrite of `insert_sep`.
+  fn flat_replace(
+    hay: &[u8],
+    needle: &[u8],
+    repl: &[u8],
+    case: bool,
+    insert_sep: &str,
+  ) -> (Vec<u8>, u64) {
+    let model = replace_model(hay, needle, repl, case, insert_sep);
+    let count = model.hits.len() as u64;
+    (model.post, count)
   }
 
   fn line_starts(flat: &[u8]) -> Vec<u64> {
@@ -3581,8 +4088,11 @@ mod replace_tests {
   /// The table equals `flat` in length, bytes, line count, every line start,
   /// the line of every (sampled) offset and a spread of line windows.
   fn assert_table_is(table: &Table, flat: &[u8]) {
+    assert_table_matches(table, flat, &line_starts(flat));
+  }
+  /// `assert_table_is` for line starts `starts` given.
+  fn assert_table_matches(table: &Table, flat: &[u8], starts: &[u64]) {
     assert_eq!(table.len(), flat.len() as u64, "len");
-    let starts = line_starts(flat);
     let lines = if flat.is_empty() {
       0
     } else {
@@ -4046,7 +4556,7 @@ mod replace_tests {
   fn replace_all_of_100k_hits_then_undo_and_redo_are_exact_and_fast() {
     let original = big_doc(100_000, 1);
     let fx = fixture(&original);
-    let (replaced, count) = flat_replace(&original, b"tok", b"TOKEN_LONGER", true);
+    let (replaced, count) = flat_replace(&original, b"tok", b"TOKEN_LONGER", true, "\n");
     assert_eq!(count, 100_000);
     within(Duration::from_secs(10), "replace all", || {
       let out = fx.replace("tok", "TOKEN_LONGER");
@@ -4166,7 +4676,18 @@ mod replace_tests {
       assert_eq!(s.generation, 0);
     });
     assert_eq!(fx.change_lists_on_disk(), 0);
-    let err = replace_all_core(&fx.state, &fx.tmp, ID, "", true, "x", 8, 100, &mut |_| {});
+    let err = replace_all_core(
+      &fx.state,
+      &fx.tmp,
+      ID,
+      "",
+      true,
+      "x",
+      "\n",
+      8,
+      100,
+      &mut |_| {},
+    );
     assert_eq!(err.unwrap_err(), "empty-query");
   }
 
@@ -4181,14 +4702,14 @@ mod replace_tests {
     for _ in 0..3 {
       assert!(!fx.undo().reload_only);
     }
-    let (replaced, _) = flat_replace(&original, b"tok", b"TOKEN", true);
+    let (replaced, _) = flat_replace(&original, b"tok", b"TOKEN", true, "\n");
     assert_eq!(fx.whole(), replaced);
     assert!(fx.undo().reload_only);
     assert_eq!(fx.whole(), original);
   }
 
   fn assert_save_roundtrip(fx: &Fixture, original: &[u8]) {
-    let (replaced, _) = flat_replace(original, b"tok", b"TOKEN-LONG", true);
+    let (replaced, _) = flat_replace(original, b"tok", b"TOKEN-LONG", true, "\n");
     fx.replace("tok", "TOKEN-LONG");
     assert_eq!(fx.whole(), replaced);
     fx.save();
@@ -4232,7 +4753,7 @@ mod replace_tests {
     assert_eq!(crate::fs_ops::linktest::links(&fx.path), 2);
     assert_eq!(
       fs::read(&other).unwrap(),
-      flat_replace(&original, b"tok", b"TOKEN-LONG", true).0
+      flat_replace(&original, b"tok", b"TOKEN-LONG", true, "\n").0
     );
   }
 
@@ -4243,7 +4764,13 @@ mod replace_tests {
     let steps: [(&str, &str); 3] = [("tok", "tokentoken"), ("entok", "E\nE"), ("E", "")];
     let mut flats = vec![original.clone()];
     for (q, r) in steps {
-      let (next, _) = flat_replace(flats.last().unwrap(), q.as_bytes(), r.as_bytes(), true);
+      let (next, _) = flat_replace(
+        flats.last().unwrap(),
+        q.as_bytes(),
+        r.as_bytes(),
+        true,
+        "\n",
+      );
       assert_ne!(&next, flats.last().unwrap());
       flats.push(next);
       fx.replace_with(q, true, r, 13, 200);
@@ -4290,7 +4817,7 @@ mod replace_tests {
     ];
     for content in docs {
       for needle in ["aa", "abab", "aab", "a"] {
-        let (want, count) = flat_replace(content, needle.as_bytes(), b"Z", true);
+        let (want, count) = flat_replace(content, needle.as_bytes(), b"Z", true, "\n");
         for chunk in 1..=content.len() + 2 {
           let fx = fixture(content);
           let out = fx.replace_with(needle, true, "Z", chunk, 1 << 20);
@@ -4315,7 +4842,8 @@ mod replace_tests {
     for (n, needle) in needles.iter().enumerate() {
       for (r, repl) in repls.iter().enumerate() {
         let original = lcg_content((n * 10 + r) as u64 + 1, 2_500);
-        let (replaced, count) = flat_replace(&original, needle.as_bytes(), repl.as_bytes(), true);
+        let (replaced, count) =
+          flat_replace(&original, needle.as_bytes(), repl.as_bytes(), true, "\n");
         assert!(count > 3, "{needle:?} has few hits");
         let fx = fixture(&original);
         let interval = 100;
@@ -4341,7 +4869,7 @@ mod replace_tests {
         // Three stacked layers on top of that.
         let mut flat = replaced.clone();
         for (q, rr) in [("tok", "TT"), ("o", "oo\n"), ("é", "")] {
-          let (next, _) = flat_replace(&flat, q.as_bytes(), rr.as_bytes(), true);
+          let (next, _) = flat_replace(&flat, q.as_bytes(), rr.as_bytes(), true, "\n");
           fx.replace_with(q, true, rr, 11, interval);
           flat = next;
           fx.with(|s| {
@@ -4400,8 +4928,8 @@ mod replace_tests {
   fn a_change_list_outlives_its_journal_entry_while_a_layer_reads_it() {
     let original = lcg_content(3, 4_000);
     let fx = fixture(&original);
-    let (replaced, _) = flat_replace(&original, b"tok", b"TT", true);
-    fx.replace("tok", "TT");
+    let (replaced, _) = flat_replace(&original, b"tok", b"TT", true, "\n");
+    let token = fx.replace("tok", "TT").token.unwrap();
     let lists = fx.live_lists();
     assert_eq!(lists.len(), 1);
     // More edit groups than the journal keeps push the replace-all out of it.
@@ -4416,6 +4944,7 @@ mod replace_tests {
         .iter()
         .all(|e| matches!(e.entry, JournalEntry::Edits(_))));
     });
+    release_replace_core(&fx.state, ID, token);
     assert!(lists[0].exists(), "the layer still reads it");
     let mut want = vec![b'e'; UNDO_LIMIT + 1];
     want.extend_from_slice(&replaced);
@@ -4430,13 +4959,13 @@ mod replace_tests {
   fn replace_save_undo_then_a_fresh_edit_keeps_the_file_until_the_next_save_or_close() {
     let original = lcg_content(5, 4_000);
     let fx = fixture(&original);
-    let (replaced, _) = flat_replace(&original, b"tok", b"TT", true);
-    fx.replace("tok", "TT");
+    let (replaced, _) = flat_replace(&original, b"tok", b"TT", true, "\n");
+    let forward = fx.replace("tok", "TT").token.unwrap();
     let first = fx.live_lists()[0].clone();
     fx.save();
     assert!(first.exists(), "the journal entry still refers to it");
     assert!(fx.live_lists().is_empty(), "but no layer reads it any more");
-    fx.undo();
+    let back = fx.undo().token.unwrap();
     let lists = fx.live_lists();
     assert_eq!(
       lists.len(),
@@ -4455,6 +4984,8 @@ mod replace_tests {
       first.exists(),
       "the live layer holds it after the redo entry is gone"
     );
+    release_replace_core(&fx.state, ID, forward);
+    release_replace_core(&fx.state, ID, back);
     fx.save();
     assert!(!first.exists());
     assert_eq!(fs::read(&fx.path).unwrap(), want);
@@ -4481,6 +5012,7 @@ mod replace_tests {
       "tok",
       true,
       "T",
+      "\n",
       8,
       100,
       &mut |chunk| {
@@ -4519,7 +5051,7 @@ mod replace_tests {
           }
         };
         replace_all_core(
-          &fx.state, &fx.tmp, ID, "tok", true, "TOKEN", 16, 100, &mut hook,
+          &fx.state, &fx.tmp, ID, "tok", true, "TOKEN", "\n", 16, 100, &mut hook,
         )
       });
       paused_rx.recv().unwrap();
@@ -4592,7 +5124,7 @@ mod replace_tests {
     let (saved, early) = while_a_pass_is_paused(&fx, |fx| save_core(&fx.state, ID, None, None));
     assert!(!early, "the save must wait for the pass");
     saved.unwrap();
-    let (replaced, _) = flat_replace(&original, b"tok", b"TOKEN", true);
+    let (replaced, _) = flat_replace(&original, b"tok", b"TOKEN", true, "\n");
     assert_eq!(fs::read(&fx.path).unwrap(), replaced);
     assert_eq!(fx.whole(), replaced);
   }
@@ -4605,7 +5137,7 @@ mod replace_tests {
     let (saved, early) = while_a_pass_is_paused(&fx, |fx| save_core(&fx.state, ID, None, None));
     assert!(!early, "the save must wait for the pass");
     saved.unwrap();
-    let (replaced, _) = flat_replace(&original, b"tok", b"TOKEN", true);
+    let (replaced, _) = flat_replace(&original, b"tok", b"TOKEN", true, "\n");
     assert_eq!(fs::read(&fx.path).unwrap(), replaced);
     assert_eq!(crate::fs_ops::linktest::links(&fx.path), 2);
     assert_eq!(fx.whole(), replaced);
@@ -4649,6 +5181,7 @@ mod replace_tests {
       "tok",
       true,
       "x",
+      "\n",
       8,
       100,
       &mut |_| {},
@@ -4658,6 +5191,1744 @@ mod replace_tests {
     // A command that waits on idle returns at once.
     assert!(fx.state.lock_idle(ID).is_ok());
     assert_eq!(fx.state.lock_idle(404).err().unwrap(), UNKNOWN_SESSION);
+  }
+  // --- offsets through a replace-all -------------------------------------------
+
+  /// Reference for `map_offset`: the hits of a leftmost non-overlapping scan,
+  /// each as its pre-replace start.
+  fn ref_hits(hay: &[u8], needle: &[u8]) -> Vec<u64> {
+    let mut hits = Vec::new();
+    let mut from = 0usize;
+    while let Some(rel) = find_sub(&hay[from..], needle, true) {
+      hits.push((from + rel) as u64);
+      from += rel + needle.len();
+    }
+    hits
+  }
+
+  /// Where the reference puts `offset` of the pre frame (`forward`) or of the
+  /// post frame (not forward).
+  fn ref_map(hits: &[u64], n: i64, r: i64, forward: bool, offset: u64) -> u64 {
+    let (hit_in, hit_out) = if forward { (n, r) } else { (r, n) };
+    let mut moved = 0i64;
+    for (i, &p) in hits.iter().enumerate() {
+      let start = if forward {
+        p as i64
+      } else {
+        p as i64 + i as i64 * (r - n)
+      };
+      let o = offset as i64;
+      // A hit with no input text (an empty replacement, undone) is a point
+      // that an offset on it has passed.
+      if o < start || (o == start && hit_in > 0) {
+        break;
+      }
+      if o < start + hit_in {
+        return (start + moved + hit_out) as u64;
+      }
+      moved += hit_out - hit_in;
+    }
+    (offset as i64 + moved) as u64
+  }
+
+  #[test]
+  fn map_offset_matches_the_reference_for_every_offset_in_both_directions() {
+    let original = lcg_content(11, 3_000);
+    for repl in ["T", "TOKEN-LONGER", "", "a\nb", "tok"] {
+      let fx = fixture(&original);
+      let out = fx.replace_with("tok", true, repl, 13, 70);
+      let fwd = out.token.expect("a replace with hits has a token");
+      let hits = ref_hits(&original, b"tok");
+      assert!(hits.len() > 20);
+      let (n, r) = (3i64, repl.len() as i64);
+      let pre: Vec<u64> = (0..=original.len() as u64).collect();
+      let want: Vec<u64> = pre.iter().map(|&o| ref_map(&hits, n, r, true, o)).collect();
+      assert_eq!(
+        map_replace_core(&fx.state, ID, fwd, &pre).unwrap(),
+        want,
+        "forward, replacement {repl:?}"
+      );
+      let post_len = fx.with(|s| s.table.len());
+      let back = fx.undo().token.expect("an undone replace has a token");
+      let post: Vec<u64> = (0..=post_len).collect();
+      let want: Vec<u64> = post
+        .iter()
+        .map(|&o| ref_map(&hits, n, r, false, o))
+        .collect();
+      assert_eq!(
+        map_replace_core(&fx.state, ID, back, &post).unwrap(),
+        want,
+        "inverse, replacement {repl:?}"
+      );
+      // The redo maps pre to post again with its own token.
+      let again = fx.redo().token.unwrap();
+      assert_ne!(again, fwd);
+      let want: Vec<u64> = pre.iter().map(|&o| ref_map(&hits, n, r, true, o)).collect();
+      assert_eq!(map_replace_core(&fx.state, ID, again, &pre).unwrap(), want);
+    }
+  }
+
+  #[test]
+  fn map_offset_places_offsets_before_between_inside_and_after_hits() {
+    // "ab tok cd tok ef": hits at 3 and 10, three bytes each.
+    let fx = fixture(b"ab tok cd tok ef");
+    let token = fx.replace("tok", "LONGER").token.unwrap();
+    // Before the first hit, at its start, inside it, at its end, between the
+    // hits, inside the second, and after the last one.
+    let got = map_replace_core(&fx.state, ID, token, &[0, 3, 4, 5, 6, 8, 13, 14, 16]).unwrap();
+    assert_eq!(got, vec![0, 3, 9, 9, 9, 11, 19, 20, 22]);
+    assert_eq!(fx.whole(), b"ab LONGER cd LONGER ef");
+    // A shorter replacement moves the offsets the other way.
+    let fx = fixture(b"ab tok cd tok ef");
+    let token = fx.replace("tok", "X").token.unwrap();
+    let got = map_replace_core(&fx.state, ID, token, &[3, 4, 6, 10, 12, 16]).unwrap();
+    assert_eq!(got, vec![3, 4, 4, 8, 9, 12]);
+  }
+
+  #[test]
+  fn a_replace_all_without_hits_has_no_token() {
+    let fx = fixture(b"nothing here\n");
+    assert!(fx.replace("tok", "X").token.is_none());
+    fx.with(|s| assert!(s.replace_tokens.is_empty()));
+  }
+
+  #[test]
+  fn a_token_outlives_the_journal_and_the_layer_until_it_is_released() {
+    let fx = fixture(b"a tok b tok\nc\n");
+    let forward = fx.replace("tok", "TOKEN").token.unwrap();
+    let back = fx.undo().token.unwrap();
+    assert_ne!(forward, back);
+    // The layer is off the table; the typing edit empties the redo stack.
+    fx.edit(vec![ed(0, 0, "ZZ")], true);
+    assert!(fx.live_lists().is_empty());
+    assert_eq!(
+      fx.change_lists_on_disk(),
+      1,
+      "the tokens still hold the list"
+    );
+    // The undo's token maps the post frame onto the pre frame, whatever has
+    // been typed since: post "a TOKEN b TOKEN" -> pre "a tok b tok".
+    let got = map_replace_core(&fx.state, ID, back, &[0, 2, 4, 8, 9, 15]).unwrap();
+    assert_eq!(got, vec![0, 2, 5, 6, 7, 11]);
+    release_replace_core(&fx.state, ID, forward);
+    assert_eq!(
+      fx.change_lists_on_disk(),
+      1,
+      "the other token still holds it"
+    );
+    release_replace_core(&fx.state, ID, back);
+    assert_eq!(fx.change_lists_on_disk(), 0);
+    assert_eq!(
+      map_replace_core(&fx.state, ID, back, &[0]).unwrap_err(),
+      UNKNOWN_TOKEN
+    );
+    // Releasing a token that is gone, or in a session that is gone, is quiet.
+    release_replace_core(&fx.state, ID, back);
+    release_replace_core(&fx.state, 404, back);
+  }
+
+  #[test]
+  fn closing_the_session_drops_its_tokens_and_their_files() {
+    let fx = fixture(b"a tok b tok\nc\n");
+    fx.replace("tok", "TOKEN");
+    fx.undo();
+    fx.edit(vec![ed(0, 0, "ZZ")], true);
+    assert_eq!(fx.change_lists_on_disk(), 1);
+    close_core(&fx.state, ID);
+    assert_eq!(fx.change_lists_on_disk(), 0);
+    assert_eq!(
+      map_replace_core(&fx.state, ID, 1, &[0]).unwrap_err(),
+      UNKNOWN_SESSION
+    );
+  }
+
+  #[test]
+  fn offset_line_counts_cr_and_lf_breaks() {
+    // Lines by the core's count: "a\n" | "b\r\n" | "c\r" | "d\n" | "e".
+    let fx = fixture(b"a\nb\r\nc\rd\ne");
+    let at = |o: u64| offset_line_core(&fx.state, ID, o).unwrap();
+    assert_eq!(at(0), 0);
+    assert_eq!(at(1), 0, "before the first LF");
+    assert_eq!(at(2), 1);
+    // Inside a CRLF: before the LF, so still on the line of the CR.
+    assert_eq!(at(4), 1);
+    assert_eq!(at(5), 2);
+    assert_eq!(at(6), 2, "before the lone CR");
+    // A lone CR is a break: the next byte opens a line.
+    assert_eq!(at(7), 3);
+    assert_eq!(at(8), 3);
+    assert_eq!(at(10), 4);
+    // The file end is on the last line; past it is an error.
+    let end = fx.whole().len() as u64;
+    assert_eq!(at(end), 4);
+    assert!(offset_line_core(&fx.state, ID, end + 1).is_err());
+    assert_eq!(
+      offset_line_core(&fx.state, 404, 0).unwrap_err(),
+      UNKNOWN_SESSION
+    );
+  }
+  #[test]
+  fn pos_to_offset_stops_before_a_lone_cr() {
+    // Lines: "ab\r" | "cd\r\n" | "ef\r" | "".
+    let fx = fixture(b"ab\rcd\r\nef\r");
+    fx.with(|s| {
+      let at = |line: u64, col: u64| pos_to_offset(&s.table, line, col).unwrap();
+      assert_eq!(at(0, 0), 0);
+      assert_eq!(at(0, 2), 2);
+      assert_eq!(at(0, 99), 2, "a column past the end stops before the CR");
+      assert_eq!(at(1, 99), 5);
+      assert_eq!(at(2, 1), 8);
+      assert_eq!(at(2, 99), 9);
+      assert_eq!(at(3, 0), 10, "the empty line after a final CR");
+      assert_eq!(at(9, 0), 10, "a line past the end is the last line");
+      let pos = offset_to_pos(&s.table, 3).unwrap();
+      assert_eq!((pos.line, pos.col), (1, 0));
+    });
+  }
+  // --- The line rule: `\n`, and `\r` not followed by `\n` ----------------------
+  /// Line starts of `flat` by the line rule, written out directly.
+  fn rule_line_starts(flat: &[u8]) -> Vec<u64> {
+    let mut starts = vec![0u64];
+    for i in 0..flat.len() {
+      if flat[i] == b'\n' || (flat[i] == b'\r' && flat.get(i + 1) != Some(&b'\n')) {
+        starts.push(i as u64 + 1);
+      }
+    }
+    starts
+  }
+
+  fn assert_table_by_rule(table: &Table, flat: &[u8]) {
+    assert_table_matches(table, flat, &rule_line_starts(flat));
+  }
+  /// Every line start and the line of every offset, exhaustively.
+  fn assert_every_line_and_offset(table: &Table, flat: &[u8], what: &str) {
+    let starts = rule_line_starts(flat);
+    let lines = if flat.is_empty() {
+      0
+    } else {
+      starts.len() as u64
+    };
+    assert_eq!(table.line_count(), lines, "{what}: line_count of {flat:?}");
+    for line in 0..lines {
+      let got = table
+        .line_to_offset(line)
+        .unwrap_or_else(|e| panic!("{what}: line_to_offset({line}) of {flat:?}: {e}"));
+      assert_eq!(
+        got, starts[line as usize],
+        "{what}: line_to_offset({line}) of {flat:?}"
+      );
+    }
+    for off in 0..=flat.len() as u64 {
+      let got = table
+        .offset_to_line(off)
+        .unwrap_or_else(|e| panic!("{what}: offset_to_line({off}) of {flat:?}: {e}"));
+      assert_eq!(
+        got,
+        starts.partition_point(|&s| s <= off) as u64 - 1,
+        "{what}: offset_to_line({off}) of {flat:?}"
+      );
+    }
+    assert_table_by_rule(table, flat);
+  }
+  /// Line and UTF-16 column of `off` in `flat`.
+  fn rule_pos(flat: &[u8], off: u64) -> Pos {
+    let starts = rule_line_starts(flat);
+    let line = starts.partition_point(|&s| s <= off) as u64 - 1;
+    let text = String::from_utf8_lossy(&flat[starts[line as usize] as usize..off as usize]);
+    Pos {
+      line,
+      col: text.encode_utf16().count() as u64,
+    }
+  }
+  /// Offset of `line` / `col` in `flat`; a column past the text lands at its
+  /// end, before the line's break.
+  fn rule_offset(flat: &[u8], line: u64, col: u64) -> u64 {
+    let starts = rule_line_starts(flat);
+    let line = (line as usize).min(starts.len() - 1);
+    let start = starts[line] as usize;
+    let end = starts.get(line + 1).map_or(flat.len(), |&e| e as usize);
+    let mut text = &flat[start..end];
+    if text.ends_with(b"\n") {
+      text = &text[..text.len() - 1];
+    }
+    if text.ends_with(b"\r") {
+      text = &text[..text.len() - 1];
+    }
+    let text = std::str::from_utf8(text).unwrap();
+    let mut units = 0u64;
+    for (i, ch) in text.char_indices() {
+      if units >= col {
+        return (start + i) as u64;
+      }
+      units += ch.len_utf16() as u64;
+    }
+    (start + text.len()) as u64
+  }
+
+  fn rule_scan_inputs() -> Vec<Vec<u8>> {
+    let mut inputs: Vec<Vec<u8>> = [
+      &b"abcd\rxyzabc"[..],
+      b"abcd\r\nyzabc",
+      b"abcdefghi\rxy",
+      b"abcdefghi\r\ny",
+      b"abcde\rfg",
+      b"abcd\r",
+      b"abcde\r",
+      b"\r",
+      b"\r\r\r\r\r\r\r\r\r\r\r\r",
+      b"\r\n\r\n\r\n\r\n\r\n\r\n",
+      b"\n",
+      b"",
+    ]
+    .iter()
+    .map(|input| input.to_vec())
+    .collect();
+    let tokens: [&[u8]; 4] = [b"a", "é".as_bytes(), b"\r", b"\n"];
+    for seed in 1..=80u64 {
+      let mut state = seed.wrapping_mul(0x9e37_79b9_7f4a_7c15);
+      let mut input = Vec::new();
+      for _ in 0..(seed % 25) {
+        state = state
+          .wrapping_mul(6364136223846793005)
+          .wrapping_add(1442695040888963407);
+        input.extend_from_slice(tokens[((state >> 33) % 4) as usize]);
+      }
+      inputs.push(input);
+    }
+    inputs
+  }
+
+  #[test]
+  fn the_scan_follows_the_line_rule_for_any_read_size() {
+    for input in rule_scan_inputs() {
+      let starts = rule_line_starts(&input);
+      let mut want = vec![(0u64, 0u64)];
+      let mut at = 5u64;
+      while at < input.len() as u64 {
+        want.push((at, starts.partition_point(|&s| s <= at) as u64 - 1));
+        at += 5;
+      }
+      for buf in [1usize, 2, 3, 4096] {
+        let (bytes, checkpoints, total) =
+          scan_reader_at(Cursor::new(input.as_slice()), buf, 5).unwrap();
+        assert_eq!(bytes, input.len() as u64, "{input:?} / {buf}");
+        assert_eq!(total, starts.len() as u64 - 1, "total of {input:?} / {buf}");
+        assert_eq!(checkpoints, want, "checkpoints of {input:?} / {buf}");
+        let table = PieceTable::new(OriginalIndex::new(
+          input.as_slice(),
+          bytes,
+          total,
+          checkpoints,
+        ));
+        let lines = if input.is_empty() {
+          0
+        } else {
+          starts.len() as u64
+        };
+        assert_eq!(table.line_count(), lines, "{input:?} / {buf}");
+        for line in 0..lines {
+          assert_eq!(
+            table.line_to_offset(line).unwrap(),
+            starts[line as usize],
+            "line {line} of {input:?} / {buf}"
+          );
+        }
+      }
+    }
+  }
+
+  const CR_TEXTS: [&str; 5] = [
+    "a\r\nb",
+    "a\r\nb\rc\nd\r\n\re\r",
+    "\r\r\n\n\r",
+    "é\rè\r\n\r\néa\r",
+    "xa\rb\r\nxa\r\nx\r",
+  ];
+  const CR_NEEDLES: [&str; 11] = [
+    "\nb", "a\r", "\r", "\r\n", "b\r", "\n", "c\n", "\rc", "\r\r", "x", "a\r\nb",
+  ];
+  /// Non-overlapping hits from `find_sub`, as offsets.
+  fn flat_hit_offsets(flat: &[u8], needle: &[u8]) -> Vec<u64> {
+    let mut out = Vec::new();
+    let mut from = 0usize;
+    while let Some(rel) = find_sub(&flat[from..], needle, true) {
+      out.push((from + rel) as u64);
+      from += rel + needle.len();
+    }
+    out
+  }
+
+  #[test]
+  fn search_lines_and_columns_follow_the_line_rule() {
+    for text in CR_TEXTS {
+      let flat = text.as_bytes();
+      let fx = fixture(flat);
+      for needle in CR_NEEDLES {
+        let want: Vec<(u64, u64, u64)> = flat_hit_offsets(flat, needle.as_bytes())
+          .into_iter()
+          .map(|off| {
+            let pos = rule_pos(flat, off);
+            (off, pos.line, pos.col)
+          })
+          .collect();
+        for chunk in [1usize, 2, 3, 7, SCAN_CHUNK] {
+          let got: Vec<(u64, u64, u64)> = all_hits_with_cols(&fx, needle, true, chunk)
+            .into_iter()
+            .map(|(off, line, col, _)| (off, line, col))
+            .collect();
+          assert_eq!(got, want, "{text:?} / {needle:?} / chunk {chunk}");
+        }
+      }
+    }
+  }
+
+  #[test]
+  fn a_hit_inside_a_crlf_sits_on_the_line_of_its_cr() {
+    let fx = fixture(b"a\r\nb");
+    // "\nb" starts between the CR and the LF: line 0, one past the line's text.
+    assert_eq!(
+      all_hits_with_cols(&fx, "\nb", true, SCAN_CHUNK)
+        .into_iter()
+        .map(|(off, line, col, _)| (off, line, col))
+        .collect::<Vec<_>>(),
+      vec![(2, 0, 2)]
+    );
+    let find = |q: &str, line: u64, col: u64, backward: bool| {
+      find_core(
+        &fx.state,
+        ID,
+        q,
+        true,
+        line,
+        col,
+        backward,
+        SCAN_CHUNK,
+        &mut |_| {},
+      )
+      .unwrap()
+      .unwrap()
+    };
+    let forward = find("\nb", 0, 0, false);
+    assert_eq!(forward.start, Pos { line: 0, col: 2 });
+    assert_eq!(forward.end, Pos { line: 1, col: 1 });
+    let backward = find("\nb", 1, 1, true);
+    assert_eq!(backward.start, Pos { line: 0, col: 2 });
+    assert_eq!(backward.end, Pos { line: 1, col: 1 });
+    // "a\r" ends between the CR and the LF.
+    let forward = find("a\r", 0, 0, false);
+    assert_eq!(forward.start, Pos { line: 0, col: 0 });
+    assert_eq!(forward.end, Pos { line: 0, col: 2 });
+    let backward = find("a\r", 1, 1, true);
+    assert_eq!(backward.start, Pos { line: 0, col: 0 });
+    assert_eq!(backward.end, Pos { line: 0, col: 2 });
+    let listed = all_hits_with_cols(&fx, "a\r", true, SCAN_CHUNK);
+    assert_eq!(
+      listed.iter().map(|h| (h.1, h.2)).collect::<Vec<_>>(),
+      vec![(0, 0)]
+    );
+  }
+
+  #[test]
+  fn find_positions_follow_the_line_rule_in_both_directions() {
+    for text in CR_TEXTS {
+      let flat = text.as_bytes();
+      let fx = fixture(flat);
+      for needle in CR_NEEDLES {
+        let m = needle.len() as u64;
+        let all: Vec<u64> = (0..flat.len().saturating_sub(needle.len() - 1))
+          .filter(|&s| &flat[s..s + needle.len()] == needle.as_bytes())
+          .map(|s| s as u64)
+          .collect();
+        let listed = all_hits_with_cols(&fx, needle, true, SCAN_CHUNK);
+        for chunk in [2usize, SCAN_CHUNK] {
+          for from in 0..=flat.len() {
+            if std::str::from_utf8(&flat[..from]).is_err() {
+              continue;
+            }
+            let pos = rule_pos(flat, from as u64);
+            let from_off = rule_offset(flat, pos.line, pos.col);
+            for backward in [false, true] {
+              let want = if backward {
+                all
+                  .iter()
+                  .rev()
+                  .find(|&&s| s + m <= from_off)
+                  .or_else(|| all.last())
+              } else {
+                all.iter().find(|&&s| s >= from_off).or_else(|| all.first())
+              };
+              let got = find_core(
+                &fx.state,
+                ID,
+                needle,
+                true,
+                pos.line,
+                pos.col,
+                backward,
+                chunk,
+                &mut |_| {},
+              )
+              .unwrap();
+              let label = format!("{text:?} / {needle:?} / from {from} / back {backward}");
+              assert_eq!(
+                got.as_ref().map(|h| h.start_offset),
+                want.copied(),
+                "{label}"
+              );
+              if let Some(hit) = got {
+                assert_eq!(hit.start, rule_pos(flat, hit.start_offset), "{label}");
+                assert_eq!(hit.end, rule_pos(flat, hit.end_offset), "{label}");
+              }
+            }
+          }
+        }
+        // The first find and the first listed hit are one place.
+        if let Some(first) = listed.first() {
+          let hit = find_core(
+            &fx.state,
+            ID,
+            needle,
+            true,
+            0,
+            0,
+            false,
+            SCAN_CHUNK,
+            &mut |_| {},
+          )
+          .unwrap()
+          .unwrap();
+          assert_eq!(hit.start_offset, first.0);
+          assert_eq!(
+            hit.start,
+            Pos {
+              line: first.1,
+              col: first.2
+            }
+          );
+        }
+      }
+    }
+  }
+  /// Replace `q` by `r` over `content` and walk a path that builds an inverse
+  /// layer, comparing the table with a flat recomputation after every step:
+  /// replace-all, save, undo, redo; or replace-all, typing, undo of the typing,
+  /// undo, redo. The offsets the replace-all and its undo map equal the model's.
+  fn check_replace_path(
+    content: &[u8],
+    q: &str,
+    r: &str,
+    insert_sep: &str,
+    interval: u64,
+    chunk: usize,
+    typing: bool,
+  ) {
+    check_replace_path_with(content, q, r, insert_sep, interval, chunk, typing, &|_| {});
+  }
+  /// `check_replace_path`, with `more` run on the table after every step that
+  /// leaves a replace layer on top.
+  #[allow(clippy::too_many_arguments)]
+  fn check_replace_path_with(
+    content: &[u8],
+    q: &str,
+    r: &str,
+    insert_sep: &str,
+    interval: u64,
+    chunk: usize,
+    typing: bool,
+    more: &dyn Fn(&Table),
+  ) {
+    use crate::replace_layer::top_layer_dir;
+    let model = replace_model(content, q.as_bytes(), r.as_bytes(), true, insert_sep);
+    let post = model.post.clone();
+    let hits = model.hits.len() as u64;
+    let label = format!("{content:?} / {q:?} -> {r:?} / {insert_sep:?} / interval {interval}");
+    let check = |fx: &Fixture, what: &str, flat: &[u8], dir: Option<Dir>| {
+      fx.with(|s| {
+        if dir.is_some() {
+          assert_eq!(top_layer_dir(&s.table), dir, "{what}: {label}");
+          more(&s.table);
+        }
+        assert_every_line_and_offset(&s.table, flat, &format!("{what}: {label}"));
+      });
+    };
+    let fx = fixture(content);
+    let out = fx.replace_with_sep(q, true, r, insert_sep, chunk, interval);
+    assert_eq!(out.count, hits, "{label}");
+    if hits == 0 {
+      return;
+    }
+    let lines = if post.is_empty() {
+      0
+    } else {
+      rule_line_starts(&post).len() as u64
+    };
+    assert_eq!(out.total_lines, lines, "total_lines: {label}");
+    check(&fx, "forward", &post, Some(Dir::Forward));
+    let (forward, inverse) = model.maps(content.len(), q.len(), r.len());
+    let pre: Vec<u64> = (0..=content.len() as u64).collect();
+    let token = out.token.expect("a replace with hits has a token");
+    assert_eq!(
+      map_replace_core(&fx.state, ID, token, &pre).unwrap(),
+      forward,
+      "offsets forward: {label}"
+    );
+    let check_back = |back: UndoResult| {
+      let token = back.token.expect("an undone replace has a token");
+      let post_offsets: Vec<u64> = (0..=post.len() as u64).collect();
+      assert_eq!(
+        map_replace_core(&fx.state, ID, token, &post_offsets).unwrap(),
+        inverse,
+        "offsets back: {label}"
+      );
+    };
+    if !typing {
+      fx.save();
+      check(&fx, "saved", &post, None);
+      check_back(fx.undo());
+      check(&fx, "inverse after save", content, Some(Dir::Inverse));
+      fx.redo();
+      check(&fx, "forward again", &post, Some(Dir::Forward));
+      return;
+    }
+    // Typing inside the content splits its piece, so the undo that follows
+    // cannot just take the layer off.
+    let text = std::str::from_utf8(&post).unwrap();
+    let mut at = post.len() / 2;
+    while !text.is_char_boundary(at) {
+      at += 1;
+    }
+    if at == 0 || at >= post.len() {
+      return;
+    }
+    fx.edit(vec![ed(at as u64, at as u64, "Z")], true);
+    let mut typed = post.clone();
+    typed.insert(at, b'Z');
+    check(&fx, "typed", &typed, None);
+    fx.undo();
+    check(&fx, "typing undone", &post, None);
+    check_back(fx.undo());
+    check(&fx, "inverse after typing", content, Some(Dir::Inverse));
+    fx.redo();
+    check(&fx, "forward after redo", &post, Some(Dir::Forward));
+  }
+
+  const BOUNDARY_CASES: [(&[u8], &str, &str, u64); 11] = [
+    // Pre frame: a lone CR, then a CRLF cut, just before a checkpoint.
+    (b"abc\rdefghij", "hi", "Z", 4),
+    (b"abc\r\ndefghij", "hi", "Z", 4),
+    (b"abcdefg\rhijk", "jk", "Z", 4),
+    (b"abcdefg\r\nhijk", "jk", "Z", 4),
+    // Post frame: a replacement ending in CR, then a gap that starts without
+    // and with an LF, the checkpoint between them.
+    (b"xx ABy.........", "AB", "q\r", 5),
+    (b"xx AB\nzzzzzzzz", "AB", "q\r", 5),
+    (b"xx ABy.........", "AB", "q\r\n", 5),
+    // Empty replacements after a gap that ends in a lone CR: checkpoints
+    // pile up at one post offset; then a byte that is no LF, an LF, the end.
+    (b"a\rXYXYXYXYXYbcd", "XY", "", 3),
+    (b"a\rXYXYXYXYXY\nbcd", "XY", "", 3),
+    (b"a\rXYXYXYXYXY", "XY", "", 3),
+    (b"a\rXYXYXYXYXY\rbcd", "XY", "", 3),
+  ];
+
+  fn check_boundary_cases(typing: bool) {
+    for insert_sep in ["\n", "\r\n"] {
+      for (content, q, r, interval) in BOUNDARY_CASES {
+        for chunk in [2usize, SCAN_CHUNK] {
+          check_replace_path(content, q, r, insert_sep, interval, chunk, typing);
+        }
+      }
+    }
+  }
+
+  fn check_random_replaces(typing: bool) {
+    let tokens = ["a", "b", "x", "\r", "\n", "é", "ab", "\r\n", "xa\r"];
+    let needles = ["x", "\r", "\n", "\r\n", "a\r", "\nb", "b", "xa\r"];
+    let repls = ["", "\r", "\n", "\r\n", "q\r", "\rq", "zz", "\r\r"];
+    for seed in 1..=8u64 {
+      let mut state = seed.wrapping_mul(0x9e37_79b9_7f4a_7c15);
+      let mut next = || {
+        state = state
+          .wrapping_mul(6364136223846793005)
+          .wrapping_add(1442695040888963407);
+        state >> 33
+      };
+      let mut content = String::new();
+      while content.len() < 60 {
+        content.push_str(tokens[(next() % tokens.len() as u64) as usize]);
+      }
+      for _ in 0..20 {
+        let q = needles[(next() % needles.len() as u64) as usize];
+        let r = repls[(next() % repls.len() as u64) as usize];
+        let interval = [3u64, 5, 8][(next() % 3) as usize];
+        for insert_sep in ["\n", "\r\n"] {
+          check_replace_path(content.as_bytes(), q, r, insert_sep, interval, 7, typing);
+        }
+      }
+    }
+  }
+
+  #[test]
+  fn replace_all_checkpoints_follow_the_line_rule_at_chosen_boundaries_after_a_save() {
+    check_boundary_cases(false);
+  }
+
+  #[test]
+  fn replace_all_checkpoints_follow_the_line_rule_at_chosen_boundaries_after_typing() {
+    check_boundary_cases(true);
+  }
+
+  #[test]
+  fn replace_all_follows_the_line_rule_over_random_texts_after_a_save() {
+    check_random_replaces(false);
+  }
+
+  #[test]
+  fn replace_all_follows_the_line_rule_over_random_texts_after_typing() {
+    check_random_replaces(true);
+  }
+  /// Every content over {a, x, CR, LF} of length 0 to 5.
+  fn short_contents() -> Vec<Vec<u8>> {
+    let alphabet = *b"ax\r\n";
+    let mut all: Vec<Vec<u8>> = vec![Vec::new()];
+    let mut from = 0;
+    for _ in 0..5 {
+      let to = all.len();
+      for i in from..to {
+        for &b in &alphabet {
+          let mut next = all[i].clone();
+          next.push(b);
+          all.push(next);
+        }
+      }
+      from = to;
+    }
+    all
+  }
+
+  #[test]
+  fn replace_all_rewrites_every_junction_over_every_short_content() {
+    let started = Instant::now();
+    let needles = ["x", "xx", "\r", "\n", "\r\n", "x\r", "\nx"];
+    let repls = ["", "y", "\n", "\r", "\r\n", "\rq", "q\r"];
+    let contents = short_contents();
+    assert_eq!(contents.len(), 1365);
+    let mut junctions = 0;
+    for (c, content) in contents.iter().enumerate() {
+      for insert_sep in ["\n", "\r\n"] {
+        for k in 0..3 {
+          let pair = (3 * c + k) % 49;
+          let (q, r) = (needles[pair / 7], repls[pair % 7]);
+          let interval = [1u64, 2, 3][(c + k) % 3];
+          let chunk = [1usize, 2, 3, 7][(c + k) % 4];
+          let typing = (c + k) % 2 == 1;
+          check_replace_path(content, q, r, insert_sep, interval, chunk, typing);
+          junctions +=
+            replace_model(content, q.as_bytes(), r.as_bytes(), true, insert_sep).junctions;
+        }
+      }
+    }
+    assert!(junctions > 20, "{junctions} junctions");
+    let took = started.elapsed();
+    eprintln!("enumeration took {took:?}");
+    assert!(took < Duration::from_secs(60), "{took:?}");
+  }
+  /// Named shapes: content, needle, replacement.
+  const JUNCTION_SHAPES: [(&[u8], &str, &str); 15] = [
+    // A run of kept CRs that hits split: the inverse read meets it in more than
+    // one gap.
+    (b"a\rx\rx\nb", "x", ""),
+    (b"\r\rxx\r\rx\n", "x", ""),
+    (b"q\rx\rx\rx\r\n", "x", ""),
+    (b"\rx\n", "x", ""),
+    (b"\rxx\n", "x", ""),
+    (b"\r\rx\n", "x", ""),
+    (b"a\r\r\rxx\n", "x", ""),
+    (b"\rx", "x", ""),
+    (b"\rxa", "x", ""),
+    (b"x\rx\n", "x", ""),
+    (b"\rx\nx\n", "x", ""),
+    // A CR that is half of a CRLF is not a kept CR.
+    (b"a\r\nx", "x", "y"),
+    (b"\r\nb", "\n", "\n"),
+    // The replacement starts with the LF.
+    (b"\rxq\n", "x", "\nq"),
+    // A CR of the replacement before an LF of the text is not rewritten.
+    (b"x\n", "x", "q\r"),
+  ];
+
+  #[test]
+  fn replace_all_rewrites_the_named_junction_shapes_at_every_interval_and_chunk() {
+    for (content, q, r) in JUNCTION_SHAPES {
+      for interval in 1..=3u64 {
+        for chunk in [1usize, 2, 3, 7] {
+          for insert_sep in ["\n", "\r\n"] {
+            for typing in [false, true] {
+              check_replace_path(content, q, r, insert_sep, interval, chunk, typing);
+            }
+          }
+        }
+      }
+    }
+  }
+
+  #[test]
+  fn the_named_shapes_rewrite_what_the_rule_says() {
+    let rewritten = |content: &[u8], q: &str, r: &str, sep: &str| {
+      replace_model(content, q.as_bytes(), r.as_bytes(), true, sep).post
+    };
+    assert_eq!(rewritten(b"\rx\n", "x", "", "\n"), b"\n\n");
+    assert_eq!(rewritten(b"\rx\n", "x", "", "\r\n"), b"\r\n\n");
+    assert_eq!(rewritten(b"a\r\r\rxx\n", "x", "", "\n"), b"a\n\n\n\n");
+    assert_eq!(rewritten(b"a\r\r\rxx\n", "x", "", "\r\n"), b"a\r\r\r\n\n");
+    assert_eq!(rewritten(b"\rx", "x", "", "\n"), b"\r");
+    assert_eq!(rewritten(b"\rxq\n", "x", "\nq", "\r\n"), b"\r\n\nqq\n");
+    assert_eq!(rewritten(b"a\r\nx", "x", "y", "\n"), b"a\r\ny");
+    assert_eq!(rewritten(b"x\n", "x", "q\r", "\n"), b"q\r\n");
+    // The LF of a CRLF replaced by an LF leaves the pair as it was.
+    assert_eq!(rewritten(b"\r\nb", "\n", "\n", "\n"), b"\r\nb");
+  }
+  /// The checkpoints of the table's index count the breaks of `flat` before
+  /// their offset, by the line rule.
+  fn assert_checkpoint_counts(table: &Table, flat: &[u8]) {
+    use crate::line_rule::BreakCounter;
+    let mut counter = BreakCounter::new();
+    let mut fed = 0usize;
+    for &(off, nl) in table.index_checkpoints() {
+      let off = off as usize;
+      counter.feed(&flat[fed..off]);
+      fed = off;
+      let want = if off == flat.len() {
+        counter.finish()
+      } else {
+        counter.count_before_next(flat[off])
+      };
+      assert_eq!(nl, want, "checkpoint at {off}");
+    }
+  }
+  /// The change list behind `token`.
+  fn list_of(fx: &Fixture, token: u64) -> Arc<ChangeList> {
+    fx.with(|s| s.replace_tokens.get(&token).unwrap().0.clone())
+  }
+  /// Samples of the table against `flat`: length, line count, bytes, a spread
+  /// of line starts, reads that start inside a run and every checkpoint.
+  fn assert_big_table_is(table: &Table, flat: &[u8]) {
+    assert_eq!(table.len(), flat.len() as u64);
+    assert_eq!(table.read(0, table.len()).unwrap(), flat, "bytes");
+    let starts = rule_line_starts(flat);
+    assert_eq!(table.line_count(), starts.len() as u64, "line_count");
+    for line in [
+      0,
+      1,
+      2,
+      starts.len() / 2,
+      starts.len() - 2,
+      starts.len() - 1,
+    ] {
+      assert_eq!(
+        table.line_to_offset(line as u64).unwrap(),
+        starts[line],
+        "line {line}"
+      );
+    }
+    for off in [1usize, flat.len() / 3, flat.len() / 2 + 1, flat.len() - 5] {
+      assert_eq!(
+        table.read(off as u64, off as u64 + 4).unwrap(),
+        flat[off..off + 4]
+      );
+    }
+    assert_checkpoint_counts(table, flat);
+  }
+  /// A run of `run` CRs, then 3 * 512 + 1 drop-outs (more than three batches of
+  /// hit records), then an LF.
+  fn long_run_content(run: usize) -> Vec<u8> {
+    let mut content = vec![b'\r'; run];
+    content.extend(std::iter::repeat_n(b'X', 3 * 512 + 1));
+    content.push(b'\n');
+    content
+  }
+
+  #[test]
+  fn a_run_of_a_million_cr_is_rewritten_by_one_record_for_lf() {
+    let content = long_run_content(1_000_000);
+    let model = replace_model(&content, b"X", b"", true, "\n");
+    assert_eq!(model.junctions, 1);
+    assert!(model.post.iter().all(|&b| b == b'\n'));
+    let fx = fixture(&content);
+    let out = fx.replace_with_sep("X", true, "", "\n", SCAN_CHUNK, 700);
+    let token = out.token.unwrap();
+    let list = list_of(&fx, token);
+    assert_eq!(list.run_count(), 1, "one record for the whole run");
+    assert_eq!(out.total_lines, 1_000_002);
+    fx.with(|s| assert_big_table_is(&s.table, &model.post));
+    fx.save();
+    fx.undo();
+    fx.with(|s| assert_big_table_is(&s.table, &content));
+    fx.redo();
+    fx.with(|s| assert_big_table_is(&s.table, &model.post));
+  }
+
+  #[test]
+  fn a_run_of_a_million_cr_gets_one_inserted_byte_on_the_last_hit_for_crlf() {
+    let content = long_run_content(1_000_000);
+    let model = replace_model(&content, b"X", b"", true, "\r\n");
+    assert_eq!(model.junctions, 1);
+    let fx = fixture(&content);
+    let out = fx.replace_with_sep("X", true, "", "\r\n", SCAN_CHUNK, 700);
+    let list = list_of(&fx, out.token.unwrap());
+    assert_eq!(list.run_count(), 0);
+    assert!(!list.runs_path().exists(), "no run list without a run");
+    assert_eq!(list.hit_record(0), (1_000_000, 0, false));
+    let last = list.hits() - 1;
+    assert_eq!(last, 3 * 512);
+    assert_eq!(list.hit_record(last), (1_000_000 + last, 0, true));
+    fx.with(|s| assert_big_table_is(&s.table, &model.post));
+    fx.save();
+    fx.undo();
+    fx.with(|s| assert_big_table_is(&s.table, &content));
+    fx.redo();
+    fx.with(|s| assert_big_table_is(&s.table, &model.post));
+  }
+
+  #[test]
+  fn a_hundred_thousand_junctions_write_a_hundred_thousand_records_or_inserted_bytes() {
+    let content = b"\rX\n".repeat(100_000);
+    for insert_sep in ["\n", "\r\n"] {
+      let model = replace_model(&content, b"X", b"", true, insert_sep);
+      assert_eq!(model.junctions, 100_000);
+      let fx = fixture(&content);
+      let out = fx.replace_with_sep("X", true, "", insert_sep, SCAN_CHUNK, 1000);
+      let list = list_of(&fx, out.token.unwrap());
+      if insert_sep == "\n" {
+        assert_eq!(list.run_count(), 100_000);
+        assert_eq!(list.hit_record(99_999).1, 0);
+      } else {
+        assert_eq!(list.run_count(), 0);
+        assert_eq!(list.hit_record(99_999), (299_998, 99_999, true));
+        assert_eq!(list.hit_record(7), (3 * 7 + 1, 7, true));
+      }
+      fx.with(|s| assert_big_table_is(&s.table, &model.post));
+      fx.save();
+      fx.undo();
+      fx.with(|s| assert_big_table_is(&s.table, &content));
+      fx.redo();
+      fx.with(|s| assert_big_table_is(&s.table, &model.post));
+    }
+  }
+
+  #[test]
+  fn what_a_pass_holds_does_not_follow_the_run_or_the_junction_count() {
+    // Resident units of the stacked table (no checkpoint but the first, so the
+    // checkpoint count is the same) and the pass's own state before it ends.
+    let units = |content: &[u8], insert_sep: &str| -> (usize, usize) {
+      let fx = fixture(content);
+      fx.replace_with_sep("X", true, "", insert_sep, SCAN_CHUNK, 100_000_000);
+      let table = fx.with(|s| resident_units(&s.table));
+      let dir = tempdir().unwrap();
+      let mut b = Builder::create(dir.path(), b"X", b"", 100_000_000, insert_sep).unwrap();
+      for piece in content.split_inclusive(|&c| c == b'X') {
+        match piece.split_last() {
+          Some((b'X', gap)) => {
+            b.gap(gap);
+            b.hit(b"X").unwrap();
+          }
+          _ => b.gap(piece),
+        }
+      }
+      (table, b.state_units())
+    };
+    for insert_sep in ["\n", "\r\n"] {
+      assert_eq!(
+        units(&long_run_content(10), insert_sep),
+        units(&long_run_content(1_000_000), insert_sep),
+        "a run of 10 and of a million, {insert_sep:?}"
+      );
+      assert_eq!(
+        units(&b"\rX\n".repeat(10), insert_sep),
+        units(&b"\rX\n".repeat(100_000), insert_sep),
+        "10 and 100000 junctions, {insert_sep:?}"
+      );
+    }
+  }
+
+  #[test]
+  fn checkpoints_keep_their_spacing_while_a_kept_cr_waits_through_many_hits() {
+    // A kept CR, 16 drop-outs (many intervals of pre bytes with no post byte),
+    // then an LF, another byte or the end.
+    for tail in [&b"\n"[..], b"b", b""] {
+      let mut content = b"a\r".to_vec();
+      content.extend(b"XY".repeat(16));
+      content.extend(tail);
+      for insert_sep in ["\n", "\r\n"] {
+        for typing in [false, true] {
+          check_replace_path_with(&content, "XY", "", insert_sep, 3, 7, typing, &|table| {
+            assert_segments_within(table, 3);
+          });
+        }
+      }
+    }
+  }
+
+  #[test]
+  fn an_inserted_byte_belongs_to_one_hit_and_the_offsets_follow_it() {
+    // "\rxx\n": both x are dropped, so the CR meets the LF; CRLF gives
+    // "\r\n\n" with the inserted byte on the last x.
+    let fx = fixture(b"\rxx\n");
+    let token = fx
+      .replace_with_sep("x", true, "", "\r\n", SCAN_CHUNK, CHECKPOINT_INTERVAL)
+      .token
+      .unwrap();
+    assert_eq!(fx.whole(), b"\r\n\n");
+    assert_eq!(
+      map_replace_core(&fx.state, ID, token, &[0, 1, 2, 3, 4]).unwrap(),
+      vec![0, 1, 1, 2, 3]
+    );
+    let back = fx.undo().token.unwrap();
+    assert_eq!(fx.whole(), b"\rxx\n");
+    assert_eq!(
+      map_replace_core(&fx.state, ID, back, &[0, 1, 2, 3]).unwrap(),
+      vec![0, 2, 3, 4]
+    );
+    // The same for LF: no byte is inserted, the offsets only follow the hits.
+    let fx = fixture(b"\rxx\n");
+    let token = fx.replace("x", "").token.unwrap();
+    assert_eq!(fx.whole(), b"\n\n");
+    assert_eq!(
+      map_replace_core(&fx.state, ID, token, &[0, 1, 2, 3, 4]).unwrap(),
+      vec![0, 1, 1, 1, 2]
+    );
+  }
+  // --- Reads through replace layers --------------------------------------------
+  /// Every `[a, b)` read of `table` equals `flat`; for a long `flat`, the ranges
+  /// between a spread of offsets, among them the ends.
+  fn assert_reads_match(table: &Table, flat: &[u8], what: &str) {
+    assert_eq!(table.len(), flat.len() as u64, "{what}: length");
+    let n = flat.len() as u64;
+    let picks: Vec<u64> = if n <= 64 {
+      (0..=n).collect()
+    } else {
+      let mut picks = vec![0, 1, 2, 3, n / 3, n / 2, n - 3, n - 2, n - 1, n];
+      picks.sort_unstable();
+      picks.dedup();
+      picks
+    };
+    for &a in &picks {
+      for &b in picks.iter().filter(|&&b| b >= a) {
+        assert_eq!(
+          table.read(a, b).unwrap(),
+          &flat[a as usize..b as usize],
+          "{what}: read [{a}, {b})"
+        );
+      }
+    }
+  }
+  /// The table under a replace layer reads like the model's bytes: the post
+  /// bytes under a forward layer, the original under an inverse one.
+  fn assert_layer_reads_match(table: &Table, content: &[u8], q: &str, r: &str, insert_sep: &str) {
+    let model = replace_model(content, q.as_bytes(), r.as_bytes(), true, insert_sep);
+    let flat: &[u8] = match replace_layer::top_layer_dir(table) {
+      Some(Dir::Forward) => &model.post,
+      Some(Dir::Inverse) => content,
+      None => panic!("no layer on top"),
+    };
+    assert_reads_match(
+      table,
+      flat,
+      &format!("{content:?} / {q:?} -> {r:?} / {insert_sep:?}"),
+    );
+  }
+
+  #[test]
+  fn a_read_through_a_layer_equals_the_flat_model_for_the_named_shapes() {
+    for (content, q, r) in JUNCTION_SHAPES {
+      for interval in 1..=3u64 {
+        for insert_sep in ["\n", "\r\n"] {
+          check_replace_path_with(content, q, r, insert_sep, interval, 7, false, &|table| {
+            assert_layer_reads_match(table, content, q, r, insert_sep);
+          });
+        }
+      }
+    }
+  }
+
+  #[test]
+  fn a_read_through_a_layer_equals_the_flat_model_for_random_small_cases() {
+    let tokens: [&str; 7] = ["a", "x", "\r", "\n", "xx", "\r\n", "\r\r"];
+    let needles = ["x", "xx", "\r", "\n", "\r\n"];
+    let repls = ["", "y", "\n", "\r", "\r\n", "\nq"];
+    let mut state = 11u64;
+    let mut next = || {
+      state = state
+        .wrapping_mul(6364136223846793005)
+        .wrapping_add(1442695040888963407);
+      state >> 33
+    };
+    for _ in 0..200 {
+      let mut content = String::new();
+      let target = 8 + (next() % 33) as usize;
+      while content.len() < target {
+        content.push_str(tokens[(next() % tokens.len() as u64) as usize]);
+      }
+      let q = needles[(next() % needles.len() as u64) as usize];
+      let r = repls[(next() % repls.len() as u64) as usize];
+      let interval = 1 + next() % 3;
+      for insert_sep in ["\n", "\r\n"] {
+        check_replace_path_with(
+          content.as_bytes(),
+          q,
+          r,
+          insert_sep,
+          interval,
+          7,
+          false,
+          &|table| assert_layer_reads_match(table, content.as_bytes(), q, r, insert_sep),
+        );
+      }
+    }
+  }
+
+  #[test]
+  fn a_read_through_a_layer_that_drops_a_wide_span_reads_gap_by_gap() {
+    // 200,000 dropped hits between two gaps: far wider than twice the text the
+    // read takes from the table below plus the slack.
+    let mut content = b"a\r".to_vec();
+    content.extend(std::iter::repeat_n(b'x', 200_000));
+    content.extend_from_slice(b"\nb");
+    for insert_sep in ["\n", "\r\n"] {
+      for interval in [4096, CHECKPOINT_INTERVAL] {
+        let fx = fixture(&content);
+        fx.replace_with_sep("x", true, "", insert_sep, SCAN_CHUNK, interval);
+        let check = || {
+          fx.with(|s| assert_layer_reads_match(&s.table, &content, "x", "", insert_sep));
+        };
+        check();
+        fx.save();
+        fx.undo();
+        check();
+        fx.redo();
+        check();
+      }
+    }
+  }
+
+  #[test]
+  fn a_failed_read_leaves_the_caller_buffer_as_it_was() {
+    let fx = fixture(b"head\nqq tail\n");
+    fx.replace("qq", "");
+    let layer_len = fx.with(|s| s.table.len());
+    fx.with(|s| {
+      let mut out = b"keep".to_vec();
+      // Past the end of a layer.
+      assert!(s
+        .table
+        .source()
+        .read_into(0, layer_len as usize + 1, &mut out)
+        .is_err());
+      assert_eq!(out, b"keep");
+      // Past the end of a piece table.
+      assert!(s
+        .table
+        .read_into(0, layer_len as usize + 1, &mut out)
+        .is_err());
+      assert_eq!(out, b"keep");
+    });
+    // The file under the layer is cut short: the failure comes from the bottom
+    // of the stack, after the layer began to fill the buffer.
+    File::options()
+      .write(true)
+      .open(&fx.path)
+      .unwrap()
+      .set_len(3)
+      .unwrap();
+    fx.with(|s| {
+      let mut out = b"keep".to_vec();
+      assert!(s
+        .table
+        .source()
+        .read_into(0, layer_len as usize, &mut out)
+        .is_err());
+      assert_eq!(out, b"keep");
+      assert!(s.table.read_into(0, layer_len as usize, &mut out).is_err());
+      assert_eq!(out, b"keep");
+      assert!(s.table.read(0, layer_len).is_err());
+    });
+    // A file source: past the end, and a short file.
+    let file = File::open(&fx.path).unwrap();
+    let mut out = b"keep".to_vec();
+    assert!(file.read_into(0, 4, &mut out).is_err());
+    assert_eq!(out, b"keep");
+    assert!(file.read_into(1, 2, &mut out).is_ok());
+    assert_eq!(out, b"keepea");
+  }
+  // --- Memory of reads through replace layers ----------------------------------
+  const MIB: i64 = 1 << 20;
+  /// `size` bytes of `unit` repeated.
+  fn repeated(unit: &[u8], size: usize) -> Vec<u8> {
+    unit
+      .iter()
+      .cycle()
+      .take(size / unit.len() * unit.len())
+      .copied()
+      .collect()
+  }
+  /// A table over the file `path`, with a checkpoint every `CHECKPOINT_INTERVAL`.
+  fn file_table(path: &Path) -> Table {
+    build_table(path).unwrap().0
+  }
+  /// The change list of replacing every `needle` in `content` by nothing.
+  fn drop_all(dir: &Path, content: &[u8], needle: &[u8], insert_sep: &str) -> Arc<ChangeList> {
+    let mut builder = Builder::create(dir, needle, b"", CHECKPOINT_INTERVAL, insert_sep).unwrap();
+    let (mut at, mut start) = (0, 0);
+    while at + needle.len() <= content.len() {
+      if &content[at..at + needle.len()] == needle {
+        builder.gap(&content[start..at]);
+        builder.hit(&content[at..at + needle.len()]).unwrap();
+        at += needle.len();
+        start = at;
+      } else {
+        at += 1;
+      }
+    }
+    builder.gap(&content[start..]);
+    Arc::new(builder.finish(content.len() as u64).unwrap())
+  }
+
+  fn whole_bytes(table: &Table) -> Vec<u8> {
+    let mut bytes = Vec::new();
+    table.write_all(&mut bytes, SCAN_BUF).unwrap();
+    bytes
+  }
+  /// What `write_all` of a table cost, run twice in a row.
+  struct Cost {
+    /// Peak live bytes above the level before the first run.
+    run1: i64,
+    /// The same for the second run.
+    run2: i64,
+    /// Allocations of 64 KiB or more in the second run.
+    big2: usize,
+    /// Change-list reads and `Layer::read_into` calls of the second run.
+    list_reads: u64,
+    layer_reads: u64,
+  }
+
+  fn write_all_twice(table: &Table) -> Cost {
+    use crate::test_alloc as alloc;
+    let mut sink = std::io::sink();
+    let before = alloc::live();
+    alloc::reset_peak();
+    table.write_all(&mut sink, SCAN_BUF).unwrap();
+    let run1 = alloc::peak() - before;
+    let before = alloc::live();
+    alloc::reset_peak();
+    alloc::reset_big();
+    replace_layer::reset_read_counts();
+    table.write_all(&mut sink, SCAN_BUF).unwrap();
+    let (list_reads, layer_reads) = replace_layer::read_counts();
+    Cost {
+      run1,
+      run2: alloc::peak() - before,
+      big2: alloc::big(),
+      list_reads,
+      layer_reads,
+    }
+  }
+  /// The R1 bounds of one case.
+  fn assert_cost(name: &str, table: &Table) -> Cost {
+    let cost = write_all_twice(table);
+    eprintln!(
+      "{name}: run1 {:.3} MiB, run2 {:.3} MiB, run2 big allocs {}, change-list reads {} in {} layer reads",
+      cost.run1 as f64 / MIB as f64,
+      cost.run2 as f64 / MIB as f64,
+      cost.big2,
+      cost.list_reads,
+      cost.layer_reads
+    );
+    assert!(
+      cost.run2 <= SCAN_BUF as i64 + 64 * 1024,
+      "{name}: run 2 peak {}",
+      cost.run2
+    );
+    assert_eq!(
+      cost.big2, 1,
+      "{name}: allocations of 64 KiB or more in run 2"
+    );
+    assert!(cost.run1 <= 8 * MIB, "{name}: run 1 peak {}", cost.run1);
+    let bound = replace_layer::sequential_read_bound(table) + 64 * cost.layer_reads;
+    assert!(
+      cost.list_reads <= bound,
+      "{name}: {} change-list reads, bound {bound}",
+      cost.list_reads
+    );
+    cost
+  }
+  /// A 4 MiB file of `unit` with every `qq` dropped: the cost of `write_all` of
+  /// (a) the forward table, (b) an inverse layer over the saved bytes, (c) a
+  /// forward layer over (b). Every layer is new, so its first read is cold.
+  fn costs_of(name: &str, unit: &[u8], insert_sep: &str) -> [Cost; 3] {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("m.txt");
+    let content = repeated(unit, 4 << 20);
+    fs::write(&path, &content).unwrap();
+    let list = drop_all(dir.path(), &content, b"qq", insert_sep);
+    let forward = replace_layer::stack(1, Dir::Forward, file_table(&path), list.clone());
+    let a = assert_cost(&format!("{name} (a) forward"), &forward);
+    let saved = dir.path().join("s.txt");
+    fs::write(&saved, whole_bytes(&forward)).unwrap();
+    let inverse = replace_layer::stack(2, Dir::Inverse, file_table(&saved), list.clone());
+    let b = assert_cost(&format!("{name} (b) inverse after save"), &inverse);
+    let redo = replace_layer::stack(3, Dir::Forward, inverse, list);
+    let c = assert_cost(&format!("{name} (c) redo over inverse"), &redo);
+    [a, b, c]
+  }
+
+  #[test]
+  fn writing_a_table_over_replace_layers_holds_a_few_buffers() {
+    let sparse_unit = [vec![b'x'; 61], b"qq\n".to_vec()].concat();
+    let sparse = costs_of("sparse", &sparse_unit, "\n");
+    for (name, unit, insert_sep) in [
+      ("dense", b"aqq\n".as_slice(), "\n"),
+      ("junction LF", b"\rqq\n".as_slice(), "\n"),
+      ("junction CRLF", b"\rqq\n".as_slice(), "\r\n"),
+    ] {
+      let costs = costs_of(name, unit, insert_sep);
+      for step in 0..3 {
+        assert!(
+          costs[step].run1 <= sparse[step].run1 + MIB,
+          "{name} step {step}: run 1 peak {} against sparse {}",
+          costs[step].run1,
+          sparse[step].run1
+        );
+      }
+    }
+  }
+
+  #[test]
+  fn writing_two_stacked_forward_layers_holds_a_few_buffers() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("m.txt");
+    let content = repeated(b"aqq\n", 4 << 20);
+    fs::write(&path, &content).unwrap();
+    let first = replace_layer::stack(
+      1,
+      Dir::Forward,
+      file_table(&path),
+      drop_all(dir.path(), &content, b"qq", "\n"),
+    );
+    let once = whole_bytes(&first);
+    let second = replace_layer::stack(
+      2,
+      Dir::Forward,
+      first,
+      drop_all(dir.path(), &once, b"a", "\n"),
+    );
+    let cost = write_all_twice(&second);
+    eprintln!(
+      "forward over forward: run2 {:.3} MiB",
+      cost.run2 as f64 / MIB as f64
+    );
+    assert!(cost.run2 <= 6 * MIB, "run 2 peak {}", cost.run2);
+  }
+
+  #[test]
+  fn one_read_of_a_whole_layer_keeps_nothing_afterwards() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("m.txt");
+    let sparse_unit = [vec![b'x'; 61], b"qq\n".to_vec()].concat();
+    let content = repeated(&sparse_unit, 4 << 20);
+    fs::write(&path, &content).unwrap();
+    let forward = replace_layer::stack(
+      1,
+      Dir::Forward,
+      file_table(&path),
+      drop_all(dir.path(), &content, b"qq", "\n"),
+    );
+    let before = crate::test_alloc::live();
+    let whole = forward.read(0, forward.len()).unwrap();
+    assert_eq!(whole.len() as u64, forward.len());
+    drop(whole);
+    let kept = crate::test_alloc::live() - before;
+    eprintln!("retained after one whole read: {kept} bytes");
+    assert!(kept <= 256 * 1024, "{kept} bytes kept");
+  }
+}
+/// Junction rewrites: a lone `\r` that an edit would join to a `\n` is rewritten in
+/// the same batch, and an LF rewrite also takes the run of `\r` before it.
+#[cfg(test)]
+mod junction_tests {
+  use super::*;
+  use tempfile::{tempdir, TempDir};
+  /// A session over `content` whose index has a checkpoint every `interval`.
+  fn open_at(dir: &TempDir, content: &[u8], interval: u64) -> Session {
+    let path = dir.path().join("junction.txt");
+    fs::write(&path, content).unwrap();
+    let (total, checkpoints, newlines) =
+      scan_reader_at(File::open(&path).unwrap(), 4096, interval).unwrap();
+    let index = OriginalIndex::new(
+      Src::File(File::open(&path).unwrap()),
+      total,
+      newlines,
+      checkpoints.clone(),
+    );
+    let checkpoint_index = CheckpointIndex {
+      checkpoints,
+      total_newlines: newlines,
+      line_rule: LINE_RULE,
+    };
+    Session::new(
+      PieceTable::new(index),
+      path.clone(),
+      fingerprint_of(&path).unwrap(),
+      checkpoint_index,
+      0,
+    )
+  }
+  /// One edit of a batch: `(start, end, text, rewrite)`; a rewrite carries
+  /// `keep_start` and `cascade`.
+  type Item<'a> = (u64, u64, &'a str, bool);
+  fn batch(items: &[Item]) -> Vec<Edit> {
+    items
+      .iter()
+      .map(|&(start, end, text, rewrite)| Edit {
+        start,
+        end,
+        text: text.to_string(),
+        keep_start: rewrite,
+        cascade: rewrite,
+      })
+      .collect()
+  }
+  /// The document after `items`, written out directly: edits in descending
+  /// `(start, end)` order, then every LF rewrite turns the `\r` bytes before it
+  /// into `\n`. The rewrite bytes are tracked by tag, not by arithmetic.
+  fn flat(content: &[u8], items: &[Item]) -> Vec<u8> {
+    let mut bytes: Vec<(u8, bool)> = content.iter().map(|&b| (b, false)).collect();
+    let mut ordered = items.to_vec();
+    ordered.sort_by_key(|i| std::cmp::Reverse((i.0, i.1)));
+    for (start, end, text, rewrite) in ordered {
+      bytes.splice(
+        start as usize..end as usize,
+        text.bytes().map(|b| (b, rewrite)),
+      );
+    }
+    for i in 0..bytes.len() {
+      if bytes[i].1 && bytes[i].0 == b'\n' && !(i > 0 && bytes[i - 1] == (b'\r', true)) {
+        let mut from = i;
+        while from > 0 && bytes[from - 1].0 == b'\r' {
+          from -= 1;
+        }
+        for byte in &mut bytes[from..i] {
+          byte.0 = b'\n';
+        }
+      }
+    }
+    bytes.into_iter().map(|(b, _)| b).collect()
+  }
+
+  fn rule_starts(c: &[u8]) -> Vec<u64> {
+    let mut starts = vec![0u64];
+    for i in 0..c.len() {
+      if c[i] == b'\n' || (c[i] == b'\r' && c.get(i + 1) != Some(&b'\n')) {
+        starts.push(i as u64 + 1);
+      }
+    }
+    starts
+  }
+  /// The session's bytes and line structure equal `flat`. `full` checks every
+  /// line start, else the count and a few lines.
+  fn assert_is(s: &Session, flat: &[u8], full: bool, what: &str) {
+    assert_eq!(s.table.len(), flat.len() as u64, "{what}: length");
+    if flat.len() <= 4096 {
+      assert_eq!(
+        s.table.read(0, s.table.len()).unwrap(),
+        flat,
+        "{what}: bytes"
+      );
+    }
+    let starts = rule_starts(flat);
+    let lines = if flat.is_empty() {
+      0
+    } else {
+      starts.len() as u64
+    };
+    assert_eq!(s.table.line_count(), lines, "{what}: line count");
+    let picks: Vec<u64> = if full {
+      (0..lines).collect()
+    } else {
+      [0, lines / 3, lines / 2, lines.saturating_sub(1)]
+        .into_iter()
+        .filter(|&l| l < lines)
+        .collect()
+    };
+    for line in picks {
+      assert_eq!(
+        s.table.line_to_offset(line).unwrap(),
+        starts[line as usize],
+        "{what}: start of line {line}"
+      );
+    }
+  }
+  /// Apply `items`, undo, redo: each state equals the flat model.
+  fn round_trip(content: &[u8], items: &[Item], interval: u64, full: bool, what: &str) {
+    let dir = tempdir().unwrap();
+    let mut s = open_at(&dir, content, interval);
+    let after = flat(content, items);
+    s.apply(batch(items), true).unwrap();
+    assert_is(&s, &after, full, &format!("{what}: apply"));
+    s.undo().unwrap();
+    assert_is(&s, content, full, &format!("{what}: undo"));
+    s.redo().unwrap();
+    assert_is(&s, &after, full, &format!("{what}: redo"));
+    s.undo().unwrap();
+    assert_is(&s, content, full, &format!("{what}: undo again"));
+  }
+
+  #[test]
+  fn a_window_knows_its_neighbours() {
+    let dir = tempdir().unwrap();
+    // Lines: `a\r`, `b\r\n`, `\n`, `c\n`, and a last one holding `d`.
+    let s = open_at(&dir, b"a\rb\r\n\nc\nd", 4);
+    let read = |from: u64, to: u64| {
+      let w = read_window_result(&s.table, from, to).unwrap();
+      (w.start_offset, w.end_offset, w.prev_lone_cr, w.next_is_lf)
+    };
+    // The start of the file has nothing before it; the end has nothing after.
+    assert_eq!(read(0, 1), (0, 2, false, false));
+    assert_eq!(read(0, 5), (0, 9, false, false));
+    // After the lone `\r`, and before the `\n` of the empty line that follows.
+    assert_eq!(read(1, 2), (2, 5, true, true));
+    // After a CRLF (the byte before is its `\n`), and before other bytes.
+    assert_eq!(read(2, 3), (5, 6, false, false));
+    assert_eq!(read(3, 5), (6, 9, false, false));
+    let s = open_at(&dir, b"a\n\nb\r", 4);
+    let w = read_window_result(&s.table, 0, 1).unwrap();
+    assert!(w.next_is_lf && !w.prev_lone_cr);
+    // A file ending in a lone `\r`: the last window has nothing after it.
+    let w = read_window_result(&s.table, 2, 3).unwrap();
+    assert_eq!((w.start_offset, w.end_offset), (3, 5));
+    assert!(!w.next_is_lf && !w.prev_lone_cr);
+  }
+
+  #[test]
+  fn an_enter_after_a_lone_cr_is_rewritten_and_undone() {
+    // `x\ry`: Enter at the start of `y` inserts `\n`, which would join the `\r`.
+    let items: &[Item] = &[(2, 2, "\n", false), (1, 2, "\n", true)];
+    round_trip(b"x\ry", items, 3, true, "LF");
+    // The same step in the journal: the undo edit puts the `\r` back and keeps
+    // its start anchored.
+    let dir = tempdir().unwrap();
+    let mut s = open_at(&dir, b"x\ry", 3);
+    s.apply(batch(items), true).unwrap();
+    let undone = s.undo().unwrap();
+    assert_eq!(
+      serde_json::to_value(&undone.edits).unwrap(),
+      serde_json::json!([
+        { "start": 2, "end": 3, "text": "", "keep_start": false, "fill": null },
+        { "start": 1, "end": 2, "text": "\r", "keep_start": true, "fill": null },
+      ])
+    );
+    let redone = s.redo().unwrap();
+    assert_eq!(
+      serde_json::to_value(&redone.edits).unwrap(),
+      serde_json::json!([
+        { "start": 1, "end": 2, "text": "\n", "keep_start": true, "fill": null },
+        { "start": 2, "end": 2, "text": "\n", "keep_start": false, "fill": null },
+      ])
+    );
+  }
+
+  #[test]
+  fn deleting_between_a_lone_cr_and_an_lf_keeps_both_lines() {
+    // `x\rmid\nt`: deleting `mid` would join the `\r` to the `\n`.
+    for (sep, expected) in [("\n", &b"x\n\nt"[..]), ("\r\n", b"x\r\n\nt")] {
+      let items: &[Item] = &[(2, 5, "", false), (1, 2, sep, true)];
+      assert_eq!(flat(b"x\rmid\nt", items), expected);
+      round_trip(b"x\rmid\nt", items, 3, true, sep);
+    }
+  }
+
+  #[test]
+  fn a_cascade_takes_the_whole_run_of_cr() {
+    // Runs of 1, 2, 3, 1000, across checkpoints, at the start of the file.
+    for run in [1usize, 2, 3, 1000] {
+      for lead in [&b""[..], b"x", b"head\nxx"] {
+        let mut content = lead.to_vec();
+        content.extend(std::iter::repeat_n(b'\r', run));
+        content.extend_from_slice(b"tail\nend");
+        let last = (lead.len() + run - 1) as u64;
+        let at = last + 1;
+        // Enter at the start of `tail`: the run's last `\r` would join it.
+        let enter: &[Item] = &[(at, at, "\n", false), (last, at, "\n", true)];
+        let after = flat(&content, enter);
+        let n = after.iter().filter(|&&b| b == b'\n').count();
+        assert!(n > run, "the model turned the run into LF");
+        round_trip(
+          &content,
+          enter,
+          7,
+          run <= 3,
+          &format!("enter, run {run}, lead {lead:?}"),
+        );
+        // The same run, with the `tail` line deleted down to its LF.
+        let del: &[Item] = &[(at, at + 4, "", false), (last, at, "\n", true)];
+        round_trip(
+          &content,
+          del,
+          7,
+          run <= 3,
+          &format!("delete, run {run}, lead {lead:?}"),
+        );
+      }
+    }
+    // A file of nothing but `\r`, and the CR-only example from the plan.
+    round_trip(
+      b"x\r\r",
+      &[(3, 3, "\n", false), (2, 3, "\n", true)],
+      4,
+      true,
+      "x CR CR",
+    );
+    assert_eq!(
+      flat(b"x\r\r", &[(3, 3, "\n", false), (2, 3, "\n", true)]),
+      b"x\n\n\n"
+    );
+    round_trip(
+      b"\r\r\r\ra",
+      &[(4, 4, "\n", false), (3, 4, "\n", true)],
+      2,
+      true,
+      "CR only",
+    );
+  }
+
+  #[test]
+  fn a_crlf_rewrite_does_not_cascade() {
+    // `x\r\r` then a deleted line: only the last `\r` becomes `\r\n`.
+    let content = b"x\r\rmid\nt";
+    let items: &[Item] = &[(3, 6, "", false), (2, 3, "\r\n", true)];
+    assert_eq!(flat(content, items), b"x\r\r\n\nt");
+    round_trip(content, items, 3, true, "CRLF run");
+  }
+
+  #[test]
+  fn a_drag_move_deleting_inside_a_run_is_handled_like_any_other_edit() {
+    // `a` + three `\r` + `b`: one `\r` of the run deleted, an LF inserted after
+    // the run, all in one batch.
+    let content = b"a\r\r\rb";
+    let items: &[Item] = &[(4, 4, "\n", false), (2, 3, "", false), (3, 4, "\n", true)];
+    assert_eq!(flat(content, items), b"a\n\n\nb");
+    round_trip(content, items, 3, true, "drag move");
+  }
+
+  #[test]
+  fn an_insertion_and_a_rewrite_at_one_start_land_in_the_right_order() {
+    // The text goes before the rewritten byte; the deletion after it makes the
+    // junction (the tie rule: batches order by start and end).
+    for (sep, expected) in [("\n", &b"xb\n\nt"[..]), ("\r\n", b"xb\r\n\nt")] {
+      let content = b"x\rk\nt";
+      let items: &[Item] = &[(1, 1, "b", false), (2, 3, "", false), (1, 2, sep, true)];
+      assert_eq!(flat(content, items), expected);
+      round_trip(content, items, 3, true, sep);
+    }
+  }
+
+  #[test]
+  fn a_rewrite_over_something_else_rejects_the_batch() {
+    let dir = tempdir().unwrap();
+    let mut s = open_at(&dir, b"x\ny\r", 3);
+    for bad in [
+      vec![(1u64, 2u64, "\n", true)],
+      vec![(0, 1, "\n", true)],
+      vec![(2, 3, "\n", true), (0, 0, "q", false)],
+      vec![(3, 4, "ab", true)],
+      vec![(2, 4, "\n", true)],
+    ] {
+      let items: Vec<Item> = bad.iter().map(|&(a, b, t, r)| (a, b, t, r)).collect();
+      let before = s.table.len();
+      assert!(s.apply(batch(&items), true).is_err(), "{items:?}");
+      assert_eq!(s.table.len(), before, "the document is untouched");
+      assert!(s.undo_stack.is_empty());
+    }
+  }
+
+  #[test]
+  fn an_edit_comes_over_json_with_or_without_the_rewrite_flags() {
+    let plain: Edit = serde_json::from_str(r#"{"start":1,"end":2,"text":"a"}"#).unwrap();
+    assert!(!plain.keep_start && !plain.cascade);
+    let rewrite: Edit =
+      serde_json::from_str(r#"{"start":1,"end":2,"text":"\n","keep_start":true,"cascade":true}"#)
+        .unwrap();
+    assert!(rewrite.keep_start && rewrite.cascade);
+    // The rewrite as the frontend sends it, applied over a run of three `\r`;
+    // the undo and the redo come back as literal JSON, the run as a `fill`.
+    let dir = tempdir().unwrap();
+    let mut s = open_at(&dir, b"x\r\r\ry", 3);
+    let edits: Vec<Edit> = serde_json::from_str(
+      r#"[{"start":4,"end":4,"text":"\n"},
+          {"start":3,"end":4,"text":"\n","keep_start":true,"cascade":true}]"#,
+    )
+    .unwrap();
+    s.apply(edits, true).unwrap();
+    assert_eq!(s.table.read(0, s.table.len()).unwrap(), b"x\n\n\n\ny");
+    let undone = s.undo().unwrap();
+    assert_eq!(
+      serde_json::to_string(&undone.edits).unwrap(),
+      concat!(
+        r#"[{"start":1,"end":3,"text":"","keep_start":false,"fill":"\r"},"#,
+        r#"{"start":4,"end":5,"text":"","keep_start":false,"fill":null},"#,
+        r#"{"start":3,"end":4,"text":"\r","keep_start":true,"fill":null}]"#
+      )
+    );
+    assert_eq!(s.table.read(0, s.table.len()).unwrap(), b"x\r\r\ry");
+    let redone = s.redo().unwrap();
+    assert_eq!(
+      serde_json::to_string(&redone.edits).unwrap(),
+      concat!(
+        r#"[{"start":3,"end":4,"text":"\n","keep_start":true,"fill":null},"#,
+        r#"{"start":4,"end":4,"text":"\n","keep_start":false,"fill":null},"#,
+        r#"{"start":1,"end":3,"text":"","keep_start":false,"fill":"\n"}]"#
+      )
+    );
+    assert_eq!(s.table.read(0, s.table.len()).unwrap(), b"x\n\n\n\ny");
+  }
+
+  #[test]
+  fn the_journal_and_the_table_do_not_grow_with_the_run() {
+    // The same step over a run of 10 and of a million `\r`: the typed bytes
+    // are all the add buffer gains, and the journal holds no text of the run.
+    let mut grown = Vec::new();
+    for run in [10usize, 1_000_000] {
+      let mut content = b"h\n".to_vec();
+      content.extend(std::iter::repeat_n(b'\r', run));
+      content.extend_from_slice(b"tail");
+      let dir = tempdir().unwrap();
+      let mut s = open_at(&dir, &content, 1024 * 1024);
+      let (last, at) = ((run + 1) as u64, (run + 2) as u64);
+      let before = s.table.add_len();
+      s.apply(
+        batch(&[(at, at, "\n", false), (last, at, "\n", true)]),
+        true,
+      )
+      .unwrap();
+      grown.push(s.table.add_len() - before);
+      let Some(Step {
+        entry: JournalEntry::Edits(group),
+        ..
+      }) = s.undo_stack.last()
+      else {
+        panic!("one edit group");
+      };
+      let held: usize = group.iter().map(|e| e.text.len()).sum();
+      assert!(held <= 2, "the group holds {held} bytes of text");
+      assert_eq!(group.iter().filter(|e| e.fill.is_some()).count(), 1);
+      let undone = s.undo().unwrap();
+      assert_eq!(undone.edits.iter().map(|e| e.text.len()).sum::<usize>(), 1);
+      assert_is(&s, &content, false, "undo");
+      s.redo().unwrap();
+      assert_eq!(s.table.len(), content.len() as u64 + 1);
+      assert_eq!(s.table.line_count(), run as u64 + 3);
+    }
+    assert_eq!(grown[0], grown[1], "typed bytes only");
+    assert_eq!(grown[0], 2);
   }
 }
 
@@ -4683,6 +6954,9 @@ mod heavy_io_command_threading_tests {
     "windowed_find",
     "windowed_search",
     "windowed_replace_all",
+    "windowed_map_replace",
+    "windowed_release_replace",
+    "windowed_offset_line",
   ];
 
   #[test]
@@ -4725,6 +6999,9 @@ mod heavy_io_command_threading_tests {
       "fn save_core",
       "fn set_path_core",
       "fn close_core",
+      "fn map_replace_core",
+      "fn release_replace_core",
+      "fn offset_line_core",
       "fn find_once",
       "fn search_core",
     ] {

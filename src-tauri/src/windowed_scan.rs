@@ -170,7 +170,7 @@ pub fn scan_backward(
 #[cfg(test)]
 mod tests {
   use super::*;
-  use crate::large_file::count_newlines;
+  use crate::line_rule::count_breaks;
 
   fn slice_reader(content: &[u8]) -> impl FnMut(u64, usize) -> Result<Vec<u8>, ScanStop> + '_ {
     move |off, len| Ok(content[off as usize..off as usize + len].to_vec())
@@ -285,7 +285,7 @@ mod tests {
       &mut slice_reader(hay),
       &mut |ev| {
         match ev {
-          Event::Gap { bytes } => seen += count_newlines(bytes),
+          Event::Gap { bytes } => seen += count_breaks(bytes),
           Event::Hit { .. } => lines_before.push(seen),
         }
         Ok(Flow::Continue)

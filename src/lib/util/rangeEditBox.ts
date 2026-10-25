@@ -5,7 +5,7 @@
  *  Tauri so they are unit-testable in isolation. Nothing here is persisted. */
 import type { Text } from '@codemirror/state';
 import type { Fingerprint } from '../state/documentWindow.svelte';
-import { rangeWriteText, sliceEndsWithBreak } from './rangeEdit';
+import { rangeWriteBytes, sliceEndsWithBreak } from './rangeEdit';
 import {
   detectLineEnding,
   normalizeToLf,
@@ -13,6 +13,7 @@ import {
   textFromString,
   type LineEnding,
 } from './text';
+import { scanBreaks, type LineBreak } from './windowedEdit';
 /** An open edit box. `fingerprint` is the source's identity when the slice was
  *  read, the baseline the write-back's conflict check compares against. */
 export interface RangeBox {
@@ -29,6 +30,8 @@ export interface RangeBox {
   lineEnding: LineEnding;
   /** The slice as read, LF-normalized: what the buffer is diffed against. */
   saved: Text;
+  /** The separator of each line break of the slice as read, in order. */
+  breaks: LineBreak[];
   /** The buffer being edited. */
   content: Text;
   /** The last write-back found the source changed; the conflict dialog is up. */
@@ -63,6 +66,7 @@ export function openRangeBox(init: RangeBoxInit): RangeBox {
     trailingBreak: sliceEndsWithBreak(init.text),
     lineEnding: detectLineEnding(init.text),
     saved: content,
+    breaks: scanBreaks(init.text),
     content,
     conflict: false,
     missing: false,
@@ -102,8 +106,10 @@ export function isRangeBoxDirty(box: RangeBox): boolean {
 }
 /** The text the box writes back into the source. */
 export function rangeBoxWriteText(box: RangeBox): string {
-  return rangeWriteText(
+  return rangeWriteBytes(
+    box.saved.toString(),
     box.content.toString(),
+    box.breaks,
     box.trailingBreak,
     box.lineEnding,
   );

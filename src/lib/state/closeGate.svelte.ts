@@ -34,6 +34,7 @@ type GateWindow = Pick<
   | 'activeIndex'
   | 'discardChanges'
   | 'discardWindowedActive'
+  | 'endComposition'
   | 'firstBlockingDirty'
   | 'firstOversizedDirtyIndex'
   | 'firstUnwritableDirtyIndex'
@@ -47,6 +48,7 @@ type GateWindow = Pick<
   | 'saveActive'
   | 'saveAs'
   | 'switchTo'
+  | 'windowedPending'
 >;
 /** The gate before a quit, a window close or a tab close that would lose
  *  something no snapshot can carry: the quit and window-close handshakes and
@@ -72,6 +74,8 @@ export class CloseGate {
   private quitting = false;
   /** A prompt was asked for while another dialog held the window. */
   private deferred = false;
+  /** Callers waiting for the next `flush-cancelled`. */
+  private cancelWaiters: (() => void)[] = [];
   /** Called when the gate has no more say: the dialog was cancelled or left
    *  after a declined save, or the quit, close or tab close it guarded went
    *  through. */
@@ -211,6 +215,19 @@ export class CloseGate {
    *  restore reopens unsaved tabs afterward. */
   async onFlushRequest(): Promise<void> {
     this.quitting = true;
+    // Input still on its way into the core (a composition, queued input, an
+    // apply in flight) would be lost: veto this quit at once, let the input
+    // land, and carry on once the veto has gone round. What it leaves behind is
+    // asked about as usual, and a clean result quits on this one request.
+    if (this.win.windowedPending?.() === true) {
+      const cancelled = this.nextCancelled();
+      await invoke('flush_cancel');
+      await this.win.endComposition?.();
+      await cancelled;
+      this.continuation = 'quit';
+      await this.prompt();
+      return;
+    }
     // A dirty tab too large to snapshot, or an edit box with changes, cannot be
     // silently restored after quit; veto this quit right away (before the
     // handshake times out and exits anyway) and make the user deal with it.
@@ -236,7 +253,18 @@ export class CloseGate {
    *  completes. */
   onFlushCancelled(): void {
     this.quitting = false;
+    const waiting = this.cancelWaiters;
+    this.cancelWaiters = [];
+    for (const wake of waiting) {
+      wake();
+    }
     this.onVetoed?.();
+  }
+  /** Resolves at the next `flush-cancelled`. */
+  private nextCancelled(): Promise<void> {
+    return new Promise((resolve) => {
+      this.cancelWaiters.push(resolve);
+    });
   }
   /** `close-flush-request`: the OS close of this window. Dirty tabs are
    *  snapshotted (a restart restores them), then the backend destroys the
@@ -247,6 +275,9 @@ export class CloseGate {
       // A quit handshake already owns this window's shutdown; let it finish
       // instead of racing it through `confirm_close`.
       return;
+    }
+    if (this.win.windowedPending?.() === true) {
+      await this.win.endComposition?.();
     }
     if (this.knownBlocking()) {
       this.continuation = 'close';
