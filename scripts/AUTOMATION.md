@@ -7,6 +7,8 @@ It is **doubly gated**: the Rust module is compiled only under
 
 ## Launch
 
+Run `npm run licenses` first (needs `cargo-bundle-licenses`); the app does not build without its output.
+
 ```sh
 NOTE_N_PAD_AUTOMATION=1 npm run tauri dev
 ```
