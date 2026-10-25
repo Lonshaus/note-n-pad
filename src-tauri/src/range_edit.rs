@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-3.0-only
 
 use serde::{Deserialize, Serialize};
+use std::borrow::Cow;
 use std::fs::{self, File};
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::Path;
@@ -20,6 +21,9 @@ const SPLICE_BUF: usize = 1024 * 1024;
 /// caps range editing at 32 MiB in the frontend; this backstop only prevents a bad
 /// call from allocating an unbounded buffer.
 const READ_RANGE_MAX: u64 = 64 * 1024 * 1024;
+/// Bytes read per step when a splice looks backwards for the start of a run of
+/// `\r`.
+const RUN_READ: usize = 64 * 1024;
 
 /// A byte slice decoded as text plus whether the decode was lossy. `lossy` is
 /// true when the bytes were not valid UTF-8 and replacement characters were
@@ -79,20 +83,37 @@ fn copy_exact<R: Read, W: Write>(
   }
   Ok(())
 }
-
-/// Stream the spliced file into `tmp`: original `[0, start)`, then `replacement`,
-/// then original `[end, EOF)`. Never loads the whole file into memory, and fsyncs
-/// the temp file. Putting it in `src`'s place is `fs_ops::replace_with`'s job.
+/// Write `n` copies of `byte` to `writer` through `buf`.
+fn write_repeated<W: Write>(
+  writer: &mut W,
+  byte: u8,
+  mut n: u64,
+  buf: &mut [u8],
+) -> Result<(), String> {
+  while n > 0 {
+    let take = n.min(buf.len() as u64) as usize;
+    buf[..take].fill(byte);
+    writer.write_all(&buf[..take]).map_err(|e| e.to_string())?;
+    n -= take as u64;
+  }
+  Ok(())
+}
+/// Stream the spliced file into `tmp`: original `[0, start)`, then `lead_lf`
+/// copies of `\n`, then `replacement`, then original `[end, EOF)`. Never loads
+/// the whole file into memory, and fsyncs the temp file. Putting it in `src`'s
+/// place is `fs_ops::replace_with`'s job.
 fn perform_splice(
   src: &Path,
   out: &mut File,
   start: u64,
   end: u64,
+  lead_lf: u64,
   replacement: &[u8],
 ) -> Result<(), String> {
   let mut source = File::open(src).map_err(|e| e.to_string())?;
   let mut buf = vec![0u8; SPLICE_BUF];
   copy_exact(&mut source, out, start, &mut buf)?;
+  write_repeated(out, b'\n', lead_lf, &mut buf)?;
   out.write_all(replacement).map_err(|e| e.to_string())?;
   source
     .seek(SeekFrom::Start(end))
@@ -112,6 +133,7 @@ fn splice_write(
   label: &str,
   start: u64,
   end: u64,
+  lead_lf: u64,
   replacement: &[u8],
 ) -> Result<(), String> {
   // Through `fs_ops::replace_with` so this writer answers a sandboxed folder and
@@ -120,21 +142,117 @@ fn splice_write(
   // in `label` is not unique on coarse clocks), fail loudly instead of quietly
   // truncating the other writer's file.
   crate::fs_ops::replace_with(src, label, true, None, |out| {
-    perform_splice(src, out, start, end, replacement)
+    perform_splice(src, out, start, end, lead_lf, replacement)
   })
+}
+/// The byte at `at` of `file`, or `None` at or past `size`.
+fn byte_at(file: &mut File, at: u64, size: u64) -> Result<Option<u8>, String> {
+  if at >= size {
+    return Ok(None);
+  }
+  let mut one = [0u8; 1];
+  file.seek(SeekFrom::Start(at)).map_err(|e| e.to_string())?;
+  file.read_exact(&mut one).map_err(|e| e.to_string())?;
+  Ok(Some(one[0]))
+}
+/// Where the run of `\r` bytes that ends at `end` begins, read backwards in
+/// `RUN_READ` steps so a run of any length costs no more memory than a short one.
+fn cr_run_start(file: &mut File, end: u64) -> Result<u64, String> {
+  let mut at = end;
+  let mut buf = vec![0u8; RUN_READ];
+  while at > 0 {
+    let from = at.saturating_sub(RUN_READ as u64);
+    let n = (at - from) as usize;
+    file
+      .seek(SeekFrom::Start(from))
+      .map_err(|e| e.to_string())?;
+    file.read_exact(&mut buf[..n]).map_err(|e| e.to_string())?;
+    if let Some(i) = buf[..n].iter().rposition(|&b| b != b'\r') {
+      return Ok(from + i as u64 + 1);
+    }
+    at = from;
+  }
+  Ok(0)
+}
+/// What a splice writes: `lead_lf` copies of `\n` then `replacement` in place of
+/// file bytes `[start, end)`.
+struct SplicePlan<'a> {
+  start: u64,
+  lead_lf: u64,
+  replacement: Cow<'a, [u8]>,
+}
+/// The splice for `[start, end)` and `replacement`, widened where it would join
+/// a lone `\r` to a `\n` into one `\r\n`: the `\r` is rewritten to `insert_sep`
+/// (and, for `\n`, the whole run of `\r` bytes ending in it, as each would
+/// meet the `\n` in turn). Two edges: a lone `\r` of the file just before
+/// `start` with a `\n` first after the splice, and a `\r` ending the
+/// replacement with a `\n` at `end`.
+fn plan_splice<'a>(
+  file: &mut File,
+  size: u64,
+  start: u64,
+  end: u64,
+  replacement: &'a str,
+  insert_sep: &str,
+) -> Result<SplicePlan<'a>, String> {
+  let lf = match insert_sep {
+    "\n" => true,
+    "\r\n" => false,
+    _ => return Err("invalid insert separator".to_string()),
+  };
+  let mut repl: Cow<[u8]> = Cow::Borrowed(replacement.as_bytes());
+  let at_end = byte_at(file, end, size)?;
+  if at_end == Some(b'\n') && repl.last() == Some(&b'\r') {
+    let bytes = repl.to_mut();
+    if lf {
+      let run = bytes.iter().rev().take_while(|&&b| b == b'\r').count();
+      let from = bytes.len() - run;
+      bytes[from..].fill(b'\n');
+    } else {
+      bytes.pop();
+      bytes.extend_from_slice(b"\r\n");
+    }
+  }
+  let next = repl.first().copied().or(at_end);
+  let before = if start > 0 {
+    byte_at(file, start - 1, size)?
+  } else {
+    None
+  };
+  let mut plan = SplicePlan {
+    start,
+    lead_lf: 0,
+    replacement: repl,
+  };
+  if before == Some(b'\r') && byte_at(file, start, size)? != Some(b'\n') && next == Some(b'\n') {
+    if lf {
+      let run = cr_run_start(file, start)?;
+      plan.lead_lf = start - run;
+      plan.start = run;
+    } else {
+      plan.start = start - 1;
+      let mut joined = b"\r\n".to_vec();
+      joined.extend_from_slice(&plan.replacement);
+      plan.replacement = Cow::Owned(joined);
+    }
+  }
+  Ok(plan)
 }
 
 /// Splice `[start, end)` of `path` with `replacement`. `start`/`end` are byte
 /// offsets that the caller guarantees fall on UTF-8 character boundaries; this
 /// layer does not validate the file's encoding (the frontend guarantees the
 /// replacement bytes keep the file's encoding consistent). `start == end` is a
-/// pure insertion; an empty `replacement` is a pure deletion. Returns the
-/// fingerprint of the rewritten file so the caller can rebase its range view.
+/// pure insertion; an empty `replacement` is a pure deletion. `insert_sep` (`\n`
+/// or `\r\n`) is what a lone `\r` that the splice would join to a `\n` is
+/// rewritten to (see `plan_splice`). Returns the fingerprint of the rewritten
+/// file so the caller can rebase its range view.
 fn splice_at(
   path: &Path,
   start: u64,
   end: u64,
   replacement: &str,
+  insert_sep: &str,
   expected: Option<Fingerprint>,
 ) -> Result<Fingerprint, String> {
   let meta = fs::metadata(path).map_err(|e| e.to_string())?;
@@ -160,12 +278,16 @@ fn splice_at(
     .duration_since(UNIX_EPOCH)
     .map(|d| d.as_nanos())
     .unwrap_or(0);
+  let mut file = File::open(path).map_err(|e| e.to_string())?;
+  let plan = plan_splice(&mut file, size, start, end, replacement, insert_sep)?;
+  drop(file);
   splice_write(
     path,
     &format!(".splice-{nanos}"),
-    start,
+    plan.start,
     end,
-    replacement.as_bytes(),
+    plan.lead_lf,
+    &plan.replacement,
   )?;
   fingerprint_of(path)
 }
@@ -258,9 +380,17 @@ pub fn splice_file(
   start: u64,
   end: u64,
   replacement: String,
+  insert_sep: String,
   expected: Option<Fingerprint>,
 ) -> Result<Fingerprint, String> {
-  splice_at(Path::new(&path), start, end, &replacement, expected)
+  splice_at(
+    Path::new(&path),
+    start,
+    end,
+    &replacement,
+    &insert_sep,
+    expected,
+  )
 }
 
 #[tauri::command(async)]
@@ -328,7 +458,7 @@ mod tests {
   fn splice_head_range() {
     let dir = tempdir().unwrap();
     let path = write_file(dir.path(), "f.txt", b"HELLO world");
-    splice_at(&path, 0, 5, "hi", None).unwrap();
+    splice_at(&path, 0, 5, "hi", "\n", None).unwrap();
     assert_eq!(fs::read(&path).unwrap(), b"hi world");
     assert_no_temp(dir.path());
   }
@@ -337,7 +467,7 @@ mod tests {
   fn splice_tail_range() {
     let dir = tempdir().unwrap();
     let path = write_file(dir.path(), "f.txt", b"hello WORLD");
-    splice_at(&path, 6, 11, "there", None).unwrap();
+    splice_at(&path, 6, 11, "there", "\n", None).unwrap();
     assert_eq!(fs::read(&path).unwrap(), b"hello there");
   }
 
@@ -345,7 +475,7 @@ mod tests {
   fn splice_middle_range() {
     let dir = tempdir().unwrap();
     let path = write_file(dir.path(), "f.txt", b"abcXYZdef");
-    splice_at(&path, 3, 6, "123", None).unwrap();
+    splice_at(&path, 3, 6, "123", "\n", None).unwrap();
     assert_eq!(fs::read(&path).unwrap(), b"abc123def");
   }
 
@@ -353,7 +483,7 @@ mod tests {
   fn splice_pure_insertion_when_start_equals_end() {
     let dir = tempdir().unwrap();
     let path = write_file(dir.path(), "f.txt", b"abcdef");
-    splice_at(&path, 3, 3, "___", None).unwrap();
+    splice_at(&path, 3, 3, "___", "\n", None).unwrap();
     assert_eq!(fs::read(&path).unwrap(), b"abc___def");
   }
 
@@ -361,7 +491,7 @@ mod tests {
   fn splice_pure_deletion_with_empty_replacement() {
     let dir = tempdir().unwrap();
     let path = write_file(dir.path(), "f.txt", b"abcXYZdef");
-    splice_at(&path, 3, 6, "", None).unwrap();
+    splice_at(&path, 3, 6, "", "\n", None).unwrap();
     assert_eq!(fs::read(&path).unwrap(), b"abcdef");
   }
 
@@ -370,7 +500,7 @@ mod tests {
     let dir = tempdir().unwrap();
     let path = write_file(dir.path(), "f.txt", b"old content");
     let size = fs::metadata(&path).unwrap().len();
-    splice_at(&path, 0, size, "brand new", None).unwrap();
+    splice_at(&path, 0, size, "brand new", "\n", None).unwrap();
     assert_eq!(fs::read(&path).unwrap(), b"brand new");
   }
 
@@ -378,7 +508,7 @@ mod tests {
   fn splice_rejects_start_after_end() {
     let dir = tempdir().unwrap();
     let path = write_file(dir.path(), "f.txt", b"abcdef");
-    assert!(splice_at(&path, 4, 2, "x", None).is_err());
+    assert!(splice_at(&path, 4, 2, "x", "\n", None).is_err());
     // File is untouched after a rejected splice.
     assert_eq!(fs::read(&path).unwrap(), b"abcdef");
   }
@@ -387,7 +517,7 @@ mod tests {
   fn splice_rejects_end_past_size() {
     let dir = tempdir().unwrap();
     let path = write_file(dir.path(), "f.txt", b"abcdef");
-    assert!(splice_at(&path, 0, 100, "x", None).is_err());
+    assert!(splice_at(&path, 0, 100, "x", "\n", None).is_err());
     assert_eq!(fs::read(&path).unwrap(), b"abcdef");
   }
 
@@ -396,7 +526,7 @@ mod tests {
     let dir = tempdir().unwrap();
     let path = write_file(dir.path(), "f.txt", b"abcdef");
     let fp = fingerprint_of(&path).unwrap();
-    splice_at(&path, 0, 3, "XYZ", Some(fp)).unwrap();
+    splice_at(&path, 0, 3, "XYZ", "\n", Some(fp)).unwrap();
     assert_eq!(fs::read(&path).unwrap(), b"XYZdef");
   }
 
@@ -406,7 +536,7 @@ mod tests {
     let path = write_file(dir.path(), "f.txt", b"abcdef");
     let mut fp = fingerprint_of(&path).unwrap();
     fp.size += 1;
-    let err = splice_at(&path, 0, 3, "XYZ", Some(fp)).unwrap_err();
+    let err = splice_at(&path, 0, 3, "XYZ", "\n", Some(fp)).unwrap_err();
     assert_eq!(err, FINGERPRINT_MISMATCH);
     assert_eq!(fs::read(&path).unwrap(), b"abcdef");
   }
@@ -418,7 +548,7 @@ mod tests {
     let mut fp = fingerprint_of(&path).unwrap();
     // A different mtime with the same size still counts as an out-of-band edit.
     fp.mtime_ms = fp.mtime_ms.wrapping_add(1000);
-    let err = splice_at(&path, 0, 3, "XYZ", Some(fp)).unwrap_err();
+    let err = splice_at(&path, 0, 3, "XYZ", "\n", Some(fp)).unwrap_err();
     assert_eq!(err, FINGERPRINT_MISMATCH);
   }
 
@@ -428,7 +558,7 @@ mod tests {
     let path = write_file(dir.path(), "f.txt", b"abcdef");
     // No fingerprint supplied: the check is skipped even though the file could
     // have changed since it was read.
-    splice_at(&path, 0, 3, "XYZ", None).unwrap();
+    splice_at(&path, 0, 3, "XYZ", "\n", None).unwrap();
     assert_eq!(fs::read(&path).unwrap(), b"XYZdef");
   }
 
@@ -443,7 +573,7 @@ mod tests {
     let path = write_file(dir.path(), "big.bin", &content);
     let start = 3 * 1024 * 1024u64;
     let end = 5 * 1024 * 1024u64;
-    splice_at(&path, start, end, "MID", None).unwrap();
+    splice_at(&path, start, end, "MID", "\n", None).unwrap();
     let result = fs::read(&path).unwrap();
     // Prefix and suffix bytes must be byte-for-byte unchanged.
     assert_eq!(&result[..start as usize], &content[..start as usize]);
@@ -457,7 +587,7 @@ mod tests {
     let path = write_file(dir.path(), "f.txt", b"abc");
     // `start` past EOF forces `copy_exact` to fail mid-stream (bypassing the
     // outer validation), exercising the cleanup path directly.
-    let result = splice_write(&path, ".splice-test", 10, 10, b"x");
+    let result = splice_write(&path, ".splice-test", 10, 10, 0, b"x");
     assert!(result.is_err());
     assert!(!dir.path().join(".f.txt.splice-test.tmp").exists());
     assert_no_temp(dir.path());
@@ -472,7 +602,7 @@ mod tests {
     let path = write_file(dir.path(), "f.txt", b"HELLO world");
     crate::fs_ops::set_test_xattr(&path, "user.note_n_pad_test", b"kept");
 
-    splice_at(&path, 0, 5, "hi", None).unwrap();
+    splice_at(&path, 0, 5, "hi", "\n", None).unwrap();
 
     assert_eq!(fs::read(&path).unwrap(), b"hi world");
     assert_eq!(
@@ -493,7 +623,7 @@ mod tests {
       return; // this platform will not make one for us
     }
 
-    splice_at(&link, 0, 5, "hi", None).unwrap();
+    splice_at(&link, 0, 5, "hi", "\n", None).unwrap();
 
     assert!(
       fs::symlink_metadata(&link)
@@ -517,7 +647,7 @@ mod tests {
     let b = dir.path().join("b.txt");
     fs::hard_link(&a, &b).unwrap();
 
-    splice_at(&a, 0, 5, "hi", None).unwrap();
+    splice_at(&a, 0, 5, "hi", "\n", None).unwrap();
 
     assert_eq!(
       crate::fs_ops::linktest::links(&a),
@@ -674,6 +804,168 @@ mod tests {
     assert!(result.is_err());
     assert!(!dir.path().join(".out.txt.copy-test.tmp").exists());
     assert_no_temp(dir.path());
+  }
+  // --- Junctions at the edges of a splice ------------------------------------
+  /// The file after `[start, end)` becomes `repl`, written out directly: every
+  /// `\r` that the splice newly brings next to a `\n` is rewritten to `sep` (a
+  /// `\n` separator also takes the run of `\r` bytes ending in it).
+  fn flat_splice(file: &[u8], start: usize, end: usize, repl: &[u8], sep: &str) -> Vec<u8> {
+    let mut post = [&file[..start], repl, &file[end..]].concat();
+    let mut junctions: Vec<usize> = Vec::new();
+    let mut check = |at: usize, post: &[u8]| {
+      if post[at] == b'\r' && post.get(at + 1) == Some(&b'\n') {
+        junctions.push(at);
+      }
+    };
+    if start > 0 && file.get(start) != Some(&b'\n') {
+      check(start - 1, &post);
+    }
+    if !repl.is_empty() && end < file.len() {
+      check(start + repl.len() - 1, &post);
+    }
+    junctions.sort_unstable();
+    junctions.dedup();
+    for &at in junctions.iter().rev() {
+      if sep == "\n" {
+        let mut from = at;
+        while from > 0 && post[from - 1] == b'\r' {
+          from -= 1;
+        }
+        post[from..=at].fill(b'\n');
+      } else {
+        post.splice(at..=at, b"\r\n".iter().copied());
+      }
+    }
+    post
+  }
+
+  #[test]
+  fn a_splice_never_joins_a_lone_cr_to_an_lf() {
+    // Every file, range and replacement over `a`, `\r`, `\n` up to a small size,
+    // against the direct rule, for both separators.
+    let atoms: [&[u8]; 3] = [b"a", b"\r", b"\n"];
+    let all = |max: usize| -> Vec<Vec<u8>> {
+      let mut out: Vec<Vec<u8>> = vec![Vec::new()];
+      let mut last = out.clone();
+      for _ in 0..max {
+        let mut next = Vec::new();
+        for base in &last {
+          for atom in atoms {
+            let mut longer = base.clone();
+            longer.extend_from_slice(atom);
+            next.push(longer);
+          }
+        }
+        out.extend(next.iter().cloned());
+        last = next;
+      }
+      out
+    };
+    let dir = tempdir().unwrap();
+    for file in all(4) {
+      let path = write_file(dir.path(), "j.txt", &file);
+      let size = file.len() as u64;
+      for repl in all(2) {
+        let repl_str = String::from_utf8(repl.clone()).unwrap();
+        // A range always starts and ends at a line start, never inside a CRLF.
+        let inside_crlf =
+          |at: usize| at > 0 && file.get(at - 1) == Some(&b'\r') && file.get(at) == Some(&b'\n');
+        for start in 0..=file.len() {
+          for end in start..=file.len() {
+            if inside_crlf(start) || inside_crlf(end) {
+              continue;
+            }
+            for sep in ["\n", "\r\n"] {
+              // The plan stands for the write: lead `\n` bytes, then the text.
+              let mut handle = File::open(&path).unwrap();
+              let plan =
+                plan_splice(&mut handle, size, start as u64, end as u64, &repl_str, sep).unwrap();
+              let mut got = file[..plan.start as usize].to_vec();
+              got.extend(std::iter::repeat_n(b'\n', plan.lead_lf as usize));
+              got.extend_from_slice(&plan.replacement);
+              got.extend_from_slice(&file[end..]);
+              assert_eq!(
+                got,
+                flat_splice(&file, start, end, &repl, sep),
+                "file {file:?} [{start}, {end}) <- {repl:?} sep {sep:?}"
+              );
+            }
+          }
+        }
+      }
+    }
+  }
+
+  #[test]
+  fn a_splice_rewrites_the_cr_before_its_start() {
+    let dir = tempdir().unwrap();
+    // An LF-led replacement after a lone `\r`.
+    let path = write_file(dir.path(), "f.txt", b"x\ry\n");
+    splice_at(&path, 2, 3, "\nz", "\n", None).unwrap();
+    assert_eq!(fs::read(&path).unwrap(), b"x\n\nz\n");
+    let path = write_file(dir.path(), "f.txt", b"x\ry\n");
+    splice_at(&path, 2, 3, "\nz", "\r\n", None).unwrap();
+    assert_eq!(fs::read(&path).unwrap(), b"x\r\n\nz\n");
+    // An empty replacement that brings the `\n` at `end` next to the `\r`.
+    let path = write_file(dir.path(), "f.txt", b"x\ry\nw");
+    splice_at(&path, 2, 3, "", "\n", None).unwrap();
+    assert_eq!(fs::read(&path).unwrap(), b"x\n\nw");
+    let path = write_file(dir.path(), "f.txt", b"x\ry\nw");
+    splice_at(&path, 2, 3, "", "\r\n", None).unwrap();
+    assert_eq!(fs::read(&path).unwrap(), b"x\r\n\nw");
+    // A `\r` that is already half of a `\r\n` stays.
+    let path = write_file(dir.path(), "f.txt", b"x\r\ny");
+    splice_at(&path, 3, 4, "\nz", "\n", None).unwrap();
+    assert_eq!(fs::read(&path).unwrap(), b"x\r\n\nz");
+  }
+
+  #[test]
+  fn a_splice_rewrites_a_cr_that_ends_its_replacement() {
+    let dir = tempdir().unwrap();
+    // Box over `a\rb\n`, buffer `a\n` (the empty line stays): the replacement
+    // `a\r` meets the `\n` at `end`.
+    let path = write_file(dir.path(), "f.txt", b"..a\rb\n\nz");
+    splice_at(&path, 2, 6, "a\r", "\n", None).unwrap();
+    assert_eq!(fs::read(&path).unwrap(), b"..a\n\nz");
+    let path = write_file(dir.path(), "f.txt", b"..a\rb\n\nz");
+    splice_at(&path, 2, 6, "a\r", "\r\n", None).unwrap();
+    assert_eq!(fs::read(&path).unwrap(), b"..a\r\n\nz");
+    // The whole trailing run goes with it, and a run that is the whole
+    // replacement carries on into the file.
+    let path = write_file(dir.path(), "f.txt", b"q\r..\n");
+    splice_at(&path, 2, 4, "\r\r", "\n", None).unwrap();
+    assert_eq!(fs::read(&path).unwrap(), b"q\n\n\n\n");
+  }
+
+  #[test]
+  fn a_splice_rejects_an_invalid_insert_separator() {
+    let dir = tempdir().unwrap();
+    let path = write_file(dir.path(), "f.txt", b"abc");
+    for sep in ["", "\r", "\n\n", "x"] {
+      assert!(splice_at(&path, 0, 1, "z", sep, None).is_err());
+    }
+    assert_eq!(fs::read(&path).unwrap(), b"abc");
+  }
+  #[test]
+  fn a_long_run_of_cr_before_the_start_is_rewritten_in_chunks() {
+    let run = 5 * 1024 * 1024usize;
+    let mut file = b"head\n".to_vec();
+    file.extend(std::iter::repeat_n(b'\r', run));
+    file.extend_from_slice(b"tail\n");
+    let dir = tempdir().unwrap();
+    let path = write_file(dir.path(), "run.txt", &file);
+    let start = 5 + run;
+    crate::test_alloc::reset_largest();
+    splice_at(&path, start as u64, start as u64 + 4, "\nZ", "\n", None).unwrap();
+    let largest = crate::test_alloc::largest();
+    assert!(
+      largest <= 2 * SPLICE_BUF,
+      "an allocation of {largest} bytes: the run was held in memory"
+    );
+    assert_eq!(
+      fs::read(&path).unwrap(),
+      flat_splice(&file, start, start + 4, b"\nZ", "\n")
+    );
   }
 }
 

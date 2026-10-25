@@ -404,6 +404,91 @@ describe('the window stays put while the dialog is up', () => {
   });
 });
 
+describe('closing a windowed tab that still has input on its way', () => {
+  /** A windowed tab whose Rust buffer is `dirty`. */
+  function windowedTab(id: string, isDirty: boolean): DocTab {
+    const tab = clean(id, `/p/${id}.log`);
+    tab.windowed = {
+      sessionId: 7,
+      totalBytes: 1,
+      totalLines: 1,
+      fingerprint: null,
+      dirty: isDirty,
+      topLine: 0,
+    };
+    return tab;
+  }
+
+  it('waits for the input to land, then asks about the tab the input made dirty', async () => {
+    const w = windowedTab('w', false);
+    open([w], 'w');
+    let landed: () => void = () => {};
+    win.windowedPending = () => true;
+    win.endComposition = () =>
+      new Promise<void>((resolve) => {
+        landed = () => {
+          // The text reaches the core: the tab is dirty now.
+          w.windowed!.dirty = true;
+          resolve();
+        };
+      });
+    missing.requestClose();
+    expect(host.finishTabClose).not.toHaveBeenCalled();
+    expect(missing.confirmClose).toBe(false);
+    landed();
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(missing.confirmClose).toBe(true);
+    expect(host.finishTabClose).not.toHaveBeenCalled();
+  });
+
+  it('does nothing twice for a repeated close while it waits', async () => {
+    open([windowedTab('w', false)], 'w');
+    let landed: () => void = () => {};
+    const end = vi.fn(
+      () =>
+        new Promise<void>((resolve) => {
+          landed = resolve;
+        }),
+    );
+    win.windowedPending = () => true;
+    win.endComposition = end;
+    missing.requestClose();
+    missing.requestClose();
+    expect(end).toHaveBeenCalledTimes(1);
+    landed();
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(host.finishTabClose).toHaveBeenCalledTimes(1);
+  });
+
+  it('stops when the active tab is another one by the time the input has landed', async () => {
+    open([windowedTab('w', false), clean('c', '/p/c.txt', 1)], 'w');
+    let landed: () => void = () => {};
+    win.windowedPending = () => true;
+    win.endComposition = () =>
+      new Promise<void>((resolve) => {
+        landed = resolve;
+      });
+    missing.requestClose();
+    win.activeIndex = 1;
+    landed();
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(host.finishTabClose).not.toHaveBeenCalled();
+    expect(missing.confirmClose).toBe(false);
+  });
+
+  it('stays synchronous with no input pending', () => {
+    open([windowedTab('w', false)], 'w');
+    win.windowedPending = () => false;
+    win.endComposition = vi.fn(() => Promise.resolve());
+    missing.requestClose();
+    expect(win.endComposition).not.toHaveBeenCalled();
+    expect(host.finishTabClose).toHaveBeenCalledTimes(1);
+  });
+});
+
 describe('closing a tab', () => {
   it('asks first when the tab has changes', () => {
     open([dirty('a', '/p/a.txt', 'A')], 'a');

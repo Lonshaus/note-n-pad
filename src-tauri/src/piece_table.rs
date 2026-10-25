@@ -9,8 +9,9 @@
 //! pieces.
 //!
 //! Coordinates are byte offsets (`u64`) throughout. This module treats content
-//! as opaque bytes: it never inspects UTF-8 structure except to count `\n`
-//! bytes for line indexing. Keeping edit boundaries on valid UTF-8 character
+//! as opaque bytes: it never inspects UTF-8 structure except to find line
+//! breaks for line indexing, by the rule in `line_rule` (every `\n`, and every
+//! `\r` not followed by `\n`). Keeping edit boundaries on valid UTF-8 character
 //! boundaries is entirely the caller's responsibility — the piece table will
 //! happily split a multi-byte sequence if asked to, and callers above this
 //! layer must not ask.
@@ -20,7 +21,16 @@
 //! for `std::fs::File` (production) and `&[u8]` (tests). Its newline structure
 //! is likewise never held densely — see `OriginalIndex` for the sparse
 //! checkpoint index and its single-segment decode cache.
+//!
+//! A piece boundary can sit between a `\r` and a `\n`. Each piece counts its
+//! own breaks as a text of its own, so a final `\r` counts, and the prefix sums
+//! take that count back when the next piece opens with `\n`.
+//!
+//! A third kind of piece, `Fill`, stands for any number of copies of one byte
+//! and holds only the byte and the count, so rewriting a long run of `\r` to
+//! `\n` (and back) costs the same for ten bytes and for a hundred million.
 
+use crate::line_rule;
 use std::cell::RefCell;
 use std::fs::File;
 use std::io::Write;
@@ -51,33 +61,39 @@ impl OriginalSource for &[u8] {
 
 impl OriginalSource for File {
   fn read_into(&self, offset: u64, len: usize, out: &mut Vec<u8>) -> Result<(), String> {
-    let mut buf = vec![0u8; len];
-    // pread-style access: does not disturb the file cursor and needs only
-    // `&self`, so several reads can interleave without external locking.
-    #[cfg(unix)]
-    {
-      use std::os::unix::fs::FileExt;
-      self
-        .read_exact_at(&mut buf, offset)
-        .map_err(|e| e.to_string())?;
+    let at = out.len();
+    out.resize(at + len, 0);
+    let read = fill_at(self, offset, &mut out[at..]);
+    if read.is_err() {
+      out.truncate(at);
     }
-    #[cfg(windows)]
-    {
-      use std::os::windows::fs::FileExt;
-      let mut done = 0usize;
-      while done < len {
-        let n = self
-          .seek_read(&mut buf[done..], offset + done as u64)
-          .map_err(|e| e.to_string())?;
-        if n == 0 {
-          return Err("read past original end".to_string());
-        }
-        done += n;
-      }
-    }
-    out.extend_from_slice(&buf);
-    Ok(())
+    read
   }
+}
+/// Fill `buf` from `file` at `offset`. pread-style access: does not disturb the
+/// file cursor and needs only `&File`, so several reads can interleave without
+/// external locking.
+fn fill_at(file: &File, offset: u64, buf: &mut [u8]) -> Result<(), String> {
+  #[cfg(unix)]
+  {
+    use std::os::unix::fs::FileExt;
+    file.read_exact_at(buf, offset).map_err(|e| e.to_string())?;
+  }
+  #[cfg(windows)]
+  {
+    use std::os::windows::fs::FileExt;
+    let mut done = 0usize;
+    while done < buf.len() {
+      let n = file
+        .seek_read(&mut buf[done..], offset + done as u64)
+        .map_err(|e| e.to_string())?;
+      if n == 0 {
+        return Err("read past original end".to_string());
+      }
+      done += n;
+    }
+  }
+  Ok(())
 }
 
 /// Sparse newline index over the immutable original buffer, plus the read
@@ -87,7 +103,9 @@ impl OriginalSource for File {
 /// five-million-line file), the original's newline structure is captured as
 /// sparse checkpoints taken at a fixed byte interval `I` (chosen by the caller;
 /// `windowed` uses 1 MiB). Each checkpoint is `(offset, newlines_before)`:
-/// `newlines_before` is the exact count of `\n` bytes in original `[0, offset)`.
+/// `newlines_before` is the exact count of line-break markers in original
+/// `[0, offset)` (see `line_rule`: a `\r` at `offset - 1` counts unless the byte
+/// at `offset` is `\n`).
 /// Checkpoints are ascending in offset, seeded with `(0, 0)`, and never more
 /// than `I` bytes apart, so any newline query resolves by binary-searching the
 /// checkpoints and scanning at most one `I`-byte segment.
@@ -95,7 +113,7 @@ impl OriginalSource for File {
 /// Checkpoint memory: `16 * ceil(original_len / I)` bytes (one `(u64, u64)` per
 /// interval) — for a 240 MB file at `I` = 1 MiB, ~240 entries ≈ 3.75 KiB.
 ///
-/// A single-segment cache holds the decoded newline byte offsets of the most
+/// A single-segment cache holds the decoded marker byte offsets of the most
 /// recently queried checkpoint segment (`Vec<u64>`, valid only within that
 /// segment). Edits query per keystroke, so decoding an `I`-byte segment on
 /// every query would be far too costly; the cache makes repeated queries in the
@@ -107,9 +125,9 @@ impl OriginalSource for File {
 /// the whole index (checkpoints and cache) is rebuilt over the new file by
 /// `windowed`, discarding stale state wholesale.
 ///
-/// Segment-cache memory: at most one segment's newline offsets — worst case a
-/// segment that is entirely `\n` bytes, `8 * I` bytes (one `u64` per newline,
-/// at most `I` newlines in an `I`-byte segment); for `I` = 1 MiB that ceiling
+/// Segment-cache memory: at most one segment's marker offsets — worst case a
+/// segment that is entirely `\n` bytes, `8 * I` bytes (one `u64` per marker,
+/// at most `I` markers in an `I`-byte segment); for `I` = 1 MiB that ceiling
 /// is 8 MiB, but real text (tens of bytes per line) stays in the low hundreds
 /// of KiB.
 pub struct OriginalIndex<O: OriginalSource> {
@@ -126,10 +144,9 @@ pub struct OriginalIndex<O: OriginalSource> {
   #[cfg(test)]
   loads: std::cell::Cell<u64>,
 }
-
-/// The decoded newline positions of one checkpoint segment. `seg == usize::MAX`
+/// The decoded marker positions of one checkpoint segment. `seg == usize::MAX`
 /// marks "no segment decoded yet". `newlines` holds the absolute original byte
-/// offsets of every `\n` in `[checkpoints[seg].0, segment_end)`, ascending.
+/// offsets of every marker in `[checkpoints[seg].0, segment_end)`, ascending.
 struct SegmentCache {
   seg: usize,
   newlines: Vec<u64>,
@@ -137,9 +154,10 @@ struct SegmentCache {
 
 impl<O: OriginalSource> OriginalIndex<O> {
   /// Build an index over `source` (whose total byte length is `len`) from the
-  /// sparse `checkpoints` and the original's `total_newlines`. `checkpoints`
-  /// must be seeded with `(0, 0)`, ascending in offset, at most one interval
-  /// apart, each carrying the newline count strictly before its offset. This
+  /// sparse `checkpoints` and the original's `total_newlines` (its marker
+  /// count). `checkpoints` must be seeded with `(0, 0)`, ascending in offset,
+  /// at most one interval apart, each carrying the marker count strictly before
+  /// its offset, by the checkpoint rule in `line_rule`. This
   /// matches the sparse index `windowed`'s single scan collects.
   pub fn new(source: O, len: u64, total_newlines: u64, checkpoints: Vec<(u64, u64)>) -> Self {
     OriginalIndex {
@@ -191,23 +209,19 @@ impl<O: OriginalSource> OriginalIndex<O> {
       .get(seg + 1)
       .map(|&(o, _)| o)
       .unwrap_or(self.len);
-    let mut buf = Vec::with_capacity((end - start) as usize);
-    self
-      .source
-      .read_into(start, (end - start) as usize, &mut buf)?;
+    // One byte past the segment shows whether a final `\r` is a marker.
+    let want = (end - start) as usize;
+    let read = want + usize::from(end < self.len);
+    let mut buf = Vec::with_capacity(read);
+    self.source.read_into(start, read, &mut buf)?;
     cache.newlines.clear();
-    for (i, &b) in buf.iter().enumerate() {
-      if b == b'\n' {
-        cache.newlines.push(start + i as u64);
-      }
-    }
+    line_rule::push_break_positions(&buf, want, start, &mut cache.newlines);
     cache.seg = seg;
     #[cfg(test)]
     self.loads.set(self.loads.get() + 1);
     Ok(())
   }
-
-  /// Count of `\n` bytes in original `[0, offset)`.
+  /// Count of markers in original `[0, offset)`.
   fn newlines_before(&self, offset: u64) -> Result<u64, String> {
     let seg = self.seg_of_offset(offset);
     // Checkpoint-aligned offsets (notably 0, the start of every unsplit
@@ -220,8 +234,7 @@ impl<O: OriginalSource> OriginalIndex<O> {
     let within = cache.newlines.partition_point(|&p| p < offset) as u64;
     Ok(self.checkpoints[seg].1 + within)
   }
-
-  /// Byte offset of the `ordinal`-th newline (1-based, `1..=total_newlines`)
+  /// Byte offset of the `ordinal`-th marker (1-based, `1..=total_newlines`)
   /// in the original.
   fn newline_pos(&self, ordinal: u64) -> Result<u64, String> {
     // The ordinal-th newline lives in the last segment whose newline-before
@@ -248,20 +261,28 @@ impl<O: OriginalSource> OriginalIndex<O> {
 enum Source {
   Original,
   Add,
+  /// `len` copies of one byte, held as the byte and the length only.
+  Fill(u8),
 }
 
 /// A contiguous run of bytes drawn from one source buffer.
 ///
 /// `start`/`len` are offsets within that source buffer (for `Original` these
-/// are absolute original-file offsets, so they stay valid across splits).
-/// `newlines` caches the number of `\n` bytes inside the run; it must be split
-/// exactly when a piece is split so prefix sums stay correct.
+/// are absolute original-file offsets, so they stay valid across splits; a
+/// `Fill` piece has no buffer and keeps `start` at 0).
+/// `newlines` caches the number of line-break markers inside the run, counted
+/// as a text of its own (a final `\r` counts); it must be split exactly when a
+/// piece is split so prefix sums stay correct. `ends_cr` and `starts_lf` say
+/// whether the run's last byte is `\r` and its first is `\n`: a `\r` that ends
+/// one piece is no marker when the next piece starts with `\n`.
 #[derive(Clone, Copy, Debug)]
 struct Piece {
   source: Source,
   start: u64,
   len: u64,
   newlines: u64,
+  ends_cr: bool,
+  starts_lf: bool,
 }
 
 pub struct PieceTable<O: OriginalSource> {
@@ -277,8 +298,12 @@ pub struct PieceTable<O: OriginalSource> {
   /// is the document byte offset at which `pieces[i]` begins, and the last
   /// entry is the total document length.
   offset_prefix: Vec<u64>,
-  /// Prefix sum of piece newline counts, same shape as `offset_prefix`.
+  /// Prefix sum of piece marker counts, same shape as `offset_prefix`. A piece
+  /// ending in `\r` followed by a piece starting with `\n` counts one less.
   newline_prefix: Vec<u64>,
+  /// Whether the first piece's `ends_cr` / `starts_lf` are set. They are read
+  /// from the original on the first edit, since `new` cannot fail.
+  flags_known: bool,
 }
 
 impl<O: OriginalSource> PieceTable<O> {
@@ -294,14 +319,18 @@ impl<O: OriginalSource> PieceTable<O> {
         start: 0,
         len: index.len,
         newlines: index.total_newlines,
+        ends_cr: false,
+        starts_lf: false,
       }]
     };
+    let flags_known = pieces.is_empty();
     let mut table = PieceTable {
       index,
       add: Vec::new(),
       pieces,
       offset_prefix: Vec::new(),
       newline_prefix: Vec::new(),
+      flags_known,
     };
     table.rebuild();
     table
@@ -319,12 +348,30 @@ impl<O: OriginalSource> PieceTable<O> {
     self.newline_prefix.push(0);
     let mut off = 0u64;
     let mut nl = 0u64;
-    for piece in &self.pieces {
+    for (i, piece) in self.pieces.iter().enumerate() {
       off += piece.len;
-      nl += piece.newlines;
+      let joined = piece.ends_cr && self.pieces.get(i + 1).is_some_and(|next| next.starts_lf);
+      nl += piece.newlines - u64::from(joined);
       self.offset_prefix.push(off);
       self.newline_prefix.push(nl);
     }
+  }
+  /// Read the first piece's `ends_cr` / `starts_lf` from the original, once.
+  fn ensure_flags(&mut self) -> Result<(), String> {
+    if self.flags_known {
+      return Ok(());
+    }
+    let len = self.index.len;
+    let mut first = Vec::with_capacity(1);
+    self.index.read_into(0, 1, &mut first)?;
+    let mut last = Vec::with_capacity(1);
+    self.index.read_into(len - 1, 1, &mut last)?;
+    if let Some(piece) = self.pieces.first_mut() {
+      piece.starts_lf = first[0] == b'\n';
+      piece.ends_cr = last[0] == b'\r';
+    }
+    self.flags_known = true;
+    Ok(())
   }
   /// The source the original run draws from.
   pub fn source(&self) -> &O {
@@ -370,8 +417,7 @@ impl<O: OriginalSource> PieceTable<O> {
   pub fn len(&self) -> u64 {
     *self.offset_prefix.last().expect("prefix seeded with 0")
   }
-
-  /// Total line count using split semantics (newline count plus one for a
+  /// Total line count using split semantics (break count plus one for a
   /// non-empty document, zero for an empty one) to match `large_file`.
   pub fn line_count(&self) -> u64 {
     let newlines = *self.newline_prefix.last().expect("prefix seeded with 0");
@@ -381,26 +427,42 @@ impl<O: OriginalSource> PieceTable<O> {
       newlines + 1
     }
   }
-
-  /// Number of `\n` bytes in a source-buffer sub-range of `piece`, covering
-  /// local offsets `[from, to)` measured from the piece's own start.
-  fn source_newlines(&self, piece: &Piece, from: u64, to: u64) -> Result<u64, String> {
+  /// Markers in the first `local` bytes of `piece` (`local < piece.len`), with
+  /// the byte at `local` deciding a final `\r`.
+  fn markers_before(&self, piece: &Piece, local: u64) -> Result<u64, String> {
     match piece.source {
       Source::Original => {
-        let a = piece.start + from;
-        let b = piece.start + to;
-        // ponytail: when `[a, b)` straddles a checkpoint boundary the two
-        // `newlines_before` calls decode two different segments, evicting
+        let a = piece.start;
+        // ponytail: when `[a, a + local)` straddles a checkpoint boundary the
+        // two `newlines_before` calls decode two different segments, evicting
         // each other; local edits keep both ends in one segment so this
         // stays a cache hit. Add a two-slot cache only if wide original
         // splits ever dominate.
-        Ok(self.index.newlines_before(b)? - self.index.newlines_before(a)?)
+        Ok(self.index.newlines_before(a + local)? - self.index.newlines_before(a)?)
       }
       Source::Add => {
-        let s = (piece.start + from) as usize;
-        let e = (piece.start + to) as usize;
-        Ok(self.add[s..e].iter().filter(|&&c| c == b'\n').count() as u64)
+        let s = piece.start as usize;
+        let e = s + piece.len as usize;
+        Ok(line_rule::breaks_before(&self.add[s..e], local as usize))
       }
+      // Every `\r` of a `\r` run is followed by a `\r` inside the piece.
+      Source::Fill(b) => Ok(if matches!(b, b'\r' | b'\n') { local } else { 0 }),
+    }
+  }
+  /// The bytes of `piece` at local offsets `loc - 1` and `loc` (`0 < loc <
+  /// piece.len`).
+  fn pair_at(&self, piece: &Piece, loc: u64) -> Result<(u8, u8), String> {
+    match piece.source {
+      Source::Original => {
+        let mut two = Vec::with_capacity(2);
+        self.index.read_into(piece.start + loc - 1, 2, &mut two)?;
+        Ok((two[0], two[1]))
+      }
+      Source::Add => {
+        let at = (piece.start + loc) as usize;
+        Ok((self.add[at - 1], self.add[at]))
+      }
+      Source::Fill(b) => Ok((b, b)),
     }
   }
 
@@ -408,18 +470,35 @@ impl<O: OriginalSource> PieceTable<O> {
   /// with `newlines` correctly partitioned. `loc` must satisfy `0 < loc <
   /// piece.len`.
   fn split_piece(&self, piece: &Piece, loc: u64) -> Result<(Piece, Piece), String> {
-    let left_nl = self.source_newlines(piece, 0, loc)?;
+    let (before, after) = self.pair_at(piece, loc)?;
+    // A `\r\n` cut in two: the left half now ends in a `\r` that counts as a
+    // marker of its own, the right half's `\n` counts either way.
+    let cut_crlf = u64::from(before == b'\r' && after == b'\n');
+    let left_nl = match piece.source {
+      Source::Original | Source::Fill(_) => self.markers_before(piece, loc)? + cut_crlf,
+      Source::Add => {
+        let s = piece.start as usize;
+        line_rule::count_breaks(&self.add[s..s + loc as usize])
+      }
+    };
     let left = Piece {
       source: piece.source,
       start: piece.start,
       len: loc,
       newlines: left_nl,
+      ends_cr: before == b'\r',
+      starts_lf: piece.starts_lf,
     };
     let right = Piece {
       source: piece.source,
-      start: piece.start + loc,
+      start: match piece.source {
+        Source::Fill(_) => 0,
+        _ => piece.start + loc,
+      },
       len: piece.len - loc,
-      newlines: piece.newlines - left_nl,
+      newlines: piece.newlines + cut_crlf - left_nl,
+      ends_cr: piece.ends_cr,
+      starts_lf: after == b'\n',
     };
     Ok((left, right))
   }
@@ -431,6 +510,7 @@ impl<O: OriginalSource> PieceTable<O> {
     if offset > self.len() {
       return Err("offset out of range".to_string());
     }
+    self.ensure_flags()?;
     let mut acc = 0u64;
     let mut i = 0;
     while i < self.pieces.len() {
@@ -462,7 +542,7 @@ impl<O: OriginalSource> PieceTable<O> {
       return Ok(());
     }
     let start = self.add.len() as u64;
-    let newlines = bytes.iter().filter(|&&c| c == b'\n').count() as u64;
+    let newlines = line_rule::count_breaks(bytes);
     self.add.extend_from_slice(bytes);
     let idx = self.split_at(offset)?;
     // ponytail: adjacent pieces from the same source that happen to be
@@ -475,6 +555,37 @@ impl<O: OriginalSource> PieceTable<O> {
         start,
         len: bytes.len() as u64,
         newlines,
+        ends_cr: bytes[bytes.len() - 1] == b'\r',
+        starts_lf: bytes[0] == b'\n',
+      },
+    );
+    self.rebuild();
+    Ok(())
+  }
+  /// Insert `len` copies of `byte` at document offset `offset` as one piece that
+  /// holds the byte and the length only, so the cost does not depend on `len`.
+  /// A zero `len` is a no-op; an out-of-range offset returns `Err`.
+  pub fn insert_fill(&mut self, offset: u64, byte: u8, len: u64) -> Result<(), String> {
+    if offset > self.len() {
+      return Err("insert offset out of range".to_string());
+    }
+    if len == 0 {
+      return Ok(());
+    }
+    let idx = self.split_at(offset)?;
+    self.pieces.insert(
+      idx,
+      Piece {
+        source: Source::Fill(byte),
+        start: 0,
+        len,
+        newlines: if matches!(byte, b'\r' | b'\n') {
+          len
+        } else {
+          0
+        },
+        ends_cr: byte == b'\r',
+        starts_lf: byte == b'\n',
       },
     );
     self.rebuild();
@@ -522,8 +633,13 @@ impl<O: OriginalSource> PieceTable<O> {
       return Err("read end out of range".to_string());
     }
     let mut out = Vec::with_capacity((end - start) as usize);
+    self.read_append(start, end, &mut out)?;
+    Ok(out)
+  }
+  /// Append document bytes `[start, end)` to `out`. The caller checks the range.
+  fn read_append(&self, start: u64, end: u64, out: &mut Vec<u8>) -> Result<(), String> {
     if start == end {
-      return Ok(out);
+      return Ok(());
     }
     for (i, piece) in self.pieces.iter().enumerate() {
       let p_start = self.offset_prefix[i];
@@ -541,16 +657,17 @@ impl<O: OriginalSource> PieceTable<O> {
         Source::Original => {
           self
             .index
-            .read_into(piece.start + from, (to - from) as usize, &mut out)?;
+            .read_into(piece.start + from, (to - from) as usize, out)?;
         }
         Source::Add => {
           let a = (piece.start + from) as usize;
           let b = (piece.start + to) as usize;
           out.extend_from_slice(&self.add[a..b]);
         }
+        Source::Fill(byte) => out.resize(out.len() + (to - from) as usize, byte),
       }
     }
-    Ok(out)
+    Ok(())
   }
 
   /// Document byte offset at which `line` begins (0-based line index). Valid
@@ -562,23 +679,28 @@ impl<O: OriginalSource> PieceTable<O> {
     if line == 0 {
       return Ok(0);
     }
-    // Line `line` starts one byte past the `line`-th newline (1-based).
-    // Find the piece whose newline prefix range contains that newline.
+    // Line `line` starts one byte past the `line`-th marker (1-based).
+    // Find the piece whose marker prefix range contains that marker.
     let piece_idx = self.newline_prefix.partition_point(|&n| n < line) - 1;
     let k = line - self.newline_prefix[piece_idx]; // 1-based within the piece
     let nl_offset = self.newline_doc_offset(piece_idx, k)?;
     Ok(nl_offset + 1)
   }
-
-  /// Document byte offset of the `k`-th newline (1-based) inside `pieces[idx]`.
+  /// Document byte offset of the `k`-th marker (1-based) inside `pieces[idx]`.
+  /// A final `\r` that the next piece's `\n` takes over is never asked for:
+  /// `k` stays within the piece's count of markers in the document.
   fn newline_doc_offset(&self, idx: usize, k: u64) -> Result<u64, String> {
     let piece = &self.pieces[idx];
     let doc_start = self.offset_prefix[idx];
+    // A final `\r` is always the piece's last marker.
+    if piece.ends_cr && k == piece.newlines {
+      return Ok(doc_start + piece.len - 1);
+    }
     match piece.source {
       Source::Original => {
         let ps = piece.start;
-        // The k-th newline at or after `ps` is the `(n + k)`-th newline of
-        // the whole original, where `n` newlines precede `ps`.
+        // The k-th marker at or after `ps` is the `(n + k)`-th marker of
+        // the whole original, where `n` markers precede `ps`.
         let n = self.index.newlines_before(ps)?;
         let newline_pos = self.index.newline_pos(n + k)?;
         Ok(doc_start + (newline_pos - ps))
@@ -586,22 +708,18 @@ impl<O: OriginalSource> PieceTable<O> {
       Source::Add => {
         let base = piece.start as usize;
         let end = base + piece.len as usize;
-        let mut count = 0u64;
-        for (i, &b) in self.add[base..end].iter().enumerate() {
-          if b == b'\n' {
-            count += 1;
-            if count == k {
-              return Ok(doc_start + i as u64);
-            }
-          }
-        }
-        Err("newline index out of range".to_string())
+        line_rule::nth_break(&self.add[base..end], k)
+          .map(|i| doc_start + i as u64)
+          .ok_or_else(|| "newline index out of range".to_string())
       }
+      // Every byte of a break fill is a marker of the piece.
+      Source::Fill(_) => Ok(doc_start + k - 1),
     }
   }
 
   /// 0-based line index containing document byte `offset`, i.e. the number of
-  /// newlines strictly before `offset`. `offset` may equal `len()`; anything
+  /// markers strictly before `offset`: a `\r` right before `offset` counts
+  /// unless the byte at `offset` is `\n`. `offset` may equal `len()`; anything
   /// larger returns `Err`.
   // Public inverse of `line_to_offset`, exercised by this module's tests and by
   // the windowed undo/redo commands (jump-to-change line lookup).
@@ -616,7 +734,7 @@ impl<O: OriginalSource> PieceTable<O> {
       return Ok(*self.newline_prefix.last().expect("prefix seeded with 0"));
     }
     let local = offset - self.offset_prefix[piece_idx];
-    let within = self.source_newlines(&self.pieces[piece_idx], 0, local)?;
+    let within = self.markers_before(&self.pieces[piece_idx], local)?;
     Ok(self.newline_prefix[piece_idx] + within)
   }
 
@@ -647,6 +765,16 @@ impl<O: OriginalSource> PieceTable<O> {
           let b = (piece.start + piece.len) as usize;
           out.write_all(&self.add[a..b]).map_err(|e| e.to_string())?;
         }
+        Source::Fill(byte) => {
+          let mut remaining = piece.len;
+          while remaining > 0 {
+            let take = remaining.min(cap as u64) as usize;
+            scratch.clear();
+            scratch.resize(take, byte);
+            out.write_all(&scratch).map_err(|e| e.to_string())?;
+            remaining -= take as u64;
+          }
+        }
       }
     }
     Ok(())
@@ -659,8 +787,15 @@ impl<O: OriginalSource> OriginalSource for PieceTable<O> {
     let end = offset
       .checked_add(len as u64)
       .ok_or_else(|| "read range overflows u64".to_string())?;
-    out.extend_from_slice(&self.read(offset, end)?);
-    Ok(())
+    if end > self.len() {
+      return Err("read end out of range".to_string());
+    }
+    let at = out.len();
+    let read = self.read_append(offset, end, out);
+    if read.is_err() {
+      out.truncate(at);
+    }
+    read
   }
 }
 
@@ -755,11 +890,13 @@ mod tests {
     // segment 2 (second load). Failing that second load used to leave
     // `pieces` split with stale prefix sums, so a later read panicked on an
     // out-of-bounds prefix index; the error path must rebuild instead.
+    // Reads before it: the first piece's two end bytes, the pair of bytes at
+    // each cut, and the load of segment 0 for the first cut.
     let content = b"aaaa\nbbbb\ncccc\ndddd\n".to_vec();
     let src = FailingSource {
       bytes: content.clone(),
       calls: std::cell::Cell::new(0),
-      fail_on: 2,
+      fail_on: 6,
     };
     let index = build_index(src, &content, TEST_INTERVAL);
     let mut t = PieceTable::new(index);
@@ -770,7 +907,7 @@ mod tests {
     );
     // The failed delete must leave the table fully consistent: identical
     // content and geometry, and the same edit must succeed once the source
-    // recovers (only the second read call ever fails).
+    // recovers (only that one read call ever fails).
     assert_eq!(t.len(), 20);
     assert_eq!(t.line_count(), 5);
     assert_eq!(t.read(0, 20).unwrap(), content);
@@ -1189,5 +1326,242 @@ mod tests {
     assert_eq!(pt.line_count(), 3);
     // Line 1 now starts one byte later.
     assert_eq!(pt.line_to_offset(1).unwrap(), long_len as u64 + 2);
+  }
+  // --- The line rule: `\n`, and `\r` not followed by `\n` -------------------
+  /// Line starts of `c` by the line rule, written out directly.
+  fn rule_starts(c: &[u8]) -> Vec<u64> {
+    let mut starts = vec![0u64];
+    for i in 0..c.len() {
+      if c[i] == b'\n' || (c[i] == b'\r' && c.get(i + 1) != Some(&b'\n')) {
+        starts.push(i as u64 + 1);
+      }
+    }
+    starts
+  }
+  /// A slice-backed index over `bytes` whose checkpoints follow the rule: each
+  /// carries the breaks strictly before its offset.
+  fn rule_index(bytes: &[u8], interval: u64) -> OriginalIndex<&[u8]> {
+    let starts = rule_starts(bytes);
+    let mut checkpoints = vec![(0u64, 0u64)];
+    let mut at = interval;
+    while at < bytes.len() as u64 {
+      checkpoints.push((at, starts.partition_point(|&s| s <= at) as u64 - 1));
+      at += interval;
+    }
+    OriginalIndex::new(
+      bytes,
+      bytes.len() as u64,
+      starts.len() as u64 - 1,
+      checkpoints,
+    )
+  }
+  /// Line count, every line start and the line of every offset of `pt` equal a
+  /// flat recomputation over `flat`.
+  fn assert_by_rule<O: OriginalSource>(pt: &PieceTable<O>, flat: &[u8], what: &str) {
+    let starts = rule_starts(flat);
+    assert_eq!(pt.read(0, pt.len()).unwrap(), flat, "{what}: bytes");
+    let lines = if flat.is_empty() {
+      0
+    } else {
+      starts.len() as u64
+    };
+    assert_eq!(pt.line_count(), lines, "{what}: line_count of {flat:?}");
+    for line in 0..lines {
+      assert_eq!(
+        pt.line_to_offset(line).unwrap(),
+        starts[line as usize],
+        "{what}: line_to_offset({line}) of {flat:?}"
+      );
+    }
+    for off in 0..=flat.len() as u64 {
+      assert_eq!(
+        pt.offset_to_line(off).unwrap(),
+        starts.partition_point(|&s| s <= off) as u64 - 1,
+        "{what}: offset_to_line({off}) of {flat:?}"
+      );
+    }
+  }
+
+  #[test]
+  fn the_original_follows_the_line_rule_at_checkpoint_boundaries() {
+    // Interval 4: a `\r` just before a checkpoint, with and without a `\n` at
+    // it, and a `\r` that ends the file.
+    for content in [
+      &b"abc\rdefghij"[..],
+      b"abc\r\ndefghij",
+      b"abcdefg\rhijk",
+      b"abcdefg\r\nhijk",
+      b"abc\r",
+      b"abcd\r",
+      b"\r\r\r\r\r\r\r\r\r",
+      b"\r\n\r\n\r\n\r\n\r\n",
+    ] {
+      let pt = PieceTable::new(rule_index(content, 4));
+      assert_by_rule(&pt, content, "pristine");
+    }
+  }
+
+  #[test]
+  fn random_edits_keep_the_line_rule() {
+    let tokens: [&[u8]; 4] = [b"a", "é".as_bytes(), b"\r", b"\n"];
+    let token = |rng: &mut Lcg| tokens[rng.below(tokens.len() as u64) as usize];
+    let fills = *b"\r\n";
+    for seed in 1..=24u64 {
+      let mut rng = Lcg(seed.wrapping_mul(0x9e37_79b9_7f4a_7c15));
+      let mut reference: Vec<u8> = Vec::new();
+      for _ in 0..rng.below(40) {
+        reference.extend_from_slice(token(&mut rng));
+      }
+      let original = reference.clone();
+      let mut pt = PieceTable::new(rule_index(&original, 7));
+      assert_by_rule(&pt, &reference, "start");
+      for step in 0..300 {
+        let len = reference.len() as u64;
+        let op = rng.below(3);
+        if op == 0 || len == 0 {
+          let at = rng.below(len + 1);
+          let mut bytes = Vec::new();
+          for _ in 0..rng.below(4) {
+            bytes.extend_from_slice(token(&mut rng));
+          }
+          pt.insert(at, &bytes).unwrap();
+          reference.splice(at as usize..at as usize, bytes);
+        } else if op == 1 {
+          let start = rng.below(len);
+          let end = start + rng.below(len - start + 1).min(6);
+          pt.delete(start, end).unwrap();
+          reference.drain(start as usize..end as usize);
+        } else {
+          // A run of `\r` or `\n` as a fill piece, anywhere, so fills get
+          // split, partly deleted and joined to `\r`/`\n` neighbours.
+          let at = rng.below(len + 1);
+          let byte = fills[rng.below(2) as usize];
+          let n = 1 + rng.below(9);
+          pt.insert_fill(at, byte, n).unwrap();
+          reference.splice(
+            at as usize..at as usize,
+            std::iter::repeat_n(byte, n as usize),
+          );
+        }
+        assert_by_rule(&pt, &reference, &format!("seed {seed} step {step}"));
+      }
+    }
+  }
+
+  #[test]
+  fn every_small_edit_keeps_the_line_rule() {
+    // Every original of up to four of `a`, `\r`, `\n`; one insert anywhere;
+    // then one delete of any range: junctions form and break at piece and
+    // checkpoint boundaries.
+    let atoms: [&[u8]; 3] = [b"a", b"\r", b"\n"];
+    let mut originals: Vec<Vec<u8>> = vec![Vec::new()];
+    let mut last = originals.clone();
+    for _ in 0..4 {
+      let mut next = Vec::new();
+      for base in &last {
+        for atom in atoms {
+          let mut longer = base.clone();
+          longer.extend_from_slice(atom);
+          next.push(longer);
+        }
+      }
+      originals.extend(next.iter().cloned());
+      last = next;
+    }
+    let inserts: [&[u8]; 4] = [b"\r", b"\n", b"\r\n", b"a"];
+    let fills: [(u8, u64); 3] = [(b'\r', 2), (b'\n', 3), (b'\r', 3)];
+    for original in &originals {
+      for interval in [2u64, 3] {
+        for at in 0..=original.len() {
+          for insert in inserts {
+            let mut flat = original.clone();
+            flat.splice(at..at, insert.iter().copied());
+            let build = || {
+              let mut pt = PieceTable::new(rule_index(original, interval));
+              pt.insert(at as u64, insert).unwrap();
+              pt
+            };
+            assert_by_rule(&build(), &flat, "insert");
+            for from in 0..=flat.len() {
+              for to in from..=flat.len() {
+                let mut pt = build();
+                pt.delete(from as u64, to as u64).unwrap();
+                let mut after = flat.clone();
+                after.drain(from..to);
+                assert_by_rule(&pt, &after, "delete");
+              }
+            }
+          }
+          for (byte, n) in fills {
+            let mut flat = original.clone();
+            flat.splice(at..at, std::iter::repeat_n(byte, n as usize));
+            let build = || {
+              let mut pt = PieceTable::new(rule_index(original, interval));
+              pt.insert_fill(at as u64, byte, n).unwrap();
+              pt
+            };
+            assert_by_rule(&build(), &flat, "insert_fill");
+            for from in 0..=flat.len() {
+              for to in from..=flat.len() {
+                let mut pt = build();
+                pt.delete(from as u64, to as u64).unwrap();
+                let mut after = flat.clone();
+                after.drain(from..to);
+                assert_by_rule(&pt, &after, "delete over a fill");
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+
+  #[test]
+  fn a_fill_piece_reads_writes_and_counts_like_its_bytes() {
+    let original = b"ab\r\ncd\ref";
+    for (byte, n) in [(b'\r', 3u64), (b'\n', 4)] {
+      for at in 0..=original.len() {
+        let mut pt = PieceTable::new(rule_index(original, 4));
+        pt.insert_fill(at as u64, byte, n).unwrap();
+        let mut flat = original.to_vec();
+        flat.splice(at..at, std::iter::repeat_n(byte, n as usize));
+        assert_by_rule(&pt, &flat, "fill");
+        // The streaming save writes the generated bytes, chunk by chunk.
+        for buf in [1usize, 2, 5, 4096] {
+          let mut out = Vec::new();
+          pt.write_all(&mut out, buf).unwrap();
+          assert_eq!(out, flat, "write_all with a buffer of {buf}");
+        }
+      }
+    }
+    let mut pt = PieceTable::new(rule_index(original, 4));
+    assert!(pt.insert_fill(original.len() as u64 + 1, b'\r', 1).is_err());
+    pt.insert_fill(2, b'\r', 0).unwrap();
+    assert!(pt.is_pristine(), "a zero-length fill changes nothing");
+  }
+
+  #[test]
+  fn a_huge_fill_piece_is_held_as_a_count() {
+    // A hundred million bytes: only the length is stored, and a window of it
+    // reads, splits and counts without ever being generated whole.
+    let n = 100_000_000u64;
+    let mut pt = PieceTable::new(rule_index(b"x\ny", 4));
+    pt.insert_fill(1, b'\r', n).unwrap();
+    assert_eq!(pt.len(), n + 3);
+    assert_eq!(pt.add_len(), 0);
+    // The last `\r` meets the original `\n` and is one `\r\n` with it.
+    assert_eq!(pt.line_count(), n + 1);
+    assert_eq!(pt.line_to_offset(n / 2).unwrap(), n / 2 + 1);
+    assert_eq!(pt.offset_to_line(n / 2 + 1).unwrap(), n / 2);
+    assert_eq!(pt.read(n / 2, n / 2 + 3).unwrap(), b"\r\r\r");
+    // Cut it in two and take the middle out: the pieces stay few.
+    pt.delete(1000, n - 1000).unwrap();
+    assert_eq!(pt.len(), 2003);
+    assert_eq!(pt.line_count(), 2001);
+    assert!(pt.piece_count() <= 4);
+    let mut crlf = PieceTable::new(rule_index(b"\nx", 4));
+    crlf.insert_fill(0, b'\r', n).unwrap();
+    assert_eq!(crlf.line_count(), n + 1);
+    assert_eq!(crlf.line_to_offset(n).unwrap(), n + 1);
   }
 }

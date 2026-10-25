@@ -27,6 +27,7 @@ mod jumplist;
 mod large_file;
 mod launch_windows;
 mod licenses;
+mod line_rule;
 mod linux_clipboard;
 mod linux_desktop_actions;
 mod locale_store;
@@ -52,6 +53,8 @@ mod snapshot_lock;
 mod store_state;
 #[cfg(all(target_os = "macos", feature = "storekit"))]
 mod storekit;
+#[cfg(test)]
+mod test_alloc;
 mod theme_store;
 mod transfer;
 mod webview2_runtime;
@@ -3089,6 +3092,9 @@ pub fn run() {
       windowed::windowed_save,
       windowed::windowed_set_path,
       windowed::windowed_close,
+      windowed::windowed_map_replace,
+      windowed::windowed_release_replace,
+      windowed::windowed_offset_line,
       windowed::windowed_find,
       windowed::windowed_search,
       windowed::windowed_search_cancel,

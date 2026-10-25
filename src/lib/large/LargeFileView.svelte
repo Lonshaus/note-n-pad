@@ -17,7 +17,7 @@
   } from '../util/largeView';
   import { moveResultCursor, parseGotoRange } from '../util/largeSearch';
   import { detectBreakStyle } from '../util/windowedEdit';
-  import { readPageLines } from '../util/largePage';
+  import { readPageLines, splitLines } from '../util/largePage';
   import {
     RANGE_EDIT_MAX,
     rangeWithinLimit,
@@ -323,7 +323,7 @@
           Math.max(READ_LEN, avgBytes * LOAD_PAGE * 2),
         );
         const chunk = await invoke<Chunk>('read_chunk', { path, offset, len });
-        return chunk.text;
+        return { text: chunk.text, eof: chunk.end >= size };
       },
     });
   }
@@ -1044,7 +1044,7 @@
           offset: 0,
           len: READ_LEN,
         });
-        const lines = first.text.split('\n');
+        const lines = splitLines(first.text, first.end >= size);
         const newlines = Math.max(1, lines.length - 1);
         avgBytes = Math.max(
           1,

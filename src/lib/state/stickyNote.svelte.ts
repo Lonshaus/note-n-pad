@@ -12,6 +12,9 @@ import { detectByContent, MAX_HIGHLIGHT_CHARS } from '../editor/language';
 export interface CheckpointIndex {
   checkpoints: [number, number][];
   total_newlines: number;
+  /** Which line rule the counts follow; absent in an index saved before the
+   *  field existed, which the core then rescans. */
+  line_rule?: number;
 }
 
 export interface NoteSnapshot {

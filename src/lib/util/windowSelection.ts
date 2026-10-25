@@ -125,6 +125,45 @@ export function fitsWindow(global: LineSelection): boolean {
     WINDOW_LINES - 2 * MARGIN_LINES
   );
 }
+/** Whether the loaded window can take the input replayed at the selection: a
+ *  selection that fits one window has both ends inside; one that does not is
+ *  replayed in the window holding its head, with the other end clamped. */
+export function replayReady(
+  global: LineSelection,
+  startLine: number,
+  lineCount: number,
+): boolean {
+  if (fitsWindow(global)) {
+    return insideWindow(global, startLine, lineCount);
+  }
+  const line = global.head.line;
+  return line >= startLine && line < startLine + lineCount;
+}
+/** Which ends a pointer selection moved: an end left where it was (the anchor
+ *  of a shift-click) keeps the queued caret's position. */
+export function movedEnds(
+  prev: { anchor: number; head: number },
+  next: { anchor: number; head: number },
+): { anchor: boolean; head: boolean } {
+  return {
+    anchor: prev.anchor !== next.anchor,
+    head: prev.head !== next.head,
+  };
+}
+/** The ends a pointer selection queues: the converted position of each end it
+ *  moved, the queued caret's end for the others. */
+export function queuedSelectEnds<T>(
+  prev: { anchor: number; head: number },
+  next: { anchor: number; head: number },
+  convert: (pos: number) => T,
+  caret: { anchor: T; head: T },
+): { anchor: T; head: T } {
+  const moved = movedEnds(prev, next);
+  return {
+    anchor: moved.anchor ? convert(next.anchor) : caret.anchor,
+    head: moved.head ? convert(next.head) : caret.head,
+  };
+}
 /** The first line of a window holding both ends of a selection that fits one,
  *  clamped to the file. */
 export function windowStartFor(
