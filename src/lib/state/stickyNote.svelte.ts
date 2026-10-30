@@ -6,7 +6,6 @@ import { debounce } from '../util/debounce';
 import { nextSeq } from '../util/seq';
 import { settingsState } from './settings.svelte';
 import { detectByContent, MAX_HIGHLIGHT_CHARS } from '../editor/language';
-
 /** Sparse line-checkpoint index of a windowed-editing tab, mirroring the Rust
  *  `windowed::CheckpointIndex` (snake_case field as serialized). */
 export interface CheckpointIndex {
@@ -65,9 +64,10 @@ export interface NoteSnapshot {
   /** Whether the source slice ended with a line break. null for a record from
    *  before this field. */
   range_trailing_break: boolean | null;
-  /** Sparse line-checkpoint index of a windowed-editing tab. Its presence is
-   *  what marks the tab as "was unlocked" on restore — there is deliberately
-   *  no separate boolean for that fact. null for every non-windowed tab. */
+  /** Sparse line-checkpoint index of a windowed-editing tab. Its presence, or
+   *  that of `windowed_encoding` for a file in another encoding (which has no
+   *  index), marks the tab as "was unlocked" on restore. null for every
+   *  non-windowed tab. */
   windowed_index: CheckpointIndex | null;
   /** Fingerprint (size + mtime) `windowed_index` was built against, so restore
    *  can validate it before trusting it verbatim. */
@@ -82,10 +82,15 @@ export interface NoteSnapshot {
   /** 0-based top-of-viewport line at snapshot time, fed back through
    *  `initialTopLine` on restore. */
   windowed_top_line: number | null;
+  /** The encoding the file of a large-file tab that was a converted document is
+   *  written in, when it is not plain UTF-8 (restore decodes the file with it).
+   *  null otherwise. */
+  windowed_encoding: string | null;
+  /** Whether that file starts with a byte order mark. */
+  windowed_bom: boolean;
 }
 
 export type PinMode = 'none' | 'top' | 'app';
-
 /** Owns the single note bound to this sticky window. */
 class StickyNoteState {
   note = $state<NoteSnapshot | null>(null);
@@ -118,7 +123,6 @@ class StickyNoteState {
         console.error('upsert_note failed', error);
       });
   }, 500);
-
   /** Content-based detection for a pathless note the user hasn't overridden. */
   private autoDetectContent(): void {
     const note = this.note;
@@ -159,7 +163,6 @@ class StickyNoteState {
     this.explicit = true;
     this.persist();
   }
-
   /** Logical window bounds captured after a move or resize. */
   setBounds(x: number, y: number, width: number, height: number): void {
     if (this.note === null) {
@@ -208,13 +211,11 @@ class StickyNoteState {
     this.persist.flush();
     void settingsState.save({ default_sticky_paper: paper });
   }
-
   /** Push any pending upsert and wait until it reaches disk. */
   async flush(): Promise<void> {
     this.persist.flush();
     await this.lastSave;
   }
-
   /** Drop any pending upsert so a following delete can't be undone by it. */
   discard(): void {
     this.persist.cancel();

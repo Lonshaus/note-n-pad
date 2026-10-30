@@ -1,5 +1,4 @@
 name: E2E
-
 # Automatic on pull requests into master only, where a merge means a version
 # is being released. Everywhere else it stays on demand.
 on:
@@ -16,15 +15,20 @@ on:
         type: choice
         options:
           - all
+          - e2e-clip
           - e2e-close-flush
           - e2e-editor-focus
           - e2e-file-drop
+          - e2e-global-edit
           - e2e-goto
           - e2e-highlight
           - e2e-i18n
           - e2e-large
           - e2e-longline
+          - e2e-paste
           - e2e-range
+          - e2e-select-all
+          - e2e-spill
           - e2e-table
           - e2e-view-mode
           - e2e-windowed
@@ -93,7 +97,9 @@ jobs:
         run: |
           cargo install cargo-bundle-licenses --version 4.2.0 --locked
           npm run licenses
-
+      # tauri-build fails without the clipboard helper on Windows.
+      - name: Build the clipboard helper
+        run: node scripts/build-cliphelper.mjs
       # Each suite waits for the automation socket on its own timeout; on a cold
       # cache that wait would be racing a full compile.
       - name: Prebuild the app
@@ -126,7 +132,6 @@ jobs:
               scripts="$scripts scripts/e2e/$name.sh"
             done
           fi
-
           # WebKitGTK wants a GPU and an accessibility bus the runner has not got.
           if [ "$RUNNER_OS" = Linux ]; then
             export WEBKIT_DISABLE_COMPOSITING_MODE=1 WEBKIT_DISABLE_DMABUF_RENDERER=1 NO_AT_BRIDGE=1
@@ -150,7 +155,6 @@ jobs:
             echo "$name $result $(( $(date +%s) - start ))s" >>e2e-logs/summary.txt
             echo "::endgroup::"
           done
-
           # The app's own output goes to $OUT/dev-<suite>.log, which is outside
           # the upload path; without it a failed launch shows only the socket
           # refusing connections. $OUT also holds the multi-hundred-MB fixtures,

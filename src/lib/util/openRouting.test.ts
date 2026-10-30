@@ -4,7 +4,6 @@
 import { describe, expect, it } from 'vitest';
 import { routeOpen, orphanCandidates, documentGroup } from './openRouting';
 import type { NoteSnapshot } from '../state/stickyNote.svelte';
-
 /** Minimal document note carrying only the fields the router reads. */
 function doc(over: Partial<NoteSnapshot>): NoteSnapshot {
   return {
@@ -43,6 +42,8 @@ function doc(over: Partial<NoteSnapshot>): NoteSnapshot {
     windowed_fp_mtime: null,
     windowed_digest: null,
     windowed_top_line: null,
+    windowed_encoding: null,
+    windowed_bom: false,
     ...over,
   };
 }

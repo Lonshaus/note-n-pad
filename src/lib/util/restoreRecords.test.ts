@@ -46,6 +46,8 @@ function note(over: Partial<NoteSnapshot>): NoteSnapshot {
     windowed_fp_mtime: null,
     windowed_digest: null,
     windowed_top_line: null,
+    windowed_encoding: null,
+    windowed_bom: false,
     ...over,
   };
 }
@@ -89,6 +91,12 @@ describe('needsRewrite', () => {
     expect(needsRewrite(windowed, true)).toBe(true);
     expect(needsRewrite(large, false)).toBe(false);
     expect(needsRewrite(windowed, false)).toBe(false);
+  });
+
+  it('is true in the trial for a record that has only the encoding of a windowed tab', () => {
+    const encoded = note({ windowed_encoding: 'Shift_JIS' });
+    expect(needsRewrite(encoded, true)).toBe(true);
+    expect(needsRewrite(encoded, false)).toBe(false);
   });
 
   it('is false for an ordinary record and for a sticky', () => {

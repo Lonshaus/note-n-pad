@@ -15,6 +15,8 @@
   import { t } from './lib/i18n';
   import { debounce } from './lib/util/debounce';
   import { nativeFieldHistory, nativeSelectAll } from './lib/util/menuBar';
+  import { installPasteWindow, pasteEnv } from './lib/util/pasteEnv';
+  import { fieldPaste } from './lib/util/pasteRouting';
   import { docLabel, groupOpenDocuments } from './lib/util/openDocuments';
   import { guessOsFromUserAgent } from './lib/util/guessOs';
   import {
@@ -70,7 +72,6 @@
   }
 
   const win = getCurrentWindow();
-
   // Paper -> dot color, taken from the sticky paper backgrounds (app.css) so the
   // dot matches the note's card.
   const PAPER_DOT: Record<string, string> = {
@@ -408,7 +409,6 @@
   function openFile(path: string, project: string): void {
     void invoke('open_project_file', { path, root: project });
   }
-
   /** File > Open, routed here when the workspace is the focused window. It holds
    *  no document to fill, so the picked files go wherever an open handed over by
    *  Finder would: `open_picked_files` honours the tab-or-window setting and
@@ -421,12 +421,10 @@
     const paths = Array.isArray(selected) ? selected : [selected];
     await invoke('open_picked_files', { paths });
   }
-
   /** Replace the selection with a single row. */
   function selectOnly(path: string): void {
     selectedPaths = new Set([path]);
   }
-
   /** Toggle one row's membership without touching the rest (Cmd/Option-click). */
   function toggleSelected(path: string): void {
     const next = new Set(selectedPaths);
@@ -437,7 +435,6 @@
     }
     selectedPaths = next;
   }
-
   /** Selected file rows in visible order (folder members ignored). Backs both the
    *  context-menu "open selected" gate and the actual open. */
   const selectedFiles = $derived.by<VisibleRow[]>(() =>
@@ -445,7 +442,6 @@
       (r) => !r.isDir && !r.isError && selectedPaths.has(r.path),
     ),
   );
-
   /** Open every selected file in visible order, each through the row's own
    *  project routing (project-tree files keep opening tabs in the bound window). */
   function openSelectedFiles(): void {
@@ -453,7 +449,6 @@
       openFile(r.path, r.project);
     }
   }
-
   // Row identity carried in a context-menu payload (round-tripped through Rust).
   interface RowPayload {
     path: string;
@@ -462,13 +457,11 @@
     isDir: boolean;
     root: boolean;
   }
-
   /** Open the native context menu for a workspace row. The payload round-trips
    *  through Rust and comes back with the chosen action as `ctx-action`. */
   function openRowMenu(kind: string, payload: Record<string, unknown>): void {
     void invoke('popup_row_menu', { kind, payload });
   }
-
   /** Open the tree context menu for a visible tree row (folders, files, roots).
    *  Error placeholder rows have no menu. */
   function openTreeMenu(row: VisibleRow): void {
@@ -487,7 +480,6 @@
       targetSelected: selectedPaths.has(row.path),
     });
   }
-
   // An in-progress inline naming/rename row rendered inside the tree. `anchorPath`
   // is the row it attaches to: a create row renders just below its anchor, a
   // rename row replaces its anchor. `parent` is the directory a create lands in.
@@ -891,7 +883,6 @@
       value: '',
     };
   }
-
   /** Row-hover quick-add: open the same inline naming row the context menu uses,
    *  anchored to this folder row. */
   function quickAdd(
@@ -962,7 +953,6 @@
       cancelInline();
     }
   }
-
   /** Route a context-menu selection to its handler. `p` is the original row
    *  payload the menu was opened with. */
   function handleCtxAction(
@@ -1007,7 +997,6 @@
         break;
     }
   }
-
   // Per-section collapse state for the three sidebar groups.
   let secOpen = $state({ stickies: true, docs: true, project: true });
 
@@ -1022,7 +1011,6 @@
   function stickyClose(id: string): void {
     void invoke('sticky_row_action', { id, action: 'close' });
   }
-
   /** Raise the document window holding this tab. The list is built from the
    *  store, which keeps a document after its window is closed (the content lives
    *  on in the snapshot), so a row can outlive its window — those reopen the
@@ -1035,7 +1023,6 @@
     }
     await invoke('focus_doc_tab', { group, tabIndex });
   }
-
   // Reflect the editor theme and the interface chrome onto the document root.
   $effect(() => {
     applyTheme(settingsState.themeId);
@@ -1047,6 +1034,7 @@
     const unlistenChanges = settingsState.listenChanges();
     const unlistenThemes = themeRegistry.listen();
     const unlistenLocales = localeRegistry.listen();
+    const uninstallPaste = installPasteWindow();
     // Reveal the window only after the theme is loaded and applied, so a
     // dark-theme window never flashes its default white background.
     void revealWhenThemed();
@@ -1074,7 +1062,6 @@
       }
       loadPending();
     })();
-
     // Live sync: any store mutation re-reads the note list (debounced so a burst
     // of mutations collapses into one fetch).
     const refetch = debounce(() => {
@@ -1087,7 +1074,6 @@
         refreshOpenFolders();
       }
     });
-
     // Native context-menu selection: Rust echoes the chosen action plus the row
     // payload the menu was opened with.
     const unlistenCtx = win.listen<{
@@ -1096,7 +1082,6 @@
     }>('ctx-action', (event) => {
       handleCtxAction(event.payload.action, event.payload.payload);
     });
-
     // Persist logical bounds after the user finishes moving or resizing.
     const captureBounds = debounce(() => {
       void (async (): Promise<void> => {
@@ -1136,7 +1121,6 @@
         nativeSelectAll();
       }
     });
-
     // DEV-only automation hook; dynamic import keeps it out of production.
     if (import.meta.env.DEV) {
       void import('./lib/dev/auto').then((m) =>
@@ -1256,6 +1240,7 @@
       );
     }
     return () => {
+      uninstallPaste();
       endPress();
       refetch.cancel();
       captureBounds.cancel();
@@ -1582,6 +1567,7 @@
               title={inlineError ?? undefined}
               bind:value={inlineEdit!.value}
               onkeydown={onInlineKeydown}
+              onpaste={(e) => void fieldPaste(e, e.currentTarget, pasteEnv)}
               onblur={cancelInline}
               autofocus
             />

@@ -1,12 +1,10 @@
 name: CI
-
 # Pull requests rather than pushes: a branch is pushed many times while it is
 # being worked on, and only the state that is about to be merged has to be
 # green.
 on:
   pull_request:
   workflow_dispatch:
-
 # Cancel superseded runs on the same ref to save CI minutes.
 concurrency:
   group: ci-${{ github.workflow }}-${{ github.ref }}
@@ -22,7 +20,6 @@ jobs:
         os: [macos-latest, windows-latest, ubuntu-24.04]
     steps:
       - uses: actions/checkout@v7
-
       # The list lives in scripts/linux-check/apt-packages.txt so this job and
       # the local Linux container (scripts/linux-check/check.sh) install exactly
       # the same packages; two hand-copied lists had already drifted apart once,
@@ -42,14 +39,12 @@ jobs:
 
       - name: Install npm dependencies
         run: npm ci
-
       # rustfmt and clippy are not in the minimal profile this action installs
       # by default, so both are requested explicitly.
       - name: Setup Rust toolchain
         uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
-
       # Needs no compilation, so it runs before the build cache is even restored.
       - name: Rust format check (cargo fmt)
         working-directory: src-tauri
@@ -74,11 +69,23 @@ jobs:
 
       - name: Format check (prettier)
         run: npm run format:check
+      # tauri-build fails without the helper that tauri.windows.conf.json lists
+      # as an external binary, so it is built before any cargo run in the app's
+      # crate. A target that is not Windows needs none and the script returns.
+      - name: Build the clipboard helper
+        run: node scripts/build-cliphelper.mjs
 
       - name: Rust tests (cargo test)
         working-directory: src-tauri
         run: cargo test
 
+      - name: Clipboard helper tests (cargo test)
+        working-directory: src-tauri/cliphelper
+        run: cargo test
+
+      - name: Clipboard helper lint (cargo clippy)
+        working-directory: src-tauri/cliphelper
+        run: cargo clippy --all-targets -- -D warnings
       # Runs on all three platforms deliberately: most of the platform-specific
       # code is behind #[cfg(target_os = ...)], so a lint that only ran on one
       # runner would never compile the other two platforms' branches at all.

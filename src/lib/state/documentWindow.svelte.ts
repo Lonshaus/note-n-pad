@@ -18,7 +18,7 @@ import {
   restoreOutcome,
 } from '../util/restoreOutcome';
 import { saveDialogOptions, suggestedName } from '../util/saveDialog';
-import { retargetPath, type PathRules } from '../util/filePath';
+import { fileName, retargetPath, type PathRules } from '../util/filePath';
 import { Text } from '@codemirror/state';
 import {
   detectLineEnding,
@@ -56,31 +56,33 @@ import {
   debounceContentPolicy,
 } from '../util/snapshotPolicy';
 import { t } from '../i18n';
-import { READ_ONLY_DESTINATION, isLiteRefusal } from '../util/protocol';
+import {
+  convertController,
+  type DocConvertHost,
+} from './convertController.svelte';
+import {
+  FILE_NOT_FOUND,
+  READ_ONLY_DESTINATION,
+  isLiteRefusal,
+} from '../util/protocol';
 import { appliedTarget } from '../util/windowedApplied';
-
 /** Rust `splice_file` rejects an out-of-band-edited source with this exact error
  *  string; the write-back keys its conflict flow off it (protocol value). */
 const FINGERPRINT_MISMATCH = 'fingerprint-mismatch';
-
 /** Cross-window broadcast: a source file was rewritten by a splice, so any large
  *  viewer showing it must rebuild its line index. Carries the affected path. */
 export const RANGE_SPLICED_EVENT = 'range-spliced';
-
 /** Rust `windowed_open` rejects a non-UTF-8 file with this exact error string;
  *  the open flow surfaces it as a refusal (protocol value). */
 const WINDOWED_NOT_UTF8 = 'not-utf8';
-
 /** Rust `windowed_open` / `windowed_reopen` reject a file at or above
  *  `LARGE_EDIT_MAX` with this exact error string (protocol value, matches the
  *  Rust `TOO_LARGE` constant). */
 const WINDOWED_TOO_LARGE = 'too-large';
-
 /** Reason `unlockLargeTab` and the lazy restore path both key their disabled
  *  lock message off, so an oversized file and a non-UTF-8 file are explained
  *  the same way regardless of which entry point hit the refusal. */
 type WindowedRefusalReason = 'notUtf8' | 'tooLarge' | 'cannot';
-
 /** Map a windowed unlock/reopen failure to its reason (see
  *  `WindowedRefusalReason`). Pure: no i18n lookup here, just the dispatch on
  *  the protocol error string, so it is unit-testable without the translation
@@ -104,7 +106,6 @@ function isLargeKind(tab: DocTab): boolean {
     tab.windowedRestore !== undefined
   );
 }
-
 /** `windowedRefusalReason` resolved to its `doc.edit.*` translation, the
  *  message shown on a tab's disabled lock (see `DocTab.large.unlockRefused`). */
 function windowedRefusalMessage(error: string): string {
@@ -117,7 +118,6 @@ function windowedRefusalMessage(error: string): string {
       return t('doc.edit.cannot');
   }
 }
-
 /** A windowed tab's snapshot is always clean, regardless of
  *  `liveDirty` (the live quit-gate flag `firstOversizedDirtyIndex` reads
  *  straight off state, correctly untouched by this). Its unsaved edits live
@@ -132,7 +132,6 @@ export function windowedSnapshotDirty(
 ): boolean {
   return isWindowed ? false : liveDirty;
 }
-
 /** A snapshot's `large` field prefers the on-disk size a windowed
  *  tab's fingerprint carries (`windowedFingerprintSize`) over its live,
  *  possibly post-edit `windowedTotalBytes`. Persisting `totalBytes` instead
@@ -150,7 +149,6 @@ export function windowedSnapshotLarge(
     plainLargeSize ?? windowedFingerprintSize ?? windowedTotalBytes ?? null
   );
 }
-
 /** How long a lazy windowed restore waits before falling back to the read-only
  *  viewer while `windowed_reopen` is still in flight. The fast path (index,
  *  fingerprint, and digest all match) resolves in microseconds and always wins
@@ -158,15 +156,12 @@ export function windowedSnapshotLarge(
  *  closed) is still pending when it fires, and only then does the tab drop to
  *  the honest read-only/indexing state instead of blocking the switch. */
 const WINDOWED_RESTORE_GRACE_MS = 120;
-
 /** Rust `windowed_save` rejects an out-of-band-edited source with an error string
  *  containing this token; the save flow keys its conflict modal off it. */
 const WINDOWED_FINGERPRINT_MISMATCH = 'fingerprint-mismatch';
-
 /** Result of a windowed-save/apply/conflict write-back: written, refused for a
  *  conflict (the conflict modal is now up), or failed for another reason. */
 export type WindowedSaveResult = 'ok' | 'mismatch' | 'error';
-
 /** Result of the Rust `windowed_open` command (snake_case as serialized). */
 interface WindowedOpen {
   session_id: number;
@@ -174,7 +169,6 @@ interface WindowedOpen {
   total_lines: number;
   fingerprint: Fingerprint;
 }
-
 /** Result of the Rust `windowed_save` command. */
 interface WindowedSaved {
   fingerprint: Fingerprint;
@@ -182,8 +176,18 @@ interface WindowedSaved {
   total_lines: number;
   clean: boolean;
   generation: number;
+  /** What the session writes now; null once it is plain UTF-8 again. */
+  conv: ConvState | null;
 }
-
+/** What a converted session writes (Rust `ConvState`). */
+interface ConvState {
+  encoding: string;
+  bom: boolean;
+  in_place: boolean;
+}
+/** The error `windowed_save` and `convert_save` give for a text that has no form
+ *  in the encoding it is saved in (protocol value). */
+const UNMAPPABLE = 'unmappable';
 /** Result of the Rust `windowed_reopen` command. `rescanned` is true when a
  *  full rescan ran (the persisted index couldn't be trusted verbatim) — the
  *  restore path uses it to decide whether the fast path already won the race
@@ -195,7 +199,6 @@ interface WindowedReopened {
   fingerprint: Fingerprint;
   rescanned: boolean;
 }
-
 /** Result of the Rust `windowed_index` command: a live session's checkpoint
  *  index plus the fingerprint and digest it was built against, for persisting
  *  (see `snapshot()`) and later handing back to `windowed_reopen`. */
@@ -249,14 +252,12 @@ export async function spliceRange(
   void emit(RANGE_SPLICED_EVENT, target.sourcePath);
   return { status: 'ok', fingerprint };
 }
-
 /** A byte slice decoded as text plus whether the decode was lossy (invalid
  *  UTF-8 replaced), mirroring the Rust `ReadRange`. */
 interface RangeRead {
   text: string;
   lossy: boolean;
 }
-
 /** Result of a Rust decode command; content is BOM-free, line endings intact. */
 interface Decoded {
   content: string;
@@ -268,7 +269,6 @@ interface Decoded {
 interface FileStat {
   size: number;
 }
-
 /** Cheap on-disk identity of the source file at the moment a range was read,
  *  mirroring the Rust `Fingerprint` (snake_case fields as serialized). The next
  *  step keys the splice write-back's conflict check off this. */
@@ -276,7 +276,6 @@ export interface Fingerprint {
   size: number;
   mtime_ms: number;
 }
-
 /** Above this size an open routes to the read-only large-file view instead of a
  *  full decode. A constant for now; a future setting can override it. */
 export const LARGE_FILE_THRESHOLD = 100 * 1024 * 1024;
@@ -284,13 +283,11 @@ export const LARGE_FILE_THRESHOLD = 100 * 1024 * 1024;
  *  this big whole would blow the WebView's memory, so above it the confirm only
  *  offers the read-only view. */
 export const LARGE_EDIT_MAX = 512 * 1024 * 1024;
-
 /** Whether a file of `size` bytes opens in the read-only large-file viewer. The
  *  Lite edition has no viewer: every size opens in the ordinary editor. */
 export function opensInLargeViewer(size: number, lite: boolean): boolean {
   return !lite && size > LARGE_FILE_THRESHOLD;
 }
-
 /** One open document tab. The buffer (`content`) is always LF-normalized. It is a
  *  CodeMirror `Text` (rope), not a string, so a keystroke costs O(edit) instead of
  *  copying the whole buffer; string materialization happens only at flush points
@@ -355,7 +352,9 @@ export interface DocTab {
    *  class doc for the fast/slow-path contract. Never persisted itself (the
    *  snapshot fields it was built from are what's persisted; see `snapshot()`). */
   windowedRestore?: {
-    index: CheckpointIndex;
+    /** Null for a file that is not plain UTF-8: its record names the encoding
+     *  instead, and the restore rebuilds the session by decoding the file. */
+    index: CheckpointIndex | null;
     fingerprint: Fingerprint;
     /** Decimal string, not a number — see `NoteSnapshot.windowed_digest`. */
     digest: string;
@@ -363,6 +362,10 @@ export interface DocTab {
     /** On-disk size at snapshot time, the fallback tab's `large.size` if the
      *  restore falls back to the read-only viewer. */
     size: number;
+    /** Set when the file is not plain UTF-8: the encoding it is written in and
+     *  whether it starts with a byte order mark. The restore decodes it. */
+    encoding?: string;
+    bom?: boolean;
   };
   /** True when this tab's most recent snapshot write attempted its full
    *  content (not the size-ceiling 'skip' path) and failed to reach disk —
@@ -373,6 +376,24 @@ export interface DocTab {
    *  moved away. In memory only, never persisted. Such a tab is never written
    *  back to `path`: saving asks for a new path instead. */
   missing?: boolean;
+  /** Present on a large-file editing tab that a paste made out of a document or
+   *  a sticky note, until it is a plain UTF-8 file. */
+  converted?: ConvertedTab;
+}
+/** What a tab made by a paste needs to know of where it came from and what it
+ *  is written as. */
+export interface ConvertedTab {
+  /** The file a save goes to; null while there is none (an untitled document
+   *  or a sticky note), and a save asks for one. */
+  target: string | null;
+  encoding: string;
+  bom: boolean;
+  origin: 'document' | 'untitled' | 'sticky';
+  /** The sticky note the tab came from (origin 'sticky'). */
+  noteId?: string;
+  /** Saved at least once: the tab has a record of its own from then on. Before,
+   *  the record of the document or the note stays as it was. */
+  saved: boolean;
 }
 /** How the host compares paths, for following a rename. */
 function pathRules(): PathRules {
@@ -381,6 +402,24 @@ function pathRules(): PathRules {
     backslash: platform.isWindows,
   };
 }
+/** What `convert_claim` gives a window that takes a handoff. */
+export interface ClaimedHandoff {
+  convert_id: string;
+  note_id: string;
+  language: string | null;
+  encoding: string;
+  line_ending: LineEnding;
+}
+/** A fresh open of `path` could not read it; `error` is what the core said. */
+export class ReadFailed extends Error {
+  readonly error: string;
+
+  constructor(path: string, error: string) {
+    super(`cannot read ${path}`);
+    this.name = 'ReadFailed';
+    this.error = error;
+  }
+}
 
 interface Bounds {
   x: number | null;
@@ -388,7 +427,6 @@ interface Bounds {
   width: number | null;
   height: number | null;
 }
-
 /** Owns every tab living in one document window (grouped by window_group).
  *
  * Restoring a windowed-editing tab (`DocTab.windowedRestore`, see
@@ -565,6 +603,9 @@ export class DocumentWindowState {
    *  named in bytes this side cannot address. Reported rather than opened as a
    *  blank tab, which would save over a path the user never chose. */
   openFailed = $state<string | null>(null);
+  /** A discard of a tab's changes that failed: the tab's name and the error. The
+   *  tab is left as it was. */
+  discardFailed = $state<{ name: string; error: string } | null>(null);
   /** Paths of restored clean tabs that exist but could not be read. They are
    *  not opened (a blank tab would pass for the file); reported once. */
   restoreUnreadable = $state<string[]>([]);
@@ -574,35 +615,33 @@ export class DocumentWindowState {
    *  write that succeeds. No UI reads this yet (see the follow-up issue) —
    *  it exists so a failure is not swallowed into nothing. */
   snapshotFailed = $state(false);
-
   /** Dismiss the unreadable-restore report. */
   dismissRestoreUnreadable(): void {
     this.restoreUnreadable = [];
   }
-
   /** Dismiss the failed-open report. */
   dismissOpenFailed(): void {
     this.openFailed = null;
   }
-
+  /** Dismiss the failed-discard report. */
+  dismissDiscardFailed(): void {
+    this.discardFailed = null;
+  }
   /** Set when a write to disk (save, save-as, or a range-conflict save-as)
    *  rejects. Carries the path and the error text so the user learns which
    *  file failed and why, rather than the save silently doing nothing. The
    *  tab itself is left dirty by the caller, exactly as an unhandled
    *  rejection would have — this only makes the failure observable. */
   saveFailed = $state<{ path: string; error: string } | null>(null);
-
   /** Dismiss the failed-save report. */
   dismissSaveFailed(): void {
     this.saveFailed = null;
   }
-
   /** Path of a clean tab whose re-decode (`setEncoding`) failed — deleted,
    *  unreadable, or a permissions change since it was opened. Reported rather
    *  than swallowed, which used to leave the encoding picker silently
    *  snapping back with no explanation. */
   encodingFailed = $state<string | null>(null);
-
   /** Dismiss the failed-encoding-change report. */
   dismissEncodingFailed(): void {
     this.encodingFailed = null;
@@ -721,8 +760,18 @@ export class DocumentWindowState {
     // `setBounds`) would persist `windowed_index: null` and wipe the only
     // marker that the tab was ever unlocked.
     const pendingRestore = tab.windowedRestore;
+    // The encoding of a converted tab's file, once it has one; a restore that is
+    // still pending keeps what it was restored with.
+    const savedConv = tab.converted?.saved === true ? tab.converted : undefined;
+    const windowedEncoding =
+      savedConv?.encoding ?? pendingRestore?.encoding ?? null;
+    const windowedBom = savedConv?.bom ?? pendingRestore?.bom ?? false;
+    // A record with an encoding is told from a plain one by the encoding alone:
+    // the restore decodes the file and has no use for the checkpoint index.
     const windowedIndex =
-      windowedIndexSnap?.index ?? pendingRestore?.index ?? null;
+      windowedEncoding !== null
+        ? null
+        : (windowedIndexSnap?.index ?? pendingRestore?.index ?? null);
     const windowedFpSize =
       windowedIndexSnap?.fingerprint.size ??
       pendingRestore?.fingerprint.size ??
@@ -808,9 +857,10 @@ export class DocumentWindowState {
       windowed_fp_mtime: windowedFpMtime,
       windowed_digest: windowedDigest,
       windowed_top_line: windowedTopLine,
+      windowed_encoding: windowedEncoding,
+      windowed_bom: windowedBom,
     };
   }
-
   // Not `async`: `flush(); await this.lastSave` (see `switchTo`/`flushAll`)
   // depends on `this.lastSave` being assigned to the promise this call just
   // started, synchronously, before the caller regains control. `snapshot()`
@@ -831,6 +881,11 @@ export class DocumentWindowState {
   // exits without it). Failure is recorded on `snapshotFailed` instead of
   // being silently dropped.
   private upsertTab(tab: DocTab): Promise<void> {
+    // A tab a paste made is not written until it is saved: the record of the
+    // document or the note it came from is what a restart restores.
+    if (tab.converted !== undefined && !tab.converted.saved) {
+      return Promise.resolve();
+    }
     // Captured before `snapshot()` (async) rather than inside the `.then()`
     // below: `snapshot()`'s duration varies (it awaits `windowed_index`), so
     // two overlapping calls could otherwise resolve in a different order than
@@ -851,7 +906,6 @@ export class DocumentWindowState {
     this.lastSave = promise;
     return promise;
   }
-
   /** Read a file from disk and build a tab, honouring a restored snapshot when
    *  it carries unsaved edits (snapshot wins over disk, matching stickies). */
   private async loadTab(
@@ -891,7 +945,8 @@ export class DocumentWindowState {
     // either restores as an ordinary tab of its file.
     const trial = isLite();
     // A restored windowed-editing tab knows it was unlocked (the persisted
-    // checkpoint index is the marker — see `NoteSnapshot.windowed_index`) but
+    // checkpoint index, or the encoding of a file that is not UTF-8, is the
+    // marker — see `NoteSnapshot.windowed_index`) but
     // has no live Rust session yet: it carries the data `beginWindowedRestore`
     // needs to reopen one lazily once this tab becomes active. Until then it
     // has neither `windowed` nor `large` set, so DocumentApp renders nothing
@@ -900,7 +955,7 @@ export class DocumentWindowState {
     if (
       snap !== null &&
       !trial &&
-      snap.windowed_index !== null &&
+      (snap.windowed_index !== null || snap.windowed_encoding !== null) &&
       snap.large !== null
     ) {
       return {
@@ -913,8 +968,8 @@ export class DocumentWindowState {
         explicit: false,
         lineEnding: settingsState.defaultLineEnding,
         savedLineEnding: settingsState.defaultLineEnding,
-        hadBom: false,
-        encoding: settingsState.defaultEncoding,
+        hadBom: snap.windowed_encoding !== null && snap.windowed_bom,
+        encoding: snap.windowed_encoding ?? settingsState.defaultEncoding,
         lossy: false,
         tabIndex: snap.tab_index,
         windowedRestore: {
@@ -926,6 +981,9 @@ export class DocumentWindowState {
           digest: snap.windowed_digest ?? '0',
           topLine: snap.windowed_top_line ?? 0,
           size: snap.large,
+          ...(snap.windowed_encoding === null
+            ? {}
+            : { encoding: snap.windowed_encoding, bom: snap.windowed_bom }),
         },
       };
     }
@@ -1010,7 +1068,7 @@ export class DocumentWindowState {
     // a new empty buffer is what let a failed open present as a blank document
     // and then, on save, write to a path the user never chose.
     if (!fileExists && snap === null && path !== '') {
-      throw new Error(`cannot read ${path}`);
+      throw new ReadFailed(path, readError ?? '');
     }
     const diskRaw = decoded?.content ?? '';
     const diskContent = normalizeToLf(diskRaw);
@@ -1069,7 +1127,6 @@ export class DocumentWindowState {
       tabIndex,
     };
   }
-
   /** Load every tab for this window's group, or open a single fresh tab when a
    *  brand-new window carries only an initial path. */
   async init(
@@ -1174,7 +1231,6 @@ export class DocumentWindowState {
     this.ready = true;
     this.onRestored?.();
   }
-
   /** Set by the window: ends an IME composition in the active editor and
    *  resolves once its text is in the tab. A switch waits for it. */
   endComposition: (() => Promise<void>) | null = null;
@@ -1186,7 +1242,6 @@ export class DocumentWindowState {
    *  windowed editor is in the core, leaving a composition open. A save waits
    *  for it, so it writes what was typed. */
   windowedFlushed: (() => Promise<void>) | null = null;
-
   /** Switch tabs, flushing the outgoing tab's pending upsert first. */
   async switchTo(index: number): Promise<void> {
     if (index === this.activeIndex || index < 0 || index >= this.tabs.length) {
@@ -1234,7 +1289,6 @@ export class DocumentWindowState {
     }
     void this.beginWindowedRestore(tab);
   }
-
   /** Lazily reopen a restored windowed tab's Rust session from its persisted
    *  checkpoint index. Two outcomes, both ending with `windowedRestore` cleared:
    *
@@ -1278,12 +1332,30 @@ export class DocumentWindowState {
     }, WINDOWED_RESTORE_GRACE_MS);
     let reopened: WindowedReopened;
     try {
-      reopened = await invoke<WindowedReopened>('windowed_reopen', {
-        path: tab.path,
-        index: wr.index,
-        fingerprint: wr.fingerprint,
-        digest: wr.digest,
-      });
+      if (wr.encoding === undefined) {
+        reopened = await invoke<WindowedReopened>('windowed_reopen', {
+          path: tab.path,
+          index: wr.index,
+          fingerprint: wr.fingerprint,
+          digest: wr.digest,
+        });
+      } else {
+        // The file is not UTF-8: it is decoded into a file of the core, which
+        // the session is opened over.
+        const bom = wr.bom ?? false;
+        const convertId = await invoke<string>('convert_from_file', {
+          path: tab.path,
+          encoding: wr.encoding,
+          withBom: bom,
+        });
+        const open = await invoke<WindowedOpen>('windowed_reopen_converted', {
+          convertId,
+          target: tab.path,
+          encoding: wr.encoding,
+          withBom: bom,
+        });
+        reopened = { ...open, rescanned: false };
+      }
     } catch (e) {
       window.clearTimeout(graceTimer);
       delete tab.windowedRestore;
@@ -1296,7 +1368,9 @@ export class DocumentWindowState {
     }
     window.clearTimeout(graceTimer);
     this.restoringWindowedIds.delete(tab.id);
-    this.lastWindowedRestoreRescanned = reopened.rescanned;
+    if (wr.encoding === undefined) {
+      this.lastWindowedRestoreRescanned = reopened.rescanned;
+    }
     // The tab was closed while this restore was in flight: release the session
     // just opened rather than leaking it, and don't resurrect the deleted note
     // by upserting a tab no longer in this window.
@@ -1316,9 +1390,17 @@ export class DocumentWindowState {
       topLine: wr.topLine,
       initialLine: wr.topLine,
     };
+    if (wr.encoding !== undefined) {
+      tab.converted = {
+        target: tab.path,
+        encoding: wr.encoding,
+        bom: wr.bom ?? false,
+        origin: 'document',
+        saved: true,
+      };
+    }
     await this.upsertTab(tab);
   }
-
   /** Live-mirror the WindowedEditor's current top-of-viewport line onto the
    *  active windowed tab, so a later snapshot persists it as `windowed_top_line`
    *  (restore feeds it back through `initialLine`). No-op if the active tab is
@@ -1339,7 +1421,6 @@ export class DocumentWindowState {
     }
     void this.switchTo((this.activeIndex + delta + count) % count);
   }
-
   /** The next free tab index: above both the counter and every open tab, so an
    *  index is never handed out twice even if the counter fell behind. */
   private allocIndex(): number {
@@ -1350,7 +1431,6 @@ export class DocumentWindowState {
     this.nextIndex = index + 1;
     return index;
   }
-
   /** Open a fresh untitled tab (no path, empty buffer) and switch to it. */
   async newTab(): Promise<void> {
     await this.indexSettled;
@@ -1374,7 +1454,6 @@ export class DocumentWindowState {
     await this.switchTo(this.tabs.length - 1);
     await this.upsertTab(tab);
   }
-
   /** Open `path` as a new tab, or activate its existing tab (dedupe by path).
    *  Untitled tabs carry an empty path and must never match this dedupe.
    *  Over-threshold files stat once here and raise the open-mode confirm instead
@@ -1456,7 +1535,6 @@ export class DocumentWindowState {
     }
     await this.openNormal(path);
   }
-
   /** Open `path` as an ordinary editable tab (full decode), bypassing the
    *  large-file gate. Used by the normal path and by the edit-mode confirm. */
   private async openNormal(path: string): Promise<void> {
@@ -1485,7 +1563,6 @@ export class DocumentWindowState {
     await this.switchTo(this.tabs.length - 1);
     await this.upsertTab(tab);
   }
-
   /** Open-dialog choice. 'asis' commits the buffer unchanged (it opens in the
    *  long-line gate mode); 'format' swaps in the pre-computed beautified JSON;
    *  'softwrap' inserts a break every SOFT_WRAP_LIMIT code units. The
@@ -1512,14 +1589,12 @@ export class DocumentWindowState {
       await this.upsertTab(tab);
     })();
   }
-
   /** Open-dialog cancel: drop the staged open as if it never happened. */
   cancelLongLineOpen(): void {
     this.pendingLongLineOpen = null;
     this.pendingLongLineTab = null;
     this.pendingLongLineFormatted = null;
   }
-
   /** Consult the note store for a stored tab of `path` in another window group.
    *  Returns how the open should route: focus a still-live window, adopt an
    *  orphaned snapshot, or open fresh. Any command failure degrades to 'fresh'. */
@@ -1545,7 +1620,6 @@ export class DocumentWindowState {
     }
     return routeOpen(all, path, this.group, new Set(live));
   }
-
   /** Re-home an orphaned stored tab (its window group is gone) into this window:
    *  rebuild it via loadTab so a dirty snapshot restores its unsaved edits over
    *  disk, keep its note id, but give it a fresh tab index in this window. The
@@ -1576,7 +1650,6 @@ export class DocumentWindowState {
     await this.switchTo(this.tabs.length - 1);
     await this.upsertTab(tab);
   }
-
   /** Bring a dirty orphan's unsaved edits into an existing clean tab for the same
    *  file (snapshot wins over disk), then delete the orphan record so it stops
    *  haunting the store. No-op when the local tab is itself dirty — a genuine
@@ -1598,7 +1671,6 @@ export class DocumentWindowState {
     this.reloadSeq += 1;
     await this.upsertTab(tab);
   }
-
   /** Confirm choice: open the pending file in the read-only large-file view.
    *  With `edit` true (the confirm's Edit button, or 'edit' open mode) an editable
    *  file unlocks straight into in-place editing right after the tab opens. */
@@ -1654,7 +1726,6 @@ export class DocumentWindowState {
       }
     })();
   }
-
   /** Unlock the active read-only large-file tab into an editable one, in place:
    *  attach a Rust windowed session and swap the tab's `large` field for a
    *  `windowed` field (same tab id, so the view swaps from LargeFileView to
@@ -1718,7 +1789,184 @@ export class DocumentWindowState {
     await this.upsertTab(tab);
     return null;
   }
-
+  /** What a conversion to the large-file mode needs of this window. */
+  convertHost(): DocConvertHost {
+    return {
+      tab: (id) => {
+        const tab = this.tabs.find((t) => t.id === id);
+        return tab === undefined
+          ? null
+          : {
+              path: tab.path,
+              encoding: tab.encoding,
+              hadBom: tab.hadBom,
+              lineEnding: tab.lineEnding,
+              language: tab.language,
+            };
+      },
+      install: (id, convertId) => this.installConverted(id, convertId),
+      showViewer: (id, path, size) => this.showConvertedViewer(id, path, size),
+    };
+  }
+  /** Makes the ordinary tab `tabId` a large-file editing tab over the finished
+   *  conversion `convertId`, in place (same tab id, as `unlockTabNow` does). The
+   *  tab is unsaved: its record stays as it was, so a restart restores the
+   *  document as it was before the paste. Rejects with the reason, and the tab is
+   *  then untouched. */
+  async installConverted(tabId: string, convertId: string): Promise<void> {
+    const tab = this.tabs.find((t) => t.id === tabId);
+    if (tab === undefined) {
+      throw new Error('the tab is gone');
+    }
+    return this.runTabOp(tab, () => this.installConvertedNow(tab, convertId));
+  }
+  private async installConvertedNow(
+    tab: DocTab,
+    convertId: string,
+  ): Promise<void> {
+    if (!this.tabs.includes(tab) || !isOrdinaryTab(tab)) {
+      throw new Error('the tab is gone');
+    }
+    // What was typed before the paste is in the record, whole, before the tab
+    // stops writing one.
+    if (tab === this.activeTab) {
+      this.persistActive.flush();
+    }
+    await this.lastSave;
+    const target = tab.path === '' ? null : tab.path;
+    const open = await invoke<WindowedOpen>('windowed_open_converted', {
+      convertId,
+      target,
+      encoding: tab.encoding,
+      withBom: tab.hadBom,
+      dirty: true,
+    });
+    // Closed during the open: drop the session rather than bring the tab back.
+    if (!this.tabs.includes(tab)) {
+      void invoke('windowed_close', { sessionId: open.session_id });
+      throw new Error('the tab is gone');
+    }
+    this.releaseTabView(tab.id);
+    tab.content = Text.empty;
+    tab.savedContent = Text.empty;
+    tab.savedLineEnding = tab.lineEnding;
+    tab.insertLineEnding = tab.lineEnding === 'CRLF' ? '\r\n' : '\n';
+    tab.windowed = {
+      sessionId: open.session_id,
+      totalBytes: open.total_bytes,
+      totalLines: open.total_lines,
+      fingerprint: open.fingerprint,
+      dirty: true,
+      topLine: 0,
+    };
+    tab.converted = {
+      target,
+      encoding: tab.encoding,
+      bom: tab.hadBom,
+      origin: target === null ? 'untitled' : 'document',
+      saved: false,
+    };
+  }
+  /** A handoff this window claimed (`convert_claim`) opened as a tab; see
+   *  `openConverted`. */
+  openClaimed(claimed: ClaimedHandoff): Promise<string | null> {
+    return this.openConverted(
+      claimed.convert_id,
+      claimed.note_id,
+      claimed.language,
+      claimed.encoding,
+      claimed.line_ending,
+    );
+  }
+  /** A sticky note handed over as a tab: opens a new tab over the conversion
+   *  `convertId` the handoff gave, with the note's `language` and the `encoding`
+   *  and `lineEnding` the conversion was written with. Returns the id of the
+   *  tab, or null when it could not be opened (the core has the conversion file
+   *  deleted then). */
+  async openConverted(
+    convertId: string,
+    noteId: string,
+    language: string | null,
+    encoding: string,
+    lineEnding: LineEnding,
+  ): Promise<string | null> {
+    await this.indexSettled;
+    let open: WindowedOpen;
+    try {
+      open = await invoke<WindowedOpen>('windowed_open_converted', {
+        convertId,
+        target: null,
+        encoding,
+        withBom: false,
+        dirty: true,
+      });
+    } catch {
+      return null;
+    }
+    const tab: DocTab = {
+      id: crypto.randomUUID(),
+      path: '',
+      readOnlyFile: false,
+      content: Text.empty,
+      savedContent: Text.empty,
+      language,
+      explicit: false,
+      lineEnding,
+      savedLineEnding: lineEnding,
+      insertLineEnding: lineEnding === 'CRLF' ? '\r\n' : '\n',
+      hadBom: false,
+      encoding,
+      lossy: false,
+      tabIndex: this.allocIndex(),
+      windowed: {
+        sessionId: open.session_id,
+        totalBytes: open.total_bytes,
+        totalLines: open.total_lines,
+        fingerprint: open.fingerprint,
+        dirty: true,
+        topLine: 0,
+      },
+      converted: {
+        target: null,
+        encoding,
+        bom: false,
+        origin: 'sticky',
+        noteId,
+        saved: false,
+      },
+    };
+    this.tabs.push(tab);
+    await this.switchTo(this.tabs.length - 1);
+    return tab.id;
+  }
+  /** A paste that was too big to edit was saved to `path`: the tab shows that
+   *  file in the read-only view. */
+  async showConvertedViewer(
+    tabId: string,
+    path: string,
+    size: number,
+  ): Promise<void> {
+    const tab = this.tabs.find((t) => t.id === tabId);
+    if (tab === undefined) {
+      return;
+    }
+    tab.path = path;
+    tab.missing = false;
+    if (!tab.explicit) {
+      tab.language = detectByFilename(path);
+    }
+    tab.content = Text.empty;
+    tab.savedContent = Text.empty;
+    tab.savedLineEnding = tab.lineEnding;
+    tab.large = { size };
+    try {
+      tab.readOnlyFile = !(await invoke<boolean>('path_writable', { path }));
+    } catch {
+      tab.readOnlyFile = false;
+    }
+    await this.upsertTab(tab);
+    void invoke('add_recent_file', { path });
+  }
   /** Confirm choice: cancel the pending open (as if it never happened). */
   cancelLargeOpen(): void {
     this.pendingLargeOpen = null;
@@ -1757,7 +2005,6 @@ export class DocumentWindowState {
     tab.explicit = true;
     this.persistActive();
   }
-
   /** Toggle the active tab's line ending; the buffer stays LF, save writes the
    *  chosen ending. Dirty is tracked against savedLineEnding, so this marks it. */
   setLineEnding(ending: LineEnding): void {
@@ -1778,7 +2025,6 @@ export class DocumentWindowState {
     }
     this.setLineEnding(tab.lineEnding === 'LF' ? 'CRLF' : 'LF');
   }
-
   /** Save the active tab. An untitled tab (empty path) first asks for a target
    *  via the native save dialog; `pathOverride` skips it (automation/E2E).
    *  Returns false when the dialog was cancelled (no side effects), and for a
@@ -1796,6 +2042,11 @@ export class DocumentWindowState {
     // A windowed tab saves its Rust-side buffer through windowed_save; only a
     // clean write counts as saved (a conflict raises the modal).
     if (tab.windowed !== undefined) {
+      // A tab a paste made has no file yet when it came from an untitled
+      // document or a note: a save there asks where it goes.
+      if (tab.converted !== undefined && tab.converted.target === null) {
+        return this.saveAs(pathOverride);
+      }
       return (await this.saveWindowed(tab, false)) === 'ok';
     }
     // A viewer, or a tab still restoring its session, has no changes to write;
@@ -1842,7 +2093,6 @@ export class DocumentWindowState {
     await this.upsertTab(tab);
     return true;
   }
-
   /** File > Save As: always prompt for a new path and write the active tab's
    *  buffer there, turning the tab into an ordinary saved document at that path.
    *  A windowed tab is written by its Rust session and retargeted to the new path.
@@ -2130,7 +2380,6 @@ export class DocumentWindowState {
   rangeBoxCancel(): void {
     this.rangeBox = nextRangeBox(this.rangeBox, { kind: 'cancel' });
   }
-
   /** Rebuild the line index of any large-file viewer of `path` open in this window
    *  by remounting its keyed view. Called on the local window and by the
    *  cross-window `range-spliced` listener after a source is rewritten. */
@@ -2198,7 +2447,6 @@ export class DocumentWindowState {
           endByte: box.endByte,
         };
   }
-
   /** Open `path` as a windowed-editing tab: the Rust core opens a session and
    *  streams the file a window at a time (the WindowedEditor owns the CM view).
    *  Returns a message when the open is refused (a non-UTF-8 file), else null.
@@ -2290,7 +2538,6 @@ export class DocumentWindowState {
     this.windowedGate(sessionId).begin(op);
     return op;
   }
-
   /** Called by the WindowedEditor after each successful apply, undo or redo:
    *  record the fresh totals and set the session's tab dirty unless the content
    *  equals the last save. A result older than one already seen is dropped. */
@@ -2381,7 +2628,6 @@ export class DocumentWindowState {
     }
     this.setDetectedEnding(tab, style);
   }
-
   /** Save a windowed tab back to disk. `force` skips the fingerprint check; a
    *  conflict raises the conflict modal instead of writing. On success the
    *  fingerprint refreshes, totals update, and the tab goes clean. */
@@ -2403,6 +2649,9 @@ export class DocumentWindowState {
         this.windowedConflict = tab;
         return 'mismatch';
       }
+      if (String(e) === UNMAPPABLE) {
+        return this.resolveUnmappable(tab, null);
+      }
       // Reported for the same reason as `splice`'s: past the conflict check
       // every failure means the save did not happen, and the tab is left dirty
       // either way. This call always writes to `tab.path` (pathOverride is
@@ -2421,18 +2670,30 @@ export class DocumentWindowState {
       return 'ok';
     }
     this.applyWindowedSaved(live.windowed, saved);
+    await this.afterConvertedSave(live, saved);
     this.windowedConflict = null;
     await this.upsertTab(live);
     return 'ok';
   }
-
+  /** Reports a discard that failed and leaves the tab as it is; false. */
+  private failDiscard(tab: DocTab, error: unknown): false {
+    this.discardFailed = {
+      name: fileName(tab.path) || t('doc.untitled'),
+      error: String(error),
+    };
+    return false;
+  }
   /** Discard a windowed tab's unsaved edits: close its session and reopen a fresh
    *  one at the on-disk baseline. The new sessionId remounts the WindowedEditor
-   *  (keyed on it), reloading the window from disk. */
-  async discardWindowed(tab: DocTab): Promise<void> {
+   *  (keyed on it), reloading the window from disk. False when it failed: the
+   *  tab keeps its session and the failure is in `discardFailed`. */
+  async discardWindowed(tab: DocTab): Promise<boolean> {
     const w = tab.windowed;
     if (w === undefined) {
-      return;
+      return true;
+    }
+    if (tab.converted !== undefined) {
+      return this.discardConverted(tab, tab.converted, w);
     }
     // The fresh session is opened before the old one is let go: when the open
     // is refused (lite) or fails, the tab keeps the session it has.
@@ -2440,9 +2701,9 @@ export class DocumentWindowState {
     if (!isLite()) {
       try {
         open = await invoke<WindowedOpen>('windowed_open', { path: tab.path });
-      } catch {
+      } catch (e) {
         if (!isLite()) {
-          return;
+          return this.failDiscard(tab, e);
         }
       }
     }
@@ -2452,8 +2713,8 @@ export class DocumentWindowState {
     if (open === null) {
       try {
         open = await this.reopenAtBaseline(tab.path, w.sessionId);
-      } catch {
-        return;
+      } catch (e) {
+        return this.failDiscard(tab, e);
       }
     }
     void invoke('windowed_close', { sessionId: w.sessionId });
@@ -2469,8 +2730,147 @@ export class DocumentWindowState {
     };
     this.windowedConflict = null;
     await this.upsertTab(tab);
+    return true;
   }
-
+  /** `discardWindowed` for a tab a paste made: what it was before the paste
+   *  comes back (a file that is not UTF-8 has no `windowed_open` to go through). */
+  private async discardConverted(
+    tab: DocTab,
+    conv: ConvertedTab,
+    w: NonNullable<DocTab['windowed']>,
+  ): Promise<boolean> {
+    if (conv.saved) {
+      // The file is the target in another encoding: decoded again, as at a
+      // restart. Not a thing the edition may refuse.
+      let open: WindowedOpen;
+      try {
+        const convertId = await invoke<string>('convert_from_file', {
+          path: tab.path,
+          encoding: conv.encoding,
+          withBom: conv.bom,
+        });
+        open = await invoke<WindowedOpen>('windowed_reopen_converted', {
+          convertId,
+          target: tab.path,
+          encoding: conv.encoding,
+          withBom: conv.bom,
+        });
+      } catch (e) {
+        return this.failDiscard(tab, e);
+      }
+      void invoke('windowed_close', { sessionId: w.sessionId });
+      this.windowedGates.delete(w.sessionId);
+      this.windowedGenerations.delete(w.sessionId);
+      tab.windowed = {
+        sessionId: open.session_id,
+        totalBytes: open.total_bytes,
+        totalLines: open.total_lines,
+        fingerprint: open.fingerprint,
+        dirty: false,
+        topLine: 0,
+      };
+      this.windowedConflict = null;
+      await this.upsertTab(tab);
+      return true;
+    }
+    if (conv.origin === 'sticky') {
+      // The note comes back and the tab goes (`deleteTab` lets the note go).
+      await this.deleteTab(this.tabs.indexOf(tab));
+      return true;
+    }
+    let fresh: DocTab;
+    if (conv.origin === 'document') {
+      const original = await this.originalOf(tab);
+      if (original === null) {
+        return false;
+      }
+      fresh = original;
+    } else {
+      fresh = {
+        id: tab.id,
+        path: '',
+        readOnlyFile: false,
+        content: Text.empty,
+        savedContent: Text.empty,
+        language: null,
+        explicit: false,
+        lineEnding: tab.lineEnding,
+        savedLineEnding: tab.lineEnding,
+        hadBom: tab.hadBom,
+        encoding: tab.encoding,
+        lossy: false,
+        tabIndex: tab.tabIndex,
+      };
+    }
+    void invoke('windowed_close', { sessionId: w.sessionId });
+    this.windowedGates.delete(w.sessionId);
+    this.windowedGenerations.delete(w.sessionId);
+    this.releaseTabView(tab.id);
+    const { id, tabIndex } = tab;
+    const bare: Partial<DocTab> = tab;
+    for (const key of Object.keys(bare) as (keyof DocTab)[]) {
+      delete bare[key];
+    }
+    Object.assign(tab, fresh, { id, tabIndex });
+    this.windowedConflict = null;
+    await this.upsertTab(tab);
+    return true;
+  }
+  /** The tab as it opens from the file it was a document of, the way an open
+   *  routes by size. A file that is gone leaves the tab blank, with the path and
+   *  the missing mark; a file that cannot be read is reported and gives null. */
+  private async originalOf(tab: DocTab): Promise<DocTab | null> {
+    if (!isLite()) {
+      try {
+        const size = (await invoke<FileStat>('stat_file', { path: tab.path }))
+          .size;
+        if (opensInLargeViewer(size, false)) {
+          return {
+            id: tab.id,
+            path: tab.path,
+            readOnlyFile: tab.readOnlyFile,
+            content: Text.empty,
+            savedContent: Text.empty,
+            language: null,
+            explicit: false,
+            lineEnding: tab.lineEnding,
+            savedLineEnding: tab.lineEnding,
+            hadBom: false,
+            encoding: settingsState.defaultEncoding,
+            lossy: false,
+            tabIndex: tab.tabIndex,
+            large: { size },
+          };
+        }
+      } catch {
+        // Read below.
+      }
+    }
+    try {
+      return await this.loadTab(tab.path, null);
+    } catch (e) {
+      if (!(e instanceof ReadFailed) || e.error !== FILE_NOT_FOUND) {
+        this.failDiscard(tab, e instanceof ReadFailed ? e.error : e);
+        return null;
+      }
+      return {
+        id: tab.id,
+        path: tab.path,
+        readOnlyFile: false,
+        content: Text.empty,
+        savedContent: Text.empty,
+        language: tab.language,
+        explicit: tab.explicit,
+        lineEnding: tab.lineEnding,
+        savedLineEnding: tab.lineEnding,
+        hadBom: tab.hadBom,
+        encoding: tab.encoding,
+        lossy: false,
+        tabIndex: tab.tabIndex,
+        missing: true,
+      };
+    }
+  }
   /** A fresh session on `path` at its on-disk baseline, made from the index of
    *  the live session `sessionId` through `windowed_reopen` instead of
    *  `windowed_open`. */
@@ -2494,7 +2894,6 @@ export class DocumentWindowState {
       fingerprint: r.fingerprint,
     };
   }
-
   /** Wait until the active editor has handed what was typed to the core. Only
    *  the active tab has an editor; a switch settles the others first. */
   private async flushWindowedInput(tab: DocTab): Promise<void> {
@@ -2502,7 +2901,6 @@ export class DocumentWindowState {
       await this.windowedFlushed?.();
     }
   }
-
   /** DEV/E2E: save the active windowed tab (fingerprint-checked). */
   async saveWindowedActive(): Promise<WindowedSaveResult> {
     const tab = this.activeTab;
@@ -2511,7 +2909,6 @@ export class DocumentWindowState {
     }
     return this.saveWindowed(tab, false);
   }
-
   /** DEV/E2E: force-save the active windowed tab past the fingerprint check. */
   async saveWindowedForce(): Promise<WindowedSaveResult> {
     const tab = this.activeTab;
@@ -2520,26 +2917,47 @@ export class DocumentWindowState {
     }
     return this.saveWindowed(tab, true);
   }
-
-  /** DEV/E2E: discard the active windowed tab's unsaved edits. */
-  async discardWindowedActive(): Promise<void> {
+  /** DEV/E2E: discard the active windowed tab's unsaved edits; false when that
+   *  failed. */
+  async discardWindowedActive(): Promise<boolean> {
     const tab = this.activeTab;
     if (tab?.windowed === undefined) {
-      return;
+      return true;
     }
-    await this.discardWindowed(tab);
+    return this.discardWindowed(tab);
   }
-
   /** Whether the active tab is a windowed tab (DEV/E2E surface). */
   isWindowedTab(): boolean {
     return this.activeTab?.windowed !== undefined;
   }
-
+  /** The active tab as a paste left it (DEV/E2E surface): its `converted`, whether
+   *  its session is unsaved, and what the session writes. */
+  async convertTabInfo(): Promise<{
+    converted: ConvertedTab | null;
+    dirty: boolean;
+    conv: ConvState | null;
+  }> {
+    const tab = this.activeTab;
+    const conv = tab?.converted;
+    let state: ConvState | null = null;
+    if (tab?.windowed !== undefined && conv !== undefined) {
+      // Sets what it already is: the only way to ask the session.
+      state = await invoke<ConvState>('windowed_set_encoding', {
+        sessionId: tab.windowed.sessionId,
+        encoding: conv.encoding,
+        withBom: conv.bom,
+      }).catch(() => null);
+    }
+    return {
+      converted: conv === undefined ? null : { ...conv },
+      dirty: tab?.windowed?.dirty ?? false,
+      conv: state,
+    };
+  }
   /** Whether the windowed save-conflict modal is up (DEV/E2E surface). */
   windowedConflictVisible(): boolean {
     return this.windowedConflict !== null;
   }
-
   /** `rescanned` from the most recently completed `windowed_reopen` (DEV/E2E
    *  surface — see `lastWindowedRestoreRescanned`). Null before any restore
    *  has completed in this window. */
@@ -2554,7 +2972,6 @@ export class DocumentWindowState {
     }
     return this.saveWindowed(tab, true);
   }
-
   /** Conflict choice: save the current buffer to a chosen path instead. The
    *  session and the tab both move to the chosen path. */
   async windowedConflictSaveAs(pathOverride?: string): Promise<boolean> {
@@ -2589,6 +3006,9 @@ export class DocumentWindowState {
         pathOverride: chosen,
       });
     } catch (e) {
+      if (String(e) === UNMAPPABLE) {
+        return (await this.resolveUnmappable(tab, chosen)) === 'ok';
+      }
       // The user picked this path by hand, so every failure here is reported
       // rather than handing back a dialog that looks like it did nothing.
       // `chosen` is the target, not `tab.path`, which is still the old file.
@@ -2608,17 +3028,102 @@ export class DocumentWindowState {
       live.language = detectByFilename(chosen);
     }
     this.applyWindowedSaved(live.windowed, saved);
+    await this.afterConvertedSave(live, saved);
     this.windowedConflict = null;
     await this.upsertTab(live);
     void invoke('add_recent_file', { path: chosen });
     return true;
   }
-
+  /** After every successful write of a windowed tab, before its record is
+   *  written. The first write of a tab a paste made gives it a record of its own
+   *  (and takes a sticky note's away); a session that is plain UTF-8 again is an
+   *  ordinary large-file tab from then on. */
+  private async afterConvertedSave(
+    tab: DocTab,
+    saved: WindowedSaved,
+  ): Promise<void> {
+    const conv = tab.converted;
+    if (conv === undefined) {
+      return;
+    }
+    conv.target = tab.path;
+    if (!conv.saved) {
+      conv.saved = true;
+      if (conv.origin === 'sticky' && conv.noteId !== undefined) {
+        try {
+          await invoke('convert_sticky_saved', { noteId: conv.noteId });
+        } catch (e) {
+          // The file is written; the note's record is what is left over.
+          console.error('convert_sticky_saved failed', e);
+        }
+      }
+    }
+    if (saved.conv == null) {
+      delete tab.converted;
+    } else {
+      conv.encoding = saved.conv.encoding;
+      conv.bom = saved.conv.bom;
+    }
+  }
+  /** D13: a save that cannot write some text in the encoding of the tab. The
+   *  user may save as UTF-8 to the same place, save as UTF-8 under another name,
+   *  or leave it. `chosen` is the path of a save as that failed (null: the save in
+   *  place). */
+  private async resolveUnmappable(
+    tab: DocTab,
+    chosen: string | null,
+  ): Promise<WindowedSaveResult> {
+    const w = tab.windowed;
+    if (w === undefined) {
+      return 'error';
+    }
+    const name = (chosen ?? tab.path).split(/[/\\]/).pop() ?? '';
+    const choice = await convertController.askUnmappable(
+      name === '' ? t('doc.untitled') : name,
+      tab.converted?.encoding ?? tab.encoding,
+    );
+    if (choice === 'cancel') {
+      return 'error';
+    }
+    let path = chosen;
+    // The dialog comes first: a cancelled one leaves the tab and the session as
+    // they are.
+    if (
+      choice === 'saveAs' ||
+      (chosen === null && tab.converted?.target === null)
+    ) {
+      path = await save(
+        saveDialogOptions(tab.language, suggestedName(chosen ?? tab.path)),
+      );
+      if (path === null) {
+        return 'error';
+      }
+    }
+    try {
+      const set = await invoke<ConvState>('windowed_set_encoding', {
+        sessionId: w.sessionId,
+        encoding: 'UTF-8',
+        withBom: false,
+      });
+      tab.encoding = set.encoding;
+      tab.hadBom = set.bom;
+      if (tab.converted !== undefined) {
+        tab.converted.encoding = set.encoding;
+        tab.converted.bom = set.bom;
+      }
+    } catch (e) {
+      this.saveFailed = { path: chosen ?? tab.path, error: String(e) };
+      return 'error';
+    }
+    if (path === null) {
+      return this.saveWindowed(tab, false);
+    }
+    return (await this.windowedSaveTo(tab, path)) ? 'ok' : 'error';
+  }
   /** Conflict choice: dismiss the modal, leaving the tab unsaved. */
   windowedConflictCancel(): void {
     this.windowedConflict = null;
   }
-
   /** Change the active tab's encoding. A clean tab re-decodes from disk under
    *  the new encoding (fresh content, saved baseline reset); a dirty tab keeps
    *  its buffer and only changes the encoding used at save time (stays dirty). */
@@ -2660,7 +3165,6 @@ export class DocumentWindowState {
     this.reloadSeq += 1;
     this.persistActive();
   }
-
   /** Persist all logical bounds onto every tab so the lowest-index one (used on
    *  restore) always carries fresh bounds. */
   setBounds(x: number, y: number, width: number, height: number): void {
@@ -2678,12 +3182,10 @@ export class DocumentWindowState {
       void this.upsertTab(tab);
     }
   }
-
   /** Drop a pending active-tab upsert so a following delete can't be undone. */
   cancelPending(): void {
     this.persistActive.cancel();
   }
-
   /** Index of the first dirty tab whose unsaved buffer is too large to ride
    *  along in a snapshot ('skip'), or -1. The quit gate blocks on such a tab:
    *  its edits cannot be restored after exit, so the user must save or discard
@@ -2696,7 +3198,6 @@ export class DocumentWindowState {
           snapshotContentPolicy(true, t.content.length) === 'skip',
     );
   }
-
   /** Index of the first dirty tab, within the snapshot size ceiling, whose
    *  most recent full-content write failed to reach disk (the snapshot folder
    *  missing/unwritable, the disk full, made read-only, ...). Unlike
@@ -2726,7 +3227,6 @@ export class DocumentWindowState {
     const index = this.tabs.findIndex((t) => t.id === box.tabId);
     return index === -1 ? null : { index, oversized: false, rangeBox: true };
   }
-
   /** The tab the quit/close gate must block on right now, if any. An edit box
    *  with changes comes first (`rangeBox` is set then), then an oversized dirty
    *  tab — it is known before a write is even attempted — then a dirty tab
@@ -2749,7 +3249,6 @@ export class DocumentWindowState {
     const unwritable = this.firstUnwritableDirtyIndex();
     return unwritable === -1 ? null : { index: unwritable, oversized: false };
   }
-
   /** Discard a tab's unsaved edits, reverting it to its last saved state so it
    *  no longer blocks the quit gate. The buffer becomes clean (the on-disk
    *  content for a path/range tab, empty for an untitled one), the change is
@@ -2767,7 +3266,6 @@ export class DocumentWindowState {
     }
     void this.upsertTab(tab);
   }
-
   /** Remove a tab's store entry and drop it from the window. */
   async deleteTab(index: number): Promise<void> {
     const tab = this.tabs[index];
@@ -2782,6 +3280,19 @@ export class DocumentWindowState {
       void invoke('windowed_close', { sessionId: tab.windowed.sessionId });
       this.windowedGates.delete(tab.windowed.sessionId);
       this.windowedGenerations.delete(tab.windowed.sessionId);
+    }
+    // A paste still turning the tab into a large file is given up.
+    convertController.cancelTab(tab.id);
+    // A sticky note whose text was handed over and never saved comes back.
+    const conv = tab.converted;
+    if (conv?.saved === false && conv.origin === 'sticky') {
+      if (conv.noteId !== undefined) {
+        try {
+          await invoke('convert_release', { noteId: conv.noteId });
+        } catch (e) {
+          console.error('convert_release failed', e);
+        }
+      }
     }
     if (tab === this.windowedConflict) {
       this.windowedConflict = null;
@@ -2806,7 +3317,6 @@ export class DocumentWindowState {
     }
     this.activeIndex = newActive;
   }
-
   /** Drop the store entry of every clean tab as this window closes, so the next
    *  launch does not reopen a document the user had already closed. Without it
    *  the store only ever grows: closing a *tab* deletes its record, but closing
@@ -2840,7 +3350,6 @@ export class DocumentWindowState {
     }
     await invoke('drop_closed_tabs', { label, ids: clean.map((t) => t.id) });
   }
-
   /** Push every dirty tab to disk-store before a quit ack (not just the active). */
   async flushAll(): Promise<void> {
     this.persistActive.flush();
@@ -2854,7 +3363,6 @@ export class DocumentWindowState {
     this.line = line;
     this.col = col;
   }
-
   /** Push the active tab's current buffer back into the editor. Used when
    *  leaving the table view so the CM document reflects table-side edits made
    *  while its (hidden) view was out of sync. */

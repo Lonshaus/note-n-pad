@@ -199,8 +199,13 @@ export class CloseGate {
     } else if (this.win.activeTab?.windowed !== undefined) {
       // A windowed tab's dirtiness lives in its Rust session, so a plain buffer
       // reset would not clear it (leaving the quit gate stuck); reopen the
-      // session at the on-disk baseline instead.
-      await this.win.discardWindowedActive();
+      // session at the on-disk baseline instead. A discard that failed leaves
+      // the tab unsaved: asking about it again would only repeat the question the
+      // failure message sits on top of, so the quit or close is called off.
+      if (!(await this.win.discardWindowedActive())) {
+        this.cancel();
+        return;
+      }
     } else {
       this.win.discardChanges(this.win.activeIndex);
     }

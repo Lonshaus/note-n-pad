@@ -7,7 +7,6 @@ license = "GPL-3.0-only"
 repository = "https://github.com/Lonshaus/note-n-pad"
 edition = "2021"
 rust-version = "1.77.2"
-
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [lib]
@@ -32,9 +31,10 @@ sys-locale = "0.3"
 tauri = { version = "2.11.3", features = ["tray-icon"] }
 tauri-plugin-dialog = "2.7.1"
 tauri-plugin-global-shortcut = "2.3.2"
+# Already in the tree through tauri; the clip reservations wait on `sync::watch`.
+tokio = { version = "1.53", features = ["sync", "rt-multi-thread", "time"] }
 trash = "5"
 uuid = { version = "1", features = ["v4"] }
-
 # Used only from Rust (the Help menu's Documentation / Report an Issue items);
 # never exposed to the frontend, so it needs no capability entry. Absent on
 # Windows: it reaches the shell by spawning `powershell.exe` (and `explorer.exe`
@@ -65,14 +65,19 @@ objc2-app-kit = { version = "0.3.2", features = [
   "NSMenuItem",
   "NSResponder",
   "NSFontManager",
+  "NSPasteboard",
+  "NSPasteboardItem",
 ] }
 objc2-foundation = { version = "0.3.2", features = [
   "NSArray",
   "NSBundle",
   "NSData",
+  "NSDictionary",
   "NSError",
   "NSFileManager",
+  "NSFileWrapper",
   "NSPathUtilities",
+  "NSSet",
   "NSString",
   "NSURL",
 ] }
@@ -89,6 +94,8 @@ windows-sys = { version = "0.60", features = [
   "Win32_Security",
   "Win32_Security_Authorization",
   "Win32_Graphics_Gdi",
+  "Win32_System_DataExchange",
+  "Win32_System_Memory",
 ] }
 # Only windows-sys (raw FFI, no COM) was a dependency before; the Jump List
 # needs COM interfaces (ICustomDestinationList, IShellLinkW), which windows-sys
@@ -112,7 +119,6 @@ windows = { version = "0.61", features = [
 # versions have to stay the ones wry uses for the types to be the same.
 webview2-com = "0.39"
 windows-core = "0.62"
-
 # Single-instance guard for Windows and Linux. macOS uses `mac_single_instance`
 # instead: this plugin's macOS socket lives in /tmp, which a sandboxed build
 # cannot use.
@@ -134,7 +140,6 @@ gio = "0.18"
 
 [dev-dependencies]
 tempfile = "3.27.0"
-
 # Build scripts and proc-macros only run on the build machine. Stripping their
 # debug info in release uses rustc's bundled objcopy, which on macOS 27 writes a
 # dylib dyld refuses to load, so the build fails with E0463. The shipped binary

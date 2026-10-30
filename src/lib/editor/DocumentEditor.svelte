@@ -9,6 +9,7 @@
     type Extension,
     type StateEffect,
     type Text,
+    type TransactionSpec,
   } from '@codemirror/state';
   import {
     EditorView,
@@ -53,6 +54,15 @@
   import { cmPhraseExtension, cmPhraseSignature } from './cmPhrases';
   import { shortcutsState } from '../state/shortcuts.svelte';
   import { platform } from '../state/platform.svelte';
+  import { rememberCopy } from '../util/linewiseCopy';
+  import { pasteFlowDeps } from '../util/pasteEnv';
+  import {
+    PasteFlow,
+    applyToSavedState,
+    registerPasteTarget,
+    type PasteHost,
+  } from '../util/pasteFlow';
+  import { editableWith, pasteLocks, type PasteLock } from '../util/pasteLock';
 
   interface Props {
     activeId: string;
@@ -81,6 +91,14 @@
     // automatic focus handoff so a gate/confirm keeps the keyboard.
     modalOpen?: boolean;
     onchange: (v: Text) => void;
+    // The document of a tab that is not shown changed (a paste that finished
+    // after a switch of tab).
+    oncontentof?: (tabId: string, v: Text) => void;
+    // The line ending a tab is written with.
+    lineEndingOf?: (tabId: string) => '\n' | '\r\n';
+    // Whether a paste that makes the document too big turns the tab into a
+    // large file. False for an editor that is not a tab of the window.
+    convertible?: boolean;
     onselection: (line: number, col: number) => void;
     onview?: (view: EditorView | null) => void;
     // Fired when the long-line gate for the active tab flips: true while the
@@ -105,11 +123,13 @@
     overlay = false,
     modalOpen = false,
     onchange,
+    oncontentof = () => {},
+    lineEndingOf = () => '\n',
+    convertible = true,
     onselection,
     onview,
     onlongline,
   }: Props = $props();
-
   // basicSetup minus the gutter/line-wrapping bits, which move into compartments
   // so the settings window can toggle them live. Everything else matches the
   // upstream basicSetup bundle (search, folding, bracket matching, autocomplete).
@@ -141,7 +161,6 @@
       shortcutsState.accel(id),
     );
   }
-
   // The whole gutter column (line numbers + fold + active-line gutter) toggles
   // together, so turning line numbers off removes the gutter entirely.
   function gutterExtension(on: boolean): Extension {
@@ -177,6 +196,39 @@
   // does not show it and a capture must use this record instead.
   let pendingScroll: { id: string; snap: StateEffect<unknown> } | null = null;
   let mountedId = '';
+  // A paste into a tab: it stops the event, asks the core what the clipboard
+  // holds, and pastes in one transaction. The tab may have been switched away
+  // from by then, so it reaches the tab's state wherever it is.
+  const pasteHost: PasteHost = {
+    dest: 'document',
+    stateOf: (id) =>
+      id === mountedId ? (view?.state ?? null) : (states.get(id) ?? null),
+    apply: (id: string, spec: TransactionSpec) => {
+      if (id === mountedId) {
+        view?.dispatch(spec);
+        return;
+      }
+      applyToSavedState(states, id, spec, oncontentof);
+    },
+    showLock: (id: string, lock: PasteLock | undefined) => {
+      const effects = editableCompartment.reconfigure(
+        editableWith(!hidden && !overlay, lock),
+      );
+      if (id === mountedId) {
+        view?.dispatch({ effects });
+        return;
+      }
+      const saved = states.get(id);
+      if (saved !== undefined) {
+        states.set(id, saved.update({ effects }).state);
+      }
+    },
+    eolOf: (id) => lineEndingOf(id),
+  };
+  const paste = new PasteFlow(pasteHost, {
+    ...pasteFlowDeps,
+    isLite: () => !convertible || pasteFlowDeps.isLite(),
+  });
   let langSeq = 0;
   let selRaf = 0;
   // Whether the active tab's document holds a line past LONG_LINE_THRESHOLD.
@@ -187,7 +239,7 @@
   // Phrases baked into every state so far; a reconfigure is skipped when equal.
   let appliedPhrases = cmPhraseSignature();
 
-  function buildState(doc: Text): EditorState {
+  function buildState(doc: Text, id: string): EditorState {
     return EditorState.create({
       doc,
       extensions: [
@@ -203,7 +255,22 @@
         languageCompartment.of([]),
         workerCompartment.of([]),
         themeCompartment.of(varEditorTheme(dark)),
-        editableCompartment.of(EditorView.editable.of(!hidden && !overlay)),
+        editableCompartment.of(
+          editableWith(!hidden && !overlay, pasteLocks.get(id)),
+        ),
+        // CodeMirror's own paste reads the clipboard by itself; ours asks the
+        // core first, and reads it once.
+        EditorView.domEventHandlers({
+          paste: (e, v) => paste.onPaste(mountedId, v, e),
+          copy: (_e, v) => {
+            rememberCopy(v.state);
+            return false;
+          },
+          cut: (_e, v) => {
+            rememberCopy(v.state);
+            return false;
+          },
+        }),
         EditorView.updateListener.of((update) => {
           if (update.docChanged) {
             // Zero-copy: hand the rope reference to state, no whole-buffer string.
@@ -244,7 +311,6 @@
       }
     });
   }
-
   // Report the caret's Ln/Col, coalesced to one update per frame so a burst of
   // keystrokes never churns the status-bar $state more than once per paint.
   function reportSelection(): void {
@@ -262,7 +328,6 @@
       onselection(line.number, head - line.from + 1);
     });
   }
-
   // Load a language extension off the reactive graph (async), with a sequence
   // guard so a slow earlier selection can't clobber a newer one. Synchronous
   // highlighting is forced off for oversized documents and for documents holding
@@ -280,7 +345,6 @@
       view.dispatch({ effects: languageCompartment.reconfigure(ext ?? []) });
     }
   }
-
   // Recompute the long-line gate after an edit and, when it flips, notify the
   // host. Only the value is written here (no CM dispatch): the language/worker
   // effects read `hasLongLine` and re-apply once the in-progress update settles,
@@ -318,7 +382,6 @@
       onlongline?.(next);
     }
   }
-
   // Rescan the long-line gate from scratch (on mount and on every tab switch)
   // and notify the host. Direct value set: not inside an effect.
   function rescanLongLine(doc: Text): void {
@@ -326,7 +389,6 @@
     hasLongLine = next;
     onlongline?.(next);
   }
-
   // Enable off-thread worker highlighting when the synchronous CM language path
   // is disabled (an oversized document or one with a line past the long-line
   // threshold), the setting is enabled, and a Lezer parser covers the language.
@@ -349,9 +411,13 @@
   }
 
   onMount(() => {
-    const state = buildState(content);
+    const state = buildState(content, activeId);
     view = new EditorView({ parent: container, state });
     mountedId = activeId;
+    const v = view;
+    const forget = registerPasteTarget(v, (text) =>
+      paste.pasteText(mountedId, v.state, text),
+    );
     rescanLongLine(content);
     void applyLanguage(language, hasLongLine);
     applyWorkerHighlight(language, hasLongLine);
@@ -366,6 +432,7 @@
       void import('../dev/editorRegistry').then((m) => m.setActiveView(view!));
     }
     return () => {
+      forget();
       if (selRaf !== 0) {
         cancelAnimationFrame(selRaf);
       }
@@ -377,7 +444,6 @@
       view = undefined;
     };
   });
-
   // Swap the whole document (state) when the active tab changes; save the
   // outgoing tab's state first. Depends only on activeId — content/language/dark
   // are read untracked so this never re-runs on a keystroke.
@@ -392,14 +458,14 @@
         states.set(mountedId, view.state);
         scrolls.set(mountedId, captureScroll(view));
       }
-      const incoming = states.get(id) ?? buildState(content);
+      const incoming = states.get(id) ?? buildState(content, id);
       view.setState(incoming);
       mountedId = id;
       view.dispatch({
         effects: [
           themeCompartment.reconfigure(varEditorTheme(dark)),
           editableCompartment.reconfigure(
-            EditorView.editable.of(!hidden && !overlay),
+            editableWith(!hidden && !overlay, pasteLocks.get(id)),
           ),
         ],
       });
@@ -432,7 +498,7 @@
       }
       view.dispatch({
         effects: editableCompartment.reconfigure(
-          EditorView.editable.of(!isHidden && !covered),
+          editableWith(!isHidden && !covered, pasteLocks.get(mountedId)),
         ),
       });
       if ((isHidden || covered) && view.hasFocus) {
@@ -457,7 +523,6 @@
       }
     });
   });
-
   // Replace the active tab's whole document when the buffer changed outside the
   // editor (e.g. re-decoded under a new encoding). Only reloadSeq is tracked;
   // content is read untracked so keystrokes never trigger this.
@@ -475,7 +540,6 @@
       });
     });
   });
-
   // Live language change on the active tab; also re-runs when the long-line gate
   // flips (reading hasLongLine tracks it) so synchronous highlighting is
   // restored the moment the last long line is shortened.
@@ -486,7 +550,6 @@
       void applyLanguage(name, longLine);
     }
   });
-
   // Re-evaluate worker highlighting when the language, the setting, or the
   // long-line gate changes. Reading the getter tracks settingsState.workerHighlight,
   // so a settings-changed broadcast live-remounts/removes the worker compartment.
@@ -498,7 +561,6 @@
       applyWorkerHighlight(name, longLine);
     }
   });
-
   // Live theme change (window-wide).
   $effect(() => {
     const isDark = dark;
@@ -508,7 +570,6 @@
       });
     }
   });
-
   // Live word-wrap toggle.
   $effect(() => {
     const wrap = wordWrap;
@@ -520,7 +581,6 @@
       });
     }
   });
-
   // Live line-numbers (gutter) toggle.
   $effect(() => {
     const on = showLineNumbers;
@@ -569,7 +629,6 @@
       }
     });
   });
-
   // Forget saved states for tabs that have been closed.
   $effect(() => {
     const ids = new Set(openIds);
@@ -578,6 +637,7 @@
         if (!ids.has(key)) {
           states.delete(key);
           scrolls.delete(key);
+          pasteLocks.drop(key);
         }
       }
     });

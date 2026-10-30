@@ -1,0 +1,10 @@
+{
+  "$schema": "../node_modules/@tauri-apps/cli/config.schema.json",
+  "build": {
+    "beforeDevCommand": "node scripts/build-cliphelper.mjs && npm run dev",
+    "beforeBuildCommand": "node scripts/build-cliphelper.mjs && npm run build"
+  },
+  "bundle": {
+    "externalBin": ["binaries/cliphelper"]
+  }
+}

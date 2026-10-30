@@ -23,7 +23,6 @@ import {
 } from './documentWindow.svelte';
 import { READ_ONLY_DESTINATION } from '../util/protocol';
 import { detectByFilename } from '../editor/language';
-
 // Mocked so the tests below drive `documentWindow`'s real
 // `setBounds`/`switchTo` against a fake Tauri backend instead of
 // reimplementing the logic under test. `vi.mock` is hoisted above every
@@ -35,13 +34,11 @@ vi.mock('@tauri-apps/plugin-dialog', () => ({ save: vi.fn() }));
 
 const mockInvoke = vi.mocked(invoke);
 const mockSave = vi.mocked(save);
-
 // `beginWindowedRestore`'s grace-period timer uses `window.setTimeout`/
 // `clearTimeout`; this file runs under Vitest's default node environment (no
 // jsdom), so `window` itself doesn't otherwise exist. `globalThis` already
 // carries real timers, so aliasing is enough — no jsdom dependency needed.
 vi.stubGlobal('window', globalThis);
-
 /** Minimal ordinary (non-large, non-windowed, non-range) DocTab, for tests
  *  that only care about the windowed-restore-specific fields. */
 function baseTab(overrides: Partial<DocTab>): DocTab {
@@ -62,7 +59,6 @@ function baseTab(overrides: Partial<DocTab>): DocTab {
     ...overrides,
   };
 }
-
 /** Minimal ordinary (non-large, non-windowed, non-range) persisted note, for
  *  tests that only care about the windowed-restore-specific fields returned
  *  by `list_notes`. */
@@ -103,6 +99,8 @@ function baseNote(overrides: Partial<NoteSnapshot>): NoteSnapshot {
     windowed_fp_mtime: null,
     windowed_digest: null,
     windowed_top_line: null,
+    windowed_encoding: null,
+    windowed_bom: false,
     ...overrides,
   };
 }
@@ -198,7 +196,6 @@ describe('setBounds persists a pending windowed-restore tab (F1 regression)', ()
         },
       }),
     );
-
     // Mirrors `DocumentApp.svelte`'s move/resize path (`captureBounds` ->
     // `setBounds`), which loops every tab regardless of restore state.
     documentWindow.setBounds(10, 20, 800, 600);
@@ -459,7 +456,6 @@ describe('ensureWindowedRestore kicks off the reopen for the active restored tab
     }) as typeof invoke);
 
     await documentWindow.init('g1', null, null);
-
     // `init` sets `activeIndex` to 0, which is this tab: the setter must have
     // kicked off `beginWindowedRestore` synchronously (up to its first
     // `await`), so the reopen call is already recorded by now even though
@@ -586,7 +582,6 @@ describe('deleteTab kicks off the restore of the tab that becomes active (P2 reg
     );
     documentWindow.activeIndex = 0;
     mockInvoke.mockClear();
-
     // Closing the active tab (index 0) leaves the pending-restore tab at
     // index 0 — `activeIndex`'s numeric value (0) does not change, so only a
     // funnel that re-checks on every deleteTab, not just on a changed index,
@@ -637,7 +632,6 @@ describe('saveActive on a rejected write_file_encoded (save-failure notice)', ()
     );
   });
 });
-
 // The generic message and the read-only-file message are both driven off
 // `saveFailed.error`, so the caller (DocumentApp) must be able to tell them
 // apart by exact string match against the Rust protocol value: this pins that
@@ -678,7 +672,6 @@ describe('saveActive on a read-only-destination refusal', () => {
     expect(tab.readOnlyFile).toBe(true);
   });
 });
-
 // A read-only destination gets the same doc.saveReadOnly modal as an ordinary
 // save, using the real write target (the windowed tab's own path), not a
 // possibly-empty `path`. The range box's write-back is pinned the same way in
@@ -764,7 +757,6 @@ describe('windowedConflictSaveAs on a read-only-destination refusal', () => {
     expect(documentWindow.windowedConflict).toBe(tab);
   });
 });
-
 // Both paths below reached the same dead end for anything that was not a
 // conflict or a refusal: a bare 'error'/false, a tab left dirty, and nothing at
 // all on screen to say why. Cmd+S on a windowed tab discards the return value,
@@ -1406,7 +1398,6 @@ describe('a large tab does one thing at a time (switching modes vs Save As)', ()
     expect(tab.windowed?.sessionId).toBe(5);
   });
 });
-
 // A failed `read_range`/`copy_range` used to be indistinguishable from a
 // successful extraction or a cancelled save (both were swallowed to the same
 // `null`/`false` the success/cancel paths already returned). These confirm
@@ -1520,7 +1511,6 @@ describe('saveRangeAs distinguishes failure from success and cancellation', () =
     );
   });
 });
-
 // The saved slice is a file like any other: it opens through the normal open
 // flow, as a new tab of this window.
 describe('saveRangeAs opens the saved file as a new tab', () => {
@@ -1600,7 +1590,6 @@ describe('saveRangeAs opens the saved file as a new tab', () => {
     expect(documentWindow.tabs).toHaveLength(0);
   });
 });
-
 // A failed `read_file_as` used to be swallowed silently (the encoding picker
 // just snapped back with no explanation). Confirms the failure is now
 // reported through `encodingFailed` instead of vanishing.
@@ -1692,7 +1681,6 @@ describe('the write-failure quit/close gate (firstUnwritableDirtyIndex / firstBl
       baseTab({ id: 'a', tabIndex: 0, content: Text.of(['dirty']) }),
     );
     documentWindow.activeIndex = 0;
-
     // Not known until a write is actually attempted (unlike oversized, which
     // is known from content size alone).
     expect(documentWindow.firstUnwritableDirtyIndex()).toBe(-1);
@@ -1821,7 +1809,6 @@ describe('the write-failure quit/close gate (firstUnwritableDirtyIndex / firstBl
     });
   });
 });
-
 // Nothing else covers the composition: `applyLineEnding` and `detectLineEnding`
 // have their own unit tests, and Rust covers the byte write, but no test until
 // here asserted what `saveActive` actually hands to `write_file_encoded` — so a
@@ -1888,7 +1875,6 @@ describe('saveActive line endings in the write_file_encoded payload', () => {
     expect(out.split(/\r\n/).join('\n')).toBe('one\ntwo\nthree');
   });
 });
-
 /** Full `load_settings` payload, so `settingsState.init()` resolves `ready` —
  *  every open awaits it inside `route`. `ask_long_line_open` is false so a plain
  *  open pushes its tab instead of staging the long-line gate. */
@@ -1902,6 +1888,7 @@ function loadedSettings(): Record<string, unknown> {
       editor_line_numbers: true,
       worker_highlight: false,
       large_open_mode: 'ask',
+      large_select_all: 'visible',
       ask_long_line_open: false,
       preview_local_resources: false,
       open_target: 'tab',
@@ -1920,7 +1907,6 @@ function loadedSettings(): Record<string, unknown> {
     snapshot_dir_unavailable: false,
   };
 }
-
 /** Yield until `done()` holds, or give up after a bounded number of turns. Used
  *  to park on a state the code under test reaches in its own microtasks rather
  *  than guessing how many awaits deep it is. */
@@ -1930,7 +1916,6 @@ async function until(done: () => boolean): Promise<void> {
   }
   expect(done()).toBe(true);
 }
-
 // A fresh window loads its file asynchronously, and an open that arrives while
 // it is still awaiting must not be undone by init's own tab selection. This
 // reproduces the ordering that reached CI: the second open's switchTo lands
@@ -1987,7 +1972,6 @@ describe('init does not reset the active tab over a concurrent open', () => {
     expect(documentWindow.activeIndex).toBe(1);
   });
 });
-
 // The other half of the same statement: init's write was also what kicked the
 // lazy reopen, and a fresh window's first tab can be an adopted orphan carrying
 // a windowed restore. `switchTo(0)` returns early there, so without an explicit
@@ -2037,7 +2021,6 @@ describe('a fresh window that adopts an orphaned windowed tab still restores it'
     });
   });
 });
-
 // The moved write still does its original job. The starting activeIndex differs
 // from the expected position so the assertion cannot pass on a leftover value.
 describe('init still selects the stored tab when restoring a window group', () => {

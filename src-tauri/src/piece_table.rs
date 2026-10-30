@@ -29,11 +29,18 @@
 //! A third kind of piece, `Fill`, stands for any number of copies of one byte
 //! and holds only the byte and the count, so rewriting a long run of `\r` to
 //! `\n` (and back) costs the same for ten bytes and for a hundred million.
+//!
+//! A fourth kind, `Spill`, draws its bytes from a spill file on disk (see
+//! `spill`). The table registers each file once and a piece names it by number;
+//! reads, line counts and writes of such a piece go to the file in fixed-size
+//! blocks, never whole.
 
 use crate::line_rule;
+use crate::spill::{SpillFile, SpillRef};
 use std::cell::RefCell;
 use std::fs::File;
 use std::io::Write;
+use std::sync::Arc;
 
 /// Random access to the immutable original buffer without loading it whole.
 ///
@@ -73,7 +80,7 @@ impl OriginalSource for File {
 /// Fill `buf` from `file` at `offset`. pread-style access: does not disturb the
 /// file cursor and needs only `&File`, so several reads can interleave without
 /// external locking.
-fn fill_at(file: &File, offset: u64, buf: &mut [u8]) -> Result<(), String> {
+pub(crate) fn fill_at(file: &File, offset: u64, buf: &mut [u8]) -> Result<(), String> {
   #[cfg(unix)]
   {
     use std::os::unix::fs::FileExt;
@@ -177,7 +184,10 @@ impl<O: OriginalSource> OriginalIndex<O> {
   /// Read original bytes `[offset, offset + len)` into `out` (delegates to the
   /// source). Used by the piece table's content reads and streaming save.
   fn read_into(&self, offset: u64, len: usize, out: &mut Vec<u8>) -> Result<(), String> {
-    self.source.read_into(offset, len, out)
+    let read = self.source.read_into(offset, len, out);
+    #[cfg(test)]
+    crate::spill::stats::read(len, out.capacity());
+    read
   }
   /// The source this index reads through.
   fn source(&self) -> &O {
@@ -214,6 +224,8 @@ impl<O: OriginalSource> OriginalIndex<O> {
     let read = want + usize::from(end < self.len);
     let mut buf = Vec::with_capacity(read);
     self.source.read_into(start, read, &mut buf)?;
+    #[cfg(test)]
+    crate::spill::stats::read(read, buf.capacity());
     cache.newlines.clear();
     line_rule::push_break_positions(&buf, want, start, &mut cache.newlines);
     cache.seg = seg;
@@ -263,6 +275,8 @@ enum Source {
   Add,
   /// `len` copies of one byte, held as the byte and the length only.
   Fill(u8),
+  /// A run of the spill file registered under this number.
+  Spill(u32),
 }
 
 /// A contiguous run of bytes drawn from one source buffer.
@@ -304,6 +318,20 @@ pub struct PieceTable<O: OriginalSource> {
   /// Whether the first piece's `ends_cr` / `starts_lf` are set. They are read
   /// from the original on the first edit, since `new` cannot fail.
   flags_known: bool,
+  /// The spill files the pieces draw from, by number (the index). A number whose
+  /// file no piece uses any more is `None` and may be handed out again.
+  spills: Vec<Option<Arc<SpillFile>>>,
+}
+
+/// The state of a table that an undo or redo step can put back: the pieces and
+/// their sums, the spill registry and the length of the add buffer. Holding it
+/// keeps the spill files alive.
+pub struct TableSnapshot {
+  pieces: Vec<Piece>,
+  offset_prefix: Vec<u64>,
+  newline_prefix: Vec<u64>,
+  spills: Vec<Option<Arc<SpillFile>>>,
+  add_len: usize,
 }
 
 impl<O: OriginalSource> PieceTable<O> {
@@ -331,6 +359,7 @@ impl<O: OriginalSource> PieceTable<O> {
       offset_prefix: Vec::new(),
       newline_prefix: Vec::new(),
       flags_known,
+      spills: Vec::new(),
     };
     table.rebuild();
     table
@@ -373,6 +402,87 @@ impl<O: OriginalSource> PieceTable<O> {
     self.flags_known = true;
     Ok(())
   }
+  /// The spill file registered under `id`.
+  fn spill(&self, id: u32) -> Result<&Arc<SpillFile>, String> {
+    self
+      .spills
+      .get(id as usize)
+      .and_then(Option::as_ref)
+      .ok_or_else(|| "spill file is not registered".to_string())
+  }
+  /// The number `file` is registered under, registering it first if needed.
+  fn register_spill(&mut self, file: &Arc<SpillFile>) -> u32 {
+    if let Some(at) = self
+      .spills
+      .iter()
+      .position(|s| s.as_ref().is_some_and(|f| Arc::ptr_eq(f, file)))
+    {
+      return at as u32;
+    }
+    if let Some(at) = self.spills.iter().position(Option::is_none) {
+      self.spills[at] = Some(file.clone());
+      return at as u32;
+    }
+    self.spills.push(Some(file.clone()));
+    (self.spills.len() - 1) as u32
+  }
+  /// Free the number of every spill file no piece draws from.
+  fn release_spills(&mut self) {
+    if self.spills.iter().all(Option::is_none) {
+      return;
+    }
+    let mut used = vec![false; self.spills.len()];
+    for piece in &self.pieces {
+      if let Source::Spill(id) = piece.source {
+        used[id as usize] = true;
+      }
+    }
+    for (slot, used) in self.spills.iter_mut().zip(used) {
+      if !used {
+        *slot = None;
+      }
+    }
+  }
+  /// Capture the state an undo or redo step can put back. The first piece's
+  /// break flags are settled first, so a restore never leaves them stale.
+  pub fn snapshot(&mut self) -> Result<TableSnapshot, String> {
+    self.ensure_flags()?;
+    Ok(TableSnapshot {
+      pieces: self.pieces.clone(),
+      offset_prefix: self.offset_prefix.clone(),
+      newline_prefix: self.newline_prefix.clone(),
+      spills: self.spills.clone(),
+      add_len: self.add.len(),
+    })
+  }
+  /// Put back a state captured by `snapshot`.
+  pub fn restore(&mut self, snapshot: TableSnapshot) {
+    self.add.truncate(snapshot.add_len);
+    self.pieces = snapshot.pieces;
+    self.offset_prefix = snapshot.offset_prefix;
+    self.newline_prefix = snapshot.newline_prefix;
+    self.spills = snapshot.spills;
+  }
+  /// The run of a spill file that holds document bytes `[start, end)`, when one
+  /// spill piece covers all of them.
+  pub fn spill_cover(&self, start: u64, end: u64) -> Option<SpillRef> {
+    if start >= end || end > self.len() {
+      return None;
+    }
+    let i = self.offset_prefix.partition_point(|&o| o <= start) - 1;
+    let piece = self.pieces.get(i)?;
+    let Source::Spill(id) = piece.source else {
+      return None;
+    };
+    if end > self.offset_prefix[i + 1] {
+      return None;
+    }
+    Some(SpillRef {
+      file: self.spill(id).ok()?.clone(),
+      start: piece.start + (start - self.offset_prefix[i]),
+      len: end - start,
+    })
+  }
   /// The source the original run draws from.
   pub fn source(&self) -> &O {
     self.index.source()
@@ -400,6 +510,20 @@ impl<O: OriginalSource> PieceTable<O> {
   #[cfg(test)]
   pub fn add_len(&self) -> usize {
     self.add.len()
+  }
+  /// Pieces that draw from a spill file, for the same tests.
+  #[cfg(test)]
+  pub fn spill_piece_count(&self) -> usize {
+    self
+      .pieces
+      .iter()
+      .filter(|p| matches!(p.source, Source::Spill(_)))
+      .count()
+  }
+  /// Spill files the registry holds, for the same tests.
+  #[cfg(test)]
+  pub fn spills_registered(&self) -> usize {
+    self.spills.iter().flatten().count()
   }
   /// Number of sparse checkpoints the original's index holds, for the same
   /// tests.
@@ -447,6 +571,9 @@ impl<O: OriginalSource> PieceTable<O> {
       }
       // Every `\r` of a `\r` run is followed by a `\r` inside the piece.
       Source::Fill(b) => Ok(if matches!(b, b'\r' | b'\n') { local } else { 0 }),
+      Source::Spill(id) => self
+        .spill(id)?
+        .markers_between(piece.start, piece.start + local),
     }
   }
   /// The bytes of `piece` at local offsets `loc - 1` and `loc` (`0 < loc <
@@ -463,6 +590,13 @@ impl<O: OriginalSource> PieceTable<O> {
         Ok((self.add[at - 1], self.add[at]))
       }
       Source::Fill(b) => Ok((b, b)),
+      Source::Spill(id) => {
+        let mut two = Vec::with_capacity(2);
+        self
+          .spill(id)?
+          .read_into(piece.start + loc - 1, 2, &mut two)?;
+        Ok((two[0], two[1]))
+      }
     }
   }
 
@@ -475,7 +609,9 @@ impl<O: OriginalSource> PieceTable<O> {
     // marker of its own, the right half's `\n` counts either way.
     let cut_crlf = u64::from(before == b'\r' && after == b'\n');
     let left_nl = match piece.source {
-      Source::Original | Source::Fill(_) => self.markers_before(piece, loc)? + cut_crlf,
+      Source::Original | Source::Fill(_) | Source::Spill(_) => {
+        self.markers_before(piece, loc)? + cut_crlf
+      }
       Source::Add => {
         let s = piece.start as usize;
         line_rule::count_breaks(&self.add[s..s + loc as usize])
@@ -592,6 +728,34 @@ impl<O: OriginalSource> PieceTable<O> {
     Ok(())
   }
 
+  /// Insert the spill run `spill` at document offset `offset` as one piece, so
+  /// the cost does not depend on its length. A zero length is a no-op; an
+  /// out-of-range offset returns `Err`.
+  pub fn insert_spill(&mut self, offset: u64, spill: &SpillRef) -> Result<(), String> {
+    if offset > self.len() {
+      return Err("insert offset out of range".to_string());
+    }
+    if spill.len == 0 {
+      return Ok(());
+    }
+    let info = spill.file.range_info(spill.start, spill.len)?;
+    let idx = self.split_at(offset)?;
+    let id = self.register_spill(&spill.file);
+    self.pieces.insert(
+      idx,
+      Piece {
+        source: Source::Spill(id),
+        start: spill.start,
+        len: spill.len,
+        newlines: info.newlines,
+        ends_cr: info.last == b'\r',
+        starts_lf: info.first == b'\n',
+      },
+    );
+    self.rebuild();
+    Ok(())
+  }
+
   /// Delete document bytes `[start, end)`. `start == end` is a no-op. Any of
   /// `start > end`, `end > len()` returns `Err`.
   pub fn delete(&mut self, start: u64, end: u64) -> Result<(), String> {
@@ -620,6 +784,7 @@ impl<O: OriginalSource> PieceTable<O> {
     };
     self.pieces.drain(s..e);
     self.rebuild();
+    self.release_spills();
     Ok(())
   }
 
@@ -633,6 +798,10 @@ impl<O: OriginalSource> PieceTable<O> {
       return Err("read end out of range".to_string());
     }
     let mut out = Vec::with_capacity((end - start) as usize);
+    #[cfg(test)]
+    crate::spill::stats::read((end - start) as usize, out.capacity());
+    #[cfg(test)]
+    crate::spill::stats::content_read((end - start) as usize);
     self.read_append(start, end, &mut out)?;
     Ok(out)
   }
@@ -665,6 +834,11 @@ impl<O: OriginalSource> PieceTable<O> {
           out.extend_from_slice(&self.add[a..b]);
         }
         Source::Fill(byte) => out.resize(out.len() + (to - from) as usize, byte),
+        Source::Spill(id) => {
+          self
+            .spill(id)?
+            .read_into(piece.start + from, (to - from) as usize, out)?;
+        }
       }
     }
     Ok(())
@@ -714,6 +888,12 @@ impl<O: OriginalSource> PieceTable<O> {
       }
       // Every byte of a break fill is a marker of the piece.
       Source::Fill(_) => Ok(doc_start + k - 1),
+      Source::Spill(id) => {
+        let file = self.spill(id)?;
+        let ps = piece.start;
+        let n = file.markers_between(0, ps)?;
+        Ok(doc_start + (file.newline_pos(n + k)? - ps))
+      }
     }
   }
 
@@ -738,47 +918,78 @@ impl<O: OriginalSource> PieceTable<O> {
     Ok(self.newline_prefix[piece_idx] + within)
   }
 
-  /// Stream the whole document to `out`, piece by piece. Original pieces are
-  /// copied from the original source in `buf_size`-byte slices so no more than
-  /// one buffer of any original piece is ever held in memory; add pieces are
-  /// written straight from the in-memory add buffer. Used by the save path to
-  /// write a very large document without materializing it whole.
+  /// Stream the whole document to `out`, piece by piece, in blocks of at most
+  /// `buf_size` bytes, so no more than one block of any piece is ever held in
+  /// memory. Used by the save path to write a very large document without
+  /// materializing it whole.
   pub fn write_all<W: Write>(&self, out: &mut W, buf_size: usize) -> Result<(), String> {
-    let cap = buf_size.max(1);
-    let mut scratch: Vec<u8> = Vec::with_capacity(cap);
-    for piece in &self.pieces {
-      match piece.source {
-        Source::Original => {
-          let mut off = piece.start;
-          let mut remaining = piece.len;
-          while remaining > 0 {
-            let take = remaining.min(cap as u64) as usize;
-            scratch.clear();
-            self.index.read_into(off, take, &mut scratch)?;
-            out.write_all(&scratch).map_err(|e| e.to_string())?;
-            off += take as u64;
-            remaining -= take as u64;
-          }
-        }
+    copy_range_to(self, 0, self.len(), out, buf_size)
+  }
+}
+
+/// Stream document bytes `[start, end)` of `table` to `out`, piece by piece, in
+/// blocks of at most `chunk` bytes. Original, spill and fill pieces are read or
+/// generated one block at a time, so the cost in memory does not depend on the
+/// length of the range.
+pub fn copy_range_to<O: OriginalSource, W: Write>(
+  table: &PieceTable<O>,
+  start: u64,
+  end: u64,
+  out: &mut W,
+  chunk: usize,
+) -> Result<(), String> {
+  if start > end {
+    return Err("copy start after end".to_string());
+  }
+  if end > table.len() {
+    return Err("copy end out of range".to_string());
+  }
+  if start == end {
+    return Ok(());
+  }
+  let cap = chunk.max(1);
+  let mut scratch: Vec<u8> = Vec::with_capacity(cap);
+  let first = table.offset_prefix.partition_point(|&o| o <= start) - 1;
+  for (i, piece) in table.pieces.iter().enumerate().skip(first) {
+    let p_start = table.offset_prefix[i];
+    let p_end = table.offset_prefix[i + 1];
+    if p_start >= end {
+      break;
+    }
+    let mut at = start.max(p_start) - p_start;
+    let to = end.min(p_end) - p_start;
+    while at < to {
+      let take = (to - at).min(cap as u64) as usize;
+      let block: &[u8] = match piece.source {
         Source::Add => {
-          let a = piece.start as usize;
-          let b = (piece.start + piece.len) as usize;
-          out.write_all(&self.add[a..b]).map_err(|e| e.to_string())?;
+          let a = (piece.start + at) as usize;
+          &table.add[a..a + take]
+        }
+        Source::Original => {
+          scratch.clear();
+          table
+            .index
+            .read_into(piece.start + at, take, &mut scratch)?;
+          &scratch
+        }
+        Source::Spill(id) => {
+          scratch.clear();
+          table
+            .spill(id)?
+            .read_into(piece.start + at, take, &mut scratch)?;
+          &scratch
         }
         Source::Fill(byte) => {
-          let mut remaining = piece.len;
-          while remaining > 0 {
-            let take = remaining.min(cap as u64) as usize;
-            scratch.clear();
-            scratch.resize(take, byte);
-            out.write_all(&scratch).map_err(|e| e.to_string())?;
-            remaining -= take as u64;
-          }
+          scratch.clear();
+          scratch.resize(take, byte);
+          &scratch
         }
-      }
+      };
+      out.write_all(block).map_err(|e| e.to_string())?;
+      at += take as u64;
     }
-    Ok(())
   }
+  Ok(())
 }
 /// A piece table is itself readable by byte range, so another table can be
 /// stacked over it as its original (a replace layer reads the table below).
@@ -1563,5 +1774,451 @@ mod tests {
     crlf.insert_fill(0, b'\r', n).unwrap();
     assert_eq!(crlf.line_count(), n + 1);
     assert_eq!(crlf.line_to_offset(n).unwrap(), n + 1);
+  }
+  // --- Spill pieces ----------------------------------------------------------
+
+  use crate::spill::{stats, SpillBuilder};
+
+  /// A spill file holding `bytes`, with `interval`-byte checkpoints and
+  /// `chunk`-byte scans.
+  fn spill_of(dir: &std::path::Path, bytes: &[u8], interval: u64, chunk: usize) -> Arc<SpillFile> {
+    let mut b = SpillBuilder::create_with(dir, interval, chunk).unwrap();
+    for part in bytes.chunks(chunk.max(1)) {
+      b.write_all(part).unwrap();
+    }
+    b.finish().unwrap()
+  }
+  fn whole(file: &Arc<SpillFile>) -> SpillRef {
+    SpillRef {
+      file: file.clone(),
+      start: 0,
+      len: file.len(),
+    }
+  }
+
+  /// Contents that put `\r`, `\r\n` and multi-byte characters across the
+  /// checkpoint intervals and block sizes the tests use.
+  const SPILL_TEXTS: &[&[u8]] = &[
+    b"abcdefghijklmnop",
+    b"ab\ncd\nef\ngh\nij\nkl\nmn\nop\n",
+    b"abc\r\ndefg\r\nhijk\r\nlmno\r\n",
+    b"abc\rdefg\rhijk\rlmno\r",
+    b"abc\r\r\n\r\n\r\rdefgh\r\n",
+    b"abcd\r",
+    b"\r\n",
+    b"\n\r\n\r",
+    "日本語のテキスト\r\n二行目\r三行目\n".as_bytes(),
+    b"\r\n\r\n\r\n\r\n\r\n\r\n\r\n\r\n\r\n",
+  ];
+
+  #[test]
+  fn a_spill_file_follows_the_line_rule_at_every_interval_and_block_size() {
+    let dir = tempfile::tempdir().unwrap();
+    for text in SPILL_TEXTS {
+      let starts = rule_starts(text);
+      for interval in [1u64, 3, 4, 8] {
+        for chunk in [1usize, 2, 5] {
+          let file = spill_of(dir.path(), text, interval, chunk);
+          assert_eq!(file.len(), text.len() as u64);
+          assert_eq!(file.total_newlines(), starts.len() as u64 - 1);
+          for &(o, n) in file.checkpoints() {
+            assert_eq!(
+              n,
+              starts.partition_point(|&s| s <= o) as u64 - 1,
+              "checkpoint {o} of {text:?} at interval {interval}"
+            );
+          }
+          let gaps: Vec<u64> = file
+            .checkpoints()
+            .windows(2)
+            .map(|w| w[1].0 - w[0].0)
+            .collect();
+          assert!(gaps.iter().all(|&g| g == interval), "{gaps:?}");
+          for (k, &s) in starts.iter().enumerate().skip(1) {
+            let marker = file.newline_pos(k as u64).unwrap();
+            assert_eq!(marker + 1, s, "marker {k} of {text:?}");
+          }
+          assert!(file.newline_pos(0).is_err());
+          assert!(file.newline_pos(starts.len() as u64).is_err());
+        }
+      }
+    }
+  }
+
+  #[test]
+  fn a_spill_piece_reads_counts_and_numbers_lines_like_its_bytes() {
+    let dir = tempfile::tempdir().unwrap();
+    let base = b"ab\r\ncd\ref";
+    for text in SPILL_TEXTS {
+      let file = spill_of(dir.path(), text, 4, 3);
+      for at in 0..=base.len() {
+        let mut pt = PieceTable::new(rule_index(base, 4));
+        pt.insert_spill(at as u64, &whole(&file)).unwrap();
+        let mut flat = base.to_vec();
+        flat.splice(at..at, text.iter().copied());
+        assert_by_rule(&pt, &flat, "spill piece");
+        assert_eq!(pt.add_len(), 0);
+        assert_eq!(pt.spill_piece_count(), 1);
+      }
+    }
+  }
+
+  #[test]
+  fn a_run_of_a_spill_file_counts_its_own_final_cr() {
+    let dir = tempfile::tempdir().unwrap();
+    let text = b"ab\r\ncd\r\nef\r\n";
+    let file = spill_of(dir.path(), text, 4, 3);
+    for start in 0..text.len() {
+      for len in 1..=text.len() - start {
+        let mut pt = PieceTable::new(rule_index(b"", 4));
+        let run = SpillRef {
+          file: file.clone(),
+          start: start as u64,
+          len: len as u64,
+        };
+        pt.insert_spill(0, &run).unwrap();
+        assert_by_rule(&pt, &text[start..start + len], "run of a spill file");
+      }
+    }
+  }
+
+  #[test]
+  fn spill_pieces_survive_splits_and_edits_around_them() {
+    let dir = tempfile::tempdir().unwrap();
+    let text = b"one\r\ntwo\rthree\r\nfour\n";
+    let file = spill_of(dir.path(), text, 4, 3);
+    let mut pt = PieceTable::new(rule_index(b"AA\r\nBB", 4));
+    let mut flat = b"AA\r\nBB".to_vec();
+    pt.insert_spill(3, &whole(&file)).unwrap();
+    flat.splice(3..3, text.iter().copied());
+    assert_by_rule(&pt, &flat, "inserted");
+    // Cut the spill piece in two at every offset, with a CR/LF join each way.
+    for at in 3..3 + text.len() as u64 {
+      let mut cut = PieceTable::new(rule_index(b"AA\r\nBB", 4));
+      cut.insert_spill(3, &whole(&file)).unwrap();
+      cut.insert(at, b"\n").unwrap();
+      let mut f = flat.clone();
+      f.insert(at as usize, b'\n');
+      assert_by_rule(&cut, &f, "split by an LF");
+      let mut cr = PieceTable::new(rule_index(b"AA\r\nBB", 4));
+      cr.insert_spill(3, &whole(&file)).unwrap();
+      cr.insert(at, b"\r").unwrap();
+      let mut f = flat.clone();
+      f.insert(at as usize, b'\r');
+      assert_by_rule(&cr, &f, "split by a CR");
+    }
+    pt.delete(5, 14).unwrap();
+    flat.drain(5..14);
+    assert_by_rule(&pt, &flat, "deleted across the piece");
+    assert_eq!(pt.spill_piece_count(), 2);
+  }
+
+  #[test]
+  fn the_registry_numbers_a_file_once_and_frees_it_when_no_piece_uses_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let file = spill_of(dir.path(), b"spilled\n", 4, 3);
+    let other = spill_of(dir.path(), b"other\n", 4, 3);
+    let path = file.path().to_path_buf();
+    let mut pt = PieceTable::new(rule_index(b"0123456789", 4));
+    pt.insert_spill(2, &whole(&file)).unwrap();
+    pt.insert_spill(6, &whole(&file)).unwrap();
+    pt.insert_spill(0, &whole(&other)).unwrap();
+    assert_eq!(pt.spills_registered(), 2, "one number per file");
+    drop(file);
+    assert!(path.exists(), "the registry keeps it alive");
+    // Cut the second use out: the file is still used by the first.
+    let end = pt.len();
+    pt.delete(end - 8, end).unwrap();
+    assert_eq!(pt.spills_registered(), 2);
+    // Take the first use out as well: the number is released and the file goes.
+    pt.delete(0, pt.len()).unwrap();
+    assert_eq!(pt.spills_registered(), 0);
+    assert!(!path.exists());
+    // A freed number is handed out again.
+    pt.insert_spill(0, &whole(&other)).unwrap();
+    assert_eq!(pt.spills_registered(), 1);
+    assert_eq!(pt.read(0, pt.len()).unwrap(), b"other\n");
+  }
+
+  #[test]
+  fn a_spill_file_goes_with_its_last_holder_and_an_unfinished_one_goes_at_once() {
+    let dir = tempfile::tempdir().unwrap();
+    let count = || std::fs::read_dir(dir.path()).unwrap().count();
+    let mut b = SpillBuilder::create(dir.path()).unwrap();
+    b.write_all(b"half").unwrap();
+    assert_eq!(count(), 1);
+    drop(b);
+    assert_eq!(count(), 0, "a builder dropped before finish removes it");
+    let file = spill_of(dir.path(), b"kept\n", 4, 3);
+    let second = file.clone();
+    assert!(file
+      .path()
+      .file_name()
+      .unwrap()
+      .to_string_lossy()
+      .starts_with("sp-"));
+    drop(file);
+    assert_eq!(count(), 1);
+    drop(second);
+    assert_eq!(count(), 0);
+  }
+
+  #[test]
+  fn a_range_inside_one_spill_piece_is_found_and_any_other_is_not() {
+    let dir = tempfile::tempdir().unwrap();
+    let file = spill_of(dir.path(), b"0123456789", 4, 3);
+    let mut pt = PieceTable::new(rule_index(b"AB", 4));
+    pt.insert_spill(1, &whole(&file)).unwrap();
+    let run = pt.spill_cover(3, 8).unwrap();
+    assert!(Arc::ptr_eq(&run.file, &file));
+    assert_eq!((run.start, run.len), (2, 5));
+    assert!(pt.spill_cover(0, 4).is_none(), "starts in the original");
+    assert!(pt.spill_cover(5, 12).is_none(), "ends in the original");
+    assert!(pt.spill_cover(4, 4).is_none(), "empty");
+    assert!(pt.spill_cover(1, 11).is_some());
+    let plain = PieceTable::new(rule_index(b"abcdef", 4));
+    assert!(plain.spill_cover(0, 3).is_none());
+  }
+
+  #[test]
+  fn restoring_a_snapshot_puts_back_pieces_registry_and_add_buffer() {
+    let dir = tempfile::tempdir().unwrap();
+    let file = spill_of(dir.path(), b"spilled\r\n", 4, 3);
+    let mut pt = PieceTable::new(rule_index(b"abc\r", 4));
+    pt.insert(1, b"xy").unwrap();
+    let flat = pt.read(0, pt.len()).unwrap();
+    let (add, pieces) = (pt.add_len(), pt.piece_count());
+    let snap = pt.snapshot().unwrap();
+    pt.insert_spill(2, &whole(&file)).unwrap();
+    pt.insert(0, b"more text").unwrap();
+    pt.delete(1, 4).unwrap();
+    assert_eq!(pt.spills_registered(), 1);
+    pt.restore(snap);
+    assert_eq!(pt.add_len(), add);
+    assert_eq!(pt.piece_count(), pieces);
+    assert_eq!(pt.spills_registered(), 0);
+    assert_by_rule(&pt, &flat, "restored");
+  }
+
+  /// A writer that records the largest write it was given.
+  struct Recorder {
+    bytes: Vec<u8>,
+    max_write: usize,
+  }
+  impl Write for Recorder {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+      self.max_write = self.max_write.max(buf.len());
+      self.bytes.extend_from_slice(buf);
+      Ok(buf.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+      Ok(())
+    }
+  }
+
+  #[test]
+  fn copy_range_to_matches_the_bytes_over_every_kind_of_piece_in_blocks() {
+    let dir = tempfile::tempdir().unwrap();
+    let file = spill_of(dir.path(), b"spill\r\nlines\n", 4, 3);
+    let original = b"ab\r\ncd\ref\ngh";
+    let mut pt = PieceTable::new(rule_index(original, 4));
+    pt.insert_spill(5, &whole(&file)).unwrap();
+    pt.insert(2, b"typed\r").unwrap();
+    pt.insert_fill(9, b'\n', 7).unwrap();
+    let flat = pt.read(0, pt.len()).unwrap();
+    for chunk in [1usize, 2, 5, 64] {
+      for start in 0..=flat.len() {
+        for end in start..=flat.len() {
+          let mut out = Recorder {
+            bytes: Vec::new(),
+            max_write: 0,
+          };
+          copy_range_to(&pt, start as u64, end as u64, &mut out, chunk).unwrap();
+          assert_eq!(
+            out.bytes,
+            flat[start..end],
+            "[{start}, {end}) in blocks of {chunk}"
+          );
+          assert!(
+            out.max_write <= chunk,
+            "a write of {} past {chunk}",
+            out.max_write
+          );
+        }
+      }
+    }
+    assert!(copy_range_to(&pt, 3, 2, &mut Vec::new(), 4).is_err());
+    assert!(copy_range_to(&pt, 0, pt.len() + 1, &mut Vec::new(), 4).is_err());
+  }
+
+  #[test]
+  fn copy_range_to_writes_a_plain_file_the_same_as_the_reference() {
+    let dir = tempfile::tempdir().unwrap();
+    let file = spill_of(dir.path(), "日本語\r\nspill\r".as_bytes(), 4, 3);
+    let mut pt = PieceTable::new(rule_index("héllo\r\nworld\n".as_bytes(), 4));
+    pt.insert_spill(3, &whole(&file)).unwrap();
+    pt.insert_fill(0, b'\r', 9).unwrap();
+    let flat = pt.read(0, pt.len()).unwrap();
+    let path = dir.path().join("copy.txt");
+    let mut out = File::create(&path).unwrap();
+    copy_range_to(&pt, 4, pt.len() - 2, &mut out, 5).unwrap();
+    drop(out);
+    assert_eq!(std::fs::read(&path).unwrap(), flat[4..flat.len() - 2]);
+  }
+
+  #[test]
+  fn a_spill_builder_copies_a_range_and_the_copy_is_applied_with_insert_spill() {
+    let dir = tempfile::tempdir().unwrap();
+    let original = b"one\r\ntwo\rthree\nfour\r\nfive";
+    let src = PieceTable::new(rule_index(original, 4));
+    for (start, end) in [(0u64, 25u64), (3, 9), (4, 5), (8, 17), (21, 25)] {
+      let mut b = SpillBuilder::create_with(dir.path(), 4, 3).unwrap();
+      b.copy_range(&src, start, end).unwrap();
+      let file = b.finish().unwrap();
+      let mut dst = PieceTable::new(rule_index(b"[]", 4));
+      dst.insert_spill(1, &whole(&file)).unwrap();
+      let mut flat = b"[]".to_vec();
+      flat.splice(1..1, original[start as usize..end as usize].iter().copied());
+      assert_by_rule(&dst, &flat, "copied range");
+    }
+  }
+
+  #[test]
+  fn copying_a_fill_piece_generates_it_in_blocks() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut src = PieceTable::new(rule_index(b"a\nb", 4));
+    src.insert_fill(1, b'\r', 500).unwrap();
+    stats::reset();
+    let mut b = SpillBuilder::create_with(dir.path(), 16, 16).unwrap();
+    b.copy_range(&src, 0, src.len()).unwrap();
+    let file = b.finish().unwrap();
+    let seen = stats::get();
+    assert!(seen.max_write <= 16, "wrote {} at once", seen.max_write);
+    assert!(seen.max_buf <= 16, "held {} at once", seen.max_buf);
+    assert_eq!(file.len(), 503);
+    let mut dst = PieceTable::new(rule_index(b"", 4));
+    dst.insert_spill(0, &whole(&file)).unwrap();
+    assert_eq!(dst.line_count(), src.line_count());
+    assert_eq!(dst.line_to_offset(200).unwrap(), 201);
+  }
+
+  #[test]
+  fn writing_a_spill_piece_reads_it_in_blocks() {
+    let dir = tempfile::tempdir().unwrap();
+    let text: Vec<u8> = (0..1000u32)
+      .flat_map(|i| format!("line {i}\r\n").into_bytes())
+      .collect();
+    let file = spill_of(dir.path(), &text, 64, 32);
+    let mut pt = PieceTable::new(rule_index(b"head\ntail\n", 4));
+    pt.insert_spill(5, &whole(&file)).unwrap();
+    stats::reset();
+    let mut out = Recorder {
+      bytes: Vec::new(),
+      max_write: 0,
+    };
+    pt.write_all(&mut out, 32).unwrap();
+    let seen = stats::get();
+    assert_eq!(out.bytes, pt.read(0, pt.len()).unwrap());
+    assert!(seen.max_read <= 32, "asked for {} at once", seen.max_read);
+    assert!(seen.max_buf <= 32, "held {} at once", seen.max_buf);
+  }
+
+  #[test]
+  fn six_hundred_live_spills_read_back_with_one_handle_open_at_a_time() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut pt = PieceTable::new(rule_index(b"", 4));
+    let mut expect = Vec::new();
+    let mut files = Vec::new();
+    stats::reset();
+    for i in 0..600u32 {
+      let text = format!("spill {i}\r\nsecond line {i}\n").into_bytes();
+      let file = spill_of(dir.path(), &text, 8, 5);
+      pt.insert_spill(pt.len(), &whole(&file)).unwrap();
+      expect.extend_from_slice(&text);
+      files.push(file);
+    }
+    drop(files);
+    assert_eq!(pt.spills_registered(), 600);
+    assert_by_rule_sampled(&pt, &expect);
+    let mut out = Vec::new();
+    pt.write_all(&mut out, 7).unwrap();
+    assert_eq!(out, expect);
+    for i in 0..600u64 {
+      let line = pt.line_to_offset(2 * i + 1).unwrap();
+      assert_eq!(pt.read(line, line + 6).unwrap(), b"second");
+    }
+    assert_eq!(stats::get().max_open, 1);
+  }
+
+  /// Line numbering at every 7th offset and every line start of `flat`.
+  fn assert_by_rule_sampled<O: OriginalSource>(pt: &PieceTable<O>, flat: &[u8]) {
+    let starts = rule_starts(flat);
+    assert_eq!(pt.line_count(), starts.len() as u64);
+    for (line, &start) in starts.iter().enumerate().step_by(37) {
+      assert_eq!(pt.line_to_offset(line as u64).unwrap(), start);
+    }
+    for off in (0..=flat.len() as u64).step_by(97) {
+      assert_eq!(
+        pt.offset_to_line(off).unwrap(),
+        starts.partition_point(|&s| s <= off) as u64 - 1
+      );
+    }
+  }
+
+  #[test]
+  fn random_edits_with_spill_pieces_keep_the_line_rule() {
+    let dir = tempfile::tempdir().unwrap();
+    let alphabet = b"ab\r\n\r\n\xe4\xbd\xa0";
+    let mut rng = Lcg(0x0123_4567_89ab_cdef);
+    let original: &[u8] = b"head\r\nbody\rtail";
+    let mut flat = original.to_vec();
+    let mut pt = PieceTable::new(rule_index(original, 4));
+    for step in 0..120 {
+      let len = flat.len() as u64;
+      match rng.below(3) {
+        0 => {
+          let text: Vec<u8> = (0..1 + rng.below(12))
+            .map(|_| alphabet[rng.below(alphabet.len() as u64) as usize])
+            .collect();
+          let file = spill_of(dir.path(), &text, 4, 3);
+          let from = rng.below(text.len() as u64);
+          let run = SpillRef {
+            file,
+            start: from,
+            len: 1 + rng.below(text.len() as u64 - from),
+          };
+          let at = rng.below(len + 1);
+          pt.insert_spill(at, &run).unwrap();
+          flat.splice(
+            at as usize..at as usize,
+            text[run.start as usize..(run.start + run.len) as usize]
+              .iter()
+              .copied(),
+          );
+        }
+        1 => {
+          let at = rng.below(len + 1);
+          let text: Vec<u8> = (0..rng.below(5))
+            .map(|_| alphabet[rng.below(alphabet.len() as u64) as usize])
+            .collect();
+          pt.insert(at, &text).unwrap();
+          flat.splice(at as usize..at as usize, text.iter().copied());
+        }
+        _ => {
+          let start = rng.below(len + 1);
+          let end = start + rng.below(len - start + 1);
+          pt.delete(start, end).unwrap();
+          flat.drain(start as usize..end as usize);
+        }
+      }
+      if step % 6 == 0 {
+        assert_by_rule(&pt, &flat, "random spill edits");
+      } else {
+        assert_eq!(
+          pt.line_count(),
+          rule_starts(&flat).len() as u64 - u64::from(flat.is_empty())
+        );
+      }
+    }
   }
 }

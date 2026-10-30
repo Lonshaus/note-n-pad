@@ -522,3 +522,47 @@ describe('input still on its way into a windowed editor', () => {
     expect(host.finishWindowClose).toHaveBeenCalledTimes(1);
   });
 });
+
+describe('放棄變更 of a windowed tab', () => {
+  async function discarding(worked: boolean) {
+    win.tabs.push(
+      tab({
+        id: 'w',
+        path: '/tmp/w.txt',
+        windowed: {
+          sessionId: 1,
+          totalBytes: 1,
+          totalLines: 1,
+          fingerprint: { size: 1, mtime_ms: 1 },
+          dirty: true,
+          topLine: 0,
+        },
+      }),
+    );
+    win.activeIndex = 0;
+    const discard = vi
+      .spyOn(win, 'discardWindowedActive')
+      .mockResolvedValue(worked);
+    const prompt = vi.spyOn(gate, 'prompt').mockResolvedValue();
+    const vetoed = vi.fn();
+    gate.onVetoed = vetoed;
+    gate.visible = true;
+    await gate.discard();
+    return { discard, prompt, vetoed };
+  }
+
+  it('asks about whatever is left once the session was reopened', async () => {
+    const { discard, prompt, vetoed } = await discarding(true);
+    expect(discard).toHaveBeenCalledTimes(1);
+    expect(prompt).toHaveBeenCalledTimes(1);
+    expect(vetoed).not.toHaveBeenCalled();
+  });
+
+  it('calls off the quit or close when the discard failed, and does not ask about the same tab again', async () => {
+    const { discard, prompt, vetoed } = await discarding(false);
+    expect(discard).toHaveBeenCalledTimes(1);
+    expect(prompt).not.toHaveBeenCalled();
+    expect(vetoed).toHaveBeenCalledTimes(1);
+    expect(gate.visible).toBe(false);
+  });
+});

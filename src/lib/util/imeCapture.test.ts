@@ -10,6 +10,7 @@ import {
 } from '@codemirror/state';
 import {
   accumulate,
+  capturedInput,
   captureStartAllowed,
   finishCapture,
   imeKeyAction,
@@ -314,6 +315,7 @@ describe('captureStartAllowed', () => {
     holds: 0,
     wanted: true,
     outside: true,
+    selectAllPending: false,
   };
   it('captures a composition that starts with the caret outside', () => {
     expect(captureStartAllowed(ready)).toBe(true);
@@ -337,6 +339,7 @@ describe('captureStartAllowed', () => {
     ['the queue is being replayed', { draining: true }],
     ['an undo or redo runs', { holds: 1 }],
     ['the replay does not want the input', { wanted: false }],
+    ['a select all waits to run', { selectAllPending: true }],
   ];
   for (const [name, over] of blockedInReplaySwap) {
     it(`does not capture during the swap back when ${name}`, () => {
@@ -358,6 +361,7 @@ describe('captureStartAllowed', () => {
     ['an undo or redo runs', { holds: 1 }],
     ['the replay does not want the input', { wanted: false }],
     ['the caret is inside the window', { outside: false }],
+    ['a select all waits to run', { selectAllPending: true }],
   ];
   for (const [name, over] of blocked) {
     it(`does not capture when ${name}`, () => {
@@ -419,6 +423,7 @@ describe('the shadow leaves the capture and late-input rules as they were', () =
     holds: 0,
     wanted: true,
     outside: false,
+    selectAllPending: false,
   };
   it('captures the next composition of the run', () => {
     expect(captureStartAllowed(duringShadow)).toBe(true);
@@ -438,5 +443,21 @@ describe('the shadow leaves the capture and late-input rules as they were', () =
         userEvent: 'input.type.compose',
       }),
     ).toBe('queue');
+  });
+});
+
+describe('capturedInput', () => {
+  it('is the typing and composition input of a running capture', () => {
+    expect(capturedInput(true, 'input.type')).toBe(true);
+    expect(capturedInput(true, 'input.type.compose')).toBe(true);
+    expect(capturedInput(true, 'input')).toBe(true);
+  });
+  it('is nothing without a capture', () => {
+    expect(capturedInput(false, 'input.type.compose')).toBe(false);
+  });
+  it('is no deletion, paste or untagged change', () => {
+    expect(capturedInput(true, 'delete.line')).toBe(false);
+    expect(capturedInput(true, 'input.paste')).toBe(false);
+    expect(capturedInput(true, undefined)).toBe(false);
   });
 });

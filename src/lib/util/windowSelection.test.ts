@@ -3,21 +3,34 @@
 
 import { describe, expect, it } from 'vitest';
 import {
+  blockedWhileGlobal,
+  clipboardBlocked,
   fitsWindow,
   gotoSelection,
   insideWindow,
   isEditingKey,
   isImeKey,
+  isModifierKey,
+  isNativeSelectAll,
   movedEnds,
+  movesSelection,
+  needsGlobalOp,
+  queuedClipboardAction,
   queuedSelectEnds,
   replayKind,
   replayReady,
+  selectAllTarget,
   selectionAfterChange,
   selectionAfterSwap,
   toLiveSelection,
+  wholeFileAfter,
+  wholeFileSelection,
   windowStartFor,
   type LineSelection,
   type ReplayKeyEvent,
+  type SelectAllEntry,
+  type SelectAllMode,
+  type WholeFileEvent,
   type WindowShape,
 } from './windowSelection';
 // Every line is 10 characters long.
@@ -433,5 +446,240 @@ describe('queuedSelectEnds', () => {
       anchor: true,
       head: false,
     });
+  });
+});
+
+describe('needsGlobalOp', () => {
+  // The window holds lines 100..149.
+  it('is false with both ends inside the window', () => {
+    expect(needsGlobalOp(sel(100, 0, 149, 5), 100, 50)).toBe(false);
+    expect(needsGlobalOp(sel(120, 3, 120, 3), 100, 50)).toBe(false);
+  });
+  it('is false at exactly the last line and true one line past it', () => {
+    expect(needsGlobalOp(sel(100, 0, 149, 10), 100, 50)).toBe(false);
+    expect(needsGlobalOp(sel(100, 0, 150, 0), 100, 50)).toBe(true);
+  });
+  it('is true one line before the window', () => {
+    expect(needsGlobalOp(sel(99, 0, 120, 0), 100, 50)).toBe(true);
+  });
+  it('looks at both ends, in either direction', () => {
+    expect(needsGlobalOp(sel(120, 0, 900, 0), 100, 50)).toBe(true);
+    expect(needsGlobalOp(sel(900, 0, 120, 0), 100, 50)).toBe(true);
+    expect(needsGlobalOp(sel(149, 0, 100, 0), 100, 50)).toBe(false);
+  });
+});
+
+describe('selectAllTarget', () => {
+  const entries: SelectAllEntry[] = ['key', 'menu', 'native'];
+  for (const entry of entries) {
+    it(`takes what is on screen under "visible" (${entry})`, () => {
+      expect(selectAllTarget('visible', entry)).toBe('visible');
+    });
+    it(`takes the file under "file" (${entry})`, () => {
+      expect(selectAllTarget('file', entry)).toBe('file');
+    });
+  }
+});
+
+describe('wholeFileAfter', () => {
+  const selectAll = (entry: SelectAllEntry): WholeFileEvent => ({
+    type: 'selectAll',
+    entry,
+  });
+  it('is set by a Select All under "file", through any entry', () => {
+    for (const entry of ['key', 'menu', 'native'] as const) {
+      expect(wholeFileAfter({ mode: 'file' }, selectAll(entry))).toBe(true);
+    }
+  });
+  it('is not set by a Select All under "visible"', () => {
+    for (const entry of ['key', 'menu', 'native'] as const) {
+      expect(wholeFileAfter({ mode: 'visible' }, selectAll(entry))).toBe(false);
+    }
+  });
+  it('is cleared by a click, a selection key or a new selection', () => {
+    for (const mode of ['file', 'visible'] as SelectAllMode[]) {
+      for (const type of ['click', 'key', 'select'] as const) {
+        expect(wholeFileAfter({ mode }, { type })).toBe(false);
+      }
+    }
+  });
+});
+
+describe('movesSelection', () => {
+  it('is true for the arrow, Home, End, PageUp and PageDown keys', () => {
+    for (const key of ['ArrowUp', 'Home', 'End', 'PageUp', 'PageDown']) {
+      expect(movesSelection(key)).toBe(true);
+    }
+  });
+  it('is false for other keys', () => {
+    for (const key of ['a', 'Shift', 'Enter', 'c']) {
+      expect(movesSelection(key)).toBe(false);
+    }
+  });
+});
+
+describe('wholeFileSelection', () => {
+  const end = { line: 5000, col: 7 };
+  it('selects from the start of the file to its end', () => {
+    expect(wholeFileSelection(end, win(100, 50)).globalSel).toEqual(
+      sel(0, 0, 5000, 7),
+    );
+  });
+  it('clamps the live selection to the window edges', () => {
+    expect(wholeFileSelection(end, win(100, 50)).live).toEqual(
+      sel(0, 0, 49, 10),
+    );
+  });
+  it('keeps the end inside the window when the window holds it', () => {
+    expect(wholeFileSelection(end, win(4990, 11)).live).toEqual(
+      sel(0, 0, 10, 7),
+    );
+  });
+  it('makes the last live selection the live one', () => {
+    const w = wholeFileSelection(end, win(100, 50));
+    expect(w.lastLive).toBe(w.live);
+  });
+  it('keeps the global ends through an update that only moves the selection', () => {
+    const w = wholeFileSelection(end, win(100, 50));
+    // The next update reports the same live selection.
+    const next = selectionAfterChange(
+      w.globalSel,
+      w.lastLive,
+      w.live,
+      100,
+      false,
+    );
+    expect(next.head).toEqual(end);
+    expect(next.anchor).toEqual({ line: 0, col: 0 });
+  });
+});
+
+describe('blockedWhileGlobal', () => {
+  const small = sel(100, 0, 110, 0);
+  const large = sel(0, 0, 5000, 0);
+  const userEvents = [
+    'input.type',
+    'input.type.compose',
+    'input.paste',
+    'input.drop',
+    'move.drop',
+    'delete.backward',
+    'delete.line',
+    'delete.cut',
+    'move.line',
+    'input.comment',
+    'indent',
+    'replace',
+    'anything.else',
+  ];
+  for (const userEvent of userEvents) {
+    it(`blocks ${userEvent} that changes the document under a large selection`, () => {
+      expect(blockedWhileGlobal({ docChanged: true, userEvent }, large)).toBe(
+        true,
+      );
+    });
+    it(`lets ${userEvent} through under a selection one window holds`, () => {
+      expect(blockedWhileGlobal({ docChanged: true, userEvent }, small)).toBe(
+        false,
+      );
+    });
+  }
+  it('lets a change through that no user action made', () => {
+    expect(
+      blockedWhileGlobal({ docChanged: true, userEvent: undefined }, large),
+    ).toBe(false);
+  });
+  it('lets a change of the selection alone through', () => {
+    expect(
+      blockedWhileGlobal({ docChanged: false, userEvent: 'select' }, large),
+    ).toBe(false);
+    expect(
+      blockedWhileGlobal({ docChanged: false, userEvent: undefined }, large),
+    ).toBe(false);
+  });
+  it('allows the selection that fits at exactly the limit', () => {
+    expect(
+      blockedWhileGlobal(
+        { docChanged: true, userEvent: 'input.type' },
+        sel(0, 0, 1000, 0),
+      ),
+    ).toBe(false);
+    expect(
+      blockedWhileGlobal(
+        { docChanged: true, userEvent: 'input.type' },
+        sel(0, 0, 1001, 0),
+      ),
+    ).toBe(true);
+  });
+});
+
+describe('clipboardBlocked', () => {
+  const small = sel(100, 0, 110, 0);
+  const large = sel(0, 0, 5000, 0);
+  for (const kind of ['copy', 'cut'] as const) {
+    it(`does not block ${kind} under a large selection: it goes through a clip`, () => {
+      expect(clipboardBlocked(kind, large, 'editor')).toBe(false);
+      expect(clipboardBlocked(kind, large, 'none')).toBe(false);
+    });
+  }
+  it('does not block a paste under a large selection: it replaces the selection', () => {
+    expect(clipboardBlocked('paste', large, 'editor')).toBe(false);
+    expect(clipboardBlocked('paste', large, 'none')).toBe(false);
+  });
+  for (const kind of ['copy', 'cut', 'paste'] as const) {
+    it(`lets ${kind} through in another element, such as a search field`, () => {
+      expect(clipboardBlocked(kind, large, 'other')).toBe(false);
+    });
+    it(`lets ${kind} through under a selection one window holds`, () => {
+      expect(clipboardBlocked(kind, small, 'editor')).toBe(false);
+      expect(clipboardBlocked(kind, small, 'none')).toBe(false);
+    });
+  }
+});
+
+describe('queuedClipboardAction', () => {
+  it('goes through a clip when the copy is made of the session', () => {
+    expect(queuedClipboardAction('session')).toBe('clip');
+  });
+  it('supplies the web clipboard for any other way of copying', () => {
+    expect(queuedClipboardAction('text')).toBe('supply');
+    expect(queuedClipboardAction('file')).toBe('supply');
+  });
+});
+
+describe('isNativeSelectAll', () => {
+  const native = {
+    docChanged: false,
+    isSelect: true,
+    isPointer: false,
+    keyActive: false,
+    from: 0,
+    to: 900,
+    viewportFrom: 0,
+    viewportTo: 900,
+  };
+  it('is a selection of the whole rendered range that no key or pointer made', () => {
+    expect(isNativeSelectAll(native)).toBe(true);
+    expect(isNativeSelectAll({ ...native, from: 0, to: 1000 })).toBe(true);
+  });
+  it('is not one made by a key command, a pointer or a change', () => {
+    expect(isNativeSelectAll({ ...native, keyActive: true })).toBe(false);
+    expect(isNativeSelectAll({ ...native, isPointer: true })).toBe(false);
+    expect(isNativeSelectAll({ ...native, docChanged: true })).toBe(false);
+    expect(isNativeSelectAll({ ...native, isSelect: false })).toBe(false);
+  });
+  it('is not one that leaves part of the rendered range out', () => {
+    expect(isNativeSelectAll({ ...native, from: 1 })).toBe(false);
+    expect(isNativeSelectAll({ ...native, to: 899 })).toBe(false);
+  });
+});
+
+describe('isModifierKey', () => {
+  it('knows the modifiers pressed on their own', () => {
+    for (const key of ['Shift', 'Control', 'Alt', 'Meta', 'AltGraph']) {
+      expect(isModifierKey(key)).toBe(true);
+    }
+    expect(isModifierKey('a')).toBe(false);
+    expect(isModifierKey('ArrowLeft')).toBe(false);
   });
 });
