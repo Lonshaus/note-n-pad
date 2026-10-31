@@ -488,7 +488,9 @@ diag_line() {
 # Every tab (id, active, windowed, converted), the conversions under way and how
 # the last conversion ended. $1 names the moment.
 diag_convert_state() {
-  diag_line "$1 tabs" "$(e2e_read "$DL" "JSON.stringify(__auto.getTabs().map((t)=>({id:t.id,active:t.active,windowed:t.windowed,converted:t.converted})))")"
+  # Held in a variable: bash 3.2 brace-expands {a,b} in a double-quoted string nested in "$( )".
+  local tabs_js='JSON.stringify(__auto.getTabs().map((t)=>({id:t.id,active:t.active,windowed:t.windowed,converted:t.converted})))'
+  diag_line "$1 tabs" "$(e2e_read "$DL" "$tabs_js")"
   diag_line "$1 convertJobs" "$(e2e_read "$DL" "JSON.stringify(__auto.convertJobs())")"
   diag_line "$1 lastConvertExit" "$(e2e_read "$DL" "JSON.stringify(__auto.lastConvertExit())")"
 }
