@@ -113,15 +113,12 @@ count_kind() {
   done
   echo "$n"
 }
+# Every document snapshot: the preflight requires none at the start, so all that
+# exist now are this suite's, the ones of an unnamed tab included.
 wipe_test_docs() {
   for f in "$STORE"/*.json; do
     if [ "$(jq -r '.kind' "$f" 2>/dev/null)" = "document" ]; then
-      FP=$(jq -r '.file_path // empty' "$f" 2>/dev/null)
-      case "$FP" in
-        *paste-fixture*)
-          rm -f "$f"
-          ;;
-      esac
+      rm -f "$f"
     fi
   done
 }
@@ -422,13 +419,17 @@ ctinfo() {
 wait_converted() {
   e2e_wait_eval "$DL" "String(__auto.isWindowedTab())" "true"
 }
-# Save the active tab: $1 the path, or none for the file it has. Waits for it.
+# Save the active tab: $1 the path, or none for the file it has. Waits for it;
+# with SAVE_DIAG set, the page is watched meanwhile (diag_save).
 save_to() {
   evl "$DL" "window.__sv=undefined" >/dev/null
   if [ -n "${1:-}" ]; then
     evl "$DL" "__auto.saveActive('$1').then((r)=>{window.__sv=r;});1" >/dev/null
   else
     evl "$DL" "__auto.saveActive().then((r)=>{window.__sv=r;});1" >/dev/null
+  fi
+  if [ -n "${SAVE_DIAG:-}" ]; then
+    diag_save "$SAVE_DIAG"
   fi
   e2e_wait_eval "$DL" "String(window.__sv!==undefined)" "true"
   check "the save ended well" "$(e2e_read "$DL" "String(window.__sv)")" "true"
@@ -484,11 +485,37 @@ diag_line() {
   echo "DIAG $1: $(e2e_show "$2")"
   printf 'DIAG %s: %s\n' "$1" "$2" >>"$DIAG_LOG"
 }
+# Every tab (id, active, windowed, converted), the conversions under way and how
+# the last conversion ended. $1 names the moment.
+diag_convert_state() {
+  diag_line "$1 tabs" "$(e2e_read "$DL" "JSON.stringify(__auto.getTabs().map((t)=>({id:t.id,active:t.active,windowed:t.windowed,converted:t.converted})))")"
+  diag_line "$1 convertJobs" "$(e2e_read "$DL" "JSON.stringify(__auto.convertJobs())")"
+  diag_line "$1 lastConvertExit" "$(e2e_read "$DL" "JSON.stringify(__auto.lastConvertExit())")"
+}
+# After a save was started: once a second, until it ended or 60 seconds are
+# over, how long ago the page's timer last ran (a page whose script is stuck
+# stops it) and whether the save has ended. $1 names the section.
+diag_save() {
+  local started second=0 ended
+  started=$(date +%s)
+  while [ "$second" -le 60 ]; do
+    diag_line "$1 t=${second}s timerAge" "$(e2e_read "$DL" "String(Math.round(performance.now()-window.__tick))")"
+    ended="$(e2e_read "$DL" "String(window.__sv!==undefined)")"
+    diag_line "$1 t=${second}s saveEnded" "$ended"
+    if [ "$ended" = "true" ]; then
+      return 0
+    fi
+    sleep 1
+    second=$(($(date +%s) - started))
+  done
+}
 # After the answer Continue: once a second, until the tab is a converted tab or
 # 60 seconds are over, what the page says. $1 names the section.
 diag_convert() {
-  local second=0 info
+  local started second=0 info
+  started=$(date +%s)
   while [ "$second" -le 60 ]; do
+    diag_convert_state "$1 t=${second}s"
     diag_line "$1 t=${second}s dialog" "$(e2e_read "$DL" "JSON.stringify(__auto.convertDialog())")"
     evl "$DL" "window.__ci=undefined;__auto.convertTabInfo().then((r)=>{window.__ci=r;});1" >/dev/null
     e2e_wait_until 5 _e2e_eval_equals "$DL" "String(window.__ci!==undefined)" "true"
@@ -500,7 +527,7 @@ diag_convert() {
       return 0
     fi
     sleep 1
-    second=$((second + 1))
+    second=$(($(date +%s) - started))
   done
 }
 # A document that holds the pasted text and the question, confirm: continues.
@@ -588,25 +615,6 @@ check "base.log has the size of $N_LINES lines" "$(file_size "$WORK/base.log")" 
 check "mid.log has the size of $MID_LINES lines" "$(file_size "$WORK/mid.log")" "$MID_SIZE"
 check "big.log has the size of $BIG_LINES lines" "$(file_size "$WORK/big.log")" "$BIG_SIZE"
 
-launch
-BOOT=$(boot_label)
-evl "$BOOT" "window.__TAURI_INTERNALS__.invoke('open_document_window',{path:'$WORK/seed.txt'})" >/dev/null
-e2e_wait_until doc_label_ready
-DL=$(doc_label)
-if [ -z "$DL" ]; then
-  echo "FATAL: no document window appeared"
-  exit 1
-fi
-BASE_DL="$DL"
-e2e_wait_eval "$DL" "String(typeof __auto!=='undefined' && typeof __auto.convertTabInfo==='function' && typeof __auto.convertDialog==='function' && __auto.getTabs().length===1)" "true"
-ORIG_LANG=$(e2e_read "$DL" "String(__auto.getLanguage())")
-ORIG_MODE=$(e2e_read "$DL" "String(__auto.getLargeOpenMode())")
-ORIG_SELECT=$(e2e_read "$DL" "String(__auto.largeSelectAllMode())")
-ORIG_TARGET="$(jq -r '.open_target // empty' "$APPDIR/settings.json" 2>/dev/null)"
-if [ -z "$ORIG_TARGET" ]; then
-  ORIG_TARGET="tab"
-fi
-echo "original language: $ORIG_LANG, large_open_mode: $ORIG_MODE, large_select_all: $ORIG_SELECT, open_target: $ORIG_TARGET"
 CREATED_STICKY=""
 restore_state() {
   trap '' INT TERM
@@ -649,7 +657,27 @@ restore_state() {
   wipe_test_docs
   e2e_kill_owned_ports
 }
-trap restore_state EXIT INT TERM
+trap restore_state EXIT
+trap 'exit 1' INT TERM
+launch
+BOOT=$(boot_label)
+evl "$BOOT" "window.__TAURI_INTERNALS__.invoke('open_document_window',{path:'$WORK/seed.txt'})" >/dev/null
+e2e_wait_until doc_label_ready
+DL=$(doc_label)
+if [ -z "$DL" ]; then
+  echo "FATAL: no document window appeared"
+  exit 1
+fi
+BASE_DL="$DL"
+e2e_wait_eval "$DL" "String(typeof __auto!=='undefined' && typeof __auto.convertTabInfo==='function' && typeof __auto.convertDialog==='function' && __auto.getTabs().length===1)" "true"
+ORIG_LANG=$(e2e_read "$DL" "String(__auto.getLanguage())")
+ORIG_MODE=$(e2e_read "$DL" "String(__auto.getLargeOpenMode())")
+ORIG_SELECT=$(e2e_read "$DL" "String(__auto.largeSelectAllMode())")
+ORIG_TARGET="$(jq -r '.open_target // empty' "$APPDIR/settings.json" 2>/dev/null)"
+if [ -z "$ORIG_TARGET" ]; then
+  ORIG_TARGET="tab"
+fi
+echo "original language: $ORIG_LANG, large_open_mode: $ORIG_MODE, large_select_all: $ORIG_SELECT, open_target: $ORIG_TARGET"
 evl "$DL" "__auto.setLanguage('en')" >/dev/null
 evl "$DL" "__auto.setLargeSelectAll('file')" >/dev/null
 e2e_wait_setting large_select_all "file"
@@ -675,6 +703,7 @@ check "cancel left the tab ordinary" "$(e2e_read "$DL" "String(__auto.isWindowed
 check "cancel wrote no conversion file" "$(cv_files)" "0"
 do_paste "$DL" ok
 wait_dialog "$DL" confirm
+diag_convert_state "1 before Continue"
 evl "$DL" "__t.answer(0)" >/dev/null
 diag_convert "1"
 wait_converted
@@ -699,7 +728,9 @@ paste_and_continue ok "2"
 INFO=$(ctinfo)
 check "an untitled tab has no file to write to" "$(printf '%s' "$INFO" | jq -r '.converted.target')" "null"
 SAVED_TO="$WORK/untitled-saved.txt"
-save_to "$SAVED_TO"
+evl "$DL" "window.__tick=performance.now();window.__tickTimer=setInterval(()=>{window.__tick=performance.now();},100);1" >/dev/null
+SAVE_DIAG="2" save_to "$SAVED_TO"
+evl "$DL" "clearInterval(window.__tickTimer);1" >/dev/null
 diag_line "2 save result" "$(e2e_read "$DL" "String(window.__sv)")"
 diag_line "2 tabs" "$(e2e_read "$DL" "JSON.stringify(__auto.getTabs())")"
 check "the saved file is the pasted text (SHA-256)" "$(file_sha256 "$SAVED_TO")" "$(file_sha256 "$WORK/paste-ok.txt")"

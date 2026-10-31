@@ -167,38 +167,9 @@ cp "$WORK/big.log" "$WORK/big.ask"
 make_sparse_file "$WORK/huge.bin" 600
 BIGSIZE=$(file_size "$WORK/big.log")
 echo "big.log bytes: $BIGSIZE  huge.bin bytes: $(file_size "$WORK/huge.bin")"
-
-launch
-BOOT=$(boot_label)
-if [ -z "$BOOT" ]; then
-  echo "FATAL: no bootstrap window"
-  quit_app
-  exit 1
-fi
-evl "$BOOT" "window.__TAURI_INTERNALS__.invoke('open_document_window',{path:'$WORK/big.log'})" >/dev/null
-sleep 4
-DL=$(doc_label)
-tries=0
-until [ -n "$DL" ] && [ "$(evl "$DL" "typeof __auto!=='undefined' && typeof __auto.largeConfirmVisible==='function'")" = "true" ]; do
-  sleep 1
-  tries=$((tries + 1))
-  if [ "$tries" -gt 20 ]; then
-    echo "FATAL: doc window/hooks never appeared"
-    quit_app
-    exit 1
-  fi
-  DL=$(doc_label)
-done
-
-# Pin the UI language so text assertions never depend on the host system
-# language; restore the user's real preference on exit or interrupt. The trap
-# looks the doc label up live because the restart section opens a fresh window.
-ORIG_LANG=$(e2e_read "$DL" "String(__auto.getLanguage())")
-echo "original language: $ORIG_LANG"
-# The open-modes section writes the user's real large_open_mode; capture it now
-# and restore it on any exit (single value, replacing the old ask toggle).
-ORIG_MODE=$(e2e_read "$DL" "String(__auto.getLargeOpenMode())")
-echo "original large_open_mode: $ORIG_MODE"
+# Restore the user's UI language and large-open mode and kill the app on any
+# exit. The trap looks the doc label up live because the restart section opens a
+# fresh window.
 restore_lang() {
   trap '' INT TERM
   local dl
@@ -222,7 +193,37 @@ restore_lang() {
   fi
   e2e_kill_owned_ports
 }
-trap restore_lang EXIT INT TERM
+trap restore_lang EXIT
+trap 'exit 1' INT TERM
+
+launch
+BOOT=$(boot_label)
+if [ -z "$BOOT" ]; then
+  echo "FATAL: no bootstrap window"
+  exit 1
+fi
+evl "$BOOT" "window.__TAURI_INTERNALS__.invoke('open_document_window',{path:'$WORK/big.log'})" >/dev/null
+sleep 4
+DL=$(doc_label)
+tries=0
+until [ -n "$DL" ] && [ "$(evl "$DL" "typeof __auto!=='undefined' && typeof __auto.largeConfirmVisible==='function'")" = "true" ]; do
+  sleep 1
+  tries=$((tries + 1))
+  if [ "$tries" -gt 20 ]; then
+    echo "FATAL: doc window/hooks never appeared"
+    exit 1
+  fi
+  DL=$(doc_label)
+done
+
+# Pin the UI language so text assertions never depend on the host system
+# language; the trap restores the user's real preference.
+ORIG_LANG=$(e2e_read "$DL" "String(__auto.getLanguage())")
+echo "original language: $ORIG_LANG"
+# The open-modes section writes the user's real large_open_mode; capture it now
+# and restore it on any exit (single value, replacing the old ask toggle).
+ORIG_MODE=$(e2e_read "$DL" "String(__auto.getLargeOpenMode())")
+echo "original large_open_mode: $ORIG_MODE"
 evl "$DL" "__auto.setLanguage('zh-TW')" >/dev/null
 sleep 1
 

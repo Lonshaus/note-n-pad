@@ -28,7 +28,7 @@ use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use tauri::{AppHandle, Emitter, Manager, State};
 /// One-pass scan / streaming-copy buffer (1 MiB): the same size the range-edit
 /// path uses, keeping syscall overhead low without holding much of the file.
@@ -1663,15 +1663,22 @@ pub fn windowed_index(
   state: State<WindowedState>,
   session_id: u64,
 ) -> Result<IndexSnapshot, String> {
+  let started = Instant::now();
+  log::info!("windowed_index enter: session {session_id}");
   let map = state.sessions.lock().unwrap();
   let session = map
     .get(&session_id)
     .ok_or_else(|| UNKNOWN_SESSION.to_string())?;
-  Ok(IndexSnapshot {
+  let snapshot = IndexSnapshot {
     index: session.index.clone(),
     fingerprint: session.fingerprint.clone(),
     digest: session.digest.to_string(),
-  })
+  };
+  log::info!(
+    "windowed_index exit: session {session_id}, {:?}",
+    started.elapsed()
+  );
+  Ok(snapshot)
 }
 /// Read the line window `[start_line, end_line)` (0-based, end exclusive) of a
 /// session, clamping to the current line range. Returns the window text plus the
@@ -1988,12 +1995,20 @@ pub fn windowed_save(
   expected: Option<Fingerprint>,
   path_override: Option<String>,
 ) -> Result<SaveResult, String> {
-  save_core(
+  let started = Instant::now();
+  log::info!("windowed_save enter: session {session_id}");
+  let result = save_core(
     &state,
     session_id,
     expected,
     path_override.map(PathBuf::from),
-  )
+  );
+  log::info!(
+    "windowed_save exit: session {session_id}, ok={}, {:?}",
+    result.is_ok(),
+    started.elapsed()
+  );
+  result
 }
 /// Core of `windowed_set_path`: waits for a running replace-all, then points the
 /// session at `path`. The file's bytes are the same, so its index, digest and

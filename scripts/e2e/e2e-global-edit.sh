@@ -405,20 +405,6 @@ elif mode == 'tail':
     print('true' if new == orig[starts[at] + col:] else 'false')
 PYEOF
 
-launch
-BOOT=$(boot_label)
-evl "$BOOT" "window.__TAURI_INTERNALS__.invoke('open_document_window',{path:'$WORK/seed.txt'})" >/dev/null
-e2e_wait_until doc_label_ready
-DL=$(doc_label)
-if [ -z "$DL" ]; then
-  echo "FATAL: no document window appeared"
-  exit 1
-fi
-e2e_wait_eval "$DL" "String(typeof __auto!=='undefined' && typeof __auto.windowedOpen==='function' && __auto.getTabs().length===1)" "true"
-# The settings are the user's real ones: capture them for the trap to restore.
-ORIG_LANG=$(e2e_read "$DL" "String(__auto.getLanguage())")
-ORIG_SELECT=$(e2e_read "$DL" "String(__auto.largeSelectAllMode())")
-echo "original language: $ORIG_LANG, large_select_all: $ORIG_SELECT"
 restore_state() {
   trap '' INT TERM
   local dl
@@ -447,7 +433,22 @@ restore_state() {
   wipe_test_docs
   e2e_kill_owned_ports
 }
-trap restore_state EXIT INT TERM
+trap restore_state EXIT
+trap 'exit 1' INT TERM
+launch
+BOOT=$(boot_label)
+evl "$BOOT" "window.__TAURI_INTERNALS__.invoke('open_document_window',{path:'$WORK/seed.txt'})" >/dev/null
+e2e_wait_until doc_label_ready
+DL=$(doc_label)
+if [ -z "$DL" ]; then
+  echo "FATAL: no document window appeared"
+  exit 1
+fi
+e2e_wait_eval "$DL" "String(typeof __auto!=='undefined' && typeof __auto.windowedOpen==='function' && __auto.getTabs().length===1)" "true"
+# The settings are the user's real ones: capture them for the trap to restore.
+ORIG_LANG=$(e2e_read "$DL" "String(__auto.getLanguage())")
+ORIG_SELECT=$(e2e_read "$DL" "String(__auto.largeSelectAllMode())")
+echo "original language: $ORIG_LANG, large_select_all: $ORIG_SELECT"
 evl "$DL" "__auto.setLanguage('en')" >/dev/null
 evl "$DL" "__auto.setLargeSelectAll('file')" >/dev/null
 e2e_wait_setting large_select_all "file"
@@ -896,7 +897,7 @@ e2e_wait_eval "$DL" "String(__auto.heldWindowedReads()===1)" "true"
 CLICK_LINE=5
 CLICK_COL=7
 check "the click was made" "$(e2e_read "$DL" "String(__auto.windowedPointerSelect($((CLICK_LINE * LINE_BYTES + CLICK_COL))))")" "true"
-evl "$DL" "document.execCommand('insertText',false,'Q')" >/dev/null
+press Q
 release_reads
 settle
 close_windowed
@@ -1125,6 +1126,21 @@ shadow_run shadow
 check "the undo in the shadow and the Delete after it: the same file as one after another" "$SHADOW_SHA" "$PLAIN_SHA"
 
 echo "=== 15. a selection key queued before a composition ==="
+# Records what decides whether a composition is captured, just before and just
+# after its compositionstart is handled (read as window.__imeAt). The listener is
+# on window so it runs ahead of the app's own document capture listener.
+diag_ime_listen() {
+  evl "$DL" "window.__imeAt=undefined;window.addEventListener('compositionstart',()=>{const before=__auto.windowedImeState();queueMicrotask(()=>{window.__imeAt={before,after:__auto.windowedImeState()};});},{capture:true,once:true});1" >/dev/null
+}
+# The composition of queued_run $1 with that state printed around it.
+diag_ime_compose() {
+  diag_line "15 $1 before the composition" "$(e2e_read "$DL" "JSON.stringify(__auto.windowedImeState())")"
+  diag_ime_listen
+  evl "$DL" "window.__cd=undefined;__auto.windowedCompose({target:'editor',updates:['x'],endData:'x'}).then(()=>{window.__cd=1;});1" >/dev/null
+  e2e_wait_eval "$DL" "String(window.__cd===1)" "true"
+  diag_line "15 $1 around compositionstart" "$(e2e_read "$DL" "JSON.stringify(window.__imeAt)")"
+  diag_line "15 $1 after the composition" "$(e2e_read "$DL" "JSON.stringify(__auto.windowedImeState())")"
+}
 # The head is outside the window; Shift+End is queued and its swap is held at
 # the read, a composition begins and ends, the read is released.
 queued_run() {
@@ -1137,15 +1153,13 @@ queued_run() {
     hold_reads
     press End '{shiftKey:true}'
     e2e_wait_eval "$DL" "String(__auto.heldWindowedReads()===1)" "true"
-    evl "$DL" "window.__cd=undefined;__auto.windowedCompose({target:'editor',updates:['x'],endData:'x'}).then(()=>{window.__cd=1;});1" >/dev/null
-    e2e_wait_eval "$DL" "String(window.__cd===1)" "true"
+    diag_ime_compose "$1"
     release_reads
     settle
   else
     press End '{shiftKey:true}'
     settle
-    evl "$DL" "window.__cd=undefined;__auto.windowedCompose({target:'editor',updates:['x'],endData:'x'}).then(()=>{window.__cd=1;});1" >/dev/null
-    e2e_wait_eval "$DL" "String(window.__cd===1)" "true"
+    diag_ime_compose "$1"
     settle
   fi
   close_windowed

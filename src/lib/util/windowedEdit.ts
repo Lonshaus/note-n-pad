@@ -6,6 +6,7 @@ import {
   type Extension,
   type Text,
 } from '@codemirror/state';
+import { offscreenMove } from '../editor/offscreenArrow';
 import { capturedInput, outsideInputAction } from './imeCapture';
 import {
   blockedWhileGlobal,
@@ -630,6 +631,8 @@ export interface SelectionFilterDeps {
   mode: () => SelectAllMode;
   /** A key command is being handled: its selections are no native select-all. */
   keyActive: () => boolean;
+  /** A key command is being replayed from the queue. */
+  replayingKey: () => boolean;
   /** The rendered range, or null without a view. */
   viewport: () => { from: number; to: number } | null;
   /** Ask for a Select All over the file. */
@@ -664,7 +667,10 @@ export function selectionFilters(deps: SelectionFilterDeps): Extension[] {
           docChanged: tr.docChanged,
           isSelect: tr.isUserEvent('select'),
           isPointer: tr.isUserEvent('select.pointer'),
-          keyActive: deps.keyActive(),
+          keyActive:
+            deps.keyActive() ||
+            deps.replayingKey() ||
+            tr.annotation(offscreenMove) === true,
           from: selection.main.from,
           to: selection.main.to,
           viewportFrom: viewport.from,

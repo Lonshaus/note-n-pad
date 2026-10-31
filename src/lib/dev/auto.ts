@@ -107,6 +107,10 @@ const pasteHooks = {
           ),
         };
   },
+  /** The tab ids of the conversions under way. */
+  convertJobs: (): string[] => convertController.jobTabIds(),
+  /** How the last conversion's run ended. */
+  lastConvertExit: (): string | null => convertController.lastExit,
   /** Presses a button of that question by its label; false when there is none. */
   convertAnswer: (label: string): boolean => {
     const d = convertController.dialog;
@@ -289,6 +293,20 @@ export interface DocumentHooks {
   windowedEndPos: () => Promise<{ line: number; col: number } | null>;
   /** How many items the windowed editor's replay queue holds. */
   windowedReplayLength: () => number;
+  /** What decides whether a composition that starts now is captured, or null
+   *  without a windowed editor. */
+  windowedImeState: () => {
+    capturing: boolean;
+    locked: boolean;
+    outside: boolean | null;
+    selectAllPending: boolean;
+    swapping: boolean;
+    replaySwapActive: boolean;
+    draining: boolean;
+    holds: number;
+    wanted: boolean;
+    replayLength: number;
+  } | null;
   /** The windowed editor's global selection, window, whether the swap now
    *  running leaves it open to input, how many windows it has installed and
    *  how many `windowed_apply` and global commands it has sent; null without

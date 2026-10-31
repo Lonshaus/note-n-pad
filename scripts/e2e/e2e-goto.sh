@@ -165,7 +165,8 @@ restore_wrap() {
   rm -rf "$WORK"
   e2e_kill_owned_ports
 }
-trap restore_wrap EXIT INT TERM
+trap restore_wrap EXIT
+trap 'exit 1' INT TERM
 
 launch
 BOOT=$(boot_label)

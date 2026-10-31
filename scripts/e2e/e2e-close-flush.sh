@@ -190,7 +190,8 @@ restore_state() {
   wipe_test_docs
   e2e_kill_owned_ports
 }
-trap restore_state EXIT INT TERM
+trap restore_state EXIT
+trap 'exit 1' INT TERM
 
 echo "=== scenario A: mid dirty close + restart restore ==="
 launch

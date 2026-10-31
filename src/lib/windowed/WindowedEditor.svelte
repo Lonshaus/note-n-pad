@@ -36,6 +36,11 @@
     settleViewComposition,
   } from '../editor/composition';
   import { cmPhraseExtension } from '../editor/cmPhrases';
+  import {
+    deferredMove,
+    offscreenMove,
+    settleDeferredMove,
+  } from '../editor/offscreenArrow';
   import { shortcutsState } from '../state/shortcuts.svelte';
   import { settingsState } from '../state/settings.svelte';
   import { platform } from '../state/platform.svelte';
@@ -646,7 +651,8 @@
         docChanged: tr.docChanged,
         isSelect: tr.isUserEvent('select'),
         isPointer: tr.isUserEvent('select.pointer'),
-        keyActive,
+        keyActive:
+          keyActive || replayingKey || tr.annotation(offscreenMove) === true,
         from: main.from,
         to: main.to,
         viewportFrom: v.viewport.from,
@@ -792,6 +798,7 @@
           keep: () => capture !== null && swapKeepsInput(),
           mode: () => settingsState.largeSelectAll,
           keyActive: () => keyActive,
+          replayingKey: () => replayingKey,
           viewport: () =>
             view === undefined
               ? null
@@ -2037,6 +2044,8 @@
       } finally {
         replayingKey = false;
       }
+      // A move that waits for a layout measure is part of this key.
+      await deferredMove(v);
       if (!handled && item.restore !== undefined) {
         restore(item.restore);
       }
@@ -2970,6 +2979,7 @@
     if (shadow === sh) {
       shadow = null;
     }
+    settleDeferredMove(sh.view);
     sh.view.destroy();
     sh.host.remove();
     notifyFlushWaiters();
@@ -4827,7 +4837,10 @@
       if (import.meta.env.DEV) {
         void import('../dev/editorRegistry').then((m) => m.setActiveView(null));
       }
-      view?.destroy();
+      if (view !== undefined) {
+        settleDeferredMove(view);
+        view.destroy();
+      }
       view = undefined;
     };
   });
@@ -4953,6 +4966,32 @@
   }
   export function replayLength(): number {
     return replayQueue.length;
+  }
+  // DEV/automation: every input `captureStartAllowed` reads.
+  export function imeState(): {
+    capturing: boolean;
+    locked: boolean;
+    outside: boolean | null;
+    selectAllPending: boolean;
+    swapping: boolean;
+    replaySwapActive: boolean;
+    draining: boolean;
+    holds: number;
+    wanted: boolean;
+    replayLength: number;
+  } {
+    return {
+      capturing: capture !== null,
+      locked,
+      outside: view === undefined ? null : inputOutside(view.state.doc),
+      selectAllPending: selectAllGate.pending(),
+      swapping,
+      replaySwapActive,
+      draining,
+      holds,
+      wanted: replayWanted(),
+      replayLength: replayQueue.length,
+    };
   }
   // DEV/automation: the global selection and what the editor is doing with it.
   export function globalInfo(): {

@@ -278,6 +278,18 @@
     };
     endPos: () => Promise<{ line: number; col: number }>;
     replayLength: () => number;
+    imeState: () => {
+      capturing: boolean;
+      locked: boolean;
+      outside: boolean | null;
+      selectAllPending: boolean;
+      swapping: boolean;
+      replaySwapActive: boolean;
+      draining: boolean;
+      holds: number;
+      wanted: boolean;
+      replayLength: number;
+    };
     globalInfo: () => {
       globalSel: {
         anchor: { line: number; col: number };
@@ -1573,6 +1585,9 @@
           getTitle: () => title,
           getTabs: () =>
             documentWindow.tabs.map((t, i) => ({
+              id: t.id,
+              windowed: t.windowed !== undefined,
+              converted: t.converted ?? null,
               path: t.path,
               dirty: documentWindow.isDirty(t),
               active: i === documentWindow.activeIndex,
@@ -1756,6 +1771,7 @@
           windowedGlobalSel: () => windowedRef?.globalSelection() ?? null,
           windowedEndPos: () => windowedRef?.endPos() ?? Promise.resolve(null),
           windowedReplayLength: () => windowedRef?.replayLength() ?? 0,
+          windowedImeState: () => windowedRef?.imeState() ?? null,
           windowedGlobalInfo: () => windowedRef?.globalInfo() ?? null,
           windowedPointerSelect: (offset: number) =>
             windowedRef?.pointerSelect(offset) ?? false,

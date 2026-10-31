@@ -260,22 +260,6 @@ PYEOF
   echo "longlast.log bytes: $(file_size "$WORK/longlast.log")"
 fi
 
-launch
-BOOT=$(boot_label)
-evl "$BOOT" "window.__TAURI_INTERNALS__.invoke('open_document_window',{path:'$WORK/seed.txt'})" >/dev/null
-e2e_wait_until doc_label_ready
-DL=$(doc_label)
-if [ -z "$DL" ]; then
-  echo "FATAL: no document window appeared"
-  exit 1
-fi
-e2e_wait_eval "$DL" "String(typeof __auto!=='undefined' && typeof __auto.windowedOpen==='function' && __auto.getTabs().length===1)" "true"
-# Pin the language for the page text read below, and capture what the trap
-# restores. The settings are the user's real ones.
-ORIG_LANG=$(e2e_read "$DL" "String(__auto.getLanguage())")
-ORIG_MODE=$(e2e_read "$DL" "String(__auto.getLargeOpenMode())")
-ORIG_SELECT=$(e2e_read "$DL" "String(__auto.largeSelectAllMode())")
-echo "original language: $ORIG_LANG, large_open_mode: $ORIG_MODE, large_select_all: $ORIG_SELECT"
 restore_state() {
   trap '' INT TERM
   local dl
@@ -311,7 +295,24 @@ restore_state() {
   wipe_test_docs
   e2e_kill_owned_ports
 }
-trap restore_state EXIT INT TERM
+trap restore_state EXIT
+trap 'exit 1' INT TERM
+launch
+BOOT=$(boot_label)
+evl "$BOOT" "window.__TAURI_INTERNALS__.invoke('open_document_window',{path:'$WORK/seed.txt'})" >/dev/null
+e2e_wait_until doc_label_ready
+DL=$(doc_label)
+if [ -z "$DL" ]; then
+  echo "FATAL: no document window appeared"
+  exit 1
+fi
+e2e_wait_eval "$DL" "String(typeof __auto!=='undefined' && typeof __auto.windowedOpen==='function' && __auto.getTabs().length===1)" "true"
+# Pin the language for the page text read below, and capture what the trap
+# restores. The settings are the user's real ones.
+ORIG_LANG=$(e2e_read "$DL" "String(__auto.getLanguage())")
+ORIG_MODE=$(e2e_read "$DL" "String(__auto.getLargeOpenMode())")
+ORIG_SELECT=$(e2e_read "$DL" "String(__auto.largeSelectAllMode())")
+echo "original language: $ORIG_LANG, large_open_mode: $ORIG_MODE, large_select_all: $ORIG_SELECT"
 evl "$DL" "__auto.setLanguage('en')" >/dev/null
 evl "$DL" "__auto.setLargeSelectAll('file')" >/dev/null
 e2e_wait_setting large_select_all "file"

@@ -1,7 +1,7 @@
 // Copyright © 2026 Lonshaus
 // SPDX-License-Identifier: GPL-3.0-only
 
-import { describe, expect, it } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import {
   EditorSelection,
   EditorState,
@@ -12,7 +12,13 @@ import {
   type TransactionSpec,
 } from '@codemirror/state';
 import { EditorView } from '@codemirror/view';
-import { offscreenArrowKeys, offscreenLineTarget } from './offscreenArrow';
+import {
+  deferredMove,
+  offscreenArrowKeys,
+  offscreenLineTarget,
+  offscreenMove,
+  settleDeferredMove,
+} from './offscreenArrow';
 
 describe('offscreenLineTarget', () => {
   const current = { from: 10, to: 30 };
@@ -69,8 +75,29 @@ describe('offscreen Up and Down commands', () => {
   const doc = Array.from({ length: 10 }, () => '0123456789').join('\n');
   const [up, down] = offscreenArrowKeys;
   const lineStart = (n: number): number => n * 11;
+  let frames: (() => void)[] = [];
+  beforeEach(() => {
+    frames = [];
+    vi.stubGlobal('requestAnimationFrame', (callback: () => void) => {
+      frames.push(callback);
+      return frames.length;
+    });
+  });
+  afterEach(() => {
+    vi.unstubAllGlobals();
+  });
+  /** Run the animation frames requested so far, then the measures they asked for. */
+  async function frame(flush: () => Promise<void>): Promise<void> {
+    const due = frames;
+    frames = [];
+    due.forEach((callback) => callback());
+    await flush();
+  }
 
   interface Options {
+    // CodeMirror's measure loop gave up with the request queued: it only runs
+    // once requestMeasure() is called again.
+    stalled?: boolean;
     viewport?: { from: number; to: number };
     // The viewport once the scroll has been measured.
     scrolledViewport?: { from: number; to: number };
@@ -95,6 +122,8 @@ describe('offscreen Up and Down commands', () => {
     const log: string[] = [];
     const moves: Transaction[] = [];
     const pending: (() => void)[] = [];
+    const stuck: (() => void)[] = [];
+    let connected = true;
     // Like CodeMirror, refuse layout reads and updates during a measure write.
     let measuring = false;
     let viewport = options.viewport ?? { from: 0, to: 10 };
@@ -118,9 +147,19 @@ describe('offscreen Up and Down commands', () => {
           log.push('scroll');
         }
       },
-      requestMeasure: (request: { write?: () => void }) => {
+      dom: {
+        get isConnected() {
+          return connected;
+        },
+      },
+      requestMeasure: (request?: { write?: () => void }) => {
+        if (request === undefined) {
+          log.push('rearm');
+          pending.push(...stuck.splice(0));
+          return;
+        }
         log.push('requestMeasure');
-        pending.push(() => {
+        (options.stalled ? stuck : pending).push(() => {
           if (log.includes('scroll') && options.scrolledViewport) {
             if (lateMeasures > 0) {
               lateMeasures -= 1;
@@ -157,7 +196,16 @@ describe('offscreen Up and Down commands', () => {
         await Promise.resolve();
       }
     };
-    return { view, log, moves, flush, selection: () => state.selection };
+    return {
+      view,
+      log,
+      moves,
+      flush,
+      selection: () => state.selection,
+      disconnect: () => {
+        connected = false;
+      },
+    };
   }
 
   async function press(
@@ -254,6 +302,97 @@ describe('offscreen Up and Down commands', () => {
         expect(result.selection().main.head).toBe(4);
       }
     }
+  });
+
+  it('marks the move that ran after a measure and not one that ran at once', async () => {
+    const late = await press(down, false, EditorSelection.single(11 * 6 + 4), {
+      scrolledViewport: { from: 55, to: 100 },
+    });
+    expect(late.moves[0]?.annotation(offscreenMove)).toBe(true);
+    const now = await press(down, false, EditorSelection.single(11 * 6 + 4), {
+      viewport: { from: 55, to: 100 },
+    });
+    expect(now.moves[0]?.annotation(offscreenMove)).toBeUndefined();
+  });
+
+  it('keeps a deferred move known until it has run', async () => {
+    const harness = makeView(EditorSelection.single(11 * 6 + 4), {
+      scrolledViewport: { from: 55, to: 100 },
+    });
+    expect(deferredMove(harness.view)).toBeUndefined();
+    expect(down?.run?.(harness.view)).toBe(true);
+    const waiting = deferredMove(harness.view);
+    expect(waiting).toBeInstanceOf(Promise);
+    let done = false;
+    void waiting?.then(() => {
+      done = true;
+    });
+    await Promise.resolve();
+    expect(done).toBe(false);
+    expect(harness.selection().main.head).toBe(11 * 6 + 4);
+    await harness.flush();
+    await waiting;
+    expect(done).toBe(true);
+    expect(harness.selection().main.head).toBe(lineStart(7));
+    expect(deferredMove(harness.view)).toBeUndefined();
+  });
+
+  it('asks for a measure each frame until a dropped request has run', async () => {
+    const harness = makeView(EditorSelection.single(11 * 6 + 4), {
+      scrolledViewport: { from: 55, to: 100 },
+      stalled: true,
+    });
+    expect(down?.run?.(harness.view)).toBe(true);
+    let done = false;
+    void deferredMove(harness.view)?.then(() => {
+      done = true;
+    });
+    await harness.flush();
+    expect(harness.selection().main.head).toBe(11 * 6 + 4);
+    await frame(harness.flush);
+    expect(done).toBe(true);
+    expect(harness.selection().main.head).toBe(lineStart(7));
+    expect(deferredMove(harness.view)).toBeUndefined();
+    await frame(harness.flush);
+    expect(harness.log.filter((entry) => entry === 'rearm')).toHaveLength(1);
+    expect(frames).toHaveLength(0);
+  });
+
+  it('stops asking for a measure once the view is disconnected', async () => {
+    const harness = makeView(EditorSelection.single(11 * 6 + 4), {
+      scrolledViewport: { from: 55, to: 100 },
+      stalled: true,
+    });
+    down?.run?.(harness.view);
+    harness.disconnect();
+    await frame(harness.flush);
+    expect(harness.log).not.toContain('rearm');
+    expect(frames).toHaveLength(0);
+  });
+
+  it('waits for every deferred move of a view', async () => {
+    const harness = makeView(EditorSelection.single(11 * 6 + 4), {
+      scrolledViewport: { from: 55, to: 100 },
+    });
+    down?.run?.(harness.view);
+    const first = deferredMove(harness.view);
+    down?.run?.(harness.view);
+    expect(deferredMove(harness.view)).toBe(first);
+    await harness.flush();
+    await first;
+    expect(deferredMove(harness.view)).toBeUndefined();
+  });
+
+  it('resolves a deferred move of a view that goes away', async () => {
+    const harness = makeView(EditorSelection.single(11 * 6 + 4), {
+      scrolledViewport: { from: 55, to: 100 },
+    });
+    down?.run?.(harness.view);
+    const waiting = deferredMove(harness.view);
+    settleDeferredMove(harness.view);
+    await waiting;
+    expect(deferredMove(harness.view)).toBeUndefined();
+    expect(harness.selection().main.head).toBe(11 * 6 + 4);
   });
 
   it('is still handled, without a move, when the caret is already at the end', async () => {

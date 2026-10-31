@@ -261,19 +261,6 @@ for n in 1 2 3; do
 done
 printf 'seed\n' >"$WORK/seed.txt"
 
-launch
-BOOT=$(boot_label)
-evl "$BOOT" "window.__TAURI_INTERNALS__.invoke('open_document_window',{path:'$WORK/seed.txt'})" >/dev/null
-e2e_wait_until doc_label_ready
-DL=$(doc_label)
-if [ -z "$DL" ]; then
-  echo "FATAL: no document window appeared"
-  exit 1
-fi
-e2e_wait_eval "$DL" "String(typeof __auto!=='undefined' && typeof __auto.windowedOpen==='function' && __auto.getTabs().length===1)" "true"
-# The setting is the user's real one: capture it for the trap to restore.
-ORIG_SELECT=$(e2e_read "$DL" "String(__auto.largeSelectAllMode())")
-echo "original large_select_all: $ORIG_SELECT"
 restore_state() {
   trap '' INT TERM
   local dl
@@ -291,7 +278,21 @@ restore_state() {
   wipe_test_docs
   e2e_kill_owned_ports
 }
-trap restore_state EXIT INT TERM
+trap restore_state EXIT
+trap 'exit 1' INT TERM
+launch
+BOOT=$(boot_label)
+evl "$BOOT" "window.__TAURI_INTERNALS__.invoke('open_document_window',{path:'$WORK/seed.txt'})" >/dev/null
+e2e_wait_until doc_label_ready
+DL=$(doc_label)
+if [ -z "$DL" ]; then
+  echo "FATAL: no document window appeared"
+  exit 1
+fi
+e2e_wait_eval "$DL" "String(typeof __auto!=='undefined' && typeof __auto.windowedOpen==='function' && __auto.getTabs().length===1)" "true"
+# The setting is the user's real one: capture it for the trap to restore.
+ORIG_SELECT=$(e2e_read "$DL" "String(__auto.largeSelectAllMode())")
+echo "original large_select_all: $ORIG_SELECT"
 evl "$DL" "__auto.setLargeSelectAll('visible')" >/dev/null
 e2e_wait_setting large_select_all "visible"
 # Xvfb has no window manager, so the window must be given focus or CodeMirror ignores DOM selections.
@@ -318,12 +319,13 @@ e2e_wait_eval "$DL" "$(js_total)" "$SIZE"
 e2e_wait_until _e2e_eval_equals "$DL" "$(js_idle)" "true"
 save_active
 check "undo gives back the bytes (sha256 of the saved file)" "$(file_sha256 "$WORK/doc1.log")" "$SHA_BEFORE"
-check "the spill file is still there after the undo" "$(sp_count)" "1"
+check "the undo put the spill back into the document and the save dropped the file" "$(sp_count)" "0"
 evl "$DL" "__auto.windowedRedo()" >/dev/null
 e2e_wait_eval "$DL" "$(js_total)" "$((SIZE - L))"
 e2e_wait_until _e2e_eval_equals "$DL" "$(js_idle)" "true"
 save_active
 check "redo gives the deleted bytes again (sha256 of the saved file)" "$(file_sha256 "$WORK/doc1.log")" "$SHA_DELETED"
+check "the redo made the spill file again" "$(sp_count)" "1"
 check "no exception thrown" "$(e2e_read "$DL" "$(js_errors)")" "0"
 close_windowed
 e2e_wait_until sp_count_is 0

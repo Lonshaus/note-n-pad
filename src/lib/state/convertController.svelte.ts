@@ -60,8 +60,14 @@ interface Fingerprint {
   size: number;
   mtime_ms: number;
 }
-
-class Cancelled extends Error {}
+/** The run is given up; `where` is the check that found it so. */
+class Cancelled extends Error {
+  readonly where: string;
+  constructor(where: string) {
+    super(where);
+    this.where = where;
+  }
+}
 /** The save of a result too big to edit failed: where to, and the core's error. */
 class ConvertSaveFailed extends Error {
   readonly path: string;
@@ -145,6 +151,8 @@ export class ConvertController {
   }[] = [];
   private nextDialog = 0;
   private jobs = new Map<string, Job>();
+  /** How the last run ended, for the automation hooks. */
+  lastExit: string | null = null;
   /** The notes handed to a document window and not yet taken over, by note id. */
   private handoffs = new Map<string, Job>();
   private docHost: DocConvertHost | null = null;
@@ -155,6 +163,10 @@ export class ConvertController {
   }
   attachSticky(host: StickyConvertHost | null): void {
     this.stickyHost = host;
+  }
+  /** The tabs that have a conversion under way. */
+  jobTabIds(): string[] {
+    return [...this.jobs.keys()];
   }
   /** Whether a conversion holds the tab. */
   busy(tabId: string): boolean {
@@ -271,12 +283,14 @@ export class ConvertController {
     }
   }
   private check(job: Job): void {
+    if (job.cancelled) {
+      throw new Cancelled('check: job cancelled');
+    }
     if (
-      job.cancelled ||
-      (job.request.dest === 'document' &&
-        this.docHost?.tab(job.request.tabId) == null)
+      job.request.dest === 'document' &&
+      this.docHost?.tab(job.request.tabId) == null
     ) {
-      throw new Cancelled();
+      throw new Cancelled('check: tab gone');
     }
   }
   private finish(job: Job): void {
@@ -297,7 +311,7 @@ export class ConvertController {
     }
     const tab = this.docHost?.tab(job.request.tabId);
     if (tab === undefined || tab === null) {
-      throw new Cancelled();
+      throw new Cancelled('info: tab gone');
     }
     return tab;
   }
@@ -305,8 +319,11 @@ export class ConvertController {
   private async run(job: Job): Promise<void> {
     let failure: { error: unknown } | null = null;
     let keepLock = false;
+    let exit = 'completed';
     try {
-      if ((await this.ask(job, confirmSpec())) !== 'primary') {
+      const answer = await this.ask(job, confirmSpec());
+      if (answer !== 'primary') {
+        exit = `answer: ${answer}`;
         return;
       }
       this.check(job);
@@ -333,7 +350,7 @@ export class ConvertController {
       );
       this.check(job);
       if (!done.editable) {
-        await this.tooBig(job, id, info);
+        exit = await this.tooBig(job, id, info);
       } else if (job.request.dest === 'document') {
         // The core owns the file from here on, whatever comes of it.
         job.convertId = null;
@@ -360,10 +377,14 @@ export class ConvertController {
         keepLock = true;
       }
     } catch (e) {
-      if (!(e instanceof Cancelled)) {
+      if (e instanceof Cancelled) {
+        exit = e.where;
+      } else {
+        exit = 'error';
         failure = { error: e };
       }
     } finally {
+      this.lastExit = `${job.request.tabId}: ${exit}, cancelled=${job.cancelled}`;
       this.releasePin(job);
       if (job.convertId !== null) {
         const id = job.convertId;
@@ -417,14 +438,15 @@ export class ConvertController {
     return save(saveDialogOptions(info.language, suggested));
   }
   /** D16: the result is too big to edit. The user may have it saved and shown in
-   *  the view, or have nothing pasted. */
+   *  the view, or have nothing pasted. Returns how it ended, for `lastExit`. */
   private async tooBig(
     job: Job,
     id: string,
     info: ConvertTabInfo,
-  ): Promise<void> {
-    if ((await this.ask(job, tooBigSpec())) !== 'primary') {
-      return;
+  ): Promise<string> {
+    const answer = await this.ask(job, tooBigSpec());
+    if (answer !== 'primary') {
+      return `tooBig answer: ${answer}`;
     }
     let target: string | null = info.path === '' ? null : info.path;
     let expected = job.expected;
@@ -433,7 +455,7 @@ export class ConvertController {
     if (target === null) {
       target = await this.pickPath(info, 'Untitled');
       if (target === null) {
-        return;
+        return 'tooBig: no path';
       }
     }
     let saved: Fingerprint;
@@ -461,13 +483,13 @@ export class ConvertController {
           if (choice === 'secondary') {
             const other = await this.pickPath(info, suggestedName(target));
             if (other === null) {
-              return;
+              return 'tooBig conflict: no path';
             }
             target = other;
             expected = null;
             continue;
           }
-          return;
+          return `tooBig conflict: ${choice}`;
         }
         if (why === 'unmappable') {
           const choice = await this.ask(
@@ -482,26 +504,27 @@ export class ConvertController {
           if (choice === 'secondary') {
             const other = await this.pickPath(info, suggestedName(target));
             if (other === null) {
-              return;
+              return 'tooBig unmappable: no path';
             }
             target = other;
             encoding = 'UTF-8';
             bom = false;
             continue;
           }
-          return;
+          return `tooBig unmappable: ${choice}`;
         }
         throw new ConvertSaveFailed(target, why);
       }
     }
     if (job.cancelled) {
-      return;
+      return 'tooBig: cancelled after save';
     }
     if (job.request.dest === 'document') {
       await this.docHost?.showViewer(job.request.tabId, target, saved.size);
     } else {
       await this.stickyHost?.openSaved(target);
     }
+    return 'completed';
   }
 }
 

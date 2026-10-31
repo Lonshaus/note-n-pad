@@ -643,6 +643,145 @@ describe('a conversion that fails', () => {
   });
 });
 
+describe('the record of a run', () => {
+  it('lists the tabs under way and has no exit before one ends', async () => {
+    core();
+    const s = setup();
+    expect(s.controller.jobTabIds()).toEqual([]);
+    expect(s.controller.lastExit).toBeNull();
+    s.controller.start(s.request);
+    await flush();
+    expect(s.controller.jobTabIds()).toEqual(['t1']);
+    s.controller.answer('cancel');
+    await flush();
+    expect(s.controller.jobTabIds()).toEqual([]);
+  });
+  it('notes an answer other than primary', async () => {
+    core();
+    const s = setup();
+    s.controller.start(s.request);
+    await press(s, 'cancel', 'confirm');
+    expect(s.controller.lastExit).toBe('t1: answer: cancel, cancelled=false');
+  });
+  it('notes a finished run', async () => {
+    core();
+    const s = setup();
+    await go(s);
+    expect(s.controller.lastExit).toBe('t1: completed, cancelled=false');
+  });
+  it('notes a too-big result answered other than primary', async () => {
+    core({ convert_finish: () => ({ bytes: 9, editable: false }) });
+    const s = setup({ tab: { path: '/d/a.txt' } });
+    await go(s);
+    await press(s, 'cancel', 'tooBig');
+    expect(s.controller.lastExit).toBe(
+      't1: tooBig answer: cancel, cancelled=false',
+    );
+  });
+  it('notes a too-big result that was saved and shown', async () => {
+    core({ convert_finish: () => ({ bytes: 9, editable: false }) });
+    const s = setup({ tab: { path: '/d/a.txt' } });
+    await go(s);
+    await press(s, 'primary', 'tooBig');
+    expect(s.controller.lastExit).toBe('t1: completed, cancelled=false');
+  });
+  it('notes a too-big result of an untitled document with no path picked', async () => {
+    core({ convert_finish: () => ({ bytes: 9, editable: false }) });
+    const s = setup();
+    mockSave.mockResolvedValueOnce(null);
+    await go(s);
+    await press(s, 'primary', 'tooBig');
+    expect(s.controller.lastExit).toBe('t1: tooBig: no path, cancelled=false');
+  });
+  it('notes a too-big save whose conflict question was cancelled', async () => {
+    core({
+      convert_finish: () => ({ bytes: 9, editable: false }),
+      convert_save: () => {
+        throw 'fingerprint-mismatch';
+      },
+    });
+    const s = setup({ tab: { path: '/d/a.txt' } });
+    await go(s);
+    await press(s, 'primary', 'tooBig');
+    await press(s, 'cancel', 'conflict');
+    expect(s.controller.lastExit).toBe(
+      't1: tooBig conflict: cancel, cancelled=false',
+    );
+  });
+  it('notes a too-big save as UTF-8 with no path picked', async () => {
+    core({
+      convert_finish: () => ({ bytes: 9, editable: false }),
+      convert_save: () => {
+        throw 'unmappable';
+      },
+    });
+    const s = setup({ tab: { path: '/d/a.txt', encoding: 'Shift_JIS' } });
+    mockSave.mockResolvedValueOnce(null);
+    await go(s);
+    await press(s, 'primary', 'tooBig');
+    await press(s, 'secondary', 'unmappable');
+    expect(s.controller.lastExit).toBe(
+      't1: tooBig unmappable: no path, cancelled=false',
+    );
+  });
+  it('notes a too-big save given up while it was writing', async () => {
+    let release: () => void = () => {};
+    core({
+      convert_finish: () => ({ bytes: 9, editable: false }),
+      convert_save: () =>
+        new Promise<{ size: number; mtime_ms: number }>((resolve) => {
+          release = () => resolve({ size: 77, mtime_ms: 1 });
+        }),
+    });
+    const s = setup({ tab: { path: '/d/a.txt' } });
+    await go(s);
+    await press(s, 'primary', 'tooBig');
+    s.controller.cancelTab('t1');
+    release();
+    await flush();
+    expect(s.controller.lastExit).toBe(
+      't1: tooBig: cancelled after save, cancelled=true',
+    );
+    expect(s.doc.showViewer).not.toHaveBeenCalled();
+  });
+  it('notes which check found the run given up', async () => {
+    let release: () => void = () => {};
+    core({
+      convert_append: () =>
+        new Promise<void>((resolve) => {
+          release = resolve;
+        }),
+    });
+    const closed = setup();
+    await go(closed);
+    closed.controller.cancelTab('t1');
+    release();
+    await flush();
+    expect(closed.controller.lastExit).toBe(
+      't1: check: job cancelled, cancelled=true',
+    );
+    const gone = setup();
+    gone.controller.start(gone.request);
+    await flush();
+    gone.doc.gone = true;
+    gone.controller.answer('primary');
+    await flush();
+    expect(gone.controller.lastExit).toBe(
+      't1: check: tab gone, cancelled=false',
+    );
+  });
+  it('notes a failure', async () => {
+    core({
+      convert_append: () => {
+        throw 'No space left on device (os error 28)';
+      },
+    });
+    const s = setup();
+    await go(s);
+    expect(s.controller.lastExit).toBe('t1: error, cancelled=false');
+  });
+});
+
 describe('D16, the result is too big to edit', () => {
   const tooBig = { convert_finish: () => ({ bytes: 9, editable: false }) };
   it('asks with both buttons', async () => {

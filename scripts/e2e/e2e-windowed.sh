@@ -234,25 +234,9 @@ with open('$WORK/bad.log', 'r+b') as f:
 PYEOF
 BAD_SIZE=$(file_size "$WORK/bad.log")
 echo "bad.log bytes: $BAD_SIZE (>104857600 required)"
-
-launch
-
-echo "=== non-UTF-8: lock disabled ==="
-open_large "$WORK/bad.log"
-tries=0
-until [ "$(evl "$DL" "String(__auto.isLargeTab())")" = "true" ]; do
-  sleep 1
-  tries=$((tries + 1))
-  if [ "$tries" -gt 30 ]; then
-    break
-  fi
-done
-# Pin the UI language before any text-dependent assertion so results never
-# depend on the host system language. A single combined trap restores both the
-# language and the large-open mode (captured just below); it must be the only
-# trap, since a later trap would silently replace this one.
-ORIG_LANG=$(e2e_read "$DL" "String(__auto.getLanguage())")
-echo "original language: $ORIG_LANG"
+# A single combined trap restores both the language and the large-open mode
+# (captured below); it must be the only trap, since a later trap would silently
+# replace this one.
 restore_state() {
   trap '' INT TERM
   if [ -n "${DL:-}" ] && [ -n "${ORIG_LANG:-}" ]; then
@@ -274,7 +258,25 @@ restore_state() {
   fi
   e2e_kill_owned_ports
 }
-trap restore_state EXIT INT TERM
+trap restore_state EXIT
+trap 'exit 1' INT TERM
+
+launch
+
+echo "=== non-UTF-8: lock disabled ==="
+open_large "$WORK/bad.log"
+tries=0
+until [ "$(evl "$DL" "String(__auto.isLargeTab())")" = "true" ]; do
+  sleep 1
+  tries=$((tries + 1))
+  if [ "$tries" -gt 30 ]; then
+    break
+  fi
+done
+# Pin the UI language before any text-dependent assertion so results never
+# depend on the host system language.
+ORIG_LANG=$(e2e_read "$DL" "String(__auto.getLanguage())")
+echo "original language: $ORIG_LANG"
 evl "$DL" "__auto.setLanguage('zh-TW')" >/dev/null
 sleep 1
 check "bad.log opened read-only" "$(e2e_read "$DL" "String(__auto.isLargeTab())")" "true"

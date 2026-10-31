@@ -36,6 +36,7 @@ import {
   type SelectionFilterDeps,
 } from './windowedEdit';
 import type { LineSelection, SelectAllMode } from './windowSelection';
+import { offscreenMove } from '../editor/offscreenArrow';
 
 describe('byteLength', () => {
   it('counts ASCII as one byte each', () => {
@@ -1389,6 +1390,7 @@ describe('selectionFilters', () => {
       keep: () => false,
       mode: () => 'file' as SelectAllMode,
       keyActive: () => false,
+      replayingKey: () => false,
       viewport: () => ({ from: 0, to: DOC.length }),
       request,
       ...over,
@@ -1449,6 +1451,20 @@ describe('selectionFilters', () => {
     selectAll(key.state);
     expect(key.request).not.toHaveBeenCalled();
   });
+  it('does not note the selection of a key command replayed from the queue', () => {
+    const { state, request } = setup({ replayingKey: () => true });
+    selectAll(state);
+    expect(request).not.toHaveBeenCalled();
+  });
+  it('does not note the selection of a move that ran after a measure', () => {
+    const { state, request } = setup();
+    state.update({
+      selection: { anchor: 0, head: DOC.length },
+      userEvent: 'select',
+      annotations: offscreenMove.of(true),
+    });
+    expect(request).not.toHaveBeenCalled();
+  });
   it('does not note a selection that leaves part of the range out', () => {
     const { state, request } = setup();
     state.update({
@@ -1481,6 +1497,7 @@ describe('selectionFilters', () => {
         keep: () => false,
         mode: () => 'file',
         keyActive: () => false,
+        replayingKey: () => false,
         viewport: () => ({ from: 0, to: DOC.length }),
         request,
       }),
