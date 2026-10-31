@@ -493,6 +493,20 @@ describe('decideKey', () => {
     });
   });
 
+  it('queues Option plus a character as text on macOS only', () => {
+    const e = ev('l', { code: 'KeyL', altKey: true });
+    const outside = { outside: true };
+    expect(decide(e, outside, { os: 'macos', layers: mac })).toEqual({
+      type: 'text',
+      text: 'l',
+    });
+    for (const os of ['windows', 'linux']) {
+      expect(decide(e, outside, { os, layers: win }), os).toEqual({
+        type: 'none',
+      });
+    }
+  });
+
   it('drops a key typed during a replace all pass', () => {
     expect(decide(ev('a'), { dropHold: true, outside: true })).toEqual({
       type: 'none',

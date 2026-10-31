@@ -10,11 +10,15 @@
 # order of keys that were queued before an operation.
 # Input methods: keys are keydown events dispatched at the editor
 # (__auto.windowedPressKey), with Cmd on Darwin and Ctrl elsewhere as the
-# modifier and the platform's own keys for the rest; text goes in through
-# document.execCommand('insertText') or the same keydown events; a composition is
-# __auto.windowedCompose (it never sets view.composing, a real input method is
-# checked by hand); the paste is a synthetic event carrying a DataTransfer, so
-# the system clipboard is not used.
+# modifier and the platform's own keys for the rest. Keys only move the
+# selection and run commands: a synthetic keydown types nothing where the
+# selection is inside the window, so text goes in through
+# document.execCommand('insertText' ...) there, and through keydown events only
+# over a selection larger than a window, which the replay types. A composition
+# is __auto.windowedCompose (it never sets view.composing, a real input method is
+# checked by hand). The paste is a synthetic event carrying a DataTransfer; where
+# there are clips (macOS, Windows) the core asks the system clipboard what it
+# holds, so the text is put there first (e2e_paste_os).
 # Every read of /proc for VmRSS runs on Linux only and prints a SKIP elsewhere.
 # LESSON: never put `await` inside an eval string; use `.then((r)=>{window.__x=r;})`
 # and end a fire-and-forget eval with `;1` so it does not wait for the promise.
@@ -40,6 +44,8 @@ BIG_SIZE=$((BIG_LINES * LINE_BYTES - 1))
 RSS_LIMIT_KB=65536
 mkdir -p "$OUT"
 : >"$OUT/dev-global-edit.log"
+DIAG_LOG="$OUT/dev-diag-global-edit.log"
+: >"$DIAG_LOG"
 
 ok() {
   PASS=$((PASS + 1))
@@ -53,7 +59,7 @@ check() {
   if [ "$2" = "$3" ]; then
     ok "$1"
   else
-    bad "$1 (got: [$2], want: [$3])"
+    bad "$1 (got: [$(e2e_show "$2")], want: [$(e2e_show "$3")])"
   fi
 }
 count_kind() {
@@ -181,7 +187,9 @@ file_sha256() {
 # Wait for no swap and an empty queue, then a moment for what a settled editor
 # may still start.
 settle() {
-  e2e_wait_until "${1:-300}" _e2e_eval_equals "$DL" "$(js_settled)" "true"
+  if ! e2e_wait_until "${1:-300}" _e2e_eval_equals "$DL" "$(js_settled)" "true"; then
+    bad "settle: the editor did not settle in ${1:-300} s"
+  fi
   sleep 1
 }
 # Press a key at the editor: $1 the key name, $2 the modifiers as a JS object.
@@ -202,7 +210,9 @@ press_mod() {
 }
 select_all() {
   evl "$DL" "__t.focus();__t.mod('a')" >/dev/null
-  e2e_wait_until 600 _e2e_eval_equals "$DL" "String(__t.isAll($END_LINE,$END_COL))" "true"
+  if ! e2e_wait_until 600 _e2e_eval_equals "$DL" "String(__t.isAll($END_LINE,$END_COL))" "true"; then
+    bad "select_all: the selection never became the whole file"
+  fi
 }
 total() {
   e2e_read "$DL" "$(js_total)"
@@ -455,7 +465,9 @@ BIG_END_LINE=$((BIG_LINES - 1))
 open_windowed "$WORK/big.log" 2
 big_select_all() {
   evl "$DL" "__t.focus();__t.mod('a')" >/dev/null
-  e2e_wait_until 600 _e2e_eval_equals "$DL" "String(__t.isAll($BIG_END_LINE,$END_COL))" "true"
+  if ! e2e_wait_until 600 _e2e_eval_equals "$DL" "String(__t.isAll($BIG_END_LINE,$END_COL))" "true"; then
+    bad "big_select_all: the selection never became the whole file"
+  fi
 }
 check "the big file has the lines" "$(e2e_read "$DL" "String(__auto.windowedInfo().totalLines)")" "$BIG_LINES"
 
@@ -522,6 +534,8 @@ check "three undos give the file from before the indentation" "$(file_sha256 "$W
 
 echo "--- a multi-line paste ---"
 big_select_all
+# Where there are clips the core reads the system clipboard, not the event.
+e2e_paste_os "$(printf 'one\r\ntwo\nthree')"
 rss_begin
 evl "$DL" "__t.clip('paste','one\\r\\ntwo\\nthree')" >/dev/null
 settle 600
@@ -577,7 +591,7 @@ select_all
 press End
 settle
 check "the selection is a caret at the end of the file" "$(gsel)" "{\"anchor\":{\"line\":$END_LINE,\"col\":$END_COL},\"head\":{\"line\":$END_LINE,\"col\":$END_COL}}"
-press x
+evl "$DL" "__t.focus();document.execCommand('insertText',false,'x')" >/dev/null
 settle
 close_windowed
 check "x follows the end of the file, the rest is as it was" "$(python3 "$WORK/chk.py" append "$DOC" "$WORK/base.log" x)" "true"
@@ -784,7 +798,11 @@ sleep 0.7
 REF_ALL_DOWN=$(norm_sel "$(e2e_read "$DL" "JSON.stringify(__auto.getDocSelection())")" "$SMALL_END_LINE")
 evl "$DL" "__auto.switchTab($((WIN_TAB - 1)))" >/dev/null
 e2e_wait_eval "$DL" "String(__auto.getTabs()[$((WIN_TAB - 1))].active && __auto.isWindowedTab())" "true"
-evl "$DL" "__t.focus();__auto.windowedPointerSelect($((10 * LINE_BYTES)))" >/dev/null
+# The click must land in the loaded window, which Select All moved to the end.
+evl "$DL" "__auto.windowedGoto(11)" >/dev/null
+e2e_wait_until 60 _e2e_eval_equals "$DL" "String(__auto.windowedInfo().windowStartLine<=10 && __auto.windowedGlobalInfo().settled)" "true"
+evl "$DL" "__t.focus()" >/dev/null
+check "the click at line 10 was made" "$(e2e_read "$DL" "String(__auto.windowedPointerSelect($((10 * LINE_BYTES))))")" "true"
 settle
 press ArrowDown '{shiftKey:true}'
 settle
@@ -878,7 +896,7 @@ e2e_wait_eval "$DL" "String(__auto.heldWindowedReads()===1)" "true"
 CLICK_LINE=5
 CLICK_COL=7
 check "the click was made" "$(e2e_read "$DL" "String(__auto.windowedPointerSelect($((CLICK_LINE * LINE_BYTES + CLICK_COL))))")" "true"
-press Q
+evl "$DL" "document.execCommand('insertText',false,'Q')" >/dev/null
 release_reads
 settle
 close_windowed
@@ -911,7 +929,10 @@ for variant in outside inside; do
   begin_doc
   select_all
   if [ "$variant" = "inside" ]; then
-    # Back to the start: the head is in the loaded window, the anchor is not.
+    # Collapse to the end, then Shift+document start: the anchor stays at the
+    # end, the head is at the start, in the loaded window.
+    press ArrowRight
+    settle
     press "$DOC_START_KEY" "$DOC_START_MODS"
     settle
   fi
@@ -1047,6 +1068,27 @@ echo "=== 14. an undo queued before a composition runs in the shadow ==="
 # Select All, Shift+Up (a swap, held at its read), Cmd/Ctrl+Z (queued behind
 # it), a composition that stays open, the read released: the shadow replays the
 # Shift+Up and the undo while the composition is open. Then Delete.
+# One diagnostic line: shortened in the log, whole in $DIAG_LOG.
+diag_line() {
+  echo "DIAG $1: $(e2e_show "$2")"
+  printf 'DIAG %s: %s\n' "$1" "$2" >>"$DIAG_LOG"
+}
+# The editor's state and the last 50 entries of its trace, one entry a line.
+diag_state() {
+  local tag="$1" trace entries entry
+  diag_line "$tag globalSel" "$(gsel)"
+  diag_line "$tag info" "$(e2e_read "$DL" "JSON.stringify(__auto.windowedInfo())")"
+  diag_line "$tag replayLength" "$(e2e_read "$DL" "String(__auto.windowedReplayLength())")"
+  trace="$(e2e_read "$DL" "JSON.stringify(__auto.windowedTrace().slice(-50).map((e)=>JSON.stringify(e)))")"
+  entries="$(printf '%s' "$trace" | jq -r '.[]' 2>/dev/null)"
+  if [ -z "$entries" ]; then
+    diag_line "$tag trace (unparsed)" "$trace"
+    return 0
+  fi
+  while IFS= read -r entry; do
+    diag_line "$tag trace" "$entry"
+  done <<<"$entries"
+}
 shadow_run() {
   # $1 shadow or plain; sets SHADOW_SHA.
   begin_doc
@@ -1070,8 +1112,10 @@ shadow_run() {
     settle
     e2e_wait_until 60 _e2e_eval_equals "$DL" "$(js_total)" "$BASE_SIZE"
   fi
+  diag_state "$1 before Delete"
   press Delete
   settle
+  diag_state "$1 after Delete"
   close_windowed
   SHADOW_SHA=$(file_sha256 "$DOC")
 }

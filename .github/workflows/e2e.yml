@@ -54,7 +54,9 @@ jobs:
   e2e:
     name: e2e (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 75
+    # The suites' limits below add up to 295 minutes, their 60 s grace periods
+    # to 18, and installing and building takes about 20.
+    timeout-minutes: 340
     strategy:
       fail-fast: false
       matrix:
@@ -139,28 +141,107 @@ jobs:
           else
             runner=""
           fi
+          # Minutes each suite may run, from measured run times with room to spare.
+          minutes_for() {
+            case "$1" in
+              e2e-close-flush | e2e-editor-focus | e2e-file-drop | e2e-goto | e2e-highlight | e2e-i18n | e2e-large | e2e-longline | e2e-range | e2e-windowed-two-tabs) echo 10 ;;
+              e2e-table | e2e-view-mode | e2e-windowed | e2e-clip | e2e-spill) echo 15 ;;
+              e2e-select-all) echo 30 ;;
+              e2e-global-edit | e2e-paste) echo 45 ;;
+              *) return 1 ;;
+            esac
+          }
+          for s in $scripts; do
+            minutes_for "$(basename "$s" .sh)" >/dev/null \
+              || { echo "no time limit for $s in minutes_for" >&2; exit 1; }
+          done
+          # A suite that outlives its limit gets SIGTERM, and SIGKILL for its
+          # whole process group after the grace period: the suites trap TERM,
+          # tidy up, and then do not end.
+          grace=60
+          if [ "$RUNNER_OS" != Windows ]; then
+            # timeout sends no KILL once its direct child (xvfb-run) is gone; macOS has none.
+            cat >"$RUNNER_TEMP/limit.pl" <<'PERL'
+          use strict;
+          use warnings;
+          use POSIX qw(:sys_wait_h);
+          my ($limit, $grace, @cmd) = @ARGV;
+          my $pid = fork();
+          die "fork: $!" unless defined $pid;
+          if ($pid == 0) {
+            setpgrp(0, 0);
+            exec @cmd or die "exec: $!";
+          }
+          setpgrp($pid, $pid);
+          my $start = time;
+          my ($termed, $killed, $status) = (0, 0, 0);
+          while (1) {
+            if (waitpid($pid, WNOHANG) == $pid) {
+              $status = $?;
+              last;
+            }
+            my $waited = time - $start;
+            if (!$termed && $waited >= $limit) {
+              kill 'TERM', -$pid;
+              $termed = $waited;
+            }
+            if ($termed && !$killed && $waited >= $termed + $grace) {
+              kill 'KILL', -$pid;
+              $killed = 1;
+            }
+            select(undef, undef, undef, 0.2);
+          }
+          if ($termed) {
+            # The leader can be gone while the suite it started still tidies up.
+            while (!$killed && kill(0, -$pid) && time - $start < $termed + $grace) {
+              select(undef, undef, undef, 0.2);
+            }
+            if (kill(0, -$pid)) {
+              kill 'KILL', -$pid;
+              $killed = 1;
+            }
+            exit($killed ? 137 : 124);
+          }
+          exit(($status & 127) ? 128 + ($status & 127) : $status >> 8);
+          PERL
+            limited() { local secs="$1"; shift; perl "$RUNNER_TEMP/limit.pl" "$secs" "$grace" "$@"; }
+          else
+            limited() { local secs="$1"; shift; timeout -k "$grace" -s TERM "$secs" "$@"; }
+          fi
 
           mkdir -p e2e-logs
-          failed=""
-          for s in $scripts; do
-            name="$(basename "$s" .sh)"
-            echo "::group::$name"
-            start=$(date +%s)
-            if $runner "$s" 2>&1 | tee "e2e-logs/$name.log"; then
-              result=PASS
-            else
-              result=FAIL
-              failed="$failed $name"
-            fi
-            echo "$name $result $(( $(date +%s) - start ))s" >>e2e-logs/summary.txt
-            echo "::endgroup::"
-          done
           # The app's own output goes to $OUT/dev-<suite>.log, which is outside
           # the upload path; without it a failed launch shows only the socket
           # refusing connections. $OUT also holds the multi-hundred-MB fixtures,
           # so copy the logs out rather than uploading the directory.
           out="$(bash -c '. scripts/e2e/lib.sh; printf %s "$OUT"')"
-          cp "$out"/dev-*.log e2e-logs/ 2>/dev/null || true
+          failed=""
+          for s in $scripts; do
+            name="$(basename "$s" .sh)"
+            limit=$(( $(minutes_for "$name") * 60 ))
+            echo "::group::$name"
+            start=$(date +%s)
+            code=0
+            limited "$limit" $runner "$s" 2>&1 | tee "e2e-logs/$name.log" || code=${PIPESTATUS[0]}
+            elapsed=$(( $(date +%s) - start ))
+            case "$code" in
+              0) result=PASS ;;
+              # 137 is also a kill from outside the limit, such as the OOM killer.
+              124 | 137)
+                if [ "$elapsed" -ge "$limit" ]; then
+                  result=TIMEOUT
+                else
+                  result=FAIL
+                fi
+                ;;
+              *) result=FAIL ;;
+            esac
+            [ "$result" = PASS ] || failed="$failed $name"
+            echo "$name $result ${elapsed}s" >>e2e-logs/summary.txt
+            # Kept at once, so a later suite that hangs cannot lose it.
+            cp "$out"/dev-*.log e2e-logs/ 2>/dev/null || true
+            echo "::endgroup::"
+          done
 
           cat e2e-logs/summary.txt >>"$GITHUB_STEP_SUMMARY"
           [ -z "$failed" ] || { echo "failed:$failed" >&2; exit 1; }

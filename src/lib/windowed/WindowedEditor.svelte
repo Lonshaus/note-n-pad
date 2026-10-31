@@ -119,6 +119,7 @@
   import {
     afterShadowStop,
     dequeueStep,
+    docEdgeSelect,
     globalItemAction,
     globalOpPath,
     globalSelectAction,
@@ -756,7 +757,7 @@
             tr.annotation(selectVisibleMark) === true ||
             tr.annotation(captureMark) === true,
           captureMark: (tr) => tr.annotation(captureMark) === true,
-          chord: (e) => replayKind(e, isWindows()) === 'chord',
+          chord: (e) => replayKind(e, platform.os) === 'chord',
           bound: (e) => matchesBinding(keyLayers(), e, platform.os),
           defer: (run) => run(),
           queueText: (text) =>
@@ -2128,6 +2129,12 @@
       ? commandChain(keyLayers(), item.event, platform.os)
       : [];
   }
+  function mainWindow(): { startLine: number; lineCount: number } {
+    return {
+      startLine: windowStartLine,
+      lineCount: view?.state.doc.lines ?? 0,
+    };
+  }
   function routeOf(item: ReplayItem, sel: LineSelection): GlobalAction {
     return globalItemAction({
       item,
@@ -2136,6 +2143,7 @@
       panelOpen: panelOpen(),
       own: ownCommands,
       totalLines,
+      win: mainWindow(),
     });
   }
   // Whether the queue's head is judged by the selection alone and so needs no
@@ -2653,6 +2661,7 @@
           headMapping: head?.kind === 'select' && head.mapping !== null,
           ready: replayWindowReady(v),
           totalLines,
+          win: mainWindow(),
         });
         joinNextApply = joinAfterStep(joinNextApply, step);
         if (step === 'wait') {
@@ -3164,6 +3173,10 @@
             head === undefined ||
             replayReady(sh.sel, sh.g.startLine, sh.view.state.doc.lines),
           totalLines,
+          win: {
+            startLine: sh.g.startLine,
+            lineCount: sh.view.state.doc.lines,
+          },
         });
         joinNextApply = joinAfterStep(joinNextApply, step);
         if (step === 'wait' || step === 'done') {
@@ -3378,6 +3391,28 @@
     }
     return false;
   }
+  // Whether the key is a doc-edge move whose target the window does not hold,
+  // typed where the replay takes the editor's input.
+  function docEdgeKeyOutside(e: KeyboardEvent): boolean {
+    const st = replayState();
+    if (
+      st.locked ||
+      st.focusElsewhere ||
+      st.dropHold ||
+      (st.swapping && !st.replayPending && !st.queueHold)
+    ) {
+      return false;
+    }
+    return (
+      docEdgeSelect({
+        commands: commandChain(keyLayers(), e, platform.os),
+        panelOpen: panelOpen(),
+        own: ownCommands,
+        totalLines,
+        win: mainWindow(),
+      }) !== undefined
+    );
+  }
 
   function onDocKeydown(e: KeyboardEvent): void {
     if (selectAllKeydown(e)) {
@@ -3437,11 +3472,19 @@
       );
       return;
     }
+    // A move to the start or end of the file whose target is outside the
+    // window goes through the replay, which moves the selection in the file.
+    if (docEdgeKeyOutside(e)) {
+      e.preventDefault();
+      e.stopPropagation();
+      queueReplay({ kind: 'key', event: e });
+      return;
+    }
     if (
       !replayPending &&
       e.isTrusted &&
       replayWanted() &&
-      replayKind(e, isWindows()) === 'chord'
+      replayKind(e, platform.os) === 'chord'
     ) {
       // A chord that is a no-op at the window edge leaves no transaction:
       // replay it unless a menu accelerator took it after CodeMirror passed

@@ -113,6 +113,9 @@ E2E_WAIT_SECS="${NOTE_N_PAD_E2E_WAIT_SECS:-180}"
 # first argument is a bare integer). Returns 0 as soon as it succeeds, 1 on
 # timeout — callers assert the real condition afterwards, so a timeout shows up
 # as the assertion's own FAIL with its own message rather than a bare abort.
+# The limit is wall-clock time, not a count of polls: a command that itself
+# takes seconds (an eval that times out after 3 s) would otherwise stretch the
+# wait to a multiple of it.
 #
 # Replaces ~60 hand-copied `until … tries=$((tries+1)) … break` blocks whose
 # bounds were each written out separately.
@@ -125,17 +128,47 @@ e2e_wait_until() {
       shift
       ;;
   esac
-  local waited=0
+  local started
+  started="$(date +%s)"
   while ! "$@"; do
-    if [ "$waited" -ge "$timeout" ]; then
+    if [ "$(($(date +%s) - started))" -ge "$timeout" ]; then
       return 1
     fi
     sleep 1
-    waited=$((waited + 1))
   done
   return 0
 }
-
+# <value> as the logs show it: itself, or for a value over 2,000 characters its
+# length, SHA-256 and first 200 characters. A comparison of a whole file's text
+# would otherwise put megabytes of it in a log line.
+e2e_show() {
+  local value="$1" sum
+  if [ "${#value}" -le 2000 ]; then
+    printf '%s' "$value"
+    return 0
+  fi
+  if command -v sha256sum >/dev/null 2>&1; then
+    sum="$(printf '%s' "$value" | sha256sum | cut -d ' ' -f 1)"
+  else
+    sum="$(printf '%s' "$value" | shasum -a 256 | cut -d ' ' -f 1)"
+  fi
+  printf 'len=%s sha256=%s head=%s' "${#value}" "$sum" "${value:0:200}"
+}
+# Put <text> on the system clipboard, for the platforms that have one
+# (macOS pbcopy, Windows Set-Clipboard). Returns 1 on Linux, which has none.
+e2e_paste_os() {
+  case "$(uname -s)" in
+    Darwin)
+      printf '%s' "$1" | LANG=en_US.UTF-8 pbcopy
+      ;;
+    MINGW64_NT* | MSYS_NT*)
+      E2E_CLIP_TEXT="$1" powershell -NoProfile -Command 'Set-Clipboard -Value $env:E2E_CLIP_TEXT'
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+}
 # Next eval request id, unique across the whole suite run. The 3 s
 # EVAL_TIMEOUT lets an eval's JS keep running after wait() gives up on it; a
 # late automation_result() then fills whatever slot currently carries that

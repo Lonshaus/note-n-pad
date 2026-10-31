@@ -28,6 +28,7 @@ import {
   afterShadowStop,
   classifyCommand,
   dequeueStep,
+  docEdgeOutside,
   globalItemAction,
   globalOpPath,
   globalSelectAction,
@@ -464,6 +465,7 @@ const caret = (line: number, col: number): LineSelection =>
 const LARGE = sel(0, 0, 5000, 0);
 const SMALL = sel(100, 0, 110, 0);
 const TOTAL = 9000;
+const WIN = { startLine: 0, lineCount: 100 };
 const win = { startLine: 1000, lineCount: 2000 };
 
 describe('inputOutside', () => {
@@ -765,6 +767,7 @@ function actionOf(
     panelOpen: over.panelOpen ?? false,
     own,
     totalLines: TOTAL,
+    win: WIN,
   });
 }
 const op = (o: string): GlobalAction => ({ type: 'op', op: o }) as GlobalAction;
@@ -1022,6 +1025,7 @@ describe('dequeueStep', () => {
     headMapping: false,
     ready: false,
     totalLines: TOTAL,
+    win: WIN,
   };
   it('runs typed text as a global delete, not a swap, when the head is outside the window', () => {
     const r = dequeueStep({
@@ -1098,6 +1102,7 @@ describe('shadowStep', () => {
     headMapping: false,
     ready: false,
     totalLines: TOTAL,
+    win: WIN,
   };
   it('stops for the operations the read loop runs', () => {
     expect(
@@ -1143,6 +1148,194 @@ describe('shadowStep', () => {
     );
   });
 });
+describe('a move to the start or end of the file from inside the window', () => {
+  const TOP = { startLine: 0, lineCount: 100 };
+  const MID = { startLine: 4000, lineCount: 100 };
+  const BOTTOM = { startLine: 8900, lineCount: 100 };
+  const WHOLE = { startLine: 0, lineCount: TOTAL };
+  const START: SelectSpec = { type: 'docEdge', end: false };
+  const END_SPEC: SelectSpec = { type: 'docEdge', end: true };
+  const EXTEND_START: SelectSpec = { type: 'extendDoc', end: false };
+  const EXTEND_END: SelectSpec = { type: 'extendDoc', end: true };
+  // The four keys of each platform and the selection command each one is.
+  const KEY_ROWS: [string, Ev, SelectSpec][] = [
+    ['macos', keyEv('ArrowUp', { metaKey: true }), START],
+    ['macos', keyEv('ArrowDown', { metaKey: true }), END_SPEC],
+    [
+      'macos',
+      keyEv('ArrowUp', { metaKey: true, shiftKey: true }),
+      EXTEND_START,
+    ],
+    [
+      'macos',
+      keyEv('ArrowDown', { metaKey: true, shiftKey: true }),
+      EXTEND_END,
+    ],
+    ['windows', keyEv('Home', { ctrlKey: true }), START],
+    ['windows', keyEv('End', { ctrlKey: true }), END_SPEC],
+    ['windows', keyEv('Home', { ctrlKey: true, shiftKey: true }), EXTEND_START],
+    ['windows', keyEv('End', { ctrlKey: true, shiftKey: true }), EXTEND_END],
+  ];
+  const actionIn = (
+    os: string,
+    e: Ev,
+    inWin: { startLine: number; lineCount: number },
+    from: LineSelection = SMALL,
+  ): GlobalAction =>
+    globalItemAction({
+      item: { kind: 'key' },
+      sel: from,
+      commands: commandChain(layersFor(os), e, os),
+      panelOpen: false,
+      own,
+      totalLines: TOTAL,
+      win: inWin,
+    });
+  const stepBase = {
+    sel: SMALL,
+    panelOpen: false,
+    own,
+    headMapping: false,
+    ready: true,
+    totalLines: TOTAL,
+  };
+
+  it('is outside the window only when the window lacks the target line', () => {
+    expect(docEdgeOutside(START, TOP, TOTAL)).toBe(false);
+    expect(docEdgeOutside(START, MID, TOTAL)).toBe(true);
+    expect(docEdgeOutside(START, BOTTOM, TOTAL)).toBe(true);
+    expect(docEdgeOutside(END_SPEC, TOP, TOTAL)).toBe(true);
+    expect(docEdgeOutside(END_SPEC, MID, TOTAL)).toBe(true);
+    expect(docEdgeOutside(END_SPEC, BOTTOM, TOTAL)).toBe(false);
+    expect(docEdgeOutside(EXTEND_START, TOP, TOTAL)).toBe(false);
+    expect(docEdgeOutside(EXTEND_START, MID, TOTAL)).toBe(true);
+    expect(docEdgeOutside(EXTEND_END, BOTTOM, TOTAL)).toBe(false);
+    expect(docEdgeOutside(EXTEND_END, MID, TOTAL)).toBe(true);
+    expect(docEdgeOutside(START, WHOLE, TOTAL)).toBe(false);
+    expect(docEdgeOutside(END_SPEC, WHOLE, TOTAL)).toBe(false);
+  });
+
+  it('is never outside for another selection command', () => {
+    for (const spec of [
+      { type: 'collapse', forward: true },
+      { type: 'lineBoundary' },
+      { type: 'extend', forward: false },
+      { type: 'simplify' },
+      { type: 'line' },
+      { type: 'restore' },
+    ] as SelectSpec[]) {
+      expect(docEdgeOutside(spec, MID, TOTAL), spec.type).toBe(false);
+    }
+  });
+
+  it('is a selection action when the target lies outside the window', () => {
+    for (const [os, e, spec] of KEY_ROWS) {
+      const away = 'end' in spec && spec.end ? TOP : BOTTOM;
+      expect(actionIn(os, e, away), `${os} ${e.key}`).toEqual(select(spec));
+      expect(actionIn(os, e, MID), `${os} ${e.key}`).toEqual(select(spec));
+    }
+  });
+
+  it('is left to the window when it holds the target', () => {
+    for (const [os, e, spec] of KEY_ROWS) {
+      const holds = 'end' in spec && spec.end ? BOTTOM : TOP;
+      expect(actionIn(os, e, holds), `${os} ${e.key}`).toEqual({
+        type: 'normal',
+      });
+      expect(actionIn(os, e, WHOLE), `${os} ${e.key}`).toEqual({
+        type: 'normal',
+      });
+    }
+  });
+
+  it('leaves other keys and a handled key alone', () => {
+    expect(actionIn('macos', keyEv('ArrowDown'), MID)).toEqual({
+      type: 'normal',
+    });
+    expect(actionIn('windows', keyEv('End'), MID)).toEqual({ type: 'normal' });
+    expect(
+      globalItemAction({
+        item: { kind: 'key', handled: true },
+        sel: SMALL,
+        commands: commandChain(
+          layersFor('macos'),
+          keyEv('ArrowUp', { metaKey: true }),
+          'macos',
+        ),
+        panelOpen: false,
+        own,
+        totalLines: TOTAL,
+        win: MID,
+      }),
+    ).toEqual({ type: 'normal' });
+  });
+
+  it('is not a selection action for an item that is not a key', () => {
+    expect(
+      globalItemAction({
+        item: { kind: 'text', userEvent: 'input.type' },
+        sel: SMALL,
+        commands: commandChain(
+          layersFor('macos'),
+          keyEv('ArrowUp', { metaKey: true }),
+          'macos',
+        ),
+        panelOpen: false,
+        own,
+        totalLines: TOTAL,
+        win: MID,
+      }),
+    ).toEqual({ type: 'normal' });
+  });
+
+  it('is a keySelect step in the drain and in the shadow when the target is outside', () => {
+    for (const [os, e, spec] of KEY_ROWS) {
+      const input = {
+        ...stepBase,
+        item: { kind: 'key' } as RoutedItem,
+        commands: commandChain(layersFor(os), e, os),
+        win: MID,
+      };
+      const drain = dequeueStep({ ...input, swapping: false, holds: 0 });
+      expect(drain.step, `drain ${os} ${e.key}`).toBe('keySelect');
+      expect(drain.action).toEqual(select(spec));
+      const shadow = shadowStep(input);
+      expect(shadow.step, `shadow ${os} ${e.key}`).toBe('keySelect');
+      expect(shadow.action).toEqual(select(spec));
+    }
+  });
+
+  it('is a run step in the drain and in the shadow when the window holds the target', () => {
+    for (const [os, e, spec] of KEY_ROWS) {
+      const input = {
+        ...stepBase,
+        item: { kind: 'key' } as RoutedItem,
+        commands: commandChain(layersFor(os), e, os),
+        win: 'end' in spec && spec.end ? BOTTOM : TOP,
+      };
+      expect(
+        dequeueStep({ ...input, swapping: false, holds: 0 }).step,
+        `drain ${os} ${e.key}`,
+      ).toBe('run');
+      expect(shadowStep(input).step, `shadow ${os} ${e.key}`).toBe('run');
+    }
+  });
+
+  it('puts the cursor at the start or end of the file, or extends to it', () => {
+    const cursor = caret(4050, 3);
+    expect(act(START, cursor).sel).toEqual(caret(0, 0));
+    expect(act(END_SPEC, cursor).sel).toEqual({
+      anchor: END,
+      head: END,
+    });
+    expect(act(EXTEND_START, cursor).sel).toEqual(sel(4050, 3, 0, 0));
+    expect(act(EXTEND_END, cursor).sel).toEqual({
+      anchor: { line: 4050, col: 3 },
+      head: END,
+    });
+    expect(act(EXTEND_END, cursor).replay).toBe(false);
+  });
+});
 describe('a copy or cut through a clip', () => {
   const route = (
     item: RoutedItem,
@@ -1156,6 +1349,7 @@ describe('a copy or cut through a clip', () => {
       panelOpen: false,
       own,
       totalLines,
+      win: WIN,
     });
   const clipCopy = { kind: 'copy', clip: true } as const;
   const clipCut = { kind: 'cut', clip: true } as const;
@@ -1309,6 +1503,7 @@ describe('the steps of a copy through a clip', () => {
     headMapping: false,
     ready: false,
     totalLines: TOTAL,
+    win: WIN,
   };
   const copy: RoutedItem = { kind: 'copy', clip: true };
   const cut: RoutedItem = { kind: 'cut', clip: true };
@@ -1370,6 +1565,7 @@ function actionFor(item: RoutedItem): GlobalAction {
     panelOpen: false,
     own,
     totalLines: TOTAL,
+    win: WIN,
   });
 }
 // --- Selection keys ----------------------------------------------------------
@@ -1751,6 +1947,7 @@ describe('a queued clip paste', () => {
     headMapping: false,
     ready: false,
     totalLines: TOTAL,
+    win: WIN,
   };
 
   it('is its own action whatever the selection, since what it holds is not known', () => {
@@ -1763,6 +1960,7 @@ describe('a queued clip paste', () => {
         panelOpen: false,
         own,
         totalLines: TOTAL,
+        win: WIN,
       }),
     ).toEqual({ type: 'clipPaste' });
   });

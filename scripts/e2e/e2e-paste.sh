@@ -53,8 +53,15 @@ END_COL=47
 BIG_LINES=2400000
 BIG_SIZE=$((BIG_LINES * LINE_BYTES - 1))
 BIG_END_LINE=$((BIG_LINES - 1))
+# The mid file: 105,359,999 bytes. A paste of it into 'abc' is over the 100 MiB
+# a document may hold and under the 101 MiB that can be edited.
+MID_LINES=2195000
+MID_SIZE=$((MID_LINES * LINE_BYTES - 1))
+MID_END_LINE=$((MID_LINES - 1))
 mkdir -p "$OUT"
 : >"$OUT/dev-paste.log"
+DIAG_LOG="$OUT/dev-diag-paste.log"
+: >"$DIAG_LOG"
 
 case "$(uname -s)" in
   Darwin)
@@ -91,7 +98,7 @@ check() {
   if [ "$2" = "$3" ]; then
     ok "$1"
   else
-    bad "$1 (got: [$2], want: [$3])"
+    bad "$1 (got: [$(e2e_show "$2")], want: [$(e2e_show "$3")])"
   fi
 }
 skip() {
@@ -357,7 +364,9 @@ wait_clip() {
 check_memory() {
   local growth=$((PEAK - MEM_BEFORE))
   echo "private memory before: $MEM_BEFORE, peak: $PEAK, growth: $growth"
-  if [ "$growth" -le "$MEM_LIMIT" ]; then
+  if [ "$MEM_BEFORE" -le 0 ] || [ "$PEAK" -le 0 ]; then
+    bad "$1: the private memory could not be measured (before: $MEM_BEFORE, peak: $PEAK)"
+  elif [ "$growth" -le "$MEM_LIMIT" ]; then
     ok "$1: the private memory grew by at most $((MEM_LIMIT / MIB)) MB"
   else
     bad "$1: the private memory grew by $growth bytes (more than $((MEM_LIMIT / MIB)) MB)"
@@ -432,14 +441,23 @@ tab_count() {
   e2e_read "$DL" "String(__auto.getTabs().length)"
 }
 # A fresh copy of fixture $1 as a document the suite owns; sets DOC and opens it.
+# openTab makes an ordinary tab of a file under the large-file threshold
+# (LARGE_FILE_THRESHOLD, 100 MiB), so a large-file tab of base.log or seed.txt
+# is asked for with $2 = windowed (windowedOpen, as e2e-select-all.sh does).
 NEXT=0
 DOC=""
 open_fresh() {
   NEXT=$((NEXT + 1))
   DOC="$WORK/run$NEXT.${1##*.}"
   cp "$WORK/$1" "$DOC"
-  evl "$DL" "__auto.openTab('$DOC')" >/dev/null
-  e2e_wait_eval "$DL" "String(__auto.getTabs().some((t)=>t.path==='$DOC' && t.active))" "true"
+  if [ "${2:-}" = "windowed" ]; then
+    evl "$DL" "__auto.windowedOpen('$DOC').then((r)=>{window.__ow=r;});1" >/dev/null
+    e2e_wait_eval "$DL" "String(__auto.getTabs().some((t)=>t.path==='$DOC' && t.active) && __auto.isWindowedTab() && __auto.windowedInfo().windowStartLine===0)" "true"
+    check "$1 opened without refusal" "$(e2e_read "$DL" "String(window.__ow===null)")" "true"
+  else
+    evl "$DL" "__auto.openTab('$DOC')" >/dev/null
+    e2e_wait_eval "$DL" "String(__auto.getTabs().some((t)=>t.path==='$DOC' && t.active))" "true"
+  fi
   evl "$DL" "__t.focus()" >/dev/null
   e2e_wait_eval "$DL" "String(document.activeElement===__t.content())" "true"
 }
@@ -461,12 +479,40 @@ back_to_seed() {
     n=$now
   done
 }
+# One diagnostic line: shortened in the log, whole in $DIAG_LOG.
+diag_line() {
+  echo "DIAG $1: $(e2e_show "$2")"
+  printf 'DIAG %s: %s\n' "$1" "$2" >>"$DIAG_LOG"
+}
+# After the answer Continue: once a second, until the tab is a converted tab or
+# 60 seconds are over, what the page says. $1 names the section.
+diag_convert() {
+  local second=0 info
+  while [ "$second" -le 60 ]; do
+    diag_line "$1 t=${second}s dialog" "$(e2e_read "$DL" "JSON.stringify(__auto.convertDialog())")"
+    evl "$DL" "window.__ci=undefined;__auto.convertTabInfo().then((r)=>{window.__ci=r;});1" >/dev/null
+    e2e_wait_until 5 _e2e_eval_equals "$DL" "String(window.__ci!==undefined)" "true"
+    info="$(e2e_read "$DL" "JSON.stringify(window.__ci)")"
+    diag_line "$1 t=${second}s tabInfo" "$info"
+    diag_line "$1 t=${second}s isWindowedTab" "$(e2e_read "$DL" "String(__auto.isWindowedTab())")"
+    diag_line "$1 t=${second}s errors" "$(e2e_read "$DL" "JSON.stringify(window.__errs)")"
+    if [ "$(printf '%s' "$info" | jq -r '.converted != null' 2>/dev/null)" = "true" ]; then
+      return 0
+    fi
+    sleep 1
+    second=$((second + 1))
+  done
+}
 # A document that holds the pasted text and the question, confirm: continues.
+# With $2, the page is watched after the answer (diag_convert).
 paste_and_continue() {
   do_paste "$DL" "$1"
   wait_dialog "$DL" confirm
   check "the question is the one of D8: Continue first, Cancel last" "$(e2e_read "$DL" "JSON.stringify(__t.buttons())")" '["Continue","Cancel"]'
   evl "$DL" "__t.answer(0)" >/dev/null
+  if [ -n "${2:-}" ]; then
+    diag_convert "$2"
+  fi
   wait_converted
 }
 
@@ -533,11 +579,13 @@ def write(path, n):
                 first = False
                 buf = []
 write(os.path.join(w, 'base.log'), $N_LINES)
+write(os.path.join(w, 'mid.log'), $MID_LINES)
 write(os.path.join(w, 'big.log'), $BIG_LINES)
 PYEOF
 BASE_SHA=$(file_sha256 "$WORK/base.log")
 BIG_SHA=$(file_sha256 "$WORK/big.log")
 check "base.log has the size of $N_LINES lines" "$(file_size "$WORK/base.log")" "$BASE_SIZE"
+check "mid.log has the size of $MID_LINES lines" "$(file_size "$WORK/mid.log")" "$MID_SIZE"
 check "big.log has the size of $BIG_LINES lines" "$(file_size "$WORK/big.log")" "$BIG_SIZE"
 
 launch
@@ -628,6 +676,7 @@ check "cancel wrote no conversion file" "$(cv_files)" "0"
 do_paste "$DL" ok
 wait_dialog "$DL" confirm
 evl "$DL" "__t.answer(0)" >/dev/null
+diag_convert "1"
 wait_converted
 INFO=$(ctinfo)
 check "the tab is unsaved" "$(printf '%s' "$INFO" | jq -r '.dirty')" "true"
@@ -646,11 +695,13 @@ evl "$DL" "__auto.newTab()" >/dev/null
 e2e_wait_eval "$DL" "String(__auto.getTabs().length===2 && __auto.getTabs()[1].active)" "true"
 evl "$DL" "__t.focus()" >/dev/null
 e2e_wait_eval "$DL" "String(document.activeElement===__t.content())" "true"
-paste_and_continue ok
+paste_and_continue ok "2"
 INFO=$(ctinfo)
 check "an untitled tab has no file to write to" "$(printf '%s' "$INFO" | jq -r '.converted.target')" "null"
 SAVED_TO="$WORK/untitled-saved.txt"
 save_to "$SAVED_TO"
+diag_line "2 save result" "$(e2e_read "$DL" "String(window.__sv)")"
+diag_line "2 tabs" "$(e2e_read "$DL" "JSON.stringify(__auto.getTabs())")"
 check "the saved file is the pasted text (SHA-256)" "$(file_sha256 "$SAVED_TO")" "$(file_sha256 "$WORK/paste-ok.txt")"
 check "the tab has the path now" "$(e2e_read "$DL" "__auto.getTabs().find((t)=>t.active).path")" "$SAVED_TO"
 back_to_seed
@@ -821,7 +872,7 @@ if has_clipboard; then
   wait_clip "$PREV_ID"
   # Another windowed tab to paste into: a file the paste replaces.
   evl "$DL" "__auto.closeActiveTab()" >/dev/null
-  open_fresh base.log
+  open_fresh base.log windowed
   evl "$DL" "__t.focus();__t.mod('a')" >/dev/null
   e2e_wait_until 600 _e2e_eval_equals "$DL" "String(__t.isAll($END_LINE,$END_COL))" "true"
   evl "$DL" "window.__pr=__auto.pasteText('');1" >/dev/null
@@ -840,41 +891,62 @@ else
 fi
 
 echo "=== 8. [macOS, Windows] a clip over the limit pasted into a document asks (D8) ==="
+# mid.log is over the 100 MiB a document may hold and, pasted into abc, under the
+# 101 MiB that can be edited: Continue makes an editable large file (D8). big.log
+# is over the editable limit as well: after Continue the question of D16 comes.
 if has_clipboard; then
-  open_fresh big.log
-  evl "$DL" "__t.focus();__t.mod('a')" >/dev/null
-  e2e_wait_until 600 _e2e_eval_equals "$DL" "String(__t.isAll($BIG_END_LINE,$END_COL))" "true"
-  PREV_ID=$(clip_id)
-  evl "$DL" "__auto.windowedCopy()" >/dev/null
-  wait_clip "$PREV_ID"
-  back_to_seed
-  open_fresh plain.txt
-  caret_end
-  evl "$DL" "window.__pr=__auto.pasteText('');1" >/dev/null
-  wait_dialog "$DL" confirm
-  evl "$DL" "__t.answer(0)" >/dev/null
-  wait_converted
-  check "the clip was not read by the page" "$(e2e_read "$DL" "String(window.__pr.getDataCalls)")" "0"
-  save_to
-  python3 - <<PYEOF
-with open('$WORK/ref-clip-doc.txt', 'wb') as out, open('$WORK/big.log', 'rb') as big:
+  for src in mid big; do
+    echo "--- $src.log ---"
+    if [ "$src" = "mid" ]; then
+      open_fresh mid.log windowed
+      SRC_END_LINE=$MID_END_LINE
+    else
+      open_fresh big.log
+      SRC_END_LINE=$BIG_END_LINE
+    fi
+    evl "$DL" "__t.focus();__t.mod('a')" >/dev/null
+    e2e_wait_until 600 _e2e_eval_equals "$DL" "String(__t.isAll($SRC_END_LINE,$END_COL))" "true"
+    PREV_ID=$(clip_id)
+    evl "$DL" "__auto.windowedCopy()" >/dev/null
+    wait_clip "$PREV_ID"
+    back_to_seed
+    open_fresh plain.txt
+    caret_end
+    evl "$DL" "window.__pr=__auto.pasteText('');1" >/dev/null
+    wait_dialog "$DL" confirm
+    evl "$DL" "__t.answer(0)" >/dev/null
+    if [ "$src" = "mid" ]; then
+      wait_converted
+      check "the clip was not read by the page" "$(e2e_read "$DL" "String(window.__pr.getDataCalls)")" "0"
+      save_to
+      python3 - <<PYEOF
+with open('$WORK/ref-clip-doc.txt', 'wb') as out, open('$WORK/mid.log', 'rb') as mid:
     out.write(b'abc')
     while True:
-        block = big.read(1 << 20)
+        block = mid.read(1 << 20)
         if not block:
             break
         out.write(block)
 PYEOF
-  check "the saved file is the document and the clip (SHA-256)" "$(file_sha256 "$DOC")" "$(file_sha256 "$WORK/ref-clip-doc.txt")"
-  rm -f "$WORK/ref-clip-doc.txt"
-  back_to_seed
+      check "the saved file is the document and the clip (SHA-256)" "$(file_sha256 "$DOC")" "$(file_sha256 "$WORK/ref-clip-doc.txt")"
+      rm -f "$WORK/ref-clip-doc.txt"
+    else
+      wait_dialog "$DL" tooBig
+      check "D16: the question has a save button and a do-not-paste button" "$(e2e_read "$DL" "String(__t.buttons().length)")" "2"
+      check "the clip was not read by the page" "$(e2e_read "$DL" "String(window.__pr.getDataCalls)")" "0"
+      evl "$DL" "__t.answer(-1)" >/dev/null
+      e2e_wait_eval "$DL" "String(__auto.pasteLocked())" "false"
+      check "do not paste: the document is as it was" "$(e2e_read "$DL" "__auto.getContent()")" "abc"
+    fi
+    back_to_seed
+  done
 else
   skip "8. a clip pasted into a document over the limit (macOS and Windows)"
 fi
 
 echo "=== 9. [macOS, Windows] a clip pasted into the search field is refused ==="
 if has_clipboard; then
-  open_fresh base.log
+  open_fresh base.log windowed
   evl "$DL" "__t.focus();__t.mod('a')" >/dev/null
   e2e_wait_until 600 _e2e_eval_equals "$DL" "String(__t.isAll($END_LINE,$END_COL))" "true"
   PREV_ID=$(clip_id)
@@ -891,10 +963,10 @@ if has_clipboard; then
   back_to_seed
   open_fresh plain.txt
   evl "$DL" "__auto.openFind()" >/dev/null
-  e2e_wait_eval "$DL" "String(document.activeElement===__t.searchInput())" "true"
+  e2e_wait_eval "$DL" "String(document.activeElement===document.querySelector('.cm-search input'))" "true"
   evl "$DL" "window.__pr=__auto.pasteText('');1" >/dev/null
   sleep 2
-  check "ordinary: the field is as it was" "$(e2e_read "$DL" "__t.searchInput().value")" ""
+  check "ordinary: the field is as it was" "$(e2e_read "$DL" "document.querySelector('.cm-search input').value")" ""
   check "ordinary: the document is as it was" "$(e2e_read "$DL" "__auto.getContent()")" "abc"
   evl "$DL" "__auto.closeFind()" >/dev/null
   back_to_seed
@@ -904,25 +976,29 @@ fi
 
 echo "=== 10. [macOS, Windows] typed, pasted and typed again keep their order ==="
 if has_clipboard; then
-  open_fresh base.log
+  open_fresh base.log windowed
   evl "$DL" "__t.focus();__t.mod('a')" >/dev/null
   e2e_wait_until 600 _e2e_eval_equals "$DL" "String(__t.isAll($END_LINE,$END_COL))" "true"
   PREV_ID=$(clip_id)
   evl "$DL" "__auto.windowedCopy()" >/dev/null
   wait_clip "$PREV_ID"
   back_to_seed
-  open_fresh seed.txt
-  evl "$DL" "__auto.setDocSelection(0,0)" >/dev/null
-  evl "$DL" "__auto.holdWindowedReads(true)" >/dev/null
-  evl "$DL" "(()=>{__t.press('a',{});window.__pr=__auto.pasteText('');__t.press('b',{});return 1;})()" >/dev/null
-  evl "$DL" "__auto.holdWindowedReads(false);__auto.releaseWindowedReads()" >/dev/null
-  e2e_wait_until 600 _e2e_eval_equals "$DL" "String(__auto.windowedInfo().totalBytes)" "$((BASE_SIZE + 2 + 5))"
-  save_to
+  # The file the typing, the clip and the typing make, byte for byte.
   {
     printf 'a'
     cat "$WORK/base.log"
     printf 'bseed\n'
   } >"$WORK/ref-order.txt"
+  ORDER_SIZE=$(file_size "$WORK/ref-order.txt")
+  open_fresh seed.txt windowed
+  evl "$DL" "__auto.holdWindowedReads(true)" >/dev/null
+  # The caret is at (0, 0), where windowedOpen leaves it. The clip is pasted by
+  # the core and waits in the queue behind the a; the b waits behind the paste.
+  evl "$DL" "(()=>{document.execCommand('insertText',false,'a');window.__pr=__auto.pasteText('');document.execCommand('insertText',false,'b');return 1;})()" >/dev/null
+  evl "$DL" "__auto.holdWindowedReads(false);__auto.releaseWindowedReads()" >/dev/null
+  e2e_wait_until 600 _e2e_eval_equals "$DL" "String(__auto.windowedInfo().totalBytes)" "$ORDER_SIZE"
+  check "the file is as long as a, the clip, b and seed" "$(e2e_read "$DL" "String(__auto.windowedInfo().totalBytes)")" "$ORDER_SIZE"
+  save_to
   check "the file is a, the clip, b, seed (SHA-256)" "$(file_sha256 "$DOC")" "$(file_sha256 "$WORK/ref-order.txt")"
   back_to_seed
 else
@@ -936,7 +1012,7 @@ if has_clipboard; then
   e2e_wait_until 600 _e2e_eval_equals "$DL" "String(__t.isAll($BIG_END_LINE,$END_COL))" "true"
   evl "$DL" "window.__rs=undefined" >/dev/null
   evl "$DL" "(()=>{__auto.windowedCopy();return 1;})()" >/dev/null
-  open_fresh base.log
+  open_fresh base.log windowed
   evl "$DL" "__t.focus();__t.mod('a')" >/dev/null
   e2e_wait_until 600 _e2e_eval_equals "$DL" "String(__t.isAll($END_LINE,$END_COL))" "true"
   evl "$DL" "window.__pr=__auto.pasteText('');1" >/dev/null
@@ -951,7 +1027,7 @@ fi
 
 echo "=== 12. [macOS, Windows] the text of another program is pasted, not the clip ==="
 if has_clipboard; then
-  open_fresh base.log
+  open_fresh base.log windowed
   evl "$DL" "__t.focus();__t.mod('a')" >/dev/null
   e2e_wait_until 600 _e2e_eval_equals "$DL" "String(__t.isAll($END_LINE,$END_COL))" "true"
   PREV_ID=$(clip_id)
@@ -972,7 +1048,7 @@ if has_clipboard; then
     bad "it took ${ELAPSED}s"
   fi
   back_to_seed
-  open_fresh base.log
+  open_fresh base.log windowed
   evl "$DL" "__t.focus();__t.mod('Home')" >/dev/null
   evl "$DL" "window.__pr=__auto.pasteText('');1" >/dev/null
   e2e_wait_until 600 _e2e_eval_equals "$DL" "String(__auto.windowedInfo().totalBytes)" "$((BASE_SIZE + 8))"
@@ -990,7 +1066,7 @@ fi
 
 echo "=== 13. [macOS, Windows] a copy that waits in one window is pasted in another ==="
 if has_clipboard; then
-  open_fresh base.log
+  open_fresh base.log windowed
   WIN_A="$DL"
   evl "$WIN_A" "__t.focus();__t.mod('a')" >/dev/null
   e2e_wait_until 600 _e2e_eval_equals "$WIN_A" "String(__t.isAll($END_LINE,$END_COL))" "true"
@@ -1013,7 +1089,7 @@ fi
 
 echo "=== 13b. [macOS, Windows] a copy queued behind a select key copies what the key selected ==="
 if has_clipboard; then
-  open_fresh base.log
+  open_fresh base.log windowed
   WIN_A="$DL"
   evl "$WIN_A" "__t.focus();__t.mod('Home')" >/dev/null
   # The reads are held: the select key and the copy wait in the queue, and the
@@ -1037,7 +1113,7 @@ fi
 
 echo "=== 13c. [macOS, Windows] a paste queued in a window the focus leaves is made by the core in order ==="
 if has_clipboard; then
-  open_fresh base.log
+  open_fresh base.log windowed
   WIN_A="$DL"
   evl "$WIN_A" "__t.focus();__t.mod('Home')" >/dev/null
   open_second "$WIN_A"
@@ -1045,7 +1121,7 @@ if has_clipboard; then
   clip_set "EXTQ"
   # A typed key waits behind the held read, the paste behind the key.
   evl "$WIN_A" "__auto.holdWindowedReads(true)" >/dev/null
-  evl "$WIN_A" "(()=>{__t.press('a',{});window.__pr=__auto.pasteText('');return 1;})()" >/dev/null
+  evl "$WIN_A" "(()=>{__t.focus();document.execCommand('insertText',false,'a');window.__pr=__auto.pasteText('');return 1;})()" >/dev/null
   focus_window "$WIN_B"
   evl "$WIN_A" "__auto.holdWindowedReads(false);__auto.releaseWindowedReads()" >/dev/null
   e2e_wait_until 120 _e2e_eval_equals "$WIN_A" "String(__auto.windowedInfo().totalBytes)" "$((BASE_SIZE + 5))"
@@ -1106,7 +1182,7 @@ fi
 
 echo "=== 15. [macOS, Windows] a whole line copied with no selection is pasted above the caret line ==="
 if has_clipboard; then
-  open_fresh base.log
+  open_fresh base.log windowed
   evl "$DL" "__t.focus();__t.mod('Home')" >/dev/null
   PREV_ID=$(clip_id)
   evl "$DL" "(()=>{__t.press('ArrowDown',{});return 1;})()" >/dev/null

@@ -147,6 +147,20 @@ export function selectionOutside(
 export function inputOutside(sel: LineSelection, win: WindowLines): boolean {
   return selectionOutside(sel, win) || globalOpPath(sel);
 }
+/** Whether a move to the start or end of the file, `spec` being one of the
+ *  four doc-edge selection commands, ends outside the loaded window. */
+export function docEdgeOutside(
+  spec: SelectSpec,
+  win: WindowLines,
+  totalLines: number,
+): boolean {
+  if (spec.type !== 'docEdge' && spec.type !== 'extendDoc') {
+    return false;
+  }
+  return spec.end
+    ? win.startLine + win.lineCount < totalLines
+    : win.startLine > 0;
+}
 /** Whether the swap now running leaves the editor open to a captured
  *  composition. A global operation of this very editor holds the gate read-only
  *  and still counts. */
@@ -563,6 +577,26 @@ function clipAction(
     cut: { copy, remove, linewise: caret, refuseSupply },
   };
 }
+/** The doc-edge command a key is, when its target lies outside the window. */
+export function docEdgeSelect(i: {
+  commands: readonly Command[];
+  panelOpen: boolean;
+  own: OwnCommands;
+  totalLines: number;
+  win: WindowLines;
+}): SelectSpec | undefined {
+  for (const command of i.commands) {
+    const cls = classifyCommand(command, i.own);
+    if (cls === undefined || (cls.type === 'closeBox' && !i.panelOpen)) {
+      continue;
+    }
+    return cls.type === 'select' &&
+      docEdgeOutside(cls.select, i.win, i.totalLines)
+      ? cls.select
+      : undefined;
+  }
+  return undefined;
+}
 /** What to do with the queue's head at the moment it is taken out, by the
  *  selection it acts on. `commands` is the chain of commands the key falls
  *  through (see `commandChain`). */
@@ -574,6 +608,8 @@ export function globalItemAction(i: {
   own: OwnCommands;
   /** The file's line count now. */
   totalLines: number;
+  /** The loaded window. */
+  win: WindowLines;
 }): GlobalAction {
   if (i.item.kind === 'copy' || i.item.kind === 'cut') {
     // A queued clip, or a copy that supplies the web clipboard but found its
@@ -596,8 +632,14 @@ export function globalItemAction(i: {
     // Whatever the selection: what the paste holds is not known yet.
     return { type: 'clipPaste' };
   }
-  if (!globalOpPath(i.sel) || i.item.handled === true) {
+  if (i.item.handled === true) {
     return NORMAL;
+  }
+  if (!globalOpPath(i.sel)) {
+    // A move to the start or end of the file acts on the whole file even from
+    // a caret in the window, when its target lies outside the window.
+    const edge = i.item.kind === 'key' ? docEdgeSelect(i) : undefined;
+    return edge === undefined ? NORMAL : { type: 'select', select: edge };
   }
   if (i.item.kind === 'text') {
     return i.item.userEvent === 'input.paste'
@@ -661,6 +703,7 @@ export interface DequeueInput {
   headMapping: boolean;
   ready: boolean;
   totalLines: number;
+  win: WindowLines;
 }
 /** The next step for the queue's head. An item that works on the whole file is
  *  judged before `drainStep` sees it, so the window is not swapped (or the
@@ -679,6 +722,7 @@ export function dequeueStep(i: DequeueInput): {
           panelOpen: i.panelOpen,
           own: i.own,
           totalLines: i.totalLines,
+          win: i.win,
         });
   const busy = i.swapping || i.holds > 0;
   switch (action.type) {

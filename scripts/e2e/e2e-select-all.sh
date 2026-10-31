@@ -16,7 +16,8 @@
 # walk through the guard); keys are keydown events dispatched at the editor,
 # with Cmd on Darwin and Ctrl elsewhere as the modifier; clipboard actions are
 # synthetic events carrying a DataTransfer, so the event itself is inspected and
-# the system clipboard is not used.
+# the system clipboard is not used, except by the paste into the search field
+# where there are clips: the core reads it, so it is written first.
 # LESSON: never put `await` inside an eval string; use `.then((r)=>{window.__x=r;})`.
 # A real Ctrl-C sends SIGINT to the whole process group, so app and node get
 # interrupted at once. The trap restores the language and the two large-file
@@ -42,7 +43,7 @@ check() {
   if [ "$2" = "$3" ]; then
     ok "$1"
   else
-    bad "$1 (got: [$2], want: [$3])"
+    bad "$1 (got: [$(e2e_show "$2")], want: [$(e2e_show "$3")])"
   fi
 }
 count_kind() {
@@ -370,9 +371,20 @@ echo "=== 3. a paste into the search field is not refused ==="
 evl "$DL" "__auto.openFind()" >/dev/null
 e2e_wait_eval "$DL" "String(document.activeElement===document.querySelector('.search-panel input.cm-textfield'))" "true"
 evl "$DL" "window.__pasteSeen=null;document.querySelector('.search-panel input.cm-textfield').addEventListener('paste',(e)=>{window.__pasteSeen=e.defaultPrevented;})" >/dev/null
-FIELD=$(e2e_read "$DL" "__t.clip('paste','SEARCHED')")
-check "the search field got the paste" "$(e2e_read "$DL" "String(window.__pasteSeen!==null)")" "true"
-check "the paste into the search field is not prevented" "$(printf '%s' "$FIELD" | jq -r '.prevented')" "false"
+if [ "$(uname -s)" = "Linux" ]; then
+  FIELD=$(e2e_read "$DL" "__t.clip('paste','SEARCHED')")
+  check "the search field got the paste" "$(e2e_read "$DL" "String(window.__pasteSeen!==null)")" "true"
+  check "the paste into the search field is not prevented" "$(printf '%s' "$FIELD" | jq -r '.prevented')" "false"
+else
+  # Where there are clips the field's paste is routed through the core, which
+  # reads the system clipboard; the event only has to arrive.
+  e2e_paste_os "SEARCHED"
+  FIELD=$(e2e_read "$DL" "__t.clip('paste','SEARCHED')")
+  check "the search field got the paste" "$(e2e_read "$DL" "String(window.__pasteSeen!==null)")" "true"
+  check "the paste into the search field is prevented (fieldPaste)" "$(printf '%s' "$FIELD" | jq -r '.prevented')" "true"
+  e2e_wait_eval "$DL" "document.querySelector('.search-panel input.cm-textfield').value" "SEARCHED"
+  check "the clipboard's text went into the search field" "$(e2e_read "$DL" "document.querySelector('.search-panel input.cm-textfield').value")" "SEARCHED"
+fi
 evl "$DL" "__auto.closeFind()" >/dev/null
 e2e_wait_eval "$DL" "String(document.querySelector('.search-panel')===null)" "true"
 

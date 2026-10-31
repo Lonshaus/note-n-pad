@@ -235,7 +235,7 @@ export function isImeKey(e: ReplayKeyEvent): boolean {
  *  with Ctrl+Alt arrives later as input), 'ignore' is dropped. */
 export function replayKind(
   e: ReplayKeyEvent,
-  isWindows: boolean,
+  os: string,
 ): 'text' | 'key' | 'chord' | 'ignore' {
   if (isImeKey(e) || MODIFIER_KEYS.has(e.key)) {
     return 'ignore';
@@ -245,7 +245,7 @@ export function replayKind(
   }
   if ([...e.key].length === 1) {
     // Alt+character types only on macOS; elsewhere it is a menu mnemonic.
-    return isWindows && e.altKey ? 'chord' : 'text';
+    return os !== 'macos' && e.altKey ? 'chord' : 'text';
   }
   return EDIT_KEYS.has(e.key) ? 'key' : 'ignore';
 }

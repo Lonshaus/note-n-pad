@@ -573,7 +573,7 @@ export function decideKey(i: KeyDecisionInput): KeyAction {
     return { type: 'none' };
   }
   const isWindows = i.os === 'windows';
-  const kind = replayKind(e, isWindows);
+  const kind = replayKind(e, i.os);
   if (kind === 'text') {
     return { type: 'text', text: e.key };
   }

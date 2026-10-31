@@ -6,13 +6,13 @@
 # line range. The core writes the text to a clip file in windowed-tmp and hands
 # it to the system clipboard; the app's memory does not grow with the text.
 # Where each row runs (the script picks by uname -s; every row says which):
-#   Linux container (CI): copy and cut change nothing (a Linux build has no
+#   Linux (CI, container): copy and cut change nothing (a Linux build has no
 #     clips, so they end as OfferFailed); every other row prints an explicit SKIP.
-#   macOS (local): the system clipboard is read with pbpaste, written with
+#   macOS (local and CI): the system clipboard is read with pbpaste, written with
 #     pbcopy, and memory is phys_footprint (footprint -j).
-#   Windows 11 (the acceptance VM): the clipboard is read with PowerShell
+#   Windows (CI, the acceptance VM): the clipboard is read with PowerShell
 #     Get-Clipboard and written with Set-Clipboard, memory is the private bytes
-#     of the process. The rows marked "local macOS" are not run there.
+#     of the process. The rows marked "macOS" alone are not run there.
 # Input methods: keys are keydown events dispatched at the editor
 # (__auto.windowedPressKey), with Cmd on Darwin and Ctrl elsewhere as the
 # modifier; copy and cut are events dispatched at the focused element
@@ -87,7 +87,7 @@ check() {
   if [ "$2" = "$3" ]; then
     ok "$1"
   else
-    bad "$1 (got: [$2], want: [$3])"
+    bad "$1 (got: [$(e2e_show "$2")], want: [$(e2e_show "$3")])"
   fi
 }
 skip() {
@@ -724,13 +724,32 @@ done
 check "three lines are selected" "$(e2e_read "$DL" "JSON.stringify(__auto.windowedGlobalSel().head)")" '{"line":3,"col":0}'
 PREV_ID=$(clip_id)
 FIT_TEXT=$(head -c $((3 * LINE_BYTES)) "$WORK/base.log")
-SMALL_COPY=$(e2e_read "$DL" "JSON.stringify(__auto.windowedCopy())")
+# The result with the byte count and the CR count of its text, taken in the
+# page: the evidence of where a CR comes from, which jq -r may add on Windows.
+js_with_bytes() {
+  echo "(()=>{const r=__auto.$1();return JSON.stringify(Object.assign({},r,{bytes:new TextEncoder().encode(r.data).length,cr:(r.data.match(/\\r/g)||[]).length}));})()"
+}
+# The text of such a result as the checks compare it: the breaks of the text
+# are LF, so on Windows a CRLF jq wrote is made LF.
+data_of() {
+  if [ "$ENV_NAME" = "windows" ]; then
+    printf '%s' "$1" | jq -r '.data' | sed 's/\r$//'
+  else
+    printf '%s' "$1" | jq -r '.data'
+  fi
+}
+log_data() {
+  echo "$1: $(printf '%s' "$2" | jq -r '.bytes') bytes and $(printf '%s' "$2" | jq -r '.cr') CR in the page (want $((3 * LINE_BYTES)) and 0), $(printf '%s' "$2" | jq -r '.data' | wc -c | tr -d ' ') bytes through jq -r (want $((3 * LINE_BYTES + 1)))"
+}
+SMALL_COPY=$(e2e_read "$DL" "$(js_with_bytes windowedCopy)")
+log_data "copy data" "$SMALL_COPY"
 check "copy goes to the web clipboard (types)" "$(printf '%s' "$SMALL_COPY" | jq -r '.types')" "1"
-check "copy goes to the web clipboard (the three lines)" "$(printf '%s' "$SMALL_COPY" | jq -r '.data')" "$FIT_TEXT"
+check "copy goes to the web clipboard (the three lines)" "$(data_of "$SMALL_COPY")" "$FIT_TEXT"
 check "copy changed nothing" "$(total)" "$BASE_SIZE"
-SMALL_CUT=$(e2e_read "$DL" "JSON.stringify(__auto.windowedCut())")
+SMALL_CUT=$(e2e_read "$DL" "$(js_with_bytes windowedCut)")
+log_data "cut data" "$SMALL_CUT"
 check "cut goes to the web clipboard (types)" "$(printf '%s' "$SMALL_CUT" | jq -r '.types')" "1"
-check "cut goes to the web clipboard (the three lines)" "$(printf '%s' "$SMALL_CUT" | jq -r '.data')" "$FIT_TEXT"
+check "cut goes to the web clipboard (the three lines)" "$(data_of "$SMALL_CUT")" "$FIT_TEXT"
 check "cut took the three lines out" "$(total)" "$((BASE_SIZE - 3 * LINE_BYTES))"
 check "no clip copy was made" "$(e2e_read "$DL" "String(__t.traced('clipCopy'))")" "0"
 check "the clip on the clipboard is as it was" "$(clip_id)" "$PREV_ID"
@@ -764,7 +783,7 @@ check "the selection is still the file" "$(e2e_read "$DL" "String(__t.isAll($END
 evl "$DL" "__auto.closeFind()" >/dev/null
 close_tab
 
-echo "=== 7. [local macOS] the viewer's find field under Select All or a range past the loaded rows ==="
+echo "=== 7. [macOS] the viewer's find field under Select All or a range past the loaded rows ==="
 if [ "$ENV_NAME" = "macos" ]; then
   evl "$DL" "__auto.setLargeOpenMode('view')" >/dev/null
   e2e_wait_setting large_open_mode "view"
@@ -808,10 +827,10 @@ if [ "$ENV_NAME" = "macos" ]; then
   e2e_wait_setting large_open_mode "$ORIG_MODE"
   close_tab
 else
-  skip "7. the viewer's find field (local macOS only)"
+  skip "7. the viewer's find field (macOS only)"
 fi
 
-echo "=== 8. [local macOS] the shadow meets a clip copy ==="
+echo "=== 8. [macOS] the shadow meets a clip copy ==="
 if [ "$ENV_NAME" = "macos" ]; then
   begin_doc
   select_all "$END_LINE"
@@ -854,16 +873,16 @@ if [ "$ENV_NAME" = "macos" ]; then
   check "the clipboard holds the indented file without its first two bytes (bytes)" "${CLIP_DIGEST%% *}" "$((BASE_SIZE + 2 * N_LINES - 2))"
   check "the clipboard holds the indented file without its first two bytes (SHA-256)" "${CLIP_DIGEST#* }" "$INDENTED_SHA"
   check "the clip is not linewise" "$(clip_status | jq -r '.s.linewise')" "false"
-  press Z
+  evl "$DL" "document.execCommand('insertText',false,'Z')" >/dev/null
   settle
   save_active
   close_tab
   check "the file is two spaces and the committed text and Z" "$(cat "$DOC")" "  あZ"
 else
-  skip "8. the shadow meets a clip copy (local macOS only)"
+  skip "8. the shadow meets a clip copy (macOS only)"
 fi
 
-echo "=== 9. [local macOS] copy and cut with the selection collapsed by queued typing ==="
+echo "=== 9. [macOS] copy and cut with the selection collapsed by queued typing ==="
 if [ "$ENV_NAME" = "macos" ]; then
   for what in copy cut; do
     begin_doc
@@ -894,10 +913,12 @@ if [ "$ENV_NAME" = "macos" ]; then
     fi
   done
 else
-  skip "9. copy and cut with the selection collapsed (local macOS only)"
+  skip "9. copy and cut with the selection collapsed (macOS only)"
 fi
 
 echo "=== 10. [macOS, Windows; Linux: SKIP] the clip survives the end of the app ==="
+# The app ends in this section, so the whole run's exceptions are read before.
+check "no exception thrown in the whole run" "$(e2e_read "$DL" "$(js_errors)")" "0"
 if has_clipboard; then
   open_windowed "$WORK/big.log" 2
   select_all "$BIG_END_LINE"
@@ -920,7 +941,6 @@ fi
 
 echo "=== teardown ==="
 if e2e_app_running; then
-  check "no exception thrown in the whole run" "$(e2e_read "$DL" "$(js_errors)")" "0"
   evl "$DL" "__auto.setLanguage('$ORIG_LANG')" >/dev/null
   e2e_wait_setting language "$ORIG_LANG"
   evl "$DL" "__auto.setLargeSelectAll('$ORIG_SELECT')" >/dev/null
