@@ -3,21 +3,34 @@
 
 import { describe, expect, it } from 'vitest';
 import {
+  blockedWhileGlobal,
+  clipboardBlocked,
   fitsWindow,
   gotoSelection,
   insideWindow,
   isEditingKey,
   isImeKey,
+  isModifierKey,
+  isNativeSelectAll,
   movedEnds,
+  movesSelection,
+  needsGlobalOp,
+  queuedClipboardAction,
   queuedSelectEnds,
   replayKind,
   replayReady,
+  selectAllTarget,
   selectionAfterChange,
   selectionAfterSwap,
   toLiveSelection,
+  wholeFileAfter,
+  wholeFileSelection,
   windowStartFor,
   type LineSelection,
   type ReplayKeyEvent,
+  type SelectAllEntry,
+  type SelectAllMode,
+  type WholeFileEvent,
   type WindowShape,
 } from './windowSelection';
 // Every line is 10 characters long.
@@ -262,30 +275,38 @@ function key(init: Partial<ReplayKeyEvent> & { key: string }): ReplayKeyEvent {
 
 describe('replayKind', () => {
   it('replays a letter, a Shift letter, a digit and a space as text', () => {
-    expect(replayKind(key({ key: 'a' }), false)).toBe('text');
-    expect(replayKind(key({ key: 'A', shiftKey: true }), false)).toBe('text');
-    expect(replayKind(key({ key: '7' }), true)).toBe('text');
-    expect(replayKind(key({ key: ' ' }), true)).toBe('text');
+    expect(replayKind(key({ key: 'a' }), 'macos')).toBe('text');
+    expect(replayKind(key({ key: 'A', shiftKey: true }), 'macos')).toBe('text');
+    expect(replayKind(key({ key: '7' }), 'windows')).toBe('text');
+    expect(replayKind(key({ key: ' ' }), 'windows')).toBe('text');
   });
 
   it('replays a character outside the BMP as text', () => {
-    expect(replayKind(key({ key: '\u{1F600}' }), false)).toBe('text');
+    expect(replayKind(key({ key: '\u{1F600}' }), 'macos')).toBe('text');
   });
 
   it('replays an Option character on macOS as text', () => {
-    expect(replayKind(key({ key: 'å', altKey: true }), false)).toBe('text');
+    expect(replayKind(key({ key: 'å', altKey: true }), 'macos')).toBe('text');
   });
 
-  it('treats Alt plus a character on Windows as a chord, not text', () => {
-    expect(replayKind(key({ key: 'f', altKey: true }), true)).toBe('chord');
+  it('treats Alt plus a character on Windows and Linux as a chord, not text', () => {
+    for (const os of ['windows', 'linux']) {
+      expect(replayKind(key({ key: 'f', altKey: true }), os)).toBe('chord');
+    }
+  });
+
+  it('replays a character without Alt as text on every platform', () => {
+    for (const os of ['macos', 'windows', 'linux']) {
+      expect(replayKind(key({ key: 'l' }), os)).toBe('text');
+    }
   });
 
   it('treats Ctrl+Alt plus a character as a chord on both platforms', () => {
     const find = key({ key: 'f', ctrlKey: true, altKey: true });
-    expect(replayKind(find, true)).toBe('chord');
-    expect(replayKind(find, false)).toBe('chord');
+    expect(replayKind(find, 'windows')).toBe('chord');
+    expect(replayKind(find, 'macos')).toBe('chord');
     const altGr = key({ key: '@', ctrlKey: true, altKey: true });
-    expect(replayKind(altGr, true)).toBe('chord');
+    expect(replayKind(altGr, 'windows')).toBe('chord');
   });
 
   it('replays editing and navigation keys as keys', () => {
@@ -303,40 +324,53 @@ describe('replayKind', () => {
       'PageUp',
       'PageDown',
     ]) {
-      expect(replayKind(key({ key: name }), false)).toBe('key');
-      expect(replayKind(key({ key: name }), true)).toBe('key');
+      expect(replayKind(key({ key: name }), 'macos')).toBe('key');
+      expect(replayKind(key({ key: name }), 'windows')).toBe('key');
     }
   });
 
   it('keeps the Alt and Shift variants of those keys as keys', () => {
-    expect(replayKind(key({ key: 'ArrowUp', altKey: true }), false)).toBe(
+    expect(replayKind(key({ key: 'ArrowUp', altKey: true }), 'macos')).toBe(
       'key',
     );
-    expect(replayKind(key({ key: 'ArrowUp', altKey: true }), true)).toBe('key');
-    expect(replayKind(key({ key: 'ArrowDown', shiftKey: true }), true)).toBe(
+    expect(replayKind(key({ key: 'ArrowUp', altKey: true }), 'windows')).toBe(
       'key',
     );
-    expect(replayKind(key({ key: 'Tab', shiftKey: true }), false)).toBe('key');
     expect(
-      replayKind(key({ key: 'PageDown', shiftKey: true, altKey: true }), true),
+      replayKind(key({ key: 'ArrowDown', shiftKey: true }), 'windows'),
+    ).toBe('key');
+    expect(replayKind(key({ key: 'Tab', shiftKey: true }), 'macos')).toBe(
+      'key',
+    );
+    expect(
+      replayKind(
+        key({ key: 'PageDown', shiftKey: true, altKey: true }),
+        'windows',
+      ),
     ).toBe('key');
   });
 
   it('treats any other Ctrl or Meta combination as a chord', () => {
-    expect(replayKind(key({ key: 'c', metaKey: true }), false)).toBe('chord');
-    expect(replayKind(key({ key: 's', ctrlKey: true }), true)).toBe('chord');
+    expect(replayKind(key({ key: 'c', metaKey: true }), 'macos')).toBe('chord');
+    expect(replayKind(key({ key: 's', ctrlKey: true }), 'windows')).toBe(
+      'chord',
+    );
     expect(
-      replayKind(key({ key: 'K', metaKey: true, shiftKey: true }), false),
+      replayKind(key({ key: 'K', metaKey: true, shiftKey: true }), 'macos'),
     ).toBe('chord');
-    expect(replayKind(key({ key: 'Tab', ctrlKey: true }), true)).toBe('chord');
-    expect(replayKind(key({ key: 'F5', ctrlKey: true }), true)).toBe('chord');
+    expect(replayKind(key({ key: 'Tab', ctrlKey: true }), 'windows')).toBe(
+      'chord',
+    );
+    expect(replayKind(key({ key: 'F5', ctrlKey: true }), 'windows')).toBe(
+      'chord',
+    );
   });
 
   it('treats an editing key with Ctrl or Meta as a chord', () => {
-    expect(replayKind(key({ key: 'Backspace', ctrlKey: true }), true)).toBe(
-      'chord',
-    );
-    expect(replayKind(key({ key: 'ArrowLeft', metaKey: true }), false)).toBe(
+    expect(
+      replayKind(key({ key: 'Backspace', ctrlKey: true }), 'windows'),
+    ).toBe('chord');
+    expect(replayKind(key({ key: 'ArrowLeft', metaKey: true }), 'macos')).toBe(
       'chord',
     );
   });
@@ -353,26 +387,28 @@ describe('replayKind', () => {
       expect(
         replayKind(
           key({ key: name, shiftKey: true, ctrlKey: true, altKey: true }),
-          true,
+          'windows',
         ),
       ).toBe('ignore');
     }
-    expect(replayKind(key({ key: 'CapsLock' }), false)).toBe('ignore');
+    expect(replayKind(key({ key: 'CapsLock' }), 'macos')).toBe('ignore');
   });
 
   it('ignores Escape, function keys and dead keys without Ctrl or Meta', () => {
-    expect(replayKind(key({ key: 'Escape' }), false)).toBe('ignore');
-    expect(replayKind(key({ key: 'F5' }), true)).toBe('ignore');
-    expect(replayKind(key({ key: 'Dead' }), false)).toBe('ignore');
+    expect(replayKind(key({ key: 'Escape' }), 'macos')).toBe('ignore');
+    expect(replayKind(key({ key: 'F5' }), 'windows')).toBe('ignore');
+    expect(replayKind(key({ key: 'Dead' }), 'macos')).toBe('ignore');
   });
 
   it('ignores IME process keys, keyCode 229 and composing keys', () => {
-    expect(replayKind(key({ key: 'Process' }), true)).toBe('ignore');
-    expect(replayKind(key({ key: 'a', keyCode: 229 }), true)).toBe('ignore');
-    expect(replayKind(key({ key: 'a', isComposing: true }), false)).toBe(
+    expect(replayKind(key({ key: 'Process' }), 'windows')).toBe('ignore');
+    expect(replayKind(key({ key: 'a', keyCode: 229 }), 'windows')).toBe(
       'ignore',
     );
-    expect(replayKind(key({ key: 'Enter', isComposing: true }), false)).toBe(
+    expect(replayKind(key({ key: 'a', isComposing: true }), 'macos')).toBe(
+      'ignore',
+    );
+    expect(replayKind(key({ key: 'Enter', isComposing: true }), 'macos')).toBe(
       'ignore',
     );
   });
@@ -433,5 +469,240 @@ describe('queuedSelectEnds', () => {
       anchor: true,
       head: false,
     });
+  });
+});
+
+describe('needsGlobalOp', () => {
+  // The window holds lines 100..149.
+  it('is false with both ends inside the window', () => {
+    expect(needsGlobalOp(sel(100, 0, 149, 5), 100, 50)).toBe(false);
+    expect(needsGlobalOp(sel(120, 3, 120, 3), 100, 50)).toBe(false);
+  });
+  it('is false at exactly the last line and true one line past it', () => {
+    expect(needsGlobalOp(sel(100, 0, 149, 10), 100, 50)).toBe(false);
+    expect(needsGlobalOp(sel(100, 0, 150, 0), 100, 50)).toBe(true);
+  });
+  it('is true one line before the window', () => {
+    expect(needsGlobalOp(sel(99, 0, 120, 0), 100, 50)).toBe(true);
+  });
+  it('looks at both ends, in either direction', () => {
+    expect(needsGlobalOp(sel(120, 0, 900, 0), 100, 50)).toBe(true);
+    expect(needsGlobalOp(sel(900, 0, 120, 0), 100, 50)).toBe(true);
+    expect(needsGlobalOp(sel(149, 0, 100, 0), 100, 50)).toBe(false);
+  });
+});
+
+describe('selectAllTarget', () => {
+  const entries: SelectAllEntry[] = ['key', 'menu', 'native'];
+  for (const entry of entries) {
+    it(`takes what is on screen under "visible" (${entry})`, () => {
+      expect(selectAllTarget('visible', entry)).toBe('visible');
+    });
+    it(`takes the file under "file" (${entry})`, () => {
+      expect(selectAllTarget('file', entry)).toBe('file');
+    });
+  }
+});
+
+describe('wholeFileAfter', () => {
+  const selectAll = (entry: SelectAllEntry): WholeFileEvent => ({
+    type: 'selectAll',
+    entry,
+  });
+  it('is set by a Select All under "file", through any entry', () => {
+    for (const entry of ['key', 'menu', 'native'] as const) {
+      expect(wholeFileAfter({ mode: 'file' }, selectAll(entry))).toBe(true);
+    }
+  });
+  it('is not set by a Select All under "visible"', () => {
+    for (const entry of ['key', 'menu', 'native'] as const) {
+      expect(wholeFileAfter({ mode: 'visible' }, selectAll(entry))).toBe(false);
+    }
+  });
+  it('is cleared by a click, a selection key or a new selection', () => {
+    for (const mode of ['file', 'visible'] as SelectAllMode[]) {
+      for (const type of ['click', 'key', 'select'] as const) {
+        expect(wholeFileAfter({ mode }, { type })).toBe(false);
+      }
+    }
+  });
+});
+
+describe('movesSelection', () => {
+  it('is true for the arrow, Home, End, PageUp and PageDown keys', () => {
+    for (const key of ['ArrowUp', 'Home', 'End', 'PageUp', 'PageDown']) {
+      expect(movesSelection(key)).toBe(true);
+    }
+  });
+  it('is false for other keys', () => {
+    for (const key of ['a', 'Shift', 'Enter', 'c']) {
+      expect(movesSelection(key)).toBe(false);
+    }
+  });
+});
+
+describe('wholeFileSelection', () => {
+  const end = { line: 5000, col: 7 };
+  it('selects from the start of the file to its end', () => {
+    expect(wholeFileSelection(end, win(100, 50)).globalSel).toEqual(
+      sel(0, 0, 5000, 7),
+    );
+  });
+  it('clamps the live selection to the window edges', () => {
+    expect(wholeFileSelection(end, win(100, 50)).live).toEqual(
+      sel(0, 0, 49, 10),
+    );
+  });
+  it('keeps the end inside the window when the window holds it', () => {
+    expect(wholeFileSelection(end, win(4990, 11)).live).toEqual(
+      sel(0, 0, 10, 7),
+    );
+  });
+  it('makes the last live selection the live one', () => {
+    const w = wholeFileSelection(end, win(100, 50));
+    expect(w.lastLive).toBe(w.live);
+  });
+  it('keeps the global ends through an update that only moves the selection', () => {
+    const w = wholeFileSelection(end, win(100, 50));
+    // The next update reports the same live selection.
+    const next = selectionAfterChange(
+      w.globalSel,
+      w.lastLive,
+      w.live,
+      100,
+      false,
+    );
+    expect(next.head).toEqual(end);
+    expect(next.anchor).toEqual({ line: 0, col: 0 });
+  });
+});
+
+describe('blockedWhileGlobal', () => {
+  const small = sel(100, 0, 110, 0);
+  const large = sel(0, 0, 5000, 0);
+  const userEvents = [
+    'input.type',
+    'input.type.compose',
+    'input.paste',
+    'input.drop',
+    'move.drop',
+    'delete.backward',
+    'delete.line',
+    'delete.cut',
+    'move.line',
+    'input.comment',
+    'indent',
+    'replace',
+    'anything.else',
+  ];
+  for (const userEvent of userEvents) {
+    it(`blocks ${userEvent} that changes the document under a large selection`, () => {
+      expect(blockedWhileGlobal({ docChanged: true, userEvent }, large)).toBe(
+        true,
+      );
+    });
+    it(`lets ${userEvent} through under a selection one window holds`, () => {
+      expect(blockedWhileGlobal({ docChanged: true, userEvent }, small)).toBe(
+        false,
+      );
+    });
+  }
+  it('lets a change through that no user action made', () => {
+    expect(
+      blockedWhileGlobal({ docChanged: true, userEvent: undefined }, large),
+    ).toBe(false);
+  });
+  it('lets a change of the selection alone through', () => {
+    expect(
+      blockedWhileGlobal({ docChanged: false, userEvent: 'select' }, large),
+    ).toBe(false);
+    expect(
+      blockedWhileGlobal({ docChanged: false, userEvent: undefined }, large),
+    ).toBe(false);
+  });
+  it('allows the selection that fits at exactly the limit', () => {
+    expect(
+      blockedWhileGlobal(
+        { docChanged: true, userEvent: 'input.type' },
+        sel(0, 0, 1000, 0),
+      ),
+    ).toBe(false);
+    expect(
+      blockedWhileGlobal(
+        { docChanged: true, userEvent: 'input.type' },
+        sel(0, 0, 1001, 0),
+      ),
+    ).toBe(true);
+  });
+});
+
+describe('clipboardBlocked', () => {
+  const small = sel(100, 0, 110, 0);
+  const large = sel(0, 0, 5000, 0);
+  for (const kind of ['copy', 'cut'] as const) {
+    it(`does not block ${kind} under a large selection: it goes through a clip`, () => {
+      expect(clipboardBlocked(kind, large, 'editor')).toBe(false);
+      expect(clipboardBlocked(kind, large, 'none')).toBe(false);
+    });
+  }
+  it('does not block a paste under a large selection: it replaces the selection', () => {
+    expect(clipboardBlocked('paste', large, 'editor')).toBe(false);
+    expect(clipboardBlocked('paste', large, 'none')).toBe(false);
+  });
+  for (const kind of ['copy', 'cut', 'paste'] as const) {
+    it(`lets ${kind} through in another element, such as a search field`, () => {
+      expect(clipboardBlocked(kind, large, 'other')).toBe(false);
+    });
+    it(`lets ${kind} through under a selection one window holds`, () => {
+      expect(clipboardBlocked(kind, small, 'editor')).toBe(false);
+      expect(clipboardBlocked(kind, small, 'none')).toBe(false);
+    });
+  }
+});
+
+describe('queuedClipboardAction', () => {
+  it('goes through a clip when the copy is made of the session', () => {
+    expect(queuedClipboardAction('session')).toBe('clip');
+  });
+  it('supplies the web clipboard for any other way of copying', () => {
+    expect(queuedClipboardAction('text')).toBe('supply');
+    expect(queuedClipboardAction('file')).toBe('supply');
+  });
+});
+
+describe('isNativeSelectAll', () => {
+  const native = {
+    docChanged: false,
+    isSelect: true,
+    isPointer: false,
+    keyActive: false,
+    from: 0,
+    to: 900,
+    viewportFrom: 0,
+    viewportTo: 900,
+  };
+  it('is a selection of the whole rendered range that no key or pointer made', () => {
+    expect(isNativeSelectAll(native)).toBe(true);
+    expect(isNativeSelectAll({ ...native, from: 0, to: 1000 })).toBe(true);
+  });
+  it('is not one made by a key command, a pointer or a change', () => {
+    expect(isNativeSelectAll({ ...native, keyActive: true })).toBe(false);
+    expect(isNativeSelectAll({ ...native, isPointer: true })).toBe(false);
+    expect(isNativeSelectAll({ ...native, docChanged: true })).toBe(false);
+    expect(isNativeSelectAll({ ...native, isSelect: false })).toBe(false);
+  });
+  it('is not one that leaves part of the rendered range out', () => {
+    expect(isNativeSelectAll({ ...native, from: 1 })).toBe(false);
+    expect(isNativeSelectAll({ ...native, to: 899 })).toBe(false);
+  });
+});
+
+describe('isModifierKey', () => {
+  it('knows the modifiers pressed on their own', () => {
+    for (const key of ['Shift', 'Control', 'Alt', 'Meta', 'AltGraph']) {
+      expect(isModifierKey(key)).toBe(true);
+    }
+    expect(isModifierKey('a')).toBe(false);
+    expect(isModifierKey('ArrowLeft')).toBe(false);
   });
 });

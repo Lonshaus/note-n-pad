@@ -113,6 +113,9 @@ E2E_WAIT_SECS="${NOTE_N_PAD_E2E_WAIT_SECS:-180}"
 # first argument is a bare integer). Returns 0 as soon as it succeeds, 1 on
 # timeout — callers assert the real condition afterwards, so a timeout shows up
 # as the assertion's own FAIL with its own message rather than a bare abort.
+# The limit is wall-clock time, not a count of polls: a command that itself
+# takes seconds (an eval that times out after 3 s) would otherwise stretch the
+# wait to a multiple of it.
 #
 # Replaces ~60 hand-copied `until … tries=$((tries+1)) … break` blocks whose
 # bounds were each written out separately.
@@ -125,17 +128,47 @@ e2e_wait_until() {
       shift
       ;;
   esac
-  local waited=0
+  local started
+  started="$(date +%s)"
   while ! "$@"; do
-    if [ "$waited" -ge "$timeout" ]; then
+    if [ "$(($(date +%s) - started))" -ge "$timeout" ]; then
       return 1
     fi
     sleep 1
-    waited=$((waited + 1))
   done
   return 0
 }
-
+# <value> as the logs show it: itself, or for a value over 2,000 characters its
+# length, SHA-256 and first 200 characters. A comparison of a whole file's text
+# would otherwise put megabytes of it in a log line.
+e2e_show() {
+  local value="$1" sum
+  if [ "${#value}" -le 2000 ]; then
+    printf '%s' "$value"
+    return 0
+  fi
+  if command -v sha256sum >/dev/null 2>&1; then
+    sum="$(printf '%s' "$value" | sha256sum | cut -d ' ' -f 1)"
+  else
+    sum="$(printf '%s' "$value" | shasum -a 256 | cut -d ' ' -f 1)"
+  fi
+  printf 'len=%s sha256=%s head=%s' "${#value}" "$sum" "${value:0:200}"
+}
+# Put <text> on the system clipboard, for the platforms that have one
+# (macOS pbcopy, Windows Set-Clipboard). Returns 1 on Linux, which has none.
+e2e_paste_os() {
+  case "$(uname -s)" in
+    Darwin)
+      printf '%s' "$1" | LANG=en_US.UTF-8 pbcopy
+      ;;
+    MINGW64_NT* | MSYS_NT*)
+      E2E_CLIP_TEXT="$1" powershell -NoProfile -Command 'Set-Clipboard -Value $env:E2E_CLIP_TEXT'
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+}
 # Next eval request id, unique across the whole suite run. The 3 s
 # EVAL_TIMEOUT lets an eval's JS keep running after wait() gives up on it; a
 # late automation_result() then fills whatever slot currently carries that
@@ -175,12 +208,40 @@ _e2e_setting_equals() {
 # script defines identically (it carries that script's automation id).
 e2e_wait_eval() {
   local label="$1" expr="$2" expected="$3"
-  e2e_wait_until _e2e_eval_equals "$label" "$expr" "$expected"
+  if e2e_wait_until _e2e_eval_equals "$label" "$expr" "$expected"; then
+    return 0
+  fi
+  # A page that answers simply never reached the value: the caller asserts it.
+  e2e_require_alive "$label"
+  return 1
 }
 _e2e_eval_equals() {
   [ "$(evl "$1" "$2")" = "$3" ]
 }
-
+# Whether window <label> answers an eval. Needs the sourcing script's `evl`.
+e2e_app_answers() {
+  [ "$(evl "$1" "'alive'")" = "alive" ]
+}
+# End the suite with a FAIL line. A caller in $( ) is a subshell, whose own
+# `exit` does not end the script, so the script is sent TERM first (every suite
+# traps it into `exit 1`, which runs its cleanup once).
+e2e_abort() {
+  echo "FAIL: $1" >&2
+  kill -TERM $$
+  exit 1
+}
+# End the suite unless window <label> answers: the app either stopped answering
+# or is gone.
+e2e_require_alive() {
+  if e2e_app_answers "$1"; then
+    return 0
+  fi
+  e2e_note_app_gone
+  if e2e_app_running; then
+    e2e_abort "the app stopped answering"
+  fi
+  e2e_abort "the app is gone"
+}
 # One-line record of whether the app is still there, written when a read came
 # back with nothing to read. Everything goes to stderr: `e2e_read`'s stdout is
 # the value the caller captures. A gone app leaves nothing else behind — the
@@ -233,13 +294,16 @@ e2e_note_app_gone() {
 # eval out after 3 s and a timed-out request comes back as an error, which
 # `jq -r '.data'` renders as the literal string `null` — indistinguishable
 # from a real value unless the caller knows a null there can only be a failed
-# measurement. Six attempts, 1 s apart, an order of magnitude over that 3 s
-# timeout without approaching any suite's own waits. Returns the first
-# non-null result, or `null` after six attempts, so an assertion against a
-# genuinely absent window still fails exactly as before. One line per retry
-# goes to stderr, never stdout, which is the captured value.
+# measurement. A null is checked by asking the window whether it answers at
+# all: if it does, the expression is read once more and that result is returned,
+# a null included. If it does not, the expression is not run again: the window is
+# polled five more times 1 s apart, the first answer is followed by one more read
+# of the expression (returned like the answering case), and no answer ends the
+# suite. A thrown eval is retried, six attempts 1 s apart, and then returned as
+# `EVAL-ERROR: <message>`. One line per retry or poll goes to stderr, never
+# stdout, which is the captured value.
 e2e_read() {
-  local label="$1" js="$2" attempt=1 result err
+  local label="$1" js="$2" attempt=1 result err poll
   while [ "$attempt" -le 6 ]; do
     result="$(evl "$label" "$js")"
     # A thrown eval comes back as the object automation.rs answers on its catch
@@ -259,17 +323,43 @@ e2e_read() {
       fi
       printf '%s\n' "$result"
       return 0
+    elif e2e_app_answers "$label"; then
+      # The null may be an eval that timed out while the page was busy, which is
+      # free now: read once more, and a null again is the value.
+      _e2e_read_again "$label" "$js"
+      return 0
     else
-      echo "e2e_read: retry $attempt after null" >&2
+      for poll in 1 2 3 4 5; do
+        sleep 1
+        if e2e_app_answers "$label"; then
+          _e2e_read_again "$label" "$js"
+          return 0
+        fi
+        echo "e2e_read: poll $poll after null, the app does not answer" >&2
+      done
+      e2e_note_app_gone
+      if e2e_app_running; then
+        e2e_abort "the app stopped answering"
+      fi
+      e2e_abort "the app is gone"
     fi
     sleep 1
     attempt=$((attempt + 1))
   done
+  printf 'EVAL-ERROR: %s\n' "$err"
+}
+# The final read of e2e_read: whatever comes back is the value.
+_e2e_read_again() {
+  local result err
+  result="$(evl "$1" "$2")"
+  err="$(printf '%s' "$result" | jq -r 'select(type == "object" and has("error")) | .error' 2>/dev/null)"
   if [ -n "$err" ]; then
     printf 'EVAL-ERROR: %s\n' "$err"
     return 0
   fi
-  e2e_note_app_gone
+  if [ -z "$result" ]; then
+    e2e_note_app_gone
+  fi
   printf '%s\n' "$result"
 }
 

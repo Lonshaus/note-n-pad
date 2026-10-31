@@ -1,5 +1,21 @@
 // Copyright © 2026 Lonshaus
 // SPDX-License-Identifier: GPL-3.0-only
+import {
+  EditorState,
+  Transaction,
+  type Extension,
+  type Text,
+} from '@codemirror/state';
+import { offscreenMove } from '../editor/offscreenArrow';
+import { capturedInput, outsideInputAction } from './imeCapture';
+import {
+  blockedWhileGlobal,
+  globalOpPath,
+  isNativeSelectAll,
+  selectAllTarget,
+  type LineSelection,
+  type SelectAllMode,
+} from './windowSelection';
 /** Pure helpers for the sliding-window editor: mapping a CodeMirror transaction's
  *  changes to the Rust core's global byte edits, and computing which line range a
  *  window should cover. Kept free of CodeMirror/Tauri so they unit-test in
@@ -329,7 +345,7 @@ export function fillBreaks(
 /** An edit of the core's undo or redo result, as `ByteEdit` without the flags
  *  only a forward apply sends. */
 export type UndoEdit = Pick<ByteEdit, 'start' | 'end' | 'text'> &
-  Pick<ByteEdit, 'keep_start' | 'fill'>;
+  Pick<ByteEdit, 'keep_start' | 'fill' | 'len'>;
 /** How one undo/redo edit lands in a window holding `doc` with `breaks` that
  *  starts at byte `windowStart`: the document change to dispatch (none for a
  *  `fill` edit, which only turns break bytes into other break bytes) and the
@@ -449,7 +465,8 @@ export interface RawChange {
  *  lone `\r` an edit would join to a `\n` (an offset at `start` stays there) and
  *  `cascade` asks the core to rewrite the run of `\r` before it too. `fill`
  *  (undo and redo results only) says the range's bytes became that break byte,
- *  with `text` empty. */
+ *  with `text` empty. `len` (undo and redo results only) is the byte length of
+ *  text put back from a spill file, with `text` empty. */
 export interface ByteEdit {
   start: number;
   end: number;
@@ -457,6 +474,7 @@ export interface ByteEdit {
   keep_start?: boolean;
   cascade?: boolean;
   fill?: string | null;
+  len?: number;
 }
 
 /** Convert one transaction's changes into global byte edits. `docBefore` is the
@@ -492,7 +510,7 @@ export function mapOffset(offset: number, edit: ByteEdit): number {
   if (offset < edit.start || (edit.fill ?? null) !== null) {
     return offset;
   }
-  const inserted = byteLength(edit.text);
+  const inserted = edit.len ?? byteLength(edit.text);
   if (
     edit.keep_start === true &&
     (offset === edit.start || inserted === edit.end - edit.start)
@@ -604,4 +622,218 @@ export function dropSwapSelect(
   composingKept: boolean,
 ): boolean {
   return swapping && !docChanged && userEvent === 'select' && !composingKept;
+}
+/** What the filters for selections synced from the DOM read from the editor. */
+export interface SelectionFilterDeps {
+  swapping: () => boolean;
+  /** A composition captured in the swap back to the caret keeps its syncs. */
+  keep: () => boolean;
+  mode: () => SelectAllMode;
+  /** A key command is being handled: its selections are no native select-all. */
+  keyActive: () => boolean;
+  /** A key command is being replayed from the queue. */
+  replayingKey: () => boolean;
+  /** The rendered range, or null without a view. */
+  viewport: () => { from: number; to: number } | null;
+  /** Ask for a Select All over the file. */
+  request: () => void;
+}
+/** The transaction filters for DOM-derived selections, in registration order.
+ *  CodeMirror runs the last registered first, so the one that notes a native
+ *  select-all sees the transaction before the swap's filter throws it away
+ *  (during a swap the DOM is no selection source, and the select-all would be
+ *  lost). It only asks for the Select All; the transaction passes unchanged. */
+export function selectionFilters(deps: SelectionFilterDeps): Extension[] {
+  return [
+    EditorState.transactionFilter.of((tr) =>
+      dropSwapSelect(
+        deps.swapping(),
+        tr.docChanged,
+        tr.annotation(Transaction.userEvent),
+        deps.keep(),
+      )
+        ? []
+        : tr,
+    ),
+    EditorState.transactionFilter.of((tr) => {
+      const viewport = deps.viewport();
+      const selection = tr.selection;
+      if (
+        viewport !== null &&
+        selection !== undefined &&
+        selectAllTarget(deps.mode(), 'native') === 'file' &&
+        !selection.eq(tr.startState.selection) &&
+        isNativeSelectAll({
+          docChanged: tr.docChanged,
+          isSelect: tr.isUserEvent('select'),
+          isPointer: tr.isUserEvent('select.pointer'),
+          keyActive:
+            deps.keyActive() ||
+            deps.replayingKey() ||
+            tr.annotation(offscreenMove) === true,
+          from: selection.main.from,
+          to: selection.main.to,
+          viewportFrom: viewport.from,
+          viewportTo: viewport.to,
+        })
+      ) {
+        deps.request();
+      }
+      return tr;
+    }),
+  ];
+}
+/** What the filters that route input around the loaded window read from the
+ *  editor. `E` is the keydown the component keeps. */
+export interface GlobalFilterDeps<E> {
+  swapping: () => boolean;
+  locked: () => boolean;
+  holds: () => number;
+  /** A composition is being captured. */
+  capturing: () => boolean;
+  /** An input method key came and no composition has started. */
+  pendingIme: () => boolean;
+  /** A capture ended a moment ago. */
+  late: () => boolean;
+  replayPending: () => boolean;
+  draining: () => boolean;
+  /** A key command is being handled: its selections are no pointer's. */
+  keyActive: () => boolean;
+  /** The keydown being handled, if any. */
+  keydown: () => E | undefined;
+  globalSel: () => LineSelection;
+  /** Whether the input acts outside the loaded window `doc` (see
+   *  `inputOutside`). */
+  outside: (doc: Text) => boolean;
+  /** Select All and the transactions that undo a capture are never refused. */
+  exempt: (tr: Transaction) => boolean;
+  captureMark: (tr: Transaction) => boolean;
+  /** The keydown is a Ctrl or Meta shortcut. */
+  chord: (e: E) => boolean;
+  /** The keydown matches a key binding of the editor. */
+  bound: (e: E) => boolean;
+  /** Queue text no keydown announced; never swaps the window in the filter. */
+  queueText: (text: string) => void;
+  /** Runs `run` after the filter, never inside it. */
+  defer: (run: () => void) => void;
+  queueKey: (e: E) => void;
+}
+
+function insertedText(tr: Transaction): string {
+  let text = '';
+  tr.changes.iterChanges((_fromA, _toA, _fromB, _toB, inserted) => {
+    text += inserted.toString();
+  });
+  return text;
+}
+/** The transaction filters that keep an edit or a key command off the window
+ *  edge while the selection is outside the window or too large for one, in
+ *  registration order. CodeMirror runs the last registered first, so they run
+ *  as: the outside-window rejection (which queues or refuses what it takes),
+ *  the late composition text, the refusal of a user edit under a selection too
+ *  large for one window, and the swap's refusal of user edits. The refusal
+ *  under a large selection only sees what the first two let pass, and lets a
+ *  captured composition through. */
+export function globalFilters<E>(deps: GlobalFilterDeps<E>): Extension[] {
+  const captured = (tr: Transaction): boolean =>
+    capturedInput(deps.capturing(), tr.annotation(Transaction.userEvent));
+  return [
+    EditorState.transactionFilter.of((tr) =>
+      rejectDuringSwap(
+        (deps.swapping() && !captured(tr)) || deps.holds() > 0,
+        tr.docChanged,
+        tr.annotation(Transaction.userEvent),
+      )
+        ? []
+        : tr,
+    ),
+    EditorState.transactionFilter.of((tr) =>
+      blockedWhileGlobal(
+        {
+          docChanged: tr.docChanged,
+          userEvent: tr.annotation(Transaction.userEvent),
+        },
+        deps.globalSel(),
+      ) && !captured(tr)
+        ? []
+        : tr,
+    ),
+    // The last text of a composition that just ended may arrive after its
+    // capture is gone: it is queued, wherever the swap has got to.
+    EditorState.transactionFilter.of((tr) => {
+      if (
+        deps.capturing() ||
+        !deps.replayPending() ||
+        deps.draining() ||
+        !tr.docChanged ||
+        deps.captureMark(tr) ||
+        !deps.late()
+      ) {
+        return tr;
+      }
+      const action = outsideInputAction({
+        capturing: false,
+        pending: false,
+        late: true,
+        userEvent: tr.annotation(Transaction.userEvent),
+      });
+      if (action !== 'queue') {
+        return tr;
+      }
+      const text = insertedText(tr);
+      if (text !== '') {
+        deps.defer(() => deps.queueText(text));
+      }
+      return [];
+    }),
+    EditorState.transactionFilter.of((tr) => {
+      if (
+        deps.swapping() ||
+        deps.locked() ||
+        deps.exempt(tr) ||
+        !deps.outside(tr.startState.doc)
+      ) {
+        return tr;
+      }
+      const userEvent = tr.annotation(Transaction.userEvent);
+      const edit = tr.docChanged && userEvent !== undefined;
+      const keySelect =
+        deps.keyActive() &&
+        !tr.docChanged &&
+        tr.selection !== undefined &&
+        !tr.isUserEvent('select.pointer');
+      if (!edit && !keySelect) {
+        return tr;
+      }
+      const action = edit
+        ? outsideInputAction({
+            capturing: deps.capturing(),
+            pending: deps.pendingIme(),
+            late: deps.late(),
+            userEvent,
+          })
+        : 'reject';
+      if (action === 'capture') {
+        return tr;
+      }
+      if (action === 'queue') {
+        // Text no keydown announced, such as an AltGr character or the text
+        // of an input method that did not compose.
+        const text = insertedText(tr);
+        if (text !== '') {
+          deps.defer(() => deps.queueText(text));
+        }
+        return [];
+      }
+      const e = deps.keydown();
+      if (
+        e !== undefined &&
+        ((!deps.replayPending() && deps.chord(e)) ||
+          (globalOpPath(deps.globalSel()) && deps.bound(e)))
+      ) {
+        deps.queueKey(e);
+      }
+      return [];
+    }),
+  ];
 }

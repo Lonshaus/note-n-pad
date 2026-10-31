@@ -3,7 +3,12 @@
   // SPDX-License-Identifier: GPL-3.0-only
 
   import { onMount } from 'svelte';
-  import { Compartment, EditorState, type Extension } from '@codemirror/state';
+  import {
+    Compartment,
+    EditorState,
+    type Extension,
+    type TransactionSpec,
+  } from '@codemirror/state';
   import {
     EditorView,
     keymap,
@@ -24,6 +29,15 @@
   import { cmPhraseExtension, cmPhraseSignature } from './cmPhrases';
   import { shortcutsState } from '../state/shortcuts.svelte';
   import { platform } from '../state/platform.svelte';
+  import { rememberCopy } from '../util/linewiseCopy';
+  import { pasteFlowDeps } from '../util/pasteEnv';
+  import {
+    PasteFlow,
+    STICKY_KEY,
+    registerPasteTarget,
+    type PasteHost,
+  } from '../util/pasteFlow';
+  import { editableWith, pasteLocks, type PasteLock } from '../util/pasteLock';
 
   interface Props {
     value: string;
@@ -42,11 +56,9 @@
     onchange,
     onview,
   }: Props = $props();
-
   // Sticky notes have no search: swallow Mod-f, F3 and Shift-F3 so neither
   // the search panel nor a WebView2 find bar can open from a sticky.
   const stickyNoSearch = () => true;
-
   // Paper-note editor: writing surface only, no gutters/line numbers/active-line.
   // Keeps the language + theme compartments so highlighting still works.
   const minimalSetup: Extension = [
@@ -78,15 +90,32 @@
   const keymapCompartment = new Compartment();
   // CodeMirror's own UI text in the active UI language.
   const phraseCompartment = new Compartment();
+  // The paste lock of the note: its editor is its only tab.
+  const editableCompartment = new Compartment();
   // Phrases baked into the state so far; a reconfigure is skipped when equal.
   let appliedPhrases = cmPhraseSignature();
+  // A paste into the note: it stops the event, asks the core what the
+  // clipboard holds, and pastes in one transaction.
+  const pasteHost: PasteHost = {
+    dest: 'sticky',
+    stateOf: () => view?.state ?? null,
+    apply: (_id: string, spec: TransactionSpec) => {
+      view?.dispatch(spec);
+    },
+    showLock: (_id: string, lock: PasteLock | undefined) => {
+      view?.dispatch({
+        effects: editableCompartment.reconfigure(editableWith(true, lock)),
+      });
+    },
+    eolOf: () => '\n',
+  };
+  const paste = new PasteFlow(pasteHost, pasteFlowDeps);
 
   function currentKeymap(): Extension {
     return keymapExtension('sticky', platform.os, (id) =>
       shortcutsState.accel(id),
     );
   }
-
   // Create the view exactly once; a reactive $effect here would rebuild the
   // editor (and drop focus) on every keystroke since it reads `value`.
   onMount(() => {
@@ -114,6 +143,22 @@
           phraseCompartment.of(cmPhraseExtension()),
           languageCompartment.of([]),
           themeCompartment.of([]),
+          editableCompartment.of(
+            editableWith(true, pasteLocks.get(STICKY_KEY)),
+          ),
+          // CodeMirror's own paste reads the clipboard by itself; ours asks
+          // the core first, and reads it once.
+          EditorView.domEventHandlers({
+            paste: (e, v) => paste.onPaste(STICKY_KEY, v, e),
+            copy: (_e, v) => {
+              rememberCopy(v.state);
+              return false;
+            },
+            cut: (_e, v) => {
+              rememberCopy(v.state);
+              return false;
+            },
+          }),
           EditorView.updateListener.of((update) => {
             if (update.docChanged) {
               onchange(update.state.doc.toString());
@@ -123,6 +168,9 @@
       }),
     });
     view = v;
+    const forget = registerPasteTarget(v, (text) =>
+      paste.pasteText(STICKY_KEY, v.state, text),
+    );
     onview?.(v);
     // DEV-only: expose this view to the automation hook. Dynamic import so the
     // registry (and its callers) are absent from the production bundle.
@@ -130,6 +178,7 @@
       void import('../dev/editorRegistry').then((m) => m.setActiveView(v));
     }
     return () => {
+      forget();
       onview?.(null);
       if (import.meta.env.DEV) {
         void import('../dev/editorRegistry').then((m) => m.setActiveView(null));
@@ -138,7 +187,6 @@
       view = undefined;
     };
   });
-
   // Propagate external value changes only when they differ from the current doc,
   // so our own edits (which already updated `value`) don't loop back in.
   $effect(() => {
@@ -177,7 +225,6 @@
       });
     }
   });
-
   // Swap the language extension in place; never recreate the view.
   $effect(() => {
     const next = lang;
@@ -187,7 +234,6 @@
       });
     }
   });
-
   // Swap the editor theme in place; never recreate the view.
   $effect(() => {
     const isDark = dark;

@@ -3,7 +3,7 @@
 
 import type { EditorView } from '@codemirror/view';
 import { invoke } from '@tauri-apps/api/core';
-
+import { routePastedText } from './pasteFlow';
 /** The CM view's selected text, joined the same way CM6's own copy handler
  *  joins a multi-selection (one line per range). */
 function selectedText(view: EditorView): string {
@@ -11,7 +11,6 @@ function selectedText(view: EditorView): string {
     .map((r) => view.state.sliceDoc(r.from, r.to))
     .join('\n');
 }
-
 /** Edit > Copy against a CodeMirror view: write the selection to the
  *  clipboard, or do nothing when there is none. */
 export function editorCopy(view: EditorView): void {
@@ -20,7 +19,6 @@ export function editorCopy(view: EditorView): void {
     void navigator.clipboard.writeText(text);
   }
 }
-
 /** Edit > Cut against a CodeMirror view: copy the selection, then remove it
  *  as a single edit so it lands in CM's undo history as one step.
  *  The write is awaited before the delete — a rejected clipboard write with the
@@ -38,7 +36,6 @@ export async function editorCut(view: EditorView): Promise<void> {
   }
   view.dispatch(view.state.replaceSelection(''));
 }
-
 /** Edit > Paste against a CodeMirror view. Unlike Copy/Cut, this needs
  *  clipboard *read* access. WebKitGTK on Linux blocks
  *  `navigator.clipboard.readText()` outright, so a throw or an empty result
@@ -66,5 +63,8 @@ export async function editorPaste(view: EditorView): Promise<void> {
   if (text === '') {
     return;
   }
-  view.dispatch(view.state.replaceSelection(text));
+  // The same decision as a paste event's text: it may make the tab a large file.
+  if (!routePastedText(view, text)) {
+    view.dispatch(view.state.replaceSelection(text));
+  }
 }

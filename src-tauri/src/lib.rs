@@ -5,7 +5,10 @@ mod altgr;
 mod app_watch;
 #[cfg(debug_assertions)]
 mod automation;
+mod clipboard_store;
 mod cmdline;
+mod convert;
+mod convert_handoff;
 mod ctx_menu;
 mod data_files;
 mod default_apps;
@@ -49,6 +52,7 @@ mod settings;
 mod shortcut;
 mod shortcuts;
 mod snapshot_lock;
+mod spill;
 #[cfg_attr(not(all(target_os = "macos", feature = "storekit")), allow(dead_code))]
 mod store_state;
 #[cfg(all(target_os = "macos", feature = "storekit"))]
@@ -76,7 +80,6 @@ use tauri::menu::{CheckMenuItem, IsMenuItem, Menu, MenuItem, PredefinedMenuItem,
 use tauri::tray::TrayIconBuilder;
 use tauri::{Emitter, Manager, Wry};
 use tauri_plugin_global_shortcut::ShortcutState;
-
 /// The six Undo/Redo/Cut/Copy/Paste/Select-All items built by `build_menu`,
 /// boxed as trait objects so the same tuple type covers both the predefined
 /// (macOS/Windows) and custom (Linux) constructions.
@@ -88,17 +91,14 @@ type EditMenuItems = (
   Box<dyn IsMenuItem<Wry>>,
   Box<dyn IsMenuItem<Wry>>,
 );
-
 /// Hard cap on how long a quit waits for stickies to flush before exiting anyway.
 const FLUSH_TIMEOUT: Duration = Duration::from_millis(1500);
-
 /// In-flight guard for the quit handshake. A single Cmd+Q can dispatch the quit
 /// action more than once, and two overlapping handshakes sharing one `FlushGate`
 /// can race so a stale waiter exits past a veto. This lets only the first live
 /// handshake through; it is released again only when a handshake is cancelled, so
 /// the user can retry the quit after resolving whatever vetoed it.
 static QUIT_IN_FLIGHT: AtomicBool = AtomicBool::new(false);
-
 /// How close together two distinct windows' `CloseRequested` events must land
 /// to be treated as a desktop-shell "close all windows" / "Quit N Windows"
 /// action rather than two ordinary, unrelated single-window closes. Also used
@@ -106,14 +106,12 @@ static QUIT_IN_FLIGHT: AtomicBool = AtomicBool::new(false);
 /// deletes a closed window's clean tabs, so a quit racing that same window's
 /// close still has a chance to preserve them; see `note_store::drop_closed_tabs`.
 const BATCH_CLOSE_WINDOW: Duration = Duration::from_millis(300);
-
 /// The most recent window label (and when) to receive a `CloseRequested`,
 /// used to recognize a batch close. macOS never needs this: Cmd+Q there is a
 /// real app-level event, so a batch close is never inferred from per-window
 /// events on that platform.
 #[cfg(not(target_os = "macos"))]
 static LAST_CLOSE_REQUEST: Mutex<Option<(String, std::time::Instant)>> = Mutex::new(None);
-
 /// Pure decision for whether a `CloseRequested` for `label` at `now` — given
 /// the previously recorded `(label, time)`, if any — looks like a
 /// desktop-shell batch close: a *different* window label closed within
@@ -139,7 +137,6 @@ fn is_batch_close(
     None => false,
   }
 }
-
 /// Apply one `CloseRequested` to the batch-close tracking state: decide
 /// whether it's a batch (via `is_batch_close`) and record it as `last`, in
 /// one step. The bug this fixed (see git history) was in the record-update
@@ -158,7 +155,6 @@ fn record_close_and_check_batch(
   *last = Some((label.to_string(), now));
   batch
 }
-
 /// The most recent time a `CloseRequested` was recognized as part of a
 /// desktop-shell batch close, across every window. Monotonic: set on
 /// detection, **never cleared** — in particular not by a vetoed quit, which
@@ -173,7 +169,6 @@ fn record_close_and_check_batch(
 /// only still matters when the desktop shell spreads its close requests
 /// across more than one event-loop pass, which the same-pass rule cannot see.
 static LAST_BATCH_CLOSE: Mutex<Option<std::time::Instant>> = Mutex::new(None);
-
 /// When each document window currently going through the single-close
 /// (`FlushDoc`) flow had its `CloseRequested`, keyed by label. Written in
 /// `handle_window_event`, read and removed by `note_store::drop_closed_tabs`
@@ -187,7 +182,6 @@ static LAST_BATCH_CLOSE: Mutex<Option<std::time::Instant>> = Mutex::new(None);
 /// the same-pass rule can't see (a batch spread across passes), not the
 /// common case any more.
 static CLOSE_REQUESTED_AT: Mutex<Option<HashMap<String, std::time::Instant>>> = Mutex::new(None);
-
 /// Every window label (with its `FocusKind`) that received a `CloseRequested`
 /// during the event-loop pass currently in progress. Written in
 /// `handle_window_event`, drained once per pass by the `MainEventsCleared`
@@ -196,7 +190,6 @@ static CLOSE_REQUESTED_AT: Mutex<Option<HashMap<String, std::time::Instant>>> = 
 /// by `BATCH_CLOSE_WINDOW` for why wall-clock proximity alone is not enough).
 /// Keyed by label so the same window closing twice in one pass counts once.
 static PENDING_CLOSE: Mutex<Option<HashMap<String, FocusKind>>> = Mutex::new(None);
-
 /// Set when the time-based fallback (`record_close_and_check_batch`) catches
 /// a batch during the pass currently in progress. Read and reset to `false`
 /// together with draining `PENDING_CLOSE` at `MainEventsCleared`, and fed
@@ -207,14 +200,12 @@ static PENDING_CLOSE: Mutex<Option<HashMap<String, FocusKind>>> = Mutex::new(Non
 /// was the bug: it could act on the time-based rule alone while this exact
 /// close's own record in `PENDING_CLOSE` was still unread.
 static TIME_BATCH_THIS_PASS: AtomicBool = AtomicBool::new(false);
-
 /// Monotonically increasing count of event-loop passes (`MainEventsCleared`
 /// firings), used only for the diagnostic log in `handle_window_event`: it
 /// lets a packaged build's log answer whether the desktop shell's "close all
 /// windows" delivered every `CloseRequested` in one pass or spread them
 /// across several.
 static EVENT_LOOP_PASS: AtomicU64 = AtomicU64::new(0);
-
 /// Whether `drop_closed_tabs` should actually delete a closed window's clean
 /// tabs now. `false` (keep them) when a quit is currently in flight, or when
 /// a batch close was detected at or after this window's own close request —
@@ -234,7 +225,6 @@ fn should_forget_tabs(
   }
   !matches!(last_batch, Some(t) if t >= close_at)
 }
-
 /// Persist every sticky's pending edits before exiting. Broadcasts `flush-request`
 /// so each sticky flushes and acks, then waits (off the main thread, so the event
 /// and ack IPC can still be pumped) for all acks or a timeout before quitting.
@@ -299,14 +289,12 @@ pub(crate) fn flush_then_exit(app: &tauri::AppHandle) {
     }
   });
 }
-
 /// Re-initiate the quit handshake after a window vetoed it and the state that
 /// forced the veto has been resolved.
 #[tauri::command]
 fn request_exit(app: tauri::AppHandle) {
   flush_then_exit(&app);
 }
-
 /// Destroy a document window once its webview has flushed its dirty tabs to
 /// snapshots. The OS close of a `doc-` window is intercepted (see
 /// `handle_window_event`) and routed through the `close-flush-request`
@@ -324,7 +312,6 @@ fn confirm_close(app: tauri::AppHandle, label: String) {
     let _ = window.destroy();
   }
 }
-
 /// The frontend-owned lists that populate the Format submenu's Encoding and
 /// Syntax pickers. The frontend `text.ts` ENCODINGS and `language.ts`
 /// languageNames are the single source of truth, so a document window pushes
@@ -336,7 +323,6 @@ struct MenuLists {
   encodings: Mutex<Vec<String>>,
   languages: Mutex<Vec<String>>,
 }
-
 /// The mode-dependent menu-item handles for one built menu. Rebuilding the menu
 /// (on a language change or a lists push) swaps a whole fresh set in. Enable
 /// state follows the focused window; the check items mirror the focused document
@@ -365,7 +351,6 @@ struct MenuItemRefs {
   line_numbers: CheckMenuItem<Wry>,
   always_on_top: CheckMenuItem<Wry>,
 }
-
 /// Menu items whose enabled/checked state depends on which window is focused.
 /// Held in managed state so window-focus events can toggle them after the menu
 /// is built. The item handles live behind a `Mutex` so a language-triggered
@@ -468,13 +453,11 @@ impl MenuItems {
     // item is left un-greyed by the toolkit and has to be re-marked by hand.
     win_menu_gray::gray_disabled_items(app);
   }
-
   /// Swap in the item handles from a freshly rebuilt menu.
   fn replace(&self, refs: MenuItemRefs) {
     *self.items.lock().unwrap() = refs;
   }
 }
-
 /// Re-apply the enable/check state for whichever window is currently focused.
 /// Called after a document window re-reports its tabs (its active tab's line
 /// ending / encoding / syntax may have changed) and after a settings save.
@@ -486,7 +469,6 @@ pub(crate) fn reapply_focus_menu(app: &tauri::AppHandle) {
   let kind = label.as_deref().map(focus_kind).unwrap_or(FocusKind::None);
   items.apply(app, kind, label.as_deref());
 }
-
 /// Re-apply the focused window's menu state only when `group`'s document window
 /// is the focused one, so a background window's tab report never clobbers the
 /// menu for the window the user is actually looking at.
@@ -498,7 +480,6 @@ pub(crate) fn reapply_focus_menu_for_group(app: &tauri::AppHandle, group: &str) 
     reapply_focus_menu(app);
   }
 }
-
 /// The focused window's kind, which decides menu-item availability.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum FocusKind {
@@ -509,7 +490,6 @@ enum FocusKind {
   About,
   None,
 }
-
 /// Classify a window label into the kind that drives menu enablement.
 fn focus_kind(label: &str) -> FocusKind {
   if label.starts_with("doc-") {
@@ -565,7 +545,6 @@ fn minimize_focused(app: &tauri::AppHandle) {
     let _ = window.minimize();
   }
 }
-
 /// Enabled flags for the eight mode-dependent menu items.
 struct MenuFlags {
   new_tab: bool,
@@ -577,7 +556,6 @@ struct MenuFlags {
   find_next: bool,
   find_prev: bool,
 }
-
 /// Map a focused-window kind to which mode-dependent items are enabled. Document
 /// windows get everything; stickies have no search at all and cannot open or
 /// tab; the workspace closes (which hides it) and opens -- it holds no document
@@ -605,7 +583,6 @@ fn menu_flags(kind: FocusKind) -> MenuFlags {
     find_prev: pv,
   }
 }
-
 /// Emit an event carrying `payload` to whichever window currently has focus.
 /// Windows that don't handle the event ignore it silently.
 fn emit_to_focused<T: serde::Serialize + Clone>(app: &tauri::AppHandle, event: &str, payload: T) {
@@ -668,14 +645,12 @@ fn send_to_first_responder(id: &str) {
   // nil target means "the first responder that handles it".
   let _: bool = unsafe { msg_send![&*ns_app, sendAction: action, to: none, from: none] };
 }
-
 /// Label of the document window the user was in most recently. Unlike
 /// `MenuItems::focused`, which is cleared the moment focus leaves so the menu
 /// can grey out, this survives focus loss — which is the whole point, since the
 /// case it exists for is the user being over in Finder when they open a file.
 /// Cleared on `Destroyed` so it can never name a window that is gone.
 static LAST_DOC_WINDOW: Mutex<Option<String>> = Mutex::new(None);
-
 /// Track the most recent document window for `open_shell_paths`.
 fn track_last_doc_window(window: &tauri::Window, event: &tauri::WindowEvent) {
   let label = window.label();
@@ -703,13 +678,14 @@ fn announce_app_focus(window: &tauri::Window, event: &tauri::WindowEvent) {
   if !matches!(event, tauri::WindowEvent::Focused(true)) {
     return;
   }
+  // The clip may have been replaced while the app was in the background.
+  clipboard_store::validate_on_focus();
   let app = window.app_handle();
   let windows = app.webview_windows();
   for label in doc_window_labels(windows.keys()) {
     let _ = app.emit_to(label.as_str(), "app-focused", ());
   }
 }
-
 /// The tracked document window, if it is still open. Checking with the app
 /// handle rather than trusting the stored label alone covers the window being
 /// gone without a `Destroyed` event ever reaching us.
@@ -809,7 +785,6 @@ pub(crate) fn resync_menu_focus(app: &tauri::AppHandle) {
   *items.focused.lock().unwrap() = Some(label.clone());
   items.apply(app, focus_kind(&label), Some(&label));
 }
-
 /// What the same-event-loop-pass batch-close rule decides, given every
 /// window label (with its `FocusKind`) that received a `CloseRequested`
 /// during one event-loop pass (`PENDING_CLOSE`, drained at
@@ -832,7 +807,6 @@ enum SamePassDisposition {
   /// never having been called for that kind).
   Nothing,
 }
-
 /// `time_batch` wins over the label count, and both win over kind: a
 /// document window caught in a batch close (by either rule) must not run
 /// its single-close flow, since that flow would permanently drop tabs the
@@ -863,7 +837,14 @@ pub(crate) fn apply_app_theme(app: &tauri::AppHandle, mode: &str) {
   #[cfg(target_os = "macos")]
   windows::refresh_chrome_background(app);
 }
-
+/// A page starts loading: what the window's old page held on the clipboard (pins,
+/// gates, reservations) is let go of before the new page runs. The webview's label
+/// is its window's.
+fn handle_page_load(webview: &tauri::Webview, payload: &tauri::webview::PageLoadPayload<'_>) {
+  if payload.event() == tauri::webview::PageLoadEvent::Started {
+    clipboard_store::window_reset(webview.label());
+  }
+}
 /// The app's single window-event handler: keeps the menu's focus-dependent
 /// items in sync and, for document windows, intercepts the OS close so their
 /// dirty tabs are flushed to snapshots before the window is destroyed (a raw
@@ -995,6 +976,9 @@ fn handle_window_event(window: &tauri::Window, event: &tauri::WindowEvent) {
       items.on_top.lock().unwrap().remove(window.label());
     }
     release_pending_opens(window.app_handle(), window.label());
+    convert_handoff::window_destroyed(window.app_handle(), window.label());
+    convert::window_destroyed(window.app_handle(), window.label());
+    clipboard_store::window_destroyed(window.label());
     // A destroyed window has nothing left to flush; ack it on its behalf so
     // a quit whose wait list still names it (it was already let through and
     // is mid-destroy when the quit starts) doesn't stall out the full
@@ -1008,7 +992,6 @@ fn handle_window_event(window: &tauri::Window, event: &tauri::WindowEvent) {
     }
   }
 }
-
 /// Populate (or repopulate) the File > Open Recent submenu from `recent`, newest
 /// first, ending with a separator and a Clear Menu item (disabled when the list
 /// is empty). Each path item carries id `recent:{index}`, resolved back against
@@ -1053,7 +1036,6 @@ fn populate_recent(
   submenu.append(&clear)?;
   Ok(())
 }
-
 /// Escape a menu label that may carry a literal `&` (the product name
 /// `Note&Pad`, or any translated label) for the native menu bar. muda reads a
 /// bare `&` as the mnemonic prefix on every platform (Windows and GTK underline
@@ -1066,7 +1048,6 @@ fn populate_recent(
 pub(crate) fn escape_menu_label(label: &str) -> String {
   label.replace('&', "&&")
 }
-
 /// The Help menu's items in order, by menu id and label. "Full Version Features"
 /// sits between Report an Issue and Acknowledgements and exists only in a build
 /// with editions.
@@ -1082,7 +1063,6 @@ fn help_menu_entries(editions: bool) -> Vec<(&'static str, i18n::Key)> {
   entries.push(("help-privacy", i18n::Key::PrivacyPolicy));
   entries
 }
-
 /// Build the menu bar in `locale`, returning the built menu (not yet installed;
 /// see `install_menu`) alongside the mode-dependent item handles.
 /// App/File/Edit/Format/View/Window submenus: File/Edit/Format custom items
@@ -1542,7 +1522,6 @@ fn build_menu(
     menu,
   ))
 }
-
 /// Install a freshly built menu app-wide. Every window that has no menu of its
 /// own inherits this one — both the windows open right now and any built later,
 /// which is what keeps the menu accelerators (Save, Find, Quit …) alive in a
@@ -1584,7 +1563,6 @@ fn install_menu(app: &tauri::AppHandle, menu: Menu<Wry>) -> tauri::Result<()> {
   }
   Ok(())
 }
-
 /// Build the app menu in `locale`, manage the mode-dependent item state, and wire
 /// the one-time menu-event handler. Called once at startup.
 fn build_app_menu(
@@ -1602,7 +1580,6 @@ fn build_app_menu(
   app.on_menu_event(|app, event| handle_menu_id(app, event.id.as_ref()));
   Ok(())
 }
-
 /// Run the menu command `id`. The menu-event handler above and the Windows
 /// keyboard path (`trigger_menu_accelerator`) both land here, so a shortcut
 /// always does exactly what clicking its menu item does.
@@ -1712,7 +1689,6 @@ fn accelerator_enabled(id: &str, kind: FocusKind) -> bool {
     _ => false,
   }
 }
-
 /// Windows-only keyboard path: WebView2 keyboard input never reaches Tauri's
 /// `TranslateAcceleratorW` msg_hook, so menu accelerators cannot fire while a
 /// webview has focus. The frontend's Windows-only keydown listener
@@ -1767,7 +1743,6 @@ mod menu_accelerator_command_tests {
       platform,
     )
   }
-
   // Reads the source because the failure mode is a deadlock, with nothing to
   // assert at runtime. Same style as `window_command_threading_tests` in
   // `windows.rs`.
@@ -1914,7 +1889,6 @@ mod menu_accelerator_command_tests {
     assert!(!accelerator_enabled("not-a-real-id", FocusKind::Doc));
   }
 }
-
 /// Toggle the global word-wrap setting from the Format menu, persisting it so
 /// every window's editor reacts to `settings-changed` and the menu check updates.
 fn toggle_word_wrap(app: &tauri::AppHandle) {
@@ -1924,7 +1898,6 @@ fn toggle_word_wrap(app: &tauri::AppHandle) {
     log::warn!("failed to toggle word wrap: {e}");
   }
 }
-
 /// Toggle the global line-numbers setting from the View menu, same path as word
 /// wrap.
 fn toggle_line_numbers(app: &tauri::AppHandle) {
@@ -1934,7 +1907,6 @@ fn toggle_line_numbers(app: &tauri::AppHandle) {
     log::warn!("failed to toggle line numbers: {e}");
   }
 }
-
 /// Toggle always-on-top for the focused document window, tracking the per-window
 /// state and reflecting it in the menu check.
 fn toggle_always_on_top(app: &tauri::AppHandle) {
@@ -1954,7 +1926,6 @@ fn toggle_always_on_top(app: &tauri::AppHandle) {
   let _ = win.set_always_on_top(next);
   let _ = items.items.lock().unwrap().always_on_top.set_checked(next);
 }
-
 /// Open the recent file at the index carried by a `recent:{index}` menu id,
 /// resolved against the live settings list. Opens it in a fresh document window
 /// (which re-records it, moving it to the front of the list).
@@ -1970,7 +1941,6 @@ fn open_recent(app: &tauri::AppHandle, id: &str) {
     let _ = windows::open_document(app, path, None);
   }
 }
-
 /// Clear the File > Open Recent list and repopulate the (now empty) submenu.
 fn clear_recent(app: &tauri::AppHandle) {
   if let Err(e) = settings::clear_recent_files(app) {
@@ -1979,7 +1949,6 @@ fn clear_recent(app: &tauri::AppHandle) {
   }
   refresh_recent_menu(app, &[]);
 }
-
 /// Record a freshly opened file in the recent list and repopulate the submenu.
 /// The single entry point for both backend opens (New Window / Open Recent) and
 /// the frontend `add_recent_file` command.
@@ -2008,7 +1977,6 @@ pub(crate) fn retarget_recent(app: &tauri::AppHandle, from: &str, to: &str) {
     Err(e) => log::warn!("failed to follow a rename in the recent files: {e}"),
   }
 }
-
 /// Repopulate the live Open Recent submenu from `recent`. No-op if the menu has
 /// not been built yet.
 fn refresh_recent_menu(app: &tauri::AppHandle, recent: &[String]) {
@@ -2021,7 +1989,6 @@ fn refresh_recent_menu(app: &tauri::AppHandle, recent: &[String]) {
     log::warn!("failed to refresh recent menu: {e}");
   }
 }
-
 /// The currently focused window and its label, if any.
 fn focused_window(app: &tauri::AppHandle) -> Option<(String, tauri::WebviewWindow)> {
   app
@@ -2029,7 +1996,6 @@ fn focused_window(app: &tauri::AppHandle) -> Option<(String, tauri::WebviewWindo
     .into_iter()
     .find(|(_, w)| w.is_focused().unwrap_or(false))
 }
-
 /// The focused document window's active tab's syntax language (`None` for
 /// Plain Text, and also `None` when no document window is focused or it has
 /// no active tab). Drives which entry the Format > Syntax submenu pins at top.
@@ -2043,7 +2009,6 @@ fn focused_doc_language(app: &tauri::AppHandle) -> Option<String> {
   let map = state.0.lock().unwrap();
   map.get(group)?.active_tab()?.language.clone()
 }
-
 /// Order the Format > Syntax submenu entries so `current` (`None` for Plain
 /// Text) is pinned first, followed by every other entry (Plain Text plus
 /// `languages`, in their original order) with the current one omitted so it
@@ -2056,7 +2021,6 @@ fn syntax_order(languages: &[String], current: Option<&str>) -> Vec<Option<Strin
   order.extend(base.filter(|entry| *entry != pinned));
   order
 }
-
 /// The entries of the Format > Syntax submenu: `syntax_order`, except that the
 /// Lite edition has no syntax highlighting and so lists Plain Text alone.
 fn syntax_entries(languages: &[String], current: Option<&str>, lite: bool) -> Vec<Option<String>> {
@@ -2199,7 +2163,6 @@ mod syntax_order_tests {
     );
   }
 }
-
 /// Receive the frontend's encoding and syntax lists (the single source of truth
 /// in `text.ts` / `language.ts`) so the Format submenus can be built from them.
 /// A document window pushes these once on mount; the first push that changes the
@@ -2233,16 +2196,13 @@ fn set_menu_lists(app: tauri::AppHandle, encodings: Vec<String>, languages: Vec<
     rebuild_app_menu(&app, locale);
   }
 }
-
 /// Stable id for the single tray icon, so a language change can look it up and
 /// swap its menu.
 const TRAY_ID: &str = "main";
-
 /// Side of the menu bar template icon, in pixels. The bytes beside it are raw
 /// RGBA and carry no header to read this from, so a test asserts the two agree.
 #[cfg(target_os = "macos")]
 const TRAY_TEMPLATE_SIZE: u32 = 44;
-
 /// Rebuild the app and tray menus in `locale` after a language change. The
 /// managed `MenuItems` handles are swapped for the fresh menu's, then the
 /// current focus state is re-applied so enable/disable keeps working. The
@@ -2300,7 +2260,6 @@ mod rebuild_app_menu_guard_tests {
     );
   }
 }
-
 /// Labels of the menu last handed to the tray icon, newest first in build order.
 /// Tauri has `set_menu` and no getter, so without this there is no way to read
 /// back what the icon is actually carrying — which is the only thing that shows
@@ -2349,7 +2308,6 @@ pub(crate) fn rebuild_menus(app: &tauri::AppHandle, locale: i18n::Locale) {
   #[cfg(target_os = "windows")]
   jumplist::rebuild(app);
 }
-
 /// Focus every open sticky window.
 fn show_all_notes(app: &tauri::AppHandle) {
   for (label, win) in app.webview_windows() {
@@ -2360,7 +2318,6 @@ fn show_all_notes(app: &tauri::AppHandle) {
     }
   }
 }
-
 /// Build the tray menu in `locale`. Split out so a language change can swap it
 /// onto the existing tray icon without rebuilding the whole tray.
 fn build_tray_menu(
@@ -2454,7 +2411,6 @@ fn build_tray(
     .build(app)?;
   Ok(())
 }
-
 /// Show or hide the tray/status-bar icon, respecting the user's preference. The
 /// tray is always built at startup so its menu handlers stay wired; toggling
 /// visibility is the cleanest way to honor the setting without rebuilding it.
@@ -2463,7 +2419,6 @@ pub(crate) fn set_tray_visible(app: &tauri::AppHandle, visible: bool) {
     let _ = tray.set_visible(visible);
   }
 }
-
 /// Bring the running instance to the foreground when a second launch is
 /// intercepted by the single-instance plugin (Windows/Linux only). Reveals the
 /// workspace if it is open, otherwise raises every sticky/document window,
@@ -2488,7 +2443,6 @@ fn activate_existing(app: &tauri::AppHandle) {
     let _ = windows::new_sticky(app, &store);
   }
 }
-
 /// Open files the shell handed over: a double-click on an associated file,
 /// "Open with", or a drop onto the executable. Routed by the same open-target
 /// setting as File > Open, so the two entry points cannot disagree.
@@ -2535,14 +2489,16 @@ fn release_pending_opens(app: &tauri::AppHandle, label: &str) {
   let Some(pending) = app.try_state::<pending_opens::PendingOpens>() else {
     return;
   };
-  let paths = pending.forget(label);
-  if paths.is_empty() {
+  // A converted document is given back to its sticky, never opened as a path.
+  let (paths, handoffs) = pending_opens::split_released(pending.forget(label));
+  if paths.is_empty() && handoffs.is_empty() {
     return;
   }
   // Off the event loop: building a window from a window-event handler can
   // deadlock on Windows.
   let app = app.clone();
   std::thread::spawn(move || {
+    convert_handoff::give_back_unclaimed(&app, &handoffs);
     for path in paths {
       open_in_new_window(&app, &path);
     }
@@ -2555,7 +2511,6 @@ fn open_in_new_window(app: &tauri::AppHandle, path: &str) {
     Err(err) => log::warn!("could not open {path} handed over by the shell: {err}"),
   }
 }
-
 /// Carry out one parsed command-line action. Shared by both launch paths, which
 /// differ only in what an unrecognized command line means (see the callers).
 #[cfg(any(target_os = "windows", target_os = "linux"))]
@@ -2579,7 +2534,6 @@ fn apply_launch_action(app: &tauri::AppHandle, action: cmdline::Action) {
     cmdline::Action::None => {}
   }
 }
-
 /// Route a second launch's command line (Jump List or a bare relaunch) to the
 /// action it names, falling back to `activate_existing` for anything the
 /// parser does not recognize — including the common case of a plain
@@ -2591,7 +2545,6 @@ fn handle_second_launch(app: &tauri::AppHandle, argv: Vec<String>) {
     action => apply_launch_action(app, action),
   }
 }
-
 /// Route the command line the app was started with. The single-instance plugin
 /// only sees a *second* launch, so without this a Jump List task clicked while
 /// the app is closed starts the app and then does nothing — which is the usual
@@ -2619,7 +2572,6 @@ fn launch_carries_files_at_startup() -> bool {
 fn launch_carries_files_at_startup() -> bool {
   launch_windows::opened_any()
 }
-
 /// The purchase part of the "Full Version Features" window: whether this build
 /// sells the full version, its price, and whether the store has answered about
 /// the version first installed.
@@ -2634,7 +2586,6 @@ fn store_info() -> store_state::StoreInfo {
     store_state::StoreInfo::unavailable()
   }
 }
-
 /// Buy the full version: "purchased", "cancelled", "pending" or "failed".
 /// The purchase sheet can stay open indefinitely, so it waits on the blocking
 /// pool instead of holding an async worker.
@@ -2655,7 +2606,6 @@ async fn store_purchase(app: tauri::AppHandle, window: tauri::WebviewWindow) -> 
     "failed"
   }
 }
-
 /// Restore an earlier purchase: "restored", "nothing", "cancelled" or "failed".
 /// The sign-in prompt can stay open indefinitely; see `store_purchase`.
 #[tauri::command]
@@ -2675,7 +2625,6 @@ async fn store_restore(app: tauri::AppHandle, window: tauri::WebviewWindow) -> &
     "failed"
   }
 }
-
 /// Ask the store again about the version first installed: "known" or
 /// "unknown", or "failed" when not allowed. The sign-in prompt can stay open
 /// indefinitely; see `store_purchase`.
@@ -2759,6 +2708,7 @@ pub fn run() {
         .build(),
     )
     .on_window_event(handle_window_event)
+    .on_page_load(handle_page_load)
     // The Markdown preview's only route to a local image. See `preview_img`
     // for the gates; `img-src` in tauri.conf.json must list both origin forms.
     .register_uri_scheme_protocol("docimg", preview_img::respond)
@@ -2846,7 +2796,7 @@ pub fn run() {
       let had_snapshot_skips = !snapshot_skips.is_empty();
       app.manage(note_store::StartupSkips::holding(snapshot_skips));
       // Grants must be live before any window reads a restored path.
-      match handle.path().app_data_dir() {
+      let windowed_tmp = match handle.path().app_data_dir() {
         Ok(app_data) => {
           let settings_report =
             settings::settings_path(handle).and_then(|p| settings::load_from_with_report(&p));
@@ -2858,16 +2808,25 @@ pub fn run() {
             &notes,
           );
           grants::restore_all(&app_data, keep.as_ref());
-          // Change lists of replace-alls from an earlier run are of no use.
-          replace_layer::cleanup_tmp(&app_data.join(replace_layer::TMP_DIR));
+          // Change lists and spill files of an earlier run are of no use.
+          let tmp = windowed::windowed_tmp_dir(&app_data);
+          replace_layer::cleanup_tmp(&tmp);
+          clipboard_store::cleanup_startup(&tmp);
+          Some(tmp)
         }
-        Err(e) => log::warn!("grants: no app data dir: {e}"),
-      }
+        Err(e) => {
+          log::warn!("grants: no app data dir: {e}");
+          None
+        }
+      };
+      clipboard_store::announce_revocations(handle.clone());
       app.manage(FlushGate::default());
       {
         app.manage(ctx_menu::CtxPending::default());
         app.manage(large_file::LargeFileState::default());
-        app.manage(windowed::WindowedState::default());
+        app.manage(convert::ConvertStore::new(windowed_tmp.clone()));
+        app.manage(convert_handoff::Handoffs::default());
+        app.manage(windowed::WindowedState::new(windowed_tmp));
       }
       app.manage(windows::OpenDocTabs::default());
       app.manage(pending_opens::PendingOpens::default());
@@ -3078,6 +3037,7 @@ pub fn run() {
       large_file::drop_line_index,
       large_file::stream_search,
       large_file::cancel_search,
+      large_file::clip_copy_file,
       range_edit::file_fingerprint,
       range_edit::splice_file,
       range_edit::read_range,
@@ -3095,10 +3055,46 @@ pub fn run() {
       windowed::windowed_map_replace,
       windowed::windowed_release_replace,
       windowed::windowed_offset_line,
+      windowed::windowed_end_pos,
       windowed::windowed_find,
       windowed::windowed_search,
       windowed::windowed_search_cancel,
       windowed::windowed_replace_all,
+      windowed::windowed_replace_range,
+      windowed::windowed_enter,
+      windowed::windowed_indent_range,
+      windowed::clip_copy_session,
+      windowed::windowed_paste_clip,
+      windowed::windowed_paste_system,
+      windowed::clip_read_chunk,
+      windowed::windowed_open_converted,
+      windowed::windowed_reopen_converted,
+      windowed::windowed_set_encoding,
+      convert::convert_begin,
+      convert::convert_append,
+      convert::convert_append_clip,
+      convert::convert_append_clip_line,
+      convert::convert_finish,
+      convert::convert_abort,
+      convert::convert_save,
+      convert::convert_from_file,
+      convert_handoff::convert_handoff_start,
+      convert_handoff::convert_claim,
+      convert_handoff::convert_done,
+      convert_handoff::convert_failed,
+      convert_handoff::convert_release,
+      convert_handoff::convert_sticky_saved,
+      clipboard_store::clip_status,
+      clipboard_store::clip_paste_mark,
+      clipboard_store::clip_copy_reserve,
+      clipboard_store::clip_copy_release,
+      clipboard_store::clip_copy_keepalive,
+      clipboard_store::clip_text_begin,
+      clipboard_store::clip_text_end,
+      clipboard_store::clip_pin,
+      clipboard_store::clip_unpin,
+      #[cfg(target_os = "macos")]
+      clipboard_store::clipboard_redispatch_paste,
       file_ops::create_file,
       file_ops::create_folder,
       file_ops::rename_path,
@@ -3155,6 +3151,8 @@ pub fn run() {
       }
       tauri::RunEvent::Exit => {
         log::info!("exit");
+        // Every exit path ends here, on the main thread, with the run loop stopped.
+        clipboard_store::flush_for_exit();
       }
       // Every `CloseRequested` queued in one event-loop pass is delivered
       // before this fires, no matter how long a handler in between stalls
@@ -3236,7 +3234,6 @@ mod tests {
   };
   use std::collections::HashMap;
   use std::time::{Duration, Instant};
-
   // Raw RGBA carries no header, so an icon regenerated at another size reaches
   // `Image::new` as a buffer that does not match the dimensions handed with it.
   #[cfg(target_os = "macos")]
@@ -3533,7 +3530,6 @@ mod edit_menu_route_tests {
     }
   }
 }
-
 /// Regression guard for the Content-Security-Policy declared in the committed
 /// `tauri.conf.json`. Nothing at runtime would report a mistake here: if the IPC
 /// origins fall out of `connect-src`, Tauri catches the blocked fetch, logs a
@@ -3576,7 +3572,6 @@ mod csp_config_tests {
       "connect-src lost `http://ipc.localhost`: {connect}"
     );
   }
-
   /// Same invisible-failure risk as `connect-src`, one step worse: a blocked
   /// image is just a broken image, so the preview would look merely empty.
   /// Both origin forms are needed — `docimg://` everywhere but Windows and
@@ -3592,7 +3587,6 @@ mod csp_config_tests {
     );
   }
 }
-
 /// Regression guard for the WebView2-missing check in `webview2_runtime`. That
 /// check only runs before any window is built, and Tauri builds every window
 /// declared in `app.windows` before it calls the user `setup` hook — so the
@@ -3618,7 +3612,6 @@ mod webview2_guard_placement_tests {
     );
   }
 }
-
 /// Regression guard for the static Windows CRT. Dropping `+crt-static` makes
 /// the binary import VCRUNTIME140.dll again, and that failure is silent on this
 /// side: the build still succeeds and every test still passes. It surfaces only
@@ -3783,6 +3776,36 @@ mod app_focus_tests {
     let body = &body[..body.find("\n}\n").unwrap()];
     assert!(body.contains("WindowEvent::Focused(true)"));
     assert!(body.contains("\"app-focused\""));
+  }
+}
+
+#[cfg(test)]
+mod page_load_tests {
+  #[test]
+  fn a_page_that_starts_loading_lets_go_of_what_the_old_one_held() {
+    let source = include_str!("lib.rs");
+    let run = &source[source.find("pub fn run()").unwrap()..];
+    let run = &run[..run.find("\n#[cfg(test)]").unwrap()];
+    assert!(run.contains(".on_page_load(handle_page_load)"));
+    let at = source.find("fn handle_page_load(").unwrap();
+    let body = &source[at..];
+    let body = &body[..body.find("\n}\n").unwrap()];
+    let started = body.find("PageLoadEvent::Started").unwrap();
+    let reset = body
+      .find("clipboard_store::window_reset(webview.label())")
+      .unwrap();
+    assert!(started < reset);
+  }
+}
+
+#[cfg(test)]
+mod gate_revocation_tests {
+  #[test]
+  fn the_app_tells_a_window_when_a_gate_of_it_is_revoked() {
+    let source = include_str!("lib.rs");
+    let run = &source[source.find("pub fn run()").unwrap()..];
+    let run = &run[..run.find("\n#[cfg(test)]").unwrap()];
+    assert!(run.contains("clipboard_store::announce_revocations(handle.clone())"));
   }
 }
 

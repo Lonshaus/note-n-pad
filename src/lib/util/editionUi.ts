@@ -2,11 +2,17 @@
 // SPDX-License-Identifier: GPL-3.0-only
 
 /** Which parts of the settings, language and large-file screens exist in an
- *  edition. One place decides, so the screens only read it. Lite has no theme
- *  choice, no worker highlighting (syntax is gone), no large-file open
- *  settings, no way to start editing a large file or to open a range of it for
- *  editing, no workspace to open at startup, and no way to import, export or
- *  delete a language; editing a language and restoring its default stay. */
+ *  edition. One place decides, so the screens only read it.
+ *  `lite` is the free edition, a state of the one build until the full edition
+ *  is bought.
+ *  The free edition has no theme choice.
+ *  The free edition has no worker highlighting, as syntax is gone.
+ *  The free edition has no large-file settings.
+ *  The free edition cannot start editing a large file.
+ *  The free edition cannot open a range of a large file for editing.
+ *  The free edition has no workspace to open at startup.
+ *  The free edition cannot import, export or delete a language.
+ *  Editing a language and restoring its default stay in the free edition. */
 export interface EditionUi {
   themeTab: boolean;
   workerHighlight: boolean;

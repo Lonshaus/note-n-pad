@@ -257,7 +257,8 @@ restore_settings() {
   rm -f "$SEEN"
   e2e_kill_owned_ports
 }
-trap restore_settings EXIT INT TERM
+trap restore_settings EXIT
+trap 'exit 1' INT TERM
 
 launch
 BOOT=$(boot_label)

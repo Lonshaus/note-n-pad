@@ -10,70 +10,72 @@
 //! (`windowed_close`). Byte coordinates and split-style line counting match the
 //! piece table and `large_file`.
 
+use crate::clipboard_store::{self, ClipOutcome, ClipWriter, PinReader, SystemText, Written};
+use crate::convert::{self, ConvertStore, EncodeWriter, Encoder, TmpFile};
 use crate::large_file::preview_at;
 use crate::line_rule::BreakCounter;
 use crate::note_store::{CheckpointIndex, LINE_RULE};
 use crate::piece_table::{OriginalIndex, OriginalSource, PieceTable};
 use crate::range_edit::{Fingerprint, FINGERPRINT_MISMATCH};
 use crate::replace_layer::{self, Builder, ChangeList, Dir, Src, Table};
+use crate::spill::{self, SpillBuilder, SpillCtx, SpillRef};
 use crate::windowed_scan::{scan_backward, scan_forward, Event, Flow, ScanStop};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
+use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::fs::{self, File};
-use std::io::{Read, Seek, SeekFrom};
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use tauri::{AppHandle, Emitter, Manager, State};
-
 /// One-pass scan / streaming-copy buffer (1 MiB): the same size the range-edit
 /// path uses, keeping syscall overhead low without holding much of the file.
-const SCAN_BUF: usize = 1024 * 1024;
-
+pub(crate) const SCAN_BUF: usize = 1024 * 1024;
 /// Byte distance between sparse line-index checkpoints (1 MiB). Bounds the
 /// forward scan any single original-buffer newline query costs, and sets the
 /// checkpoint memory to `16 * ceil(file_len / CHECKPOINT_INTERVAL)` bytes — for a
 /// 240 MB file, ~240 entries (< 4 KiB), versus ~40 MB for a dense per-line index.
 /// 1 MiB matches `SCAN_BUF`, so a checkpoint segment is at most one scan buffer.
-const CHECKPOINT_INTERVAL: u64 = 1024 * 1024;
-
+pub(crate) const CHECKPOINT_INTERVAL: u64 = 1024 * 1024;
 /// Protocol error string returned when a file is not valid UTF-8. The frontend
 /// keys its "can't open" message off this exact value, not off prose.
-const NOT_UTF8: &str = "not-utf8";
-
+pub(crate) const NOT_UTF8: &str = "not-utf8";
+/// Prefix of the error of a read of a clip that the system failed. The frontend
+/// tells it from a write failure by this prefix, not by prose.
+pub(crate) const CLIP_READ: &str = "clip-read: ";
+/// `e`, a failed read of a clip, with the `CLIP_READ` prefix.
+pub(crate) fn clip_read_error(e: &std::io::Error) -> String {
+  format!("{CLIP_READ}{e}")
+}
 /// Protocol error string returned by every command whose session id is not (or is
 /// no longer) live. A single constant so the frontend can match one value.
 const UNKNOWN_SESSION: &str = "unknown-session";
 /// Bytes a search or replace-all pass reads per chunk (256 KiB), the same as the
 /// viewer's search. The session lock is held for one chunk at a time.
-const SCAN_CHUNK: usize = 256 * 1024;
-
+pub(crate) const SCAN_CHUNK: usize = 256 * 1024;
 /// Protocol error strings returned when there is nothing left to undo / redo. The
 /// frontend keys silent no-ops off these exact values.
 const NOTHING_TO_UNDO: &str = "nothing-to-undo";
 const NOTHING_TO_REDO: &str = "nothing-to-redo";
 /// A replace-all token the session does not hold.
 const UNKNOWN_TOKEN: &str = "unknown-token";
-
 /// Protocol error string returned by `windowed_open` / `windowed_reopen` for a
 /// file at or above `LARGE_EDIT_MAX`. A single constant so the frontend can key
 /// its "too large to edit" message off one exact value.
 const TOO_LARGE: &str = "too-large";
-
 /// Ceiling above which windowed editing is refused (512 MiB), enforced here as
 /// an invariant rather than only as a disabled button. The frontend carries its
 /// own copy of this same threshold as `LARGE_EDIT_MAX` in
 /// `documentWindow.svelte.ts`; the two values must be kept in agreement. Do not
 /// change this without updating that one.
-const LARGE_EDIT_MAX: u64 = 512 * 1024 * 1024;
-
+pub(crate) const LARGE_EDIT_MAX: u64 = 512 * 1024 * 1024;
 /// Per-region size (4 KiB) for the sampled digest `windowed_reopen`'s fast path
 /// checks alongside the fingerprint (see `sample_digest`). At the 512 MiB
 /// ceiling there are ~512 checkpoints, so ~512 regions of this size is ~2 MiB
 /// total — well under a full-file hash, and the whole point of the fast path.
 const SAMPLE_BLOCK: u64 = 4096;
-
 /// FNV-1a 64-bit, implemented inline rather than reaching for
 /// `std::collections::hash_map::DefaultHasher`: `DefaultHasher`'s docs
 /// explicitly do not guarantee its output is stable across Rust versions or
@@ -105,7 +107,6 @@ impl Fnv1a {
     self.write(&n.to_le_bytes());
   }
 }
-
 /// Compute the sampled digest `windowed_reopen`'s fast path requires to match
 /// (alongside the fingerprint) before trusting a persisted `CheckpointIndex`
 /// verbatim. Hashes a small fixed set of regions rather than the whole file:
@@ -153,34 +154,76 @@ fn sample_digest(path: &Path, total_bytes: u64, checkpoints: &[(u64, u64)]) -> R
   }
   Ok(hasher.0)
 }
-
 /// Maximum number of undo groups kept per session; the oldest is dropped once the
 /// stack grows past it.
-// ponytail: the journal is bounded by group count, not bytes — a single group can
-// still hold arbitrarily large removed text (e.g. a huge delete). This caps the
-// common "many small edits" growth; switch to a byte budget if pathological single
-// edits ever dominate memory.
+// ponytail: the journal is bounded by group count, not bytes. Removed content past
+// `SPILL_MIN` sits in a spill file on disk, so a group costs memory only for what
+// is below it; switch to a byte budget on disk if the files ever pile up.
 const UNDO_LIMIT: usize = 512;
 /// Bytes read per step when a cascade looks backwards for the start of a run of
 /// `\r`.
 const CASCADE_READ: u64 = 64 * 1024;
-
 /// One reversible replace in global byte coordinates: replace `[start, end)` with
 /// `text`. Stored inverses undo a forward apply; applied in the frame current when
 /// each is reached (see `Session::apply` / `apply_inverse_group`).
 struct InverseEdit {
   start: u64,
   end: u64,
-  text: String,
+  removed: Removed,
   /// Copied from the forward edit: an offset at `start` stays put when the
   /// frontend maps it through this edit.
   keep_start: bool,
   /// For a run of break bytes rewritten in place: the byte the range holds
-  /// once this edit is applied, with `text` empty. The run itself is never
+  /// once this edit is applied, with `removed` empty. The run itself is never
   /// copied into the journal.
   fill: Option<u8>,
 }
+/// The content an inverse edit puts back: a string, or a run of a spill file
+/// when it was longer than the spill threshold.
+enum Removed {
+  Inline(String),
+  Spill(SpillRef),
+}
 
+impl Removed {
+  fn len(&self) -> u64 {
+    match self {
+      Removed::Inline(text) => text.len() as u64,
+      Removed::Spill(run) => run.len,
+    }
+  }
+  fn is_spill(&self) -> bool {
+    matches!(self, Removed::Spill(_))
+  }
+}
+/// The content under `[start, end)` of `table`, for the journal.
+fn take_removed(
+  table: &Table,
+  start: u64,
+  end: u64,
+  spill: Option<&SpillCtx>,
+) -> Result<Removed, String> {
+  if let Some(ctx) = spill {
+    if end - start > ctx.min {
+      return spill::spill_range(table, start, end, ctx).map(Removed::Spill);
+    }
+  }
+  let bytes = table.read(start, end)?;
+  String::from_utf8(bytes)
+    .map(Removed::Inline)
+    .map_err(|_| NOT_UTF8.to_string())
+}
+/// One replace of `[start, end)` by a run of a spill file (`Session::replace_with_spill`).
+struct SpillSwap {
+  start: u64,
+  end: u64,
+  inserted: SpillRef,
+  /// The rewrite of the lone `\r` just before `start`, if the new content opens
+  /// on a `\n`.
+  pre: Option<Edit>,
+  /// The content under `[start, end)`, when the caller has taken it already.
+  removed: Option<Removed>,
+}
 /// The inverse edits of one coalesced undo step, in the order the forward edits
 /// were applied. Undone by reverse-order sequential application, which walks the
 /// document back through each intermediate state in its own coordinate frame.
@@ -207,7 +250,6 @@ struct Step {
   before: u64,
   after: u64,
 }
-
 /// A live editing session: the piece table over the file, the path it was opened
 /// from (updated on save-as), the file's fingerprint at open / last save, the
 /// checkpoint index that produced the table's `OriginalIndex` plus the sampled
@@ -220,6 +262,9 @@ struct Step {
 /// is stacked on.
 struct Session {
   table: Table,
+  /// Declared right after `table`: the file the table reads is deleted only once
+  /// the table has let go of it.
+  conv: Option<Converted>,
   path: PathBuf,
   fingerprint: Fingerprint,
   index: CheckpointIndex,
@@ -264,6 +309,7 @@ impl Session {
   ) -> Self {
     Session {
       table,
+      conv: None,
       path,
       fingerprint,
       index,
@@ -300,7 +346,34 @@ impl Session {
     self.state_id == self.saved_state_id
   }
 }
+/// A session over a conversion file (a paste that made a document too big to hold
+/// as one, or a file restored from one): the table reads the UTF-8 file `tmp`, and
+/// a save writes the text in `encoding` to the session's path.
+struct Converted {
+  tmp: TmpFile,
+  /// The session's path is a file to write back to. Not so while the document has
+  /// no target: it can only be saved to another path.
+  in_place: bool,
+  encoding: String,
+  bom: bool,
+}
+/// What a session over a conversion file writes, as the frontend sees it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ConvState {
+  pub encoding: String,
+  pub bom: bool,
+  pub in_place: bool,
+}
 
+impl Converted {
+  fn state(&self) -> ConvState {
+    ConvState {
+      encoding: self.encoding.clone(),
+      bom: self.bom,
+      in_place: self.in_place,
+    }
+  }
+}
 /// A session's checkpoint index plus the fingerprint and sampled digest it was
 /// built against, for the frontend to persist and later hand back to
 /// `windowed_reopen`. `digest` crosses the IPC boundary as a decimal string,
@@ -318,7 +391,6 @@ pub struct IndexSnapshot {
   pub fingerprint: Fingerprint,
   pub digest: String,
 }
-
 /// Result of reopening a file for windowed editing from a previously persisted
 /// checkpoint index (see `windowed_reopen`). `rescanned` is true when the
 /// supplied fingerprint no longer matched the file on disk (or the supplied
@@ -334,7 +406,6 @@ pub struct ReopenResult {
   pub fingerprint: Fingerprint,
   pub rescanned: bool,
 }
-
 /// Managed state holding every open windowed-editing session, keyed by an
 /// incrementing id.
 // ponytail: one global lock guards all sessions, and save/rebase does file I/O
@@ -342,6 +413,10 @@ pub struct ReopenResult {
 // never contends in practice; shard per session id if that ever changes.
 #[derive(Default)]
 pub struct WindowedState {
+  /// Folder for change lists and spill files; without one, nothing spills.
+  tmp_dir: Option<PathBuf>,
+  /// Overrides the size past which removed content spills (debug builds).
+  spill_min: Option<u64>,
   sessions: Mutex<HashMap<u64, Session>>,
   /// Signalled when a replace-all pass ends and its session is idle again.
   idle: Condvar,
@@ -349,8 +424,39 @@ pub struct WindowedState {
   /// Cancel flags of the running result-list searches, by search id.
   searches: Mutex<HashMap<String, Arc<AtomicBool>>>,
 }
+/// The folder inside the app data dir that holds change lists and spill files.
+pub fn windowed_tmp_dir(app_data: &Path) -> PathBuf {
+  app_data.join(replace_layer::TMP_DIR)
+}
 
 impl WindowedState {
+  /// State whose sessions keep change lists and spill files in `tmp_dir`.
+  pub fn new(tmp_dir: Option<PathBuf>) -> Self {
+    WindowedState {
+      tmp_dir,
+      spill_min: spill::min_from_env(),
+      ..Default::default()
+    }
+  }
+  /// The folder clips are written to, if there is one.
+  pub(crate) fn clip_dir(&self) -> Option<PathBuf> {
+    self.tmp_dir.clone()
+  }
+  /// The folder a replace-all writes its change list to. Without one, the same
+  /// error as an app data dir that cannot be resolved.
+  fn replace_tmp_dir(&self) -> Result<PathBuf, String> {
+    self
+      .tmp_dir
+      .clone()
+      .ok_or_else(|| tauri::Error::UnknownPath.to_string())
+  }
+  /// Where removed content spills to, if there is a folder for it.
+  fn spill_ctx(&self) -> Option<SpillCtx> {
+    self
+      .tmp_dir
+      .as_ref()
+      .map(|dir| SpillCtx::new(dir.clone(), self.spill_min))
+  }
   /// The sessions map locked, once session `id` is not running a replace-all.
   /// An unknown session is `UNKNOWN_SESSION`. Commands that touch a session wait
   /// here, so none can land between two chunks of a pass; they are all
@@ -389,7 +495,6 @@ impl Drop for BusyGuard<'_> {
     self.state.idle.notify_all();
   }
 }
-
 /// Result of opening a file for windowed editing.
 #[derive(Serialize)]
 pub struct OpenResult {
@@ -398,7 +503,6 @@ pub struct OpenResult {
   pub total_lines: u64,
   pub fingerprint: Fingerprint,
 }
-
 /// A read-back window: its text plus the byte range it covers and the current
 /// global document statistics.
 #[derive(Serialize)]
@@ -415,9 +519,8 @@ pub struct WindowResult {
   /// The window does not end the file and the byte at its end is a `\n`.
   pub next_is_lf: bool,
 }
-
 /// Current global document statistics after a mutating command.
-#[derive(Serialize)]
+#[derive(Serialize, Debug)]
 pub struct DocStats {
   pub total_bytes: u64,
   pub total_lines: u64,
@@ -427,7 +530,6 @@ pub struct DocStats {
   /// one than another already seen is stale.
   pub generation: u64,
 }
-
 /// Result of a successful save: the rewritten file's fingerprint plus the current
 /// document statistics (unchanged by the write, but returned for symmetry).
 #[derive(Debug, Serialize)]
@@ -437,8 +539,10 @@ pub struct SaveResult {
   pub total_lines: u64,
   pub clean: bool,
   pub generation: u64,
+  /// What the session writes now: none once it is a plain UTF-8 file again (or
+  /// never was a converted one).
+  pub conv: Option<ConvState>,
 }
-
 /// A single replace expressed in global byte coordinates of the pre-apply
 /// document: replace `[start, end)` with `text`.
 ///
@@ -456,7 +560,6 @@ pub struct Edit {
   #[serde(default)]
   pub cascade: bool,
 }
-
 /// One global-byte edit an undo/redo just applied: replace `[start, end)` with
 /// `text`, in the document frame current when the frontend receives it. A
 /// `fill` edit rewrites a run of break bytes to that byte (`"\r"` or `"\n"`)
@@ -468,28 +571,34 @@ pub struct AppliedEdit {
   pub text: String,
   pub keep_start: bool,
   pub fill: Option<String>,
+  /// For text put back from a spill file: its length in bytes, with `text` empty.
+  #[serde(skip_serializing_if = "Option::is_none")]
+  pub len: Option<u64>,
 }
-
 /// Result of a successful undo/redo: the edits just applied (in application order),
 /// the 0-based line of the first edit's start (for a jump-to-change window reload),
 /// and the current document statistics. For a replace-all there are no edits:
-/// `reload_only` is set and `first_line` is the line of its first hit.
+/// `reload_only` is set and `first_line` is the line of its first hit. A group
+/// that moved a spill file also sets `reload_only`, with the edits listed (the
+/// spilled text left out) and no token.
 #[derive(Serialize, Debug)]
 pub struct UndoResult {
   pub edits: Vec<AppliedEdit>,
   pub first_line: u64,
   pub total_bytes: u64,
   pub total_lines: u64,
-  /// True for a replace-all undone or redone: `edits` is empty and the
-  /// frontend reloads its window instead of mirroring edits.
+  /// True for a replace-all undone or redone, or a group that moved a spill
+  /// file: the frontend reloads its window instead of mirroring edits.
   pub reload_only: bool,
   pub clean: bool,
   pub generation: u64,
   /// For a `reload_only` result: the token of the replace-all's change list, to
   /// map offsets with `windowed_map_replace` until `windowed_release_replace`.
   pub token: Option<u64>,
+  /// With a `track` argument: its two ends after this change.
+  #[serde(skip_serializing_if = "Option::is_none")]
+  pub tracked: Option<[Pos; 2]>,
 }
-
 /// Modification time in milliseconds since the Unix epoch, degrading to 0 when the
 /// filesystem does not expose one (mirrors the range-edit fingerprint semantics).
 // ponytail: duplicated from range_edit rather than widening its private helpers to
@@ -503,9 +612,8 @@ fn mtime_ms(meta: &fs::Metadata) -> u64 {
     .map(|d| d.as_millis() as u64)
     .unwrap_or(0)
 }
-
 /// Read a file's fingerprint (size + mtime) from its metadata.
-fn fingerprint_of(path: &Path) -> Result<Fingerprint, String> {
+pub(crate) fn fingerprint_of(path: &Path) -> Result<Fingerprint, String> {
   let meta = fs::metadata(path).map_err(|e| e.to_string())?;
   Ok(Fingerprint {
     size: meta.len(),
@@ -515,7 +623,6 @@ fn fingerprint_of(path: &Path) -> Result<Fingerprint, String> {
 /// A scan pass's `(total_bytes, checkpoints, total_newlines)` result, counted
 /// by the line rule (see `line_rule`).
 type ScanResult = (u64, Vec<(u64, u64)>, u64);
-
 /// Single streaming pass over `reader`: builds the sparse line-checkpoint index
 /// and validates the whole stream as UTF-8, carrying an incomplete trailing
 /// multi-byte sequence across buffer boundaries. Returns `(total_bytes,
@@ -589,13 +696,11 @@ fn scan_reader_at<R: Read>(
   }
   Ok((pos, checkpoints, breaks.finish()))
 }
-
 /// Scan a file on disk (see `scan_reader`) using the 1 MiB streaming buffer.
 fn scan_file(path: &Path) -> Result<ScanResult, String> {
   let file = File::open(path).map_err(|e| e.to_string())?;
   scan_reader(file, SCAN_BUF)
 }
-
 /// Build a fresh piece table over `path` after (re)scanning it. Returns the
 /// table, its total byte length, the file's fingerprint, the checkpoint index
 /// the scan produced (see `CheckpointIndex`), and the sampled digest computed
@@ -619,7 +724,6 @@ fn build_table(path: &Path) -> Result<(Table, u64, Fingerprint, CheckpointIndex,
   };
   Ok((table, total_bytes, fingerprint, checkpoint_index, digest))
 }
-
 /// Refuse a file at or above `LARGE_EDIT_MAX` before any scan or session is
 /// built for it, turning the ceiling into an invariant rather than only a
 /// disabled button. `windowed_save` deliberately does not call this: a session
@@ -630,7 +734,6 @@ fn enforce_size_ceiling(len: u64) -> Result<(), String> {
   }
   Ok(())
 }
-
 /// Validate a persisted `CheckpointIndex` against the file's actual current
 /// size before `windowed_reopen` trusts it verbatim: a malformed index would
 /// silently produce wrong line numbers, which is worse than a slow rescan.
@@ -718,7 +821,6 @@ fn valid_checkpoint_index(index: &CheckpointIndex, total_bytes: u64) -> bool {
   }
   true
 }
-
 /// Document byte offset at which `line` begins, extended over the piece table's
 /// own `line_to_offset` so a line index equal to the line count maps to the end
 /// of the document (the exclusive end of the last line's window).
@@ -737,8 +839,27 @@ impl Session {
   /// ascending start, a running length delta places each replacement's inverse
   /// at the offset the text ends up at. `new_group` false (with a non-empty undo
   /// stack and an empty redo stack) coalesces the inverse into the last group;
-  /// otherwise it opens a new group. Any apply clears the redo stack.
-  fn apply(&mut self, edits: Vec<Edit>, new_group: bool) -> Result<DocStats, String> {
+  /// otherwise it opens a new group. Any apply clears the redo stack. Removed
+  /// content past the spill threshold is written to spill files before the table
+  /// is touched, so a failure there leaves the table as it was.
+  fn apply(
+    &mut self,
+    edits: Vec<Edit>,
+    new_group: bool,
+    spill: Option<&SpillCtx>,
+  ) -> Result<DocStats, String> {
+    self.apply_prepared(edits, new_group, spill, None)
+  }
+  /// `apply`, with the content under one edit (`prepared`: its index in `edits`)
+  /// already taken, so a removal that spills was copied without holding the
+  /// session.
+  fn apply_prepared(
+    &mut self,
+    edits: Vec<Edit>,
+    new_group: bool,
+    spill: Option<&SpillCtx>,
+    mut prepared: Option<(usize, Removed)>,
+  ) -> Result<DocStats, String> {
     let len = self.table.len();
     for edit in &edits {
       if edit.start > edit.end || edit.end > len {
@@ -759,19 +880,24 @@ impl Session {
     // Edits are ordered by `(start, end)`, so an insertion and a rewrite that
     // begin at the same byte come out in exactly reverse orders in the two
     // passes below: the rewrite is applied first and the text lands before it.
-    let mut ascending: Vec<&Edit> = edits.iter().collect();
-    ascending.sort_by_key(|a| (a.start, a.end));
+    let mut ascending: Vec<(usize, &Edit)> = edits.iter().enumerate().collect();
+    ascending.sort_by_key(|(_, a)| (a.start, a.end));
     let mut inverses: EditGroup = Vec::with_capacity(ascending.len());
     let mut cumshift: i64 = 0;
-    for edit in &ascending {
-      let removed = self.table.read(edit.start, edit.end)?;
-      let removed = String::from_utf8(removed).map_err(|_| NOT_UTF8.to_string())?;
+    for (index, edit) in &ascending {
+      let removed = match prepared.take() {
+        Some((at, removed)) if at == *index => removed,
+        other => {
+          prepared = other;
+          take_removed(&self.table, edit.start, edit.end, spill)?
+        }
+      };
       let text_len = edit.text.len() as u64;
       let pstart = (edit.start as i64 + cumshift) as u64;
       inverses.push(InverseEdit {
         start: pstart,
         end: pstart + text_len,
-        text: removed,
+        removed,
         keep_start: edit.keep_start,
         fill: None,
       });
@@ -793,6 +919,13 @@ impl Session {
         }
       }
     }
+    Ok(self.record_group(inverses, new_group))
+  }
+  /// Journal the inverse group of a change just made: the generation moves, the
+  /// content takes a fresh state id, the redo stack goes. `new_group` false (with
+  /// a non-empty undo stack, an empty redo stack and no save since) coalesces the
+  /// group into the last one.
+  fn record_group(&mut self, inverses: EditGroup, new_group: bool) -> DocStats {
     self.generation += 1;
     let before = self.state_id;
     let after = self.take_state_id();
@@ -826,7 +959,88 @@ impl Session {
       }),
     }
     self.state_id = after;
-    Ok(self.stats())
+    self.stats()
+  }
+  /// Replace `[swap.start, swap.end)` with a run of a spill file, one undo step,
+  /// plus the rewrite of a lone `\r` just before it (`swap.pre`, a `keep_start`
+  /// edit of that one byte that ends at `swap.start`). The removed content is
+  /// `swap.removed` when the caller took it, else taken here. The table, the
+  /// journal and the state id stay as they were when any step fails.
+  fn replace_with_spill(
+    &mut self,
+    swap: SpillSwap,
+    new_group: bool,
+    spill: Option<&SpillCtx>,
+  ) -> Result<DocStats, String> {
+    let SpillSwap {
+      start,
+      end,
+      inserted,
+      pre,
+      removed,
+    } = swap;
+    if start > end || end > self.table.len() {
+      return Err("edit out of range".to_string());
+    }
+    if let Some(pre) = &pre {
+      if pre.end != start || !self.is_cr_rewrite(pre)? {
+        return Err("rewrite edit is not a rewrite of the CR before the range".to_string());
+      }
+    }
+    let removed = match removed {
+      Some(removed) => removed,
+      None => take_removed(&self.table, start, end, spill)?,
+    };
+    let mut inverses: EditGroup = Vec::with_capacity(3);
+    let mut shift = 0u64;
+    if let Some(pre) = &pre {
+      inverses.push(InverseEdit {
+        start: pre.start,
+        end: pre.start + pre.text.len() as u64,
+        removed: Removed::Inline("\r".to_string()),
+        keep_start: true,
+        fill: None,
+      });
+      shift = pre.text.len() as u64 - 1;
+    }
+    inverses.push(InverseEdit {
+      start: start + shift,
+      end: start + shift + inserted.len,
+      removed,
+      keep_start: false,
+      fill: None,
+    });
+    let snapshot = self.table.snapshot()?;
+    let done = self.swap_spill(start, end, &inserted, pre.as_ref(), &mut inverses);
+    if let Err(e) = done {
+      self.table.restore(snapshot);
+      return Err(e);
+    }
+    Ok(self.record_group(inverses, new_group))
+  }
+  /// The table steps of `replace_with_spill`, which it undoes on failure.
+  fn swap_spill(
+    &mut self,
+    start: u64,
+    end: u64,
+    inserted: &SpillRef,
+    pre: Option<&Edit>,
+    inverses: &mut EditGroup,
+  ) -> Result<(), String> {
+    self.table.delete(start, end)?;
+    if inserted.len > 0 {
+      self.table.insert_spill(start, inserted)?;
+    }
+    if let Some(pre) = pre {
+      self.table.delete(pre.start, pre.end)?;
+      self.table.insert(pre.start, pre.text.as_bytes())?;
+      if pre.text == "\n" {
+        if let Some(fill) = self.cascade_run(pre, std::slice::from_ref(pre))? {
+          inverses.push(fill);
+        }
+      }
+    }
+    Ok(())
   }
   /// Whether `edit` rewrites exactly one `\r` to a line separator.
   fn is_cr_rewrite(&self, edit: &Edit) -> Result<bool, String> {
@@ -869,7 +1083,7 @@ impl Session {
     Ok(Some(InverseEdit {
       start,
       end,
-      text: String::new(),
+      removed: Removed::Inline(String::new()),
       keep_start: false,
       fill: Some(b'\r'),
     }))
@@ -889,65 +1103,6 @@ impl Session {
     self.next_state_id += 1;
     id
   }
-
-  /// Apply one group's inverse edits in reverse storage order, each in the
-  /// coordinate frame current when it is reached, and return `(applied,
-  /// opposite)`: the edits as applied (application order, for the frontend) and
-  /// the opposite group that redoes them. The opposite is collected in
-  /// application order, so reverse-applying it replays through the same frames.
-  fn apply_inverse_group(
-    &mut self,
-    group: EditGroup,
-  ) -> Result<(Vec<AppliedEdit>, EditGroup), String> {
-    let mut applied: Vec<AppliedEdit> = Vec::with_capacity(group.len());
-    let mut opposite: EditGroup = Vec::with_capacity(group.len());
-    for inv in group.iter().rev() {
-      if let Some(byte) = inv.fill {
-        // A run of break bytes rewritten to the other break byte: the range
-        // keeps its length and is never read or copied.
-        let other = if byte == b'\r' { b'\n' } else { b'\r' };
-        self.table.delete(inv.start, inv.end)?;
-        self
-          .table
-          .insert_fill(inv.start, byte, inv.end - inv.start)?;
-        opposite.push(InverseEdit {
-          start: inv.start,
-          end: inv.end,
-          text: String::new(),
-          keep_start: inv.keep_start,
-          fill: Some(other),
-        });
-        applied.push(AppliedEdit {
-          start: inv.start,
-          end: inv.end,
-          text: String::new(),
-          keep_start: inv.keep_start,
-          fill: Some((byte as char).to_string()),
-        });
-        continue;
-      }
-      let removed = self.table.read(inv.start, inv.end)?;
-      let removed = String::from_utf8(removed).map_err(|_| NOT_UTF8.to_string())?;
-      let text_len = inv.text.len() as u64;
-      opposite.push(InverseEdit {
-        start: inv.start,
-        end: inv.start + text_len,
-        text: removed,
-        keep_start: inv.keep_start,
-        fill: None,
-      });
-      self.table.delete(inv.start, inv.end)?;
-      self.table.insert(inv.start, inv.text.as_bytes())?;
-      applied.push(AppliedEdit {
-        start: inv.start,
-        end: inv.end,
-        text: inv.text.clone(),
-        keep_start: inv.keep_start,
-        fill: None,
-      });
-    }
-    Ok((applied, opposite))
-  }
   /// Push an undo entry, dropping the oldest past `UNDO_LIMIT`. Dropping a
   /// replace-all entry does not delete its change list while a layer in the
   /// table still reads it: the list is shared and goes with its last holder.
@@ -957,79 +1112,91 @@ impl Session {
       self.undo_stack.remove(0);
     }
   }
-  /// Pop and apply the newest undo entry, pushing its opposite onto the redo
-  /// stack. Errors with `NOTHING_TO_UNDO` when the stack is empty.
-  fn undo(&mut self) -> Result<UndoResult, String> {
+  /// Apply the newest undo entry, moving its opposite onto the redo stack. A
+  /// typing group leaves the stacks, the generation and the state id untouched
+  /// when it fails. Errors with `NOTHING_TO_UNDO` when the stack is empty.
+  fn undo(&mut self, spill: Option<&SpillCtx>) -> Result<UndoResult, String> {
+    let Some(top) = self.undo_stack.last() else {
+      return Err(NOTHING_TO_UNDO.to_string());
+    };
+    if let JournalEntry::Edits(group) = &top.entry {
+      let (before, after) = (top.before, top.after);
+      let (applied, opposite) = apply_group_atomic(&mut self.table, group, spill)?;
+      let spilled = group.iter().chain(&opposite).any(|e| e.removed.is_spill());
+      self.undo_stack.pop();
+      self.redo_stack.push(Step {
+        entry: JournalEntry::Edits(opposite),
+        before,
+        after,
+      });
+      self.generation += 1;
+      self.state_id = before;
+      return Ok(self.outcome(applied, spilled));
+    }
     let step = self
       .undo_stack
       .pop()
       .ok_or_else(|| NOTHING_TO_UNDO.to_string())?;
     let (before, after) = (step.before, step.after);
-    match step.entry {
-      JournalEntry::Edits(group) => {
-        let (applied, opposite) = self.apply_inverse_group(group)?;
-        self.redo_stack.push(Step {
-          entry: JournalEntry::Edits(opposite),
-          before,
-          after,
-        });
-        self.generation += 1;
-        self.state_id = before;
-        Ok(self.outcome(applied))
-      }
-      JournalEntry::Replace(entry) => {
-        self.take_back_replace(&entry)?;
-        self.state_id = before;
-        let mut result = self.reload_outcome(&entry.list)?;
-        result.token = Some(self.register_token(entry.list.clone(), Dir::Inverse));
-        self.redo_stack.push(Step {
-          entry: JournalEntry::Replace(ReplaceEntry {
-            list: entry.list,
-            layer_id: None,
-          }),
-          before,
-          after,
-        });
-        Ok(result)
-      }
-    }
+    let JournalEntry::Replace(entry) = step.entry else {
+      return Err("journal entry is not a replace-all".to_string());
+    };
+    self.take_back_replace(&entry)?;
+    self.state_id = before;
+    let mut result = self.reload_outcome(&entry.list)?;
+    result.token = Some(self.register_token(entry.list.clone(), Dir::Inverse));
+    self.redo_stack.push(Step {
+      entry: JournalEntry::Replace(ReplaceEntry {
+        list: entry.list,
+        layer_id: None,
+      }),
+      before,
+      after,
+    });
+    Ok(result)
   }
-  /// Pop and apply the newest redo entry, pushing its opposite back onto the undo
-  /// stack. Errors with `NOTHING_TO_REDO` when the stack is empty.
-  fn redo(&mut self) -> Result<UndoResult, String> {
+  /// Apply the newest redo entry, moving its opposite back onto the undo stack,
+  /// with the same failure rule as `undo`. Errors with `NOTHING_TO_REDO` when
+  /// the stack is empty.
+  fn redo(&mut self, spill: Option<&SpillCtx>) -> Result<UndoResult, String> {
+    let Some(top) = self.redo_stack.last() else {
+      return Err(NOTHING_TO_REDO.to_string());
+    };
+    if let JournalEntry::Edits(group) = &top.entry {
+      let (before, after) = (top.before, top.after);
+      let (applied, opposite) = apply_group_atomic(&mut self.table, group, spill)?;
+      let spilled = group.iter().chain(&opposite).any(|e| e.removed.is_spill());
+      self.redo_stack.pop();
+      self.undo_stack.push(Step {
+        entry: JournalEntry::Edits(opposite),
+        before,
+        after,
+      });
+      self.generation += 1;
+      self.state_id = after;
+      return Ok(self.outcome(applied, spilled));
+    }
     let step = self
       .redo_stack
       .pop()
       .ok_or_else(|| NOTHING_TO_REDO.to_string())?;
     let (before, after) = (step.before, step.after);
-    match step.entry {
-      JournalEntry::Edits(group) => {
-        let (applied, opposite) = self.apply_inverse_group(group)?;
-        self.undo_stack.push(Step {
-          entry: JournalEntry::Edits(opposite),
-          before,
-          after,
-        });
-        self.generation += 1;
-        self.state_id = after;
-        Ok(self.outcome(applied))
-      }
-      JournalEntry::Replace(entry) => {
-        let layer_id = self.stack_layer(Dir::Forward, entry.list.clone());
-        self.state_id = after;
-        let mut result = self.reload_outcome(&entry.list)?;
-        result.token = Some(self.register_token(entry.list.clone(), Dir::Forward));
-        self.undo_stack.push(Step {
-          entry: JournalEntry::Replace(ReplaceEntry {
-            list: entry.list,
-            layer_id: Some(layer_id),
-          }),
-          before,
-          after,
-        });
-        Ok(result)
-      }
-    }
+    let JournalEntry::Replace(entry) = step.entry else {
+      return Err("journal entry is not a replace-all".to_string());
+    };
+    let layer_id = self.stack_layer(Dir::Forward, entry.list.clone());
+    self.state_id = after;
+    let mut result = self.reload_outcome(&entry.list)?;
+    result.token = Some(self.register_token(entry.list.clone(), Dir::Forward));
+    self.undo_stack.push(Step {
+      entry: JournalEntry::Replace(ReplaceEntry {
+        list: entry.list,
+        layer_id: Some(layer_id),
+      }),
+      before,
+      after,
+    });
+    Ok(result)
   }
   /// Put a layer over the table, returning its id. Content changes, so the
   /// generation moves.
@@ -1095,13 +1262,19 @@ impl Session {
       clean: self.clean(),
       generation: self.generation,
       token: None,
+      tracked: None,
     })
   }
-
   /// Package applied edits into an `UndoResult`, resolving the jump-to-change
-  /// line from the first applied edit's start against the post-operation table.
-  fn outcome(&self, applied: Vec<AppliedEdit>) -> UndoResult {
-    let first_start = applied.first().map(|e| e.start).unwrap_or(0);
+  /// line against the post-operation table: from the first applied edit's start,
+  /// or for a group that moved a spill file (`spilled`) from the lowest start.
+  fn outcome(&self, applied: Vec<AppliedEdit>, spilled: bool) -> UndoResult {
+    let first_start = if spilled {
+      applied.iter().map(|e| e.start).min()
+    } else {
+      applied.first().map(|e| e.start)
+    }
+    .unwrap_or(0);
     let first_line = self
       .table
       .offset_to_line(first_start.min(self.table.len()))
@@ -1111,14 +1284,90 @@ impl Session {
       first_line,
       total_bytes: self.table.len(),
       total_lines: self.table.line_count(),
-      reload_only: false,
+      reload_only: spilled,
       clean: self.clean(),
       generation: self.generation,
       token: None,
+      tracked: None,
     }
   }
 }
-
+/// Apply one group's inverse edits in reverse storage order, each in the
+/// coordinate frame current when it is reached, and return `(applied, opposite)`:
+/// the edits as applied (application order, for the frontend) and the opposite
+/// group that redoes them. The opposite is collected in application order, so
+/// reverse-applying it replays through the same frames.
+fn apply_inverse_group(
+  table: &mut Table,
+  group: &EditGroup,
+  spill: Option<&SpillCtx>,
+) -> Result<(Vec<AppliedEdit>, EditGroup), String> {
+  let mut applied: Vec<AppliedEdit> = Vec::with_capacity(group.len());
+  let mut opposite: EditGroup = Vec::with_capacity(group.len());
+  for inv in group.iter().rev() {
+    if let Some(byte) = inv.fill {
+      // A run of break bytes rewritten to the other break byte: the range
+      // keeps its length and is never read or copied.
+      let other = if byte == b'\r' { b'\n' } else { b'\r' };
+      table.delete(inv.start, inv.end)?;
+      table.insert_fill(inv.start, byte, inv.end - inv.start)?;
+      opposite.push(InverseEdit {
+        start: inv.start,
+        end: inv.end,
+        removed: Removed::Inline(String::new()),
+        keep_start: inv.keep_start,
+        fill: Some(other),
+      });
+      applied.push(AppliedEdit {
+        start: inv.start,
+        end: inv.end,
+        text: String::new(),
+        keep_start: inv.keep_start,
+        fill: Some((byte as char).to_string()),
+        len: None,
+      });
+      continue;
+    }
+    let removed = take_removed(table, inv.start, inv.end, spill)?;
+    opposite.push(InverseEdit {
+      start: inv.start,
+      end: inv.start + inv.removed.len(),
+      removed,
+      keep_start: inv.keep_start,
+      fill: None,
+    });
+    table.delete(inv.start, inv.end)?;
+    let (text, len) = match &inv.removed {
+      Removed::Inline(text) => {
+        table.insert(inv.start, text.as_bytes())?;
+        (text.clone(), None)
+      }
+      Removed::Spill(run) => {
+        table.insert_spill(inv.start, run)?;
+        (String::new(), Some(run.len))
+      }
+    };
+    applied.push(AppliedEdit {
+      start: inv.start,
+      end: inv.end,
+      text,
+      keep_start: inv.keep_start,
+      fill: None,
+      len,
+    });
+  }
+  Ok((applied, opposite))
+}
+/// `apply_inverse_group`, all or nothing: a failure part-way puts the table back
+/// as it was before the first step.
+fn apply_group_atomic(
+  table: &mut Table,
+  group: &EditGroup,
+  spill: Option<&SpillCtx>,
+) -> Result<(Vec<AppliedEdit>, EditGroup), String> {
+  let snapshot = table.snapshot()?;
+  apply_inverse_group(table, group, spill).inspect_err(|_| table.restore(snapshot))
+}
 /// Core of `windowed_open`, kept free of the `tauri::State` type so it is
 /// directly unit-testable: stat + ceiling check, scan, and package a fresh
 /// session under a new id from `next_id`.
@@ -1140,7 +1389,6 @@ fn open_new_session(
   };
   Ok((session_id, session, result))
 }
-
 /// Open `path` for windowed editing: scan once (line index + UTF-8 validation),
 /// register a session, and report the initial statistics and fingerprint.
 /// Refuses a file at or above `LARGE_EDIT_MAX` with the `TOO_LARGE` error.
@@ -1154,7 +1402,6 @@ pub fn windowed_open(state: State<WindowedState>, path: String) -> Result<OpenRe
   state.sessions.lock().unwrap().insert(session_id, session);
   Ok(result)
 }
-
 /// Core of `windowed_reopen`, kept free of the `tauri::State` type so it is
 /// directly unit-testable. Stats the file and requires all
 /// three of: the current fingerprint matching `fingerprint`, the supplied
@@ -1229,7 +1476,6 @@ fn reopen_session(
   };
   Ok((session_id, session, result))
 }
-
 /// Parse a digest handed back across the IPC boundary as a decimal string
 /// (see `IndexSnapshot`). `None` on anything malformed — the caller treats
 /// that as "does not match", falling back to the rescan rather than trusting
@@ -1237,7 +1483,6 @@ fn reopen_session(
 fn parse_digest(digest: &str) -> Option<u64> {
   digest.parse::<u64>().ok()
 }
-
 /// Reopen `path` for windowed editing from a previously persisted
 /// `CheckpointIndex`, `Fingerprint`, and sampled `digest` (see
 /// `windowed_index`). See `reopen_session` for the fast-path / fallback
@@ -1262,7 +1507,155 @@ pub fn windowed_reopen(
   state.sessions.lock().unwrap().insert(session_id, session);
   Ok(result)
 }
-
+/// The fingerprint of a target as the conversion found it. A target that is gone
+/// gets an all-zero one, which no save's `expected` check can match: the first
+/// in-place save fails with `FINGERPRINT_MISMATCH`, as for any file that vanished,
+/// and a save to another path works. Any other failure to stat is an error.
+fn target_fingerprint(target: &Path) -> Result<Fingerprint, String> {
+  match fs::metadata(target) {
+    Ok(meta) => Ok(Fingerprint {
+      size: meta.len(),
+      mtime_ms: mtime_ms(&meta),
+    }),
+    Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Fingerprint {
+      size: 0,
+      mtime_ms: 0,
+    }),
+    Err(e) => Err(e.to_string()),
+  }
+}
+/// Core of `windowed_open_converted` and `windowed_reopen_converted`: a session
+/// over the conversion file `tmp`, which goes with the session. With a `target` the
+/// session saves to it (its fingerprint is the target's now); without one it can
+/// only be saved to another path. `dirty` leaves it unsaved. The file is deleted
+/// if no session comes of it.
+fn open_converted_session(
+  next_id: &AtomicU64,
+  tmp: TmpFile,
+  target: Option<PathBuf>,
+  encoding: String,
+  bom: bool,
+  dirty: bool,
+) -> Result<(u64, Session, OpenResult), String> {
+  if !crate::encoding::is_supported_label(&encoding) {
+    return Err(format!("unsupported encoding: {encoding}"));
+  }
+  let meta = fs::metadata(tmp.path()).map_err(|e| e.to_string())?;
+  enforce_size_ceiling(meta.len())?;
+  let (table, total_bytes, tmp_fingerprint, index, digest) = build_table(tmp.path())?;
+  let total_lines = table.line_count();
+  let (path, fingerprint, in_place) = match target {
+    Some(target) => {
+      let fingerprint = target_fingerprint(&target)?;
+      (target, fingerprint, true)
+    }
+    None => (tmp.path().to_path_buf(), tmp_fingerprint, false),
+  };
+  let session_id = next_id.fetch_add(1, Ordering::Relaxed);
+  let mut session = Session::new(table, path, fingerprint.clone(), index, digest);
+  session.conv = Some(Converted {
+    tmp,
+    in_place,
+    encoding,
+    bom,
+  });
+  if dirty {
+    session.state_id = session.take_state_id();
+  }
+  let result = OpenResult {
+    session_id,
+    total_bytes,
+    total_lines,
+    fingerprint,
+  };
+  Ok((session_id, session, result))
+}
+/// Open the finished conversion `convert_id` for windowed editing: a document that
+/// outgrew the editor, or a paste into a large file. The session saves to `target`
+/// (none: the document has none yet, and a save needs another path) in `encoding`
+/// (with a byte order mark when `with_bom`). `dirty` leaves it unsaved. The
+/// conversion file is the session's now and goes when the session does.
+#[tauri::command(async)]
+pub fn windowed_open_converted(
+  state: State<WindowedState>,
+  converts: State<ConvertStore>,
+  convert_id: String,
+  target: Option<String>,
+  encoding: String,
+  with_bom: bool,
+  dirty: bool,
+) -> Result<OpenResult, String> {
+  crate::edition::require_full("large-file editing")?;
+  let tmp = converts.take(&convert_id)?;
+  let (session_id, session, result) = open_converted_session(
+    &state.next_id,
+    tmp,
+    target.map(PathBuf::from),
+    encoding,
+    with_bom,
+    dirty,
+  )?;
+  state.sessions.lock().unwrap().insert(session_id, session);
+  Ok(result)
+}
+/// `windowed_open_converted` for a file the app had open already (the file at
+/// `target`, decoded to `convert_id` by `convert_from_file`): never unsaved, and
+/// not refused in the free edition, like `windowed_reopen`.
+#[tauri::command(async)]
+pub fn windowed_reopen_converted(
+  state: State<WindowedState>,
+  converts: State<ConvertStore>,
+  convert_id: String,
+  target: String,
+  encoding: String,
+  with_bom: bool,
+) -> Result<OpenResult, String> {
+  let tmp = converts.take(&convert_id)?;
+  let (session_id, session, result) = open_converted_session(
+    &state.next_id,
+    tmp,
+    Some(PathBuf::from(target)),
+    encoding,
+    with_bom,
+    false,
+  )?;
+  state.sessions.lock().unwrap().insert(session_id, session);
+  Ok(result)
+}
+/// Core of `windowed_set_encoding`: waits for a running replace-all, then changes
+/// what later saves write.
+fn set_encoding_core(
+  state: &WindowedState,
+  session_id: u64,
+  encoding: &str,
+  bom: bool,
+) -> Result<ConvState, String> {
+  if !crate::encoding::is_supported_label(encoding) {
+    return Err(format!("unsupported encoding: {encoding}"));
+  }
+  let mut map = state.lock_idle(session_id)?;
+  let session = map
+    .get_mut(&session_id)
+    .ok_or_else(|| UNKNOWN_SESSION.to_string())?;
+  let conv = session
+    .conv
+    .as_mut()
+    .ok_or_else(|| NOT_CONVERTED.to_string())?;
+  conv.encoding = encoding.to_string();
+  conv.bom = bom;
+  Ok(conv.state())
+}
+/// Change the encoding a converted session saves in. `not-converted` for any other
+/// session.
+#[tauri::command(async)]
+pub fn windowed_set_encoding(
+  state: State<WindowedState>,
+  session_id: u64,
+  encoding: String,
+  with_bom: bool,
+) -> Result<ConvState, String> {
+  set_encoding_core(&state, session_id, &encoding, with_bom)
+}
 /// Read a session's current checkpoint index, fingerprint, and sampled digest,
 /// for the frontend to persist (see `windowed_reopen`).
 #[tauri::command]
@@ -1270,17 +1663,23 @@ pub fn windowed_index(
   state: State<WindowedState>,
   session_id: u64,
 ) -> Result<IndexSnapshot, String> {
+  let started = Instant::now();
+  log::info!("windowed_index enter: session {session_id}");
   let map = state.sessions.lock().unwrap();
   let session = map
     .get(&session_id)
     .ok_or_else(|| UNKNOWN_SESSION.to_string())?;
-  Ok(IndexSnapshot {
+  let snapshot = IndexSnapshot {
     index: session.index.clone(),
     fingerprint: session.fingerprint.clone(),
     digest: session.digest.to_string(),
-  })
+  };
+  log::info!(
+    "windowed_index exit: session {session_id}, {:?}",
+    started.elapsed()
+  );
+  Ok(snapshot)
 }
-
 /// Read the line window `[start_line, end_line)` (0-based, end exclusive) of a
 /// session, clamping to the current line range. Returns the window text plus the
 /// byte range it spans and the current global statistics. The content must be
@@ -1326,7 +1725,35 @@ fn read_window_result(
     next_is_lf,
   })
 }
-
+/// Core of `windowed_apply`: waits for a running replace-all, then applies.
+fn apply_core(
+  state: &WindowedState,
+  session_id: u64,
+  edits: Vec<Edit>,
+  new_group: bool,
+) -> Result<DocStats, String> {
+  let mut map = state.lock_idle(session_id)?;
+  let session = map
+    .get_mut(&session_id)
+    .ok_or_else(|| UNKNOWN_SESSION.to_string())?;
+  session.apply(edits, new_group, state.spill_ctx().as_ref())
+}
+/// Core of `windowed_undo`: waits for a running replace-all, then undoes.
+fn undo_core(state: &WindowedState, session_id: u64) -> Result<UndoResult, String> {
+  let mut map = state.lock_idle(session_id)?;
+  let session = map
+    .get_mut(&session_id)
+    .ok_or_else(|| UNKNOWN_SESSION.to_string())?;
+  session.undo(state.spill_ctx().as_ref())
+}
+/// Core of `windowed_redo`: waits for a running replace-all, then redoes.
+fn redo_core(state: &WindowedState, session_id: u64) -> Result<UndoResult, String> {
+  let mut map = state.lock_idle(session_id)?;
+  let session = map
+    .get_mut(&session_id)
+    .ok_or_else(|| UNKNOWN_SESSION.to_string())?;
+  session.redo(state.spill_ctx().as_ref())
+}
 /// Apply a batch of global-coordinate replaces to a session. The caller guarantees
 /// the edits are mutually non-overlapping and all expressed in the same pre-apply
 /// coordinate space; applying them by descending `start` keeps every earlier
@@ -1340,55 +1767,99 @@ pub fn windowed_apply(
   edits: Vec<Edit>,
   new_group: bool,
 ) -> Result<DocStats, String> {
-  let mut map = state.lock_idle(session_id)?;
-  let session = map
-    .get_mut(&session_id)
-    .ok_or_else(|| UNKNOWN_SESSION.to_string())?;
-  session.apply(edits, new_group)
+  apply_core(&state, session_id, edits, new_group)
 }
-
 /// Undo the newest edit group: apply its inverse into the piece table and move it
 /// to the redo stack. Returns the applied global-byte edits (for the frontend to
 /// mirror into its window) plus the jump-to-change line and fresh statistics. An
 /// empty undo stack returns the `NOTHING_TO_UNDO` protocol error for a silent skip.
+/// With `track` (a selection's two ends) the result carries them, mapped through
+/// the change.
 #[tauri::command(async)]
-pub fn windowed_undo(state: State<WindowedState>, session_id: u64) -> Result<UndoResult, String> {
-  let mut map = state.lock_idle(session_id)?;
-  let session = map
-    .get_mut(&session_id)
-    .ok_or_else(|| UNKNOWN_SESSION.to_string())?;
-  session.undo()
+pub fn windowed_undo(
+  state: State<WindowedState>,
+  session_id: u64,
+  track: Option<[Pos; 2]>,
+) -> Result<UndoResult, String> {
+  match track {
+    None => undo_core(&state, session_id),
+    Some(track) => history_tracked_core(
+      &state,
+      session_id,
+      false,
+      &track,
+      SCAN_CHUNK,
+      CHECKPOINT_INTERVAL,
+      &mut |_| {},
+    ),
+  }
 }
-
 /// Redo the newest undone group (inverse of `windowed_undo`). An empty redo stack
 /// returns the `NOTHING_TO_REDO` protocol error for a silent skip.
 #[tauri::command(async)]
-pub fn windowed_redo(state: State<WindowedState>, session_id: u64) -> Result<UndoResult, String> {
-  let mut map = state.lock_idle(session_id)?;
-  let session = map
-    .get_mut(&session_id)
-    .ok_or_else(|| UNKNOWN_SESSION.to_string())?;
-  session.redo()
+pub fn windowed_redo(
+  state: State<WindowedState>,
+  session_id: u64,
+  track: Option<[Pos; 2]>,
+) -> Result<UndoResult, String> {
+  match track {
+    None => redo_core(&state, session_id),
+    Some(track) => history_tracked_core(
+      &state,
+      session_id,
+      true,
+      &track,
+      SCAN_CHUNK,
+      CHECKPOINT_INTERVAL,
+      &mut |_| {},
+    ),
+  }
 }
-
+/// A save of a session over a conversion file that has no path of its own to go
+/// to.
+const NO_TARGET: &str = "no-target";
+/// `windowed_set_encoding` on a session that is not over a conversion file.
+const NOT_CONVERTED: &str = "not-converted";
 /// Stream a session's document into a staged file (exclusive, so a colliding
 /// staged name fails loudly), fsync it, then put it in `target`'s place.
 /// Discards the staged file on any failure before the swap, so a failed save
-/// never leaves a partial file behind.
+/// never leaves a partial file behind. With `encoded` (an encoding and whether it
+/// has a byte order mark) the text is written in that encoding, `buf` bytes at a
+/// time.
 ///
 /// Staging goes through `fs_ops` rather than straight to a sibling temp so this
 /// writer answers a sandboxed destination folder the same way an ordinary save
 /// does — a large file the user opened by hand is otherwise unsavable.
-fn write_document(session: &Session, label: &str, target: &Path) -> Result<(), String> {
+fn write_document(
+  session: &Session,
+  label: &str,
+  target: &Path,
+  buf: usize,
+  encoded: Option<(&str, bool)>,
+) -> Result<(), String> {
   crate::fs_ops::replace_with(target, label, true, None, |out| {
-    session.table.write_all(out, SCAN_BUF)?;
+    match encoded {
+      None => session.table.write_all(out, buf)?,
+      Some((encoding, bom)) => {
+        let mut writer = EncodeWriter::new(&mut *out, Encoder::new(encoding, bom)?);
+        session.table.write_all(&mut writer, buf)?;
+        writer.finish()?;
+      }
+    }
     // fsync the data before the swap so a crash cannot leave a truncated file.
     // ponytail: file-level fsync only, no parent-dir fsync, unlike the
     // atomic-write path in fs_ops.
     out.sync_all().map_err(|e| e.to_string())
   })
 }
-
+/// The text of `table` in a new conversion file in the folder of `beside`.
+fn copy_to_tmp(table: &Table, beside: &Path, buf: usize) -> Result<TmpFile, String> {
+  let dir = beside.parent().ok_or_else(no_folder)?;
+  let (mut file, tmp) = TmpFile::create(dir).map_err(|e| e.to_string())?;
+  table.write_all(&mut file, buf)?;
+  file.sync_all().map_err(|e| e.to_string())?;
+  Ok(tmp)
+}
 /// Save a session to disk, then rebase it onto the written file. When `expected`
 /// is supplied it is compared against the session file's current on-disk
 /// fingerprint (out-of-band edit detection, same semantics as range-edit); a
@@ -1397,11 +1868,28 @@ fn write_document(session: &Session, label: &str, target: &Path) -> Result<(), S
 /// that path. After a successful write the session is rebased by rescanning the
 /// output (new file handle, line index, fingerprint; pieces reset to a single
 /// original run).
+///
+/// A session over a conversion file writes the encoding it was given: the text is
+/// checked first and `unmappable` leaves everything as it was. Written as plain
+/// UTF-8 it is rebased on the target like any session, and the conversion file is
+/// deleted; in any other encoding the target cannot be read back, so the session
+/// is rebased on a fresh conversion file of the same text.
 fn save_session(
   session: &mut Session,
   expected: Option<Fingerprint>,
   path_override: Option<PathBuf>,
 ) -> Result<SaveResult, String> {
+  save_session_with(session, expected, path_override, SCAN_BUF)
+}
+fn save_session_with(
+  session: &mut Session,
+  expected: Option<Fingerprint>,
+  path_override: Option<PathBuf>,
+  buf: usize,
+) -> Result<SaveResult, String> {
+  if path_override.is_none() && session.conv.as_ref().is_some_and(|c| !c.in_place) {
+    return Err(NO_TARGET.to_string());
+  }
   let target = path_override.unwrap_or_else(|| session.path.clone());
   if let Some(exp) = expected {
     // `expected` means "the file I'm about to overwrite should still look
@@ -1417,6 +1905,18 @@ fn save_session(
       return Err(FINGERPRINT_MISMATCH.to_string());
     }
   }
+  // What a converted session writes, found out before anything is written.
+  let mut written: Option<(String, bool)> = None;
+  let mut next: Option<TmpFile> = None;
+  if let Some(conv) = &session.conv {
+    convert::precheck(&conv.encoding, conv.bom, |mut out| {
+      session.table.write_all(&mut out, buf)
+    })?;
+    if !convert::is_plain_utf8(&conv.encoding, conv.bom) {
+      written = Some((conv.encoding.clone(), conv.bom));
+      next = Some(copy_to_tmp(&session.table, conv.tmp.path(), buf)?);
+    }
+  }
   // The staged file lives in the destination directory so the final rename
   // stays on one filesystem (and is therefore atomic). The nanosecond label
   // keeps staged names distinct across runs; staging exclusively turns any
@@ -1425,18 +1925,39 @@ fn save_session(
     .duration_since(UNIX_EPOCH)
     .map(|d| d.as_nanos())
     .unwrap_or(0);
-  write_document(session, &format!(".windowed-{nanos}"), &target)?;
+  let encoded = written.as_ref().map(|(label, bom)| (label.as_str(), *bom));
+  write_document(
+    session,
+    &format!(".windowed-{nanos}"),
+    &target,
+    buf,
+    encoded,
+  )?;
   // Rebase onto the freshly written file: rescan for line index + fingerprint and
   // reset the piece table to a single original run over the new bytes.
   // ponytail: full O(size) rescan on every save. Fine at these file sizes; if it
   // ever dominates, carry the new line index forward from the in-memory pieces
   // instead of rereading the whole file.
-  let (table, total_bytes, fingerprint, index, digest) = build_table(&target)?;
+  let base = next.as_ref().map_or(target.as_path(), |tmp| tmp.path());
+  let (table, total_bytes, mut fingerprint, index, digest) = build_table(base)?;
+  if next.is_some() {
+    fingerprint = fingerprint_of(&target)?;
+  }
   let total_lines = table.line_count();
   // The old table, layers included, is dropped here: the saved file now holds
   // the flattened content, and a change list goes once no journal entry refers
   // to it either.
   session.table = table;
+  // Only now, with the old table gone, can the old conversion file be deleted.
+  session.conv = match (written, next) {
+    (Some((encoding, bom)), Some(tmp)) => Some(Converted {
+      tmp,
+      in_place: true,
+      encoding,
+      bom,
+    }),
+    _ => None,
+  };
   session.path = target;
   session.fingerprint = fingerprint.clone();
   session.index = index;
@@ -1450,6 +1971,7 @@ fn save_session(
     total_lines,
     clean: true,
     generation: session.generation,
+    conv: session.conv.as_ref().map(Converted::state),
   })
 }
 /// Core of `windowed_save`: waits for a running replace-all, then saves.
@@ -1473,12 +1995,20 @@ pub fn windowed_save(
   expected: Option<Fingerprint>,
   path_override: Option<String>,
 ) -> Result<SaveResult, String> {
-  save_core(
+  let started = Instant::now();
+  log::info!("windowed_save enter: session {session_id}");
+  let result = save_core(
     &state,
     session_id,
     expected,
     path_override.map(PathBuf::from),
-  )
+  );
+  log::info!(
+    "windowed_save exit: session {session_id}, ok={}, {:?}",
+    result.is_ok(),
+    started.elapsed()
+  );
+  result
 }
 /// Core of `windowed_set_path`: waits for a running replace-all, then points the
 /// session at `path`. The file's bytes are the same, so its index, digest and
@@ -1509,7 +2039,6 @@ fn close_core(state: &WindowedState, session_id: u64) {
     map.remove(&session_id);
   }
 }
-
 /// Release a session and its resources. No-op if the id is unknown or already
 /// closed. Remaining sessions are dropped when the app exits; no explicit cleanup
 /// is needed there.
@@ -1517,7 +2046,6 @@ fn close_core(state: &WindowedState, session_id: u64) {
 pub fn windowed_close(state: State<WindowedState>, session_id: u64) {
   close_core(&state, session_id);
 }
-
 /// Core of `windowed_map_replace`.
 fn map_replace_core(
   state: &WindowedState,
@@ -1531,7 +2059,6 @@ fn map_replace_core(
     .ok_or_else(|| UNKNOWN_SESSION.to_string())?;
   session.map_replace(token, offsets)
 }
-
 /// Map global byte `offsets` through the replace-all behind `token` (from an
 /// undo, redo or replace-all result): the offsets of the content before the
 /// change become offsets of the content after it.
@@ -1544,7 +2071,6 @@ pub fn windowed_map_replace(
 ) -> Result<Vec<u64>, String> {
   map_replace_core(&state, session_id, token, &offsets)
 }
-
 /// Core of `windowed_release_replace`. A token or session already gone is not
 /// an error.
 fn release_replace_core(state: &WindowedState, session_id: u64, token: u64) {
@@ -1554,13 +2080,11 @@ fn release_replace_core(state: &WindowedState, session_id: u64, token: u64) {
     }
   }
 }
-
 /// Drop a replace-all token.
 #[tauri::command(async)]
 pub fn windowed_release_replace(state: State<WindowedState>, session_id: u64, token: u64) {
   release_replace_core(&state, session_id, token);
 }
-
 /// Core of `windowed_offset_line`.
 fn offset_line_core(state: &WindowedState, session_id: u64, offset: u64) -> Result<u64, String> {
   let map = state.lock_idle(session_id)?;
@@ -1569,7 +2093,6 @@ fn offset_line_core(state: &WindowedState, session_id: u64, offset: u64) -> Resu
     .ok_or_else(|| UNKNOWN_SESSION.to_string())?;
   session.table.offset_to_line(offset)
 }
-
 /// The 0-based line holding global byte `offset`, by the line rule (`line_rule`).
 #[tauri::command(async)]
 pub fn windowed_offset_line(
@@ -1578,6 +2101,62 @@ pub fn windowed_offset_line(
   offset: u64,
 ) -> Result<u64, String> {
   offset_line_core(&state, session_id, offset)
+}
+/// The UTF-16 length of the last line of a text of `len` bytes: the units after
+/// its last break marker (`line_rule`), counted from the end in reads of at most
+/// `chunk` bytes. A chunk edge may fall inside a character, which `utf16_units`
+/// counts all the same; a `\r` at a chunk's last byte is a marker unless the
+/// byte after it, the first of the chunk scanned before, is `\n`.
+fn last_line_col(
+  len: u64,
+  chunk: usize,
+  read: &mut dyn FnMut(u64, u64) -> Result<Vec<u8>, String>,
+) -> Result<u64, String> {
+  let chunk = chunk.max(1) as u64;
+  let mut col = 0u64;
+  let mut hi = len;
+  let mut next: Option<u8> = None;
+  while hi > 0 {
+    let lo = hi.saturating_sub(chunk);
+    let bytes = read(lo, hi)?;
+    for i in (0..bytes.len()).rev() {
+      let after = bytes.get(i + 1).copied().or(next);
+      if bytes[i] == b'\n' || (bytes[i] == b'\r' && after != Some(b'\n')) {
+        return Ok(col + utf16_units(&bytes[i + 1..]));
+      }
+    }
+    col += utf16_units(&bytes);
+    next = bytes.first().copied();
+    hi = lo;
+  }
+  Ok(col)
+}
+/// The end of the text as a position: the last line and its length, which
+/// `pos_to_offset` maps back to `table.len()`.
+fn end_pos<O: OriginalSource>(table: &PieceTable<O>, chunk: usize) -> Result<Pos, String> {
+  let len = table.len();
+  if len == 0 {
+    return Ok(Pos { line: 0, col: 0 });
+  }
+  let col = last_line_col(len, chunk, &mut |start, end| table.read(start, end))?;
+  Ok(Pos {
+    line: table.line_count() - 1,
+    col,
+  })
+}
+/// Core of `windowed_end_pos`.
+fn end_pos_core(state: &WindowedState, session_id: u64) -> Result<Pos, String> {
+  let map = state.lock_idle(session_id)?;
+  let session = map
+    .get(&session_id)
+    .ok_or_else(|| UNKNOWN_SESSION.to_string())?;
+  end_pos(&session.table, SCAN_CHUNK)
+}
+/// The position at the end of the file, for a selection that runs to it. The
+/// last line is read in chunks, never as a whole.
+#[tauri::command(async)]
+pub fn windowed_end_pos(state: State<WindowedState>, session_id: u64) -> Result<Pos, String> {
+  end_pos_core(&state, session_id)
 }
 /// Reads session content one chunk at a time. Each read takes the sessions lock
 /// for that chunk only and refuses once the content has changed since the scan
@@ -1605,7 +2184,7 @@ impl SessionReader<'_> {
 }
 /// A position as a 0-based line and a column counted in UTF-16 code units, the
 /// unit CodeMirror uses.
-#[derive(Serialize, Debug, PartialEq, Eq)]
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Pos {
   pub line: u64,
   pub col: u64,
@@ -2076,12 +2655,16 @@ pub struct ReplaceAllOutcome {
   /// The token of the change list when at least one hit was replaced (see
   /// `UndoResult::token`).
   pub token: Option<u64>,
+  /// With a `track` argument: its two ends after the replace.
+  #[serde(skip_serializing_if = "Option::is_none")]
+  pub tracked: Option<[Pos; 2]>,
 }
 /// Core of `windowed_replace_all`. One streaming pass over the current content
 /// finds every leftmost non-overlapping hit and writes the change list to
 /// `tmp_dir`; the session's table then becomes a forward layer over the table it
 /// had, with one undo entry. The session is busy for the whole pass, so no
 /// other command lands between two chunks. `between` runs before every chunk.
+#[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 fn replace_all_core(
   state: &WindowedState,
@@ -2094,6 +2677,37 @@ fn replace_all_core(
   chunk: usize,
   interval: u64,
   between: &mut dyn FnMut(usize),
+) -> Result<ReplaceAllOutcome, String> {
+  replace_all_tracked_core(
+    state,
+    tmp_dir,
+    session_id,
+    query,
+    case_sensitive,
+    replacement,
+    insert_sep,
+    chunk,
+    interval,
+    between,
+    None,
+  )
+}
+/// `replace_all_core` that also maps a `track` selection through the replace: its
+/// ends are converted before the pass and the result after the install, both with
+/// the session's lock released, and the install maps them in between.
+#[allow(clippy::too_many_arguments)]
+fn replace_all_tracked_core(
+  state: &WindowedState,
+  tmp_dir: &Path,
+  session_id: u64,
+  query: &str,
+  case_sensitive: bool,
+  replacement: &str,
+  insert_sep: &str,
+  chunk: usize,
+  interval: u64,
+  between: &mut dyn FnMut(usize),
+  track: Option<&[Pos; 2]>,
 ) -> Result<ReplaceAllOutcome, String> {
   if query.is_empty() {
     return Err("empty-query".to_string());
@@ -2109,6 +2723,13 @@ fn replace_all_core(
   let _busy = BusyGuard {
     state,
     id: session_id,
+  };
+  let ends = match track {
+    Some(track) => {
+      let doc = Unlocked::new(state, session_id, generation, &mut *between);
+      Some(track_offsets(&doc, track, chunk)?)
+    }
+    None => None,
   };
   let needle = query.as_bytes();
   let mut builder = Builder::create(
@@ -2154,49 +2775,61 @@ fn replace_all_core(
   })?;
   let list = builder.finish(len)?;
   let count = list.hits();
-  let mut token = None;
-  let mut map = state.sessions.lock().unwrap();
-  let session = map
-    .get_mut(&session_id)
-    .ok_or_else(|| UNKNOWN_SESSION.to_string())?;
-  if count > 0 {
-    if session.generation != generation {
-      return Err("replace-all aborted: the content changed during the pass".to_string());
+  let (mut outcome, mapped) = {
+    let mut map = state.sessions.lock().unwrap();
+    let session = map
+      .get_mut(&session_id)
+      .ok_or_else(|| UNKNOWN_SESSION.to_string())?;
+    let mut token = None;
+    let mut mapped = ends;
+    if count > 0 {
+      if session.generation != generation {
+        return Err("replace-all aborted: the content changed during the pass".to_string());
+      }
+      let list = Arc::new(list);
+      session.install_replace(list.clone());
+      token = Some(session.register_token(list.clone(), Dir::Forward));
+      if let Some(ends) = ends {
+        mapped = Some(map_selection(ends, |p, assoc| {
+          list.map_offset_assoc(Dir::Forward, p, assoc)
+        })?);
+      }
     }
-    let list = Arc::new(list);
-    session.install_replace(list.clone());
-    token = Some(session.register_token(list, Dir::Forward));
+    let outcome = ReplaceAllOutcome {
+      count,
+      total_bytes: session.table.len(),
+      total_lines: session.table.line_count(),
+      clean: session.clean(),
+      generation: session.generation,
+      token,
+      tracked: None,
+    };
+    (outcome, mapped)
+  };
+  if let Some(mapped) = mapped {
+    let doc = Unlocked::new(state, session_id, outcome.generation, between);
+    outcome.tracked = Some(tracked_pos(&doc, mapped, chunk)?);
   }
-  Ok(ReplaceAllOutcome {
-    count,
-    total_bytes: session.table.len(),
-    total_lines: session.table.line_count(),
-    clean: session.clean(),
-    generation: session.generation,
-    token,
-  })
+  Ok(outcome)
 }
 /// Replace every occurrence of `query` in the session's current content with
 /// `replacement`, as one undoable step. A lone `\r` the pass leaves directly
 /// before a `\n` is rewritten to `insert_sep` (`"\n"` or `"\r\n"`) in the same
 /// step. Memory stays independent of the file size and the hit count: see
-/// `replace_layer`.
+/// `replace_layer`. With `track` (a selection's two ends) the result carries
+/// them, mapped through the replace.
 #[tauri::command(async)]
 pub fn windowed_replace_all(
-  app: AppHandle,
   state: State<WindowedState>,
   session_id: u64,
   query: String,
   case_sensitive: bool,
   replacement: String,
   insert_sep: String,
+  track: Option<[Pos; 2]>,
 ) -> Result<ReplaceAllOutcome, String> {
-  let tmp_dir = app
-    .path()
-    .app_data_dir()
-    .map_err(|e| e.to_string())?
-    .join(replace_layer::TMP_DIR);
-  replace_all_core(
+  let tmp_dir = state.replace_tmp_dir()?;
+  replace_all_tracked_core(
     &state,
     &tmp_dir,
     session_id,
@@ -2207,7 +2840,1810 @@ pub fn windowed_replace_all(
     SCAN_CHUNK,
     CHECKPOINT_INTERVAL,
     &mut |_| {},
+    track.as_ref(),
   )
+}
+/// A document the position conversions read: a table, or a session read block
+/// by block with its lock released between two blocks.
+trait Doc {
+  fn size(&self) -> Result<u64, String>;
+  fn lines(&self) -> Result<u64, String>;
+  fn line_start(&self, line: u64) -> Result<u64, String>;
+  fn line_of(&self, offset: u64) -> Result<u64, String>;
+  fn read(&self, start: u64, end: u64) -> Result<Vec<u8>, String>;
+  fn spill_cover(&self, start: u64, end: u64) -> Option<SpillRef>;
+}
+
+impl<O: OriginalSource> Doc for PieceTable<O> {
+  fn size(&self) -> Result<u64, String> {
+    Ok(self.len())
+  }
+  fn lines(&self) -> Result<u64, String> {
+    Ok(self.line_count())
+  }
+  fn line_start(&self, line: u64) -> Result<u64, String> {
+    self.line_to_offset(line)
+  }
+  fn line_of(&self, offset: u64) -> Result<u64, String> {
+    self.offset_to_line(offset)
+  }
+  fn read(&self, start: u64, end: u64) -> Result<Vec<u8>, String> {
+    PieceTable::read(self, start, end)
+  }
+  fn spill_cover(&self, start: u64, end: u64) -> Option<SpillRef> {
+    PieceTable::spill_cover(self, start, end)
+  }
+}
+/// Where a byte offset sits: its line, that line's first byte and the UTF-16
+/// column.
+struct Located {
+  offset: u64,
+  line: u64,
+  line_start: u64,
+  col: u64,
+}
+/// The line start of `line`, or the end of the document for the line after the
+/// last.
+fn doc_line_offset<D: Doc + ?Sized>(doc: &D, line: u64) -> Result<u64, String> {
+  if line >= doc.lines()? {
+    doc.size()
+  } else {
+    doc.line_start(line)
+  }
+}
+/// The place of byte `offset`, with the column counted from the line start in
+/// reads of at most `chunk` bytes, so a very long line is never read whole.
+fn locate_offset<D: Doc + ?Sized>(doc: &D, offset: u64, chunk: usize) -> Result<Located, String> {
+  if doc.size()? == 0 {
+    return Ok(Located {
+      offset: 0,
+      line: 0,
+      line_start: 0,
+      col: 0,
+    });
+  }
+  let line = doc.line_of(offset)?;
+  let line_start = doc.line_start(line)?;
+  let chunk = chunk.max(1) as u64;
+  let (mut at, mut col) = (line_start, 0u64);
+  while at < offset {
+    let to = (at + chunk).min(offset);
+    col += utf16_units(&doc.read(at, to)?);
+    at = to;
+  }
+  Ok(Located {
+    offset,
+    line,
+    line_start,
+    col,
+  })
+}
+/// Line and UTF-16 column of byte `offset` (see `locate_offset`).
+fn pos_chunked<D: Doc + ?Sized>(doc: &D, offset: u64, chunk: usize) -> Result<Pos, String> {
+  let at = locate_offset(doc, offset, chunk)?;
+  Ok(Pos {
+    line: at.line,
+    col: at.col,
+  })
+}
+/// The place of `pos`: its line clamped to the last, then forward from the line
+/// start in reads of at most `chunk` bytes by UTF-16 units. A column past the end
+/// stops at the line end, before its break, so never inside a CRLF; one inside a
+/// surrogate pair lands after the pair.
+fn locate_pos<D: Doc + ?Sized>(doc: &D, pos: &Pos, chunk: usize) -> Result<Located, String> {
+  let lines = doc.lines()?;
+  if lines == 0 {
+    return Ok(Located {
+      offset: 0,
+      line: 0,
+      line_start: 0,
+      col: 0,
+    });
+  }
+  let line = pos.line.min(lines - 1);
+  let line_start = doc.line_start(line)?;
+  let len = doc.size()?;
+  let chunk = chunk.max(1) as u64;
+  let (mut at, mut units) = (line_start, 0u64);
+  while at < len {
+    let to = (at + chunk).min(len);
+    for (i, &b) in doc.read(at, to)?.iter().enumerate() {
+      if b == b'\n' || b == b'\r' || (!(0x80..0xC0).contains(&b) && units >= pos.col) {
+        return Ok(Located {
+          offset: at + i as u64,
+          line,
+          line_start,
+          col: units,
+        });
+      }
+      if !(0x80..0xC0).contains(&b) {
+        units += if b >= 0xF0 { 2 } else { 1 };
+      }
+    }
+    at = to;
+  }
+  Ok(Located {
+    offset: len,
+    line,
+    line_start,
+    col: units,
+  })
+}
+/// Byte offset of `pos` (see `locate_pos`).
+fn pos_to_offset_chunked<D: Doc + ?Sized>(doc: &D, pos: &Pos, chunk: usize) -> Result<u64, String> {
+  Ok(locate_pos(doc, pos, chunk)?.offset)
+}
+/// Protocol error string of a pass whose session changed under it.
+const PASS_CHANGED: &str = "pass aborted: the content changed during the pass";
+/// What a pass reports when there is no folder to spill to and the content is too
+/// big to hold: the same as a replace-all without one.
+pub(crate) fn no_folder() -> String {
+  tauri::Error::UnknownPath.to_string()
+}
+/// A session read block by block: each read takes the lock for that block only,
+/// and `between` runs before it.
+struct Unlocked<'a> {
+  state: &'a WindowedState,
+  id: u64,
+  generation: Cell<u64>,
+  between: RefCell<&'a mut dyn FnMut(usize)>,
+  reads: Cell<usize>,
+}
+
+impl<'a> Unlocked<'a> {
+  fn new(
+    state: &'a WindowedState,
+    id: u64,
+    generation: u64,
+    between: &'a mut dyn FnMut(usize),
+  ) -> Self {
+    Unlocked {
+      state,
+      id,
+      generation: Cell::new(generation),
+      between: RefCell::new(between),
+      reads: Cell::new(0),
+    }
+  }
+  /// The generation the content has after this pass changed it.
+  fn moved_to(&self, generation: u64) {
+    self.generation.set(generation);
+  }
+  fn with_table<R>(&self, f: impl FnOnce(&Table) -> Result<R, String>) -> Result<R, String> {
+    let map = self.state.sessions.lock().unwrap();
+    let session = map
+      .get(&self.id)
+      .ok_or_else(|| UNKNOWN_SESSION.to_string())?;
+    if session.generation != self.generation.get() {
+      return Err(PASS_CHANGED.to_string());
+    }
+    f(&session.table)
+  }
+}
+
+impl Doc for Unlocked<'_> {
+  fn size(&self) -> Result<u64, String> {
+    self.with_table(|t| Ok(t.len()))
+  }
+  fn lines(&self) -> Result<u64, String> {
+    self.with_table(|t| Ok(t.line_count()))
+  }
+  fn line_start(&self, line: u64) -> Result<u64, String> {
+    self.with_table(|t| t.line_to_offset(line))
+  }
+  fn line_of(&self, offset: u64) -> Result<u64, String> {
+    self.with_table(|t| t.offset_to_line(offset))
+  }
+  fn read(&self, start: u64, end: u64) -> Result<Vec<u8>, String> {
+    if start >= end {
+      return Ok(Vec::new());
+    }
+    let n = self.reads.get();
+    self.reads.set(n + 1);
+    (*self.between.borrow_mut())(n);
+    let reader = SessionReader {
+      state: self.state,
+      id: self.id,
+      generation: self.generation.get(),
+    };
+    reader
+      .read(start, (end - start) as usize)
+      .map_err(|stop| match stop {
+        ScanStop::Stale => PASS_CHANGED.to_string(),
+        ScanStop::Cancelled => "cancelled".to_string(),
+        ScanStop::Failed(e) => e,
+      })
+  }
+  fn spill_cover(&self, start: u64, end: u64) -> Option<SpillRef> {
+    self
+      .with_table(|t| Ok(t.spill_cover(start, end)))
+      .ok()
+      .flatten()
+  }
+}
+/// Phase one of a pass: with the session idle, mark it busy and note its
+/// generation. The guard clears the mark however the pass ends.
+fn begin_pass<'a>(
+  state: &'a WindowedState,
+  mut map: MutexGuard<'_, HashMap<u64, Session>>,
+  id: u64,
+) -> Result<(u64, BusyGuard<'a>), String> {
+  let session = map
+    .get_mut(&id)
+    .ok_or_else(|| UNKNOWN_SESSION.to_string())?;
+  session.busy = true;
+  Ok((session.generation, BusyGuard { state, id }))
+}
+/// Phase two of a pass: `f` on the session, if its content is still the one the
+/// pass read. Keep `f` proportional to the number of edits.
+fn install<R>(
+  state: &WindowedState,
+  id: u64,
+  generation: u64,
+  f: impl FnOnce(&mut Session) -> Result<R, String>,
+) -> Result<R, String> {
+  let mut map = state.sessions.lock().unwrap();
+  let session = map
+    .get_mut(&id)
+    .ok_or_else(|| UNKNOWN_SESSION.to_string())?;
+  if session.generation != generation {
+    return Err(PASS_CHANGED.to_string());
+  }
+  f(session)
+}
+impl WindowedState {
+  /// The spill context of a pass reading `chunk` bytes at a time.
+  fn pass_ctx(&self, chunk: usize, interval: u64) -> Option<SpillCtx> {
+    self.spill_ctx().map(|ctx| SpillCtx {
+      interval,
+      chunk,
+      ..ctx
+    })
+  }
+}
+/// `"\n"` and `"\r\n"` are the only separators.
+fn check_sep(insert_sep: &str) -> Result<(), String> {
+  if insert_sep == "\n" || insert_sep == "\r\n" {
+    Ok(())
+  } else {
+    Err("invalid insert separator".to_string())
+  }
+}
+/// The content under `[start, end)` as a removal that spills, when it is longer
+/// than `ctx.min`: the run that already holds it, or a new file copied block by
+/// block.
+fn spill_removed<D: Doc + ?Sized>(
+  doc: &D,
+  start: u64,
+  end: u64,
+  ctx: &SpillCtx,
+) -> Result<Removed, String> {
+  if let Some(found) = doc.spill_cover(start, end) {
+    return Ok(Removed::Spill(found));
+  }
+  spill::spill_range_with(&mut |a, b| doc.read(a, b), start, end, ctx).map(Removed::Spill)
+}
+/// `[start, end)` as the removal a pass hands to the journal: `None` to read it
+/// under the lock when short, a spill when long, an error when long and there is
+/// no folder.
+fn plan_removed<D: Doc + ?Sized>(
+  doc: &D,
+  start: u64,
+  end: u64,
+  ctx: Option<&SpillCtx>,
+) -> Result<Option<Removed>, String> {
+  match ctx {
+    Some(ctx) if end - start > ctx.min => spill_removed(doc, start, end, ctx).map(Some),
+    None if end - start > spill::SPILL_MIN => Err(no_folder()),
+    _ => Ok(None),
+  }
+}
+/// New text collected by a pass: in memory while it stays within the spill
+/// threshold, then in a spill file, written in blocks.
+struct Sink<'a> {
+  ctx: Option<&'a SpillCtx>,
+  limit: u64,
+  chunk: usize,
+  mem: Vec<u8>,
+  file: Option<SpillBuilder>,
+  written: u64,
+  /// The first byte pushed.
+  first: Option<u8>,
+}
+/// What a `Sink` collected.
+enum Made {
+  Text(String),
+  Run(SpillRef),
+}
+
+impl<'a> Sink<'a> {
+  fn new(ctx: Option<&'a SpillCtx>, chunk: usize) -> Self {
+    Sink {
+      ctx,
+      limit: ctx.map_or(spill::SPILL_MIN, |c| c.min),
+      chunk: chunk.max(1),
+      mem: Vec::new(),
+      file: None,
+      written: 0,
+      first: None,
+    }
+  }
+  fn push(&mut self, bytes: &[u8]) -> Result<(), String> {
+    let Some(&first) = bytes.first() else {
+      return Ok(());
+    };
+    self.first.get_or_insert(first);
+    self.written += bytes.len() as u64;
+    self.mem.extend_from_slice(bytes);
+    if self.file.is_none() {
+      if self.written > self.limit {
+        self.file = Some(self.ctx.ok_or_else(no_folder)?.builder()?);
+        self.flush()?;
+      }
+    } else if self.mem.len() >= self.chunk {
+      self.flush()?;
+    }
+    Ok(())
+  }
+  /// `n` copies of `byte`.
+  fn fill(&mut self, byte: u8, n: u64) -> Result<(), String> {
+    let block = [byte; 4096];
+    let mut left = n;
+    while left > 0 {
+      let take = left.min(block.len() as u64) as usize;
+      self.push(&block[..take])?;
+      left -= take as u64;
+    }
+    Ok(())
+  }
+  fn flush(&mut self) -> Result<(), String> {
+    if let Some(file) = &mut self.file {
+      for part in self.mem.chunks(self.chunk) {
+        file.write_all(part).map_err(|e| e.to_string())?;
+      }
+      self.mem.clear();
+    }
+    Ok(())
+  }
+  fn finish(mut self) -> Result<Made, String> {
+    self.flush()?;
+    match self.file.take() {
+      None => String::from_utf8(std::mem::take(&mut self.mem))
+        .map(Made::Text)
+        .map_err(|_| NOT_UTF8.to_string()),
+      Some(file) => Ok(Made::Run(SpillRef {
+        file: file.finish()?,
+        start: 0,
+        len: self.written,
+      })),
+    }
+  }
+}
+/// Inserted text as an edit the frontend maps offsets through: the text itself
+/// when short, else only its length.
+fn applied_text(start: u64, end: u64, text: &str, keep_start: bool) -> AppliedEdit {
+  if text.len() > INLINE_EDIT_MAX {
+    return applied_len(start, end, text.len() as u64, keep_start);
+  }
+  AppliedEdit {
+    start,
+    end,
+    text: text.to_string(),
+    keep_start,
+    fill: None,
+    len: None,
+  }
+}
+/// An edit whose new text is `len` bytes long and not sent.
+fn applied_len(start: u64, end: u64, len: u64, keep_start: bool) -> AppliedEdit {
+  AppliedEdit {
+    start,
+    end,
+    text: String::new(),
+    keep_start,
+    fill: None,
+    len: Some(len),
+  }
+}
+/// The longest text an `AppliedEdit` of a pass carries.
+const INLINE_EDIT_MAX: usize = 1024;
+/// What `windowed_replace_range` and `windowed_enter` report: the edits that
+/// were made (in the order they apply, each in the frame the one before it left),
+/// the cursor after the inserted text, and the document statistics.
+#[derive(Serialize, Debug)]
+pub struct RangeResult {
+  pub edits: Vec<AppliedEdit>,
+  pub cursor: Pos,
+  pub total_bytes: u64,
+  pub total_lines: u64,
+  pub clean: bool,
+  pub generation: u64,
+}
+/// What `windowed_indent_range` reports: the edits (exact for the lines of
+/// `map_lines`, one each for everything before and after them), the two ends of
+/// the selection after the change, and the document statistics.
+#[derive(Serialize, Debug)]
+pub struct IndentResult {
+  pub edits: Vec<AppliedEdit>,
+  pub anchor: Pos,
+  pub head: Pos,
+  pub total_bytes: u64,
+  pub total_lines: u64,
+  pub clean: bool,
+  pub generation: u64,
+}
+/// The part of a lone `\r` rewrite every command shares: whether the byte before
+/// `start` is a lone `\r` that the first byte of the new content, `first`, would
+/// join to a `\n`.
+fn needs_rewrite<D: Doc + ?Sized>(doc: &D, start: u64, first: Option<u8>) -> Result<bool, String> {
+  if start == 0 || first != Some(b'\n') {
+    return Ok(false);
+  }
+  Ok(doc.read(start - 1, start)? == b"\r")
+}
+/// The rewrite edit of that byte to the separator.
+fn rewrite_edit(start: u64, insert_sep: &str) -> Edit {
+  Edit {
+    start: start - 1,
+    end: start,
+    text: insert_sep.to_string(),
+    keep_start: true,
+    cascade: true,
+  }
+}
+/// Core of `windowed_replace_range`. Three phases: the session is marked busy; the
+/// ends are located and a long removal copied to a spill, in blocks, with the
+/// lock released between them; the change is installed under a short lock if the
+/// content is still the one that was read; the cursor is located in the result.
+/// `between` runs before every block read.
+#[allow(clippy::too_many_arguments)]
+fn replace_range_core(
+  state: &WindowedState,
+  session_id: u64,
+  anchor: &Pos,
+  head: &Pos,
+  text: &str,
+  insert_sep: &str,
+  new_group: bool,
+  chunk: usize,
+  interval: u64,
+  between: &mut dyn FnMut(usize),
+) -> Result<RangeResult, String> {
+  check_sep(insert_sep)?;
+  let ctx = state.pass_ctx(chunk, interval);
+  let (generation, _busy) = begin_pass(state, state.lock_idle(session_id)?, session_id)?;
+  let doc = Unlocked::new(state, session_id, generation, between);
+  let (a, b) = (
+    locate_pos(&doc, anchor, chunk)?,
+    locate_pos(&doc, head, chunk)?,
+  );
+  let (start, end) = (a.offset.min(b.offset), a.offset.max(b.offset));
+  if start == end && text.is_empty() {
+    let stats = install(state, session_id, generation, |s| Ok(s.stats()))?;
+    return range_result(&doc, Vec::new(), start, stats, chunk);
+  }
+  if ctx.is_none() && text.len() as u64 > spill::SPILL_MIN {
+    return Err(no_folder());
+  }
+  let removed = plan_removed(&doc, start, end, ctx.as_ref())?;
+  let first = match text.as_bytes().first() {
+    Some(&byte) => Some(byte),
+    None if end < doc.size()? => doc.read(end, end + 1)?.first().copied(),
+    None => None,
+  };
+  let rewrite = needs_rewrite(&doc, start, first)?;
+  let mut edits = vec![Edit {
+    start,
+    end,
+    text: text.to_string(),
+    keep_start: false,
+    cascade: false,
+  }];
+  let mut applied = vec![applied_text(start, end, text, false)];
+  let mut cursor = start + text.len() as u64;
+  if rewrite {
+    edits.push(rewrite_edit(start, insert_sep));
+    applied.push(applied_text(start - 1, start, insert_sep, true));
+    cursor += insert_sep.len() as u64 - 1;
+  }
+  let stats = install(state, session_id, generation, |s| {
+    s.apply_prepared(
+      edits,
+      new_group,
+      ctx.as_ref(),
+      removed.map(|removed| (0, removed)),
+    )
+  })?;
+  range_result(&doc, applied, cursor, stats, chunk)
+}
+/// The result of a range command, with `cursor` located in the content as it is
+/// after the change (phase three).
+fn range_result(
+  doc: &Unlocked,
+  edits: Vec<AppliedEdit>,
+  cursor: u64,
+  stats: DocStats,
+  chunk: usize,
+) -> Result<RangeResult, String> {
+  doc.moved_to(stats.generation);
+  Ok(RangeResult {
+    edits,
+    cursor: pos_chunked(doc, cursor, chunk)?,
+    total_bytes: stats.total_bytes,
+    total_lines: stats.total_lines,
+    clean: stats.clean,
+    generation: stats.generation,
+  })
+}
+/// Whether `seq`, one whole multi-byte character, is JavaScript `\s`: not
+/// U+0085, and not `char::is_whitespace`.
+fn is_wide_space(seq: &[u8]) -> bool {
+  matches!(
+    seq,
+    [0xC2, 0xA0]
+      | [0xE1, 0x9A, 0x80]
+      | [0xE2, 0x80, 0x80..=0x8A | 0xA8 | 0xA9 | 0xAF]
+      | [0xE2, 0x81, 0x9F]
+      | [0xE3, 0x80, 0x80]
+      | [0xEF, 0xBB, 0xBF]
+  )
+}
+/// What `Prefix::feed` made of a byte.
+enum Fed {
+  /// Part of the leading whitespace (or the start of a character that may be).
+  Space,
+  /// Not whitespace: `Prefix::held` holds the bytes of the character it is in.
+  Stop,
+}
+/// The whitespace a line opens with, taken byte by byte, so the line may arrive
+/// in blocks of any size. Columns use tab size 4.
+struct Prefix {
+  /// Columns of the whitespace.
+  cols: u64,
+  /// UTF-16 units of the whitespace.
+  units: u64,
+  /// Bytes of the whitespace.
+  bytes: u64,
+  /// Plain spaces before anything else.
+  spaces: u64,
+  only_spaces: bool,
+  held: [u8; 3],
+  held_len: usize,
+}
+
+impl Prefix {
+  fn new() -> Self {
+    Prefix {
+      cols: 0,
+      units: 0,
+      bytes: 0,
+      spaces: 0,
+      only_spaces: true,
+      held: [0; 3],
+      held_len: 0,
+    }
+  }
+  fn take(&mut self, bytes: u64, cols: u64) {
+    self.cols += cols;
+    self.units += 1;
+    self.bytes += bytes;
+  }
+  fn feed(&mut self, b: u8) -> Fed {
+    if self.held_len == 0 {
+      match b {
+        b' ' => {
+          self.take(1, 1);
+          if self.only_spaces {
+            self.spaces += 1;
+          }
+        }
+        b'\t' => {
+          self.take(1, 4 - self.cols % 4);
+          self.only_spaces = false;
+        }
+        0x0B | 0x0C => {
+          self.take(1, 1);
+          self.only_spaces = false;
+        }
+        0xC2 | 0xE1 | 0xE2 | 0xE3 | 0xEF => {
+          self.held[0] = b;
+          self.held_len = 1;
+        }
+        _ => {
+          self.held[0] = b;
+          self.held_len = 1;
+          return Fed::Stop;
+        }
+      }
+      return Fed::Space;
+    }
+    self.held[self.held_len] = b;
+    self.held_len += 1;
+    let need = if self.held[0] == 0xC2 { 2 } else { 3 };
+    if self.held_len < need {
+      return Fed::Space;
+    }
+    if !is_wide_space(&self.held[..need]) {
+      return Fed::Stop;
+    }
+    self.take(need as u64, 1);
+    self.only_spaces = false;
+    self.held_len = 0;
+    Fed::Space
+  }
+}
+/// The whitespace the line starting at `start` opens with, and whether the line
+/// is nothing else. Reads at most `chunk` bytes at a time and stops at the first
+/// character that is not whitespace.
+fn leading_space<D: Doc + ?Sized>(
+  doc: &D,
+  start: u64,
+  chunk: usize,
+) -> Result<(Prefix, bool), String> {
+  let len = doc.size()?;
+  let chunk = chunk.max(1) as u64;
+  let mut prefix = Prefix::new();
+  let mut at = start;
+  while at < len {
+    let to = (at + chunk).min(len);
+    for &b in &doc.read(at, to)? {
+      if b == b'\n' || b == b'\r' {
+        return Ok((prefix, true));
+      }
+      if let Fed::Stop = prefix.feed(b) {
+        return Ok((prefix, false));
+      }
+    }
+    at = to;
+  }
+  Ok((prefix, true))
+}
+/// UTF-16 units before byte `upto` of the document, a line break of any kind one
+/// unit: the position CodeMirror gives the text there.
+fn utf16_before<D: Doc + ?Sized>(doc: &D, upto: u64, chunk: usize) -> Result<u64, String> {
+  let chunk = chunk.max(1) as u64;
+  let (mut at, mut total, mut after_cr) = (0u64, 0u64, false);
+  while at < upto {
+    let to = (at + chunk).min(upto);
+    let bytes = doc.read(at, to)?;
+    let mut joined = bytes.windows(2).filter(|w| *w == b"\r\n").count() as u64;
+    if after_cr && bytes.first() == Some(&b'\n') {
+      joined += 1;
+    }
+    total += utf16_units(&bytes) - joined;
+    after_cr = bytes.last() == Some(&b'\r');
+    at = to;
+  }
+  Ok(total)
+}
+/// `insertNewlineAndIndent` moves the start to the line start when `P + col <= w`
+/// (CodeMirror cuts the line text at the absolute position of the start): `w` is
+/// the whitespace the line opens with, `col` the start's column, `P` the line's
+/// position in the document. `B / 3 <= P <= B` for its byte offset `B`, so `P` is
+/// counted only between those bounds.
+fn snaps_to_line_start<D: Doc + ?Sized>(
+  doc: &D,
+  from: &Located,
+  w: u64,
+  chunk: usize,
+) -> Result<bool, String> {
+  let (b, col) = (from.line_start, from.col);
+  if w < b.div_ceil(3) + col {
+    return Ok(false);
+  }
+  if w >= b + col {
+    return Ok(true);
+  }
+  Ok(utf16_before(doc, b, chunk)? + col <= w)
+}
+/// Core of `windowed_enter`: what `insertNewlineAndIndent` does with no language,
+/// for a selection from `anchor` to `head`, in the three phases of
+/// `replace_range_core`.
+#[allow(clippy::too_many_arguments)]
+fn enter_core(
+  state: &WindowedState,
+  session_id: u64,
+  anchor: &Pos,
+  head: &Pos,
+  insert_sep: &str,
+  new_group: bool,
+  chunk: usize,
+  interval: u64,
+  between: &mut dyn FnMut(usize),
+) -> Result<RangeResult, String> {
+  check_sep(insert_sep)?;
+  let ctx = state.pass_ctx(chunk, interval);
+  let (generation, _busy) = begin_pass(state, state.lock_idle(session_id)?, session_id)?;
+  let doc = Unlocked::new(state, session_id, generation, between);
+  let (a, b) = (
+    locate_pos(&doc, anchor, chunk)?,
+    locate_pos(&doc, head, chunk)?,
+  );
+  let (from, to) = if a.offset <= b.offset { (a, b) } else { (b, a) };
+  // At byte 0 the empty syntax tree gives indentation 0.
+  let (cols, snap) = if from.offset == 0 {
+    (0, false)
+  } else {
+    let (lead, blank) = leading_space(&doc, from.line_start, chunk)?;
+    let in_range = from.col > 0 && from.col < 100;
+    let snap = in_range && (blank || snaps_to_line_start(&doc, &from, lead.units, chunk)?);
+    (lead.cols, snap)
+  };
+  let start = if snap { from.line_start } else { from.offset };
+  let end = to.offset;
+  let removed = plan_removed(&doc, start, end, ctx.as_ref())?;
+  let mut sink = Sink::new(ctx.as_ref(), chunk);
+  sink.push(insert_sep.as_bytes())?;
+  sink.fill(b' ', cols)?;
+  let made = sink.finish()?;
+  let rewrite = needs_rewrite(&doc, start, insert_sep.as_bytes().first().copied())?;
+  let pre = rewrite.then(|| rewrite_edit(start, insert_sep));
+  let mut applied = vec![made.applied(start, end)];
+  let mut cursor = start + insert_sep.len() as u64 + cols;
+  if rewrite {
+    applied.push(applied_text(start - 1, start, insert_sep, true));
+    cursor += insert_sep.len() as u64 - 1;
+  }
+  let stats = install(state, session_id, generation, |s| {
+    made.install(s, start, end, pre, removed, new_group, ctx.as_ref())
+  })?;
+  range_result(&doc, applied, cursor, stats, chunk)
+}
+
+impl Made {
+  /// The edit of putting this over `[start, end)`.
+  fn applied(&self, start: u64, end: u64) -> AppliedEdit {
+    match self {
+      Made::Text(text) => applied_text(start, end, text, false),
+      Made::Run(run) => applied_len(start, end, run.len, false),
+    }
+  }
+  /// Replace `[start, end)` of `session` with this, plus the rewrite `pre` of the
+  /// CR before it, as one undo step.
+  #[allow(clippy::too_many_arguments)]
+  fn install(
+    self,
+    session: &mut Session,
+    start: u64,
+    end: u64,
+    pre: Option<Edit>,
+    removed: Option<Removed>,
+    new_group: bool,
+    ctx: Option<&SpillCtx>,
+  ) -> Result<DocStats, String> {
+    match self {
+      Made::Text(text) => {
+        let mut edits = vec![Edit {
+          start,
+          end,
+          text,
+          keep_start: false,
+          cascade: false,
+        }];
+        edits.extend(pre);
+        session.apply_prepared(edits, new_group, ctx, removed.map(|removed| (0, removed)))
+      }
+      Made::Run(inserted) => session.replace_with_spill(
+        SpillSwap {
+          start,
+          end,
+          inserted,
+          pre,
+          removed,
+        },
+        new_group,
+        ctx,
+      ),
+    }
+  }
+}
+/// How a line ended.
+#[derive(Clone, Copy)]
+enum Ending {
+  Lf,
+  Crlf,
+  /// A lone `\r`, held back until the output after it shows whether a `\n`
+  /// would join it.
+  Cr,
+}
+/// What an edit of the indent pass inserted.
+#[derive(Clone, Copy)]
+enum Put {
+  Spaces(u64),
+  Sep,
+}
+/// The streaming core of `windowed_indent_range`: takes the lines of a range in
+/// blocks and writes them, indented or outdented, to a `Sink`. A lone `\r` that
+/// an emptied line would leave before a `\n` is written as the insert separator
+/// (the whole run of them for `\n`), as `junctionRewrites` does. Every edit goes
+/// through `edit`, ascending, which maps the offsets in `targets` as
+/// `mapPos(pos, 1)` does.
+struct Engine<'a> {
+  outdent: bool,
+  sep: &'a str,
+  sink: Sink<'a>,
+  /// Lines in the range, and how many have ended.
+  total: u64,
+  done: u64,
+  line_start: u64,
+  prefix: Prefix,
+  in_prefix: bool,
+  cr_at: Option<u64>,
+  /// Lone `\r` line ends held back, and the offset of the last.
+  pending: u64,
+  pending_last: u64,
+  changed: bool,
+  /// Bytes the edits so far added.
+  delta: i64,
+  targets: [(u64, Option<u64>); 2],
+  region: (u64, u64),
+  window: (u64, u64),
+  /// Edits inside the window, ascending.
+  in_window: Vec<AppliedEdit>,
+  /// Net growth of the edits before and after the window.
+  before: Option<i64>,
+  after: Option<i64>,
+}
+
+impl<'a> Engine<'a> {
+  fn new(
+    outdent: bool,
+    sep: &'a str,
+    sink: Sink<'a>,
+    total: u64,
+    region: (u64, u64),
+    window: (u64, u64),
+    targets: [u64; 2],
+  ) -> Self {
+    Engine {
+      outdent,
+      sep,
+      sink,
+      total,
+      done: 0,
+      line_start: region.0,
+      prefix: Prefix::new(),
+      in_prefix: false,
+      cr_at: None,
+      pending: 0,
+      pending_last: 0,
+      changed: false,
+      delta: 0,
+      targets: [(targets[0], None), (targets[1], None)],
+      region,
+      window,
+      in_window: Vec::new(),
+      before: None,
+      after: None,
+    }
+  }
+  fn begin_line(&mut self, start: u64) -> Result<(), String> {
+    self.line_start = start;
+    self.prefix = Prefix::new();
+    self.in_prefix = self.outdent;
+    if !self.outdent {
+      self.changed = true;
+      self.edit(start, 0, 2, Put::Spaces(2));
+      self.put_text(b"  ")?;
+    }
+    Ok(())
+  }
+  /// Text of the current line (never empty), after the `\r` line ends before it.
+  fn put_text(&mut self, bytes: &[u8]) -> Result<(), String> {
+    self.flush_pending()?;
+    self.sink.push(bytes)
+  }
+  fn flush_pending(&mut self) -> Result<(), String> {
+    let n = std::mem::take(&mut self.pending);
+    self.sink.fill(b'\r', n)
+  }
+  /// A `\n` follows the held `\r` line ends directly: write them as the
+  /// separator. For `\n` that is every one of them, else only the last.
+  fn join_pending(&mut self) -> Result<(), String> {
+    let n = std::mem::take(&mut self.pending);
+    if n == 0 {
+      return Ok(());
+    }
+    self.changed = true;
+    if self.sep == "\n" {
+      return self.sink.fill(b'\n', n);
+    }
+    self.sink.fill(b'\r', n - 1)?;
+    self.sink.push(b"\r\n")?;
+    self.edit(self.pending_last, 1, 2, Put::Sep);
+    Ok(())
+  }
+  fn end_line(&mut self, ending: Ending, at: u64, next: u64) -> Result<(), String> {
+    match ending {
+      Ending::Lf => {
+        self.join_pending()?;
+        self.sink.push(b"\n")?;
+      }
+      Ending::Crlf => {
+        self.flush_pending()?;
+        self.sink.push(b"\r\n")?;
+      }
+      Ending::Cr => {
+        self.pending += 1;
+        self.pending_last = at;
+      }
+    }
+    self.done += 1;
+    if self.done < self.total {
+      self.begin_line(next)?;
+    }
+    Ok(())
+  }
+  /// The leading whitespace of an outdented line is complete: write what
+  /// replaces it. `lf` when the line ends in `\n`.
+  fn end_prefix(&mut self, lf: bool) -> Result<(), String> {
+    self.in_prefix = false;
+    if self.prefix.bytes == 0 {
+      return Ok(());
+    }
+    // `indentLess`: the whitespace becomes the spaces of its width less two, and
+    // the plain spaces it opens with, up to that many, stay as they are.
+    let spaces = self.prefix.cols.saturating_sub(2);
+    let keep = self.prefix.spaces.min(spaces);
+    let (at, len) = (self.line_start + keep, self.prefix.bytes - keep);
+    self.changed = true;
+    if lf && spaces == 0 {
+      self.join_pending()?;
+    }
+    self.edit(at, len, spaces - keep, Put::Spaces(spaces - keep));
+    if spaces > 0 {
+      self.flush_pending()?;
+      self.sink.fill(b' ', spaces)?;
+    }
+    Ok(())
+  }
+  /// One edit of the pass: `[at, at + len)` becomes `ins` bytes.
+  fn edit(&mut self, at: u64, len: u64, ins: u64, put: Put) {
+    let delta = self.delta;
+    for target in &mut self.targets {
+      let p = target.0;
+      if target.1.is_some() || p > at + len {
+        continue;
+      }
+      let moved = (at as i64 + delta) as u64;
+      target.1 = Some(if p < at {
+        (p as i64 + delta) as u64
+      } else if len == 0 || p > at {
+        moved + ins
+      } else {
+        moved
+      });
+    }
+    self.delta += ins as i64 - len as i64;
+    let (w0, w1) = self.window;
+    let growth = ins as i64 - len as i64;
+    if at >= w1 {
+      *self.after.get_or_insert(0) += growth;
+    } else if at < w0 {
+      *self.before.get_or_insert(0) += growth;
+    } else {
+      self.in_window.push(match put {
+        Put::Spaces(n) if n <= INLINE_EDIT_MAX as u64 => {
+          applied_text(at, at + len, &" ".repeat(n as usize), false)
+        }
+        Put::Spaces(n) => applied_len(at, at + len, n, false),
+        Put::Sep => applied_text(at, at + len, self.sep, true),
+      });
+    }
+  }
+  /// Take the bytes `bytes`, which start at document offset `base`.
+  fn feed(&mut self, bytes: &[u8], base: u64) -> Result<(), String> {
+    let mut i = 0usize;
+    while i < bytes.len() && self.done < self.total {
+      let abs = base + i as u64;
+      if let Some(cr) = self.cr_at.take() {
+        if bytes[i] == b'\n' {
+          self.end_line(Ending::Crlf, cr, abs + 1)?;
+          i += 1;
+          continue;
+        }
+        self.end_line(Ending::Cr, cr, abs)?;
+        if self.done >= self.total {
+          break;
+        }
+      }
+      if self.in_prefix {
+        let b = bytes[i];
+        if b == b'\n' {
+          self.end_prefix(true)?;
+          self.end_line(Ending::Lf, abs, abs + 1)?;
+        } else if b == b'\r' {
+          self.end_prefix(false)?;
+          self.cr_at = Some(abs);
+        } else if let Fed::Stop = self.prefix.feed(b) {
+          self.end_prefix(false)?;
+          let held = self.prefix.held;
+          self.put_text(&held[..self.prefix.held_len])?;
+        }
+        i += 1;
+        continue;
+      }
+      let rest = &bytes[i..];
+      let n = rest
+        .iter()
+        .position(|&b| b == b'\n' || b == b'\r')
+        .unwrap_or(rest.len());
+      if n > 0 {
+        self.put_text(&rest[..n])?;
+      }
+      i += n;
+      if i < bytes.len() {
+        let abs = base + i as u64;
+        if bytes[i] == b'\n' {
+          self.end_line(Ending::Lf, abs, abs + 1)?;
+        } else {
+          self.cr_at = Some(abs);
+        }
+        i += 1;
+      }
+    }
+    Ok(())
+  }
+  /// The range is read: close the last line, which has no line end of its own at
+  /// the end of the document.
+  fn finish(&mut self) -> Result<(), String> {
+    if let Some(cr) = self.cr_at.take() {
+      self.end_line(Ending::Cr, cr, cr + 1)?;
+    }
+    if self.done < self.total {
+      if self.in_prefix {
+        self.end_prefix(false)?;
+      }
+      self.done += 1;
+    }
+    self.flush_pending()?;
+    let delta = self.delta;
+    for target in &mut self.targets {
+      if target.1.is_none() {
+        target.1 = Some((target.0 as i64 + delta) as u64);
+      }
+    }
+    Ok(())
+  }
+  /// The pieces a finished pass hands on: the sink, whether anything changed, the
+  /// edits for the frontend and where the two ends went. The edits are the ones
+  /// after the window as one, those in it one by one, those before it as one, from
+  /// the highest start down so each still sits where its coordinates say.
+  fn into_parts(self) -> Parts<'a> {
+    let (r0, r1) = self.region;
+    let (w0, w1) = self.window;
+    let mut edits = Vec::with_capacity(self.in_window.len() + 2);
+    if let Some(growth) = self.after {
+      let start = w1.max(r0);
+      edits.push(applied_len(
+        start,
+        r1,
+        ((r1 - start) as i64 + growth) as u64,
+        true,
+      ));
+    }
+    edits.extend(self.in_window.into_iter().rev());
+    if let Some(growth) = self.before {
+      edits.push(applied_len(
+        r0,
+        w0,
+        ((w0 - r0) as i64 + growth) as u64,
+        false,
+      ));
+    }
+    Parts {
+      sink: self.sink,
+      changed: self.changed,
+      edits,
+      ends: [
+        self.targets[0].1.unwrap_or(0),
+        self.targets[1].1.unwrap_or(0),
+      ],
+    }
+  }
+}
+/// What `Engine::into_parts` hands on.
+struct Parts<'a> {
+  sink: Sink<'a>,
+  changed: bool,
+  edits: Vec<AppliedEdit>,
+  ends: [u64; 2],
+}
+/// Core of `windowed_indent_range`: `indentMore` or `indentLess` on the lines of
+/// the selection from `anchor` to `head` (`changeBySelectedLine`), the new lines
+/// written to a `Sink` as they are read, in the three phases of
+/// `replace_range_core`. `map_lines` is the window the frontend shows.
+#[allow(clippy::too_many_arguments)]
+fn indent_range_core(
+  state: &WindowedState,
+  session_id: u64,
+  anchor: &Pos,
+  head: &Pos,
+  outdent: bool,
+  insert_sep: &str,
+  map_lines: (u64, u64),
+  new_group: bool,
+  chunk: usize,
+  interval: u64,
+  between: &mut dyn FnMut(usize),
+) -> Result<IndentResult, String> {
+  check_sep(insert_sep)?;
+  let ctx = state.pass_ctx(chunk, interval);
+  let (generation, _busy) = begin_pass(state, state.lock_idle(session_id)?, session_id)?;
+  let doc = Unlocked::new(state, session_id, generation, between);
+  let (a, b) = (
+    locate_pos(&doc, anchor, chunk)?,
+    locate_pos(&doc, head, chunk)?,
+  );
+  let (from, to) = if a.offset <= b.offset {
+    (&a, &b)
+  } else {
+    (&b, &a)
+  };
+  // A range that ends at the start of a line leaves that line alone.
+  let skip_last = from.offset != to.offset && to.offset == to.line_start;
+  let last_line = if skip_last { to.line - 1 } else { to.line };
+  let region = (from.line_start, doc_line_offset(&doc, last_line + 1)?);
+  if ctx.is_none() && region.1 - region.0 > spill::SPILL_MIN {
+    return Err(no_folder());
+  }
+  let window = (
+    doc_line_offset(&doc, map_lines.0)?,
+    doc_line_offset(&doc, map_lines.1.max(map_lines.0))?,
+  );
+  let mut engine = Engine::new(
+    outdent,
+    insert_sep,
+    Sink::new(ctx.as_ref(), chunk),
+    last_line - from.line + 1,
+    region,
+    window,
+    [a.offset, b.offset],
+  );
+  engine.begin_line(region.0)?;
+  let mut at = region.0;
+  while at < region.1 {
+    let to = (at + chunk.max(1) as u64).min(region.1);
+    engine.feed(&doc.read(at, to)?, at)?;
+    at = to;
+  }
+  engine.finish()?;
+  let Parts {
+    sink,
+    changed,
+    mut edits,
+    ends,
+  } = engine.into_parts();
+  if !changed {
+    // Nothing to do: no journal entry, no new generation.
+    let stats = install(state, session_id, generation, |s| Ok(s.stats()))?;
+    return indent_result(&doc, Vec::new(), [a.offset, b.offset], stats, chunk);
+  }
+  let first = match sink.first {
+    Some(byte) => Some(byte),
+    None if region.1 < doc.size()? => doc.read(region.1, region.1 + 1)?.first().copied(),
+    None => None,
+  };
+  let rewrite = needs_rewrite(&doc, region.0, first)?;
+  let removed = plan_removed(&doc, region.0, region.1, ctx.as_ref())?;
+  let mut shift = 0;
+  if rewrite {
+    edits.push(applied_text(region.0 - 1, region.0, insert_sep, true));
+    shift = insert_sep.len() as u64 - 1;
+  }
+  let made = sink.finish()?;
+  let pre = rewrite.then(|| rewrite_edit(region.0, insert_sep));
+  let stats = install(state, session_id, generation, |s| {
+    made.install(s, region.0, region.1, pre, removed, new_group, ctx.as_ref())
+  })?;
+  indent_result(
+    &doc,
+    edits,
+    [ends[0] + shift, ends[1] + shift],
+    stats,
+    chunk,
+  )
+}
+/// The result of an indent command, with the two ends located in the content as
+/// it is now (phase three).
+fn indent_result(
+  doc: &Unlocked,
+  edits: Vec<AppliedEdit>,
+  ends: [u64; 2],
+  stats: DocStats,
+  chunk: usize,
+) -> Result<IndentResult, String> {
+  doc.moved_to(stats.generation);
+  Ok(IndentResult {
+    edits,
+    anchor: pos_chunked(doc, ends[0], chunk)?,
+    head: pos_chunked(doc, ends[1], chunk)?,
+    total_bytes: stats.total_bytes,
+    total_lines: stats.total_lines,
+    clean: stats.clean,
+    generation: stats.generation,
+  })
+}
+/// Replace the text between two positions (either order) with `text`, whose line
+/// breaks are `insert_sep` already, as one undoable step. The ends are converted
+/// and a long removal copied to a spill with the session's lock released between
+/// blocks, so other sessions keep working. A lone `\r` the change would leave
+/// directly before a `\n` is rewritten to `insert_sep` in the same step, as
+/// `windowed_apply` does for an edit. Without a temp folder a removal longer than
+/// the spill threshold is refused.
+#[tauri::command(async)]
+pub fn windowed_replace_range(
+  state: State<WindowedState>,
+  session_id: u64,
+  anchor: Pos,
+  head: Pos,
+  text: String,
+  insert_sep: String,
+  new_group: bool,
+) -> Result<RangeResult, String> {
+  replace_range_core(
+    &state,
+    session_id,
+    &anchor,
+    &head,
+    &text,
+    &insert_sep,
+    new_group,
+    SCAN_CHUNK,
+    CHECKPOINT_INTERVAL,
+    &mut |_| {},
+  )
+}
+/// The clipboard holds our clip: the paste is one of that clip, not of text.
+const OURS: &str = "ours";
+/// Writes pasted text to a `Sink` with every line break turned into the insert
+/// separator: `\r\n`, a lone `\r` and `\n` are one break each.
+struct SepWriter<'a, 'b> {
+  sink: &'a mut Sink<'b>,
+  sep: &'a [u8],
+  /// The last break was a `\r`, whose `\n` may open the next piece.
+  after_cr: bool,
+  out: Vec<u8>,
+  /// Bytes taken so far.
+  fed: u64,
+}
+
+impl<'a, 'b> SepWriter<'a, 'b> {
+  fn new(sink: &'a mut Sink<'b>, sep: &'a str) -> Self {
+    SepWriter {
+      sink,
+      sep: sep.as_bytes(),
+      after_cr: false,
+      out: Vec::new(),
+      fed: 0,
+    }
+  }
+  fn push(&mut self, bytes: &[u8]) -> Result<(), String> {
+    self.fed += bytes.len() as u64;
+    self.out.clear();
+    let mut i = 0;
+    while i < bytes.len() {
+      if self.after_cr {
+        self.after_cr = false;
+        if bytes[i] == b'\n' {
+          i += 1;
+          continue;
+        }
+      }
+      let n = bytes[i..]
+        .iter()
+        .position(|&b| b == b'\r' || b == b'\n')
+        .unwrap_or(bytes.len() - i);
+      self.out.extend_from_slice(&bytes[i..i + n]);
+      i += n;
+      if i < bytes.len() {
+        self.out.extend_from_slice(self.sep);
+        self.after_cr = bytes[i] == b'\r';
+        i += 1;
+      }
+    }
+    self.sink.push(&self.out)
+  }
+  /// The text is over; a line-wise paste ends in a break of its own.
+  fn finish(&mut self, linewise: bool) -> Result<(), String> {
+    if linewise {
+      self.sink.push(self.sep)?;
+    }
+    Ok(())
+  }
+}
+/// Core of the pastes: `source` is poured into a `Sink` in `chunk` sized reads, its
+/// line breaks turned into `insert_sep`, and put over the selection from `anchor`
+/// to `head` (or, `linewise`, above the line of the caret `head`), in the three
+/// phases of `replace_range_core`. A source with no bytes changes nothing.
+#[allow(clippy::too_many_arguments)]
+fn paste_core(
+  state: &WindowedState,
+  session_id: u64,
+  anchor: &Pos,
+  head: &Pos,
+  linewise: bool,
+  source: &mut dyn Read,
+  insert_sep: &str,
+  new_group: bool,
+  chunk: usize,
+  interval: u64,
+  between: &mut dyn FnMut(usize),
+) -> Result<RangeResult, String> {
+  check_sep(insert_sep)?;
+  let ctx = state.pass_ctx(chunk, interval);
+  let (generation, _busy) = begin_pass(state, state.lock_idle(session_id)?, session_id)?;
+  let doc = Unlocked::new(state, session_id, generation, between);
+  let (a, b) = (
+    locate_pos(&doc, anchor, chunk)?,
+    locate_pos(&doc, head, chunk)?,
+  );
+  let (start, end) = if linewise {
+    if a.offset != b.offset {
+      return Err("a line-wise paste needs a caret".to_string());
+    }
+    (b.line_start, b.line_start)
+  } else {
+    (a.offset.min(b.offset), a.offset.max(b.offset))
+  };
+  let removed = plan_removed(&doc, start, end, ctx.as_ref())?;
+  let mut sink = Sink::new(ctx.as_ref(), chunk);
+  let fed = {
+    let mut text = SepWriter::new(&mut sink, insert_sep);
+    let mut buf = vec![0u8; chunk.max(1)];
+    loop {
+      match source.read(&mut buf) {
+        Ok(0) => break,
+        Ok(n) => text.push(&buf[..n])?,
+        Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+        Err(e) => return Err(clip_read_error(&e)),
+      }
+    }
+    text.finish(linewise)?;
+    text.fed
+  };
+  if fed == 0 {
+    let stats = install(state, session_id, generation, |s| Ok(s.stats()))?;
+    return range_result(&doc, Vec::new(), b.offset, stats, chunk);
+  }
+  let rewrite = needs_rewrite(&doc, start, sink.first)?;
+  let made = sink.finish()?;
+  let inserted = match &made {
+    Made::Text(text) => text.len() as u64,
+    Made::Run(run) => run.len,
+  };
+  let pre = rewrite.then(|| rewrite_edit(start, insert_sep));
+  let mut applied = vec![made.applied(start, end)];
+  let mut cursor = if linewise {
+    b.offset + inserted
+  } else {
+    start + inserted
+  };
+  if rewrite {
+    applied.push(applied_text(start - 1, start, insert_sep, true));
+    cursor += insert_sep.len() as u64 - 1;
+  }
+  let stats = install(state, session_id, generation, |s| {
+    made.install(s, start, end, pre, removed, new_group, ctx.as_ref())
+  })?;
+  range_result(&doc, applied, cursor, stats, chunk)
+}
+/// Core of `windowed_paste_clip`: the pinned clip is found first, so a pin that is
+/// gone touches nothing; then `paste_core`.
+#[allow(clippy::too_many_arguments)]
+fn paste_clip_core(
+  state: &WindowedState,
+  session_id: u64,
+  anchor: &Pos,
+  head: &Pos,
+  open: &dyn Fn() -> Result<Arc<File>, String>,
+  linewise: bool,
+  insert_sep: &str,
+  new_group: bool,
+  chunk: usize,
+  interval: u64,
+  between: &mut dyn FnMut(usize),
+) -> Result<RangeResult, String> {
+  let mut clip = PinReader::new(open()?);
+  paste_core(
+    state, session_id, anchor, head, linewise, &mut clip, insert_sep, new_group, chunk, interval,
+    between,
+  )
+}
+/// Core of `windowed_paste_system`: the text another app put on the clipboard is
+/// pasted like a clip is; `system` finds it. A clipboard that holds our clip is
+/// `OURS`, and no text changes nothing.
+#[allow(clippy::too_many_arguments)]
+fn paste_system_core(
+  state: &WindowedState,
+  session_id: u64,
+  anchor: &Pos,
+  head: &Pos,
+  system: &dyn Fn() -> Result<SystemText, String>,
+  insert_sep: &str,
+  new_group: bool,
+  chunk: usize,
+  interval: u64,
+  between: &mut dyn FnMut(usize),
+) -> Result<RangeResult, String> {
+  let text = match system()? {
+    SystemText::Ours => return Err(OURS.to_string()),
+    SystemText::Text(text) => text.unwrap_or_default(),
+  };
+  paste_core(
+    state,
+    session_id,
+    anchor,
+    head,
+    false,
+    &mut text.as_bytes(),
+    insert_sep,
+    new_group,
+    chunk,
+    interval,
+    between,
+  )
+}
+/// Paste the pinned clip (`clip_pin`) over the selection from `anchor` to `head`
+/// (or, `linewise`, above the line of the caret), its text streamed from the clip
+/// file and never held in memory, as one undoable step. The clip is the one the
+/// pin was made for, whatever the clipboard holds now. `pin-gone` when the pin was
+/// released or ran out: nothing is changed then.
+#[allow(clippy::too_many_arguments)]
+#[tauri::command(async)]
+pub fn windowed_paste_clip(
+  state: State<WindowedState>,
+  session_id: u64,
+  anchor: Pos,
+  head: Pos,
+  pin: u64,
+  linewise: bool,
+  insert_sep: String,
+  new_group: bool,
+) -> Result<RangeResult, String> {
+  paste_clip_core(
+    &state,
+    session_id,
+    &anchor,
+    &head,
+    &|| clipboard_store::pinned(pin),
+    linewise,
+    &insert_sep,
+    new_group,
+    SCAN_CHUNK,
+    CHECKPOINT_INTERVAL,
+    &mut |_| {},
+  )
+}
+/// Paste the text another app put on the clipboard over the selection from
+/// `anchor` to `head`, as `windowed_paste_clip` does a clip. It is read behind the
+/// clipboard's read gate; `ours` when the clipboard turns out to hold our clip
+/// (paste that instead), and nothing changes when there is no text.
+#[tauri::command(async)]
+pub fn windowed_paste_system(
+  app: AppHandle,
+  state: State<WindowedState>,
+  session_id: u64,
+  anchor: Pos,
+  head: Pos,
+  insert_sep: String,
+  new_group: bool,
+) -> Result<RangeResult, String> {
+  paste_system_core(
+    &state,
+    session_id,
+    &anchor,
+    &head,
+    &|| clipboard_store::system_text(&app),
+    &insert_sep,
+    new_group,
+    SCAN_CHUNK,
+    CHECKPOINT_INTERVAL,
+    &mut |_| {},
+  )
+}
+/// The most bytes `clip_read_chunk` returns.
+const CLIP_CHUNK: usize = 1024 * 1024;
+/// A piece of a clip: its text with every line break written `\n`, and where the
+/// next piece starts.
+#[derive(Serialize, Debug, PartialEq, Eq)]
+pub struct ClipChunk {
+  pub text: String,
+  pub next: u64,
+}
+/// Core of `clip_read_chunk`: up to `max` bytes of the clip from `offset`, cut
+/// where a character ends. A `\r` that ends the piece takes the `\n` after it along
+/// with it.
+fn read_chunk_core(
+  open: &dyn Fn() -> Result<Arc<File>, String>,
+  offset: u64,
+  max: usize,
+) -> Result<ClipChunk, String> {
+  read_chunk_with(open, &clipboard_store::read_at, offset, max)
+}
+/// A positional read of a clip file, `clipboard_store::read_at`.
+type ReadAt = dyn Fn(&File, &mut [u8], u64) -> std::io::Result<usize>;
+/// `read_chunk_core` reading with `read_at`.
+fn read_chunk_with(
+  open: &dyn Fn() -> Result<Arc<File>, String>,
+  read_at: &ReadAt,
+  offset: u64,
+  max: usize,
+) -> Result<ClipChunk, String> {
+  let file = open()?;
+  let mut buf = vec![0u8; max.max(4)];
+  let mut len = 0;
+  while len < buf.len() {
+    match read_at(&file, &mut buf[len..], offset + len as u64) {
+      Ok(0) => break,
+      Ok(n) => len += n,
+      Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+      Err(e) => return Err(clip_read_error(&e)),
+    }
+  }
+  let whole = match std::str::from_utf8(&buf[..len]) {
+    Ok(_) => len,
+    Err(e) if e.error_len().is_none() => e.valid_up_to(),
+    Err(_) => return Err(NOT_UTF8.to_string()),
+  };
+  let mut next = offset + whole as u64;
+  if whole == len && buf[..whole].last() == Some(&b'\r') {
+    let mut after = [0u8; 1];
+    let peeked = read_at(&file, &mut after, next).map_err(|e| clip_read_error(&e))?;
+    if peeked == 1 && after[0] == b'\n' {
+      next += 1;
+    }
+  }
+  let mut text = Vec::with_capacity(whole);
+  let mut i = 0;
+  while i < whole {
+    match buf[i] {
+      b'\r' => {
+        text.push(b'\n');
+        if buf.get(i + 1) == Some(&b'\n') && i + 1 < whole {
+          i += 1;
+        }
+      }
+      byte => text.push(byte),
+    }
+    i += 1;
+  }
+  let text = String::from_utf8(text).map_err(|_| NOT_UTF8.to_string())?;
+  Ok(ClipChunk { text, next })
+}
+/// The next piece of the pinned clip (`clip_pin`) from byte `offset` on, for a paste
+/// that goes through the page: at most 1 MiB, never half a character, line breaks
+/// written `\n`. `pin-gone` when the pin was released or ran out.
+#[tauri::command(async)]
+pub fn clip_read_chunk(pin: u64, offset: u64) -> Result<ClipChunk, String> {
+  read_chunk_core(&|| clipboard_store::pinned(pin), offset, CLIP_CHUNK)
+}
+/// Enter over a selection from `anchor` to `head`: what CodeMirror's
+/// `insertNewlineAndIndent` does with no language (see `enter_core`).
+#[tauri::command(async)]
+pub fn windowed_enter(
+  state: State<WindowedState>,
+  session_id: u64,
+  anchor: Pos,
+  head: Pos,
+  insert_sep: String,
+  new_group: bool,
+) -> Result<RangeResult, String> {
+  enter_core(
+    &state,
+    session_id,
+    &anchor,
+    &head,
+    &insert_sep,
+    new_group,
+    SCAN_CHUNK,
+    CHECKPOINT_INTERVAL,
+    &mut |_| {},
+  )
+}
+/// Tab or Shift+Tab over a selection from `anchor` to `head`: CodeMirror's
+/// `indentMore` or `indentLess` on every line it touches (see
+/// `indent_range_core`). `map_lines` is the line range the frontend shows.
+#[allow(clippy::too_many_arguments)]
+#[tauri::command(async)]
+pub fn windowed_indent_range(
+  state: State<WindowedState>,
+  session_id: u64,
+  anchor: Pos,
+  head: Pos,
+  outdent: bool,
+  insert_sep: String,
+  map_lines: (u64, u64),
+  new_group: bool,
+) -> Result<IndentResult, String> {
+  indent_range_core(
+    &state,
+    session_id,
+    &anchor,
+    &head,
+    outdent,
+    &insert_sep,
+    map_lines,
+    new_group,
+    SCAN_CHUNK,
+    CHECKPOINT_INTERVAL,
+    &mut |_| {},
+  )
+}
+/// Core of `clip_copy_session`: the text between two positions (either order) is
+/// written to a clip file, block by block, with the lock released between the
+/// blocks. The session is busy meanwhile and idle again when this returns, so the
+/// clip goes to the system clipboard without holding anything up. Without a temp
+/// folder nothing is read.
+#[allow(clippy::too_many_arguments)]
+fn clip_copy_session_core(
+  state: &WindowedState,
+  session_id: u64,
+  anchor: &Pos,
+  head: &Pos,
+  linewise: bool,
+  chunk: usize,
+  interval: u64,
+  between: &mut dyn FnMut(usize),
+) -> Result<Written, String> {
+  let dir = state.pass_ctx(chunk, interval).ok_or_else(no_folder)?.dir;
+  let (generation, _busy) = begin_pass(state, state.lock_idle(session_id)?, session_id)?;
+  let doc = Unlocked::new(state, session_id, generation, between);
+  let (a, b) = (
+    locate_pos(&doc, anchor, chunk)?,
+    locate_pos(&doc, head, chunk)?,
+  );
+  let (start, end) = (a.offset.min(b.offset), a.offset.max(b.offset));
+  let mut writer = ClipWriter::create(&dir, linewise)?;
+  let mut at = start;
+  while at < end {
+    let to = (at + chunk.max(1) as u64).min(end);
+    writer.push(&doc.read(at, to)?)?;
+    at = to;
+  }
+  // The session is busy, so nothing can have changed it; make sure.
+  install(state, session_id, generation, |_| Ok(()))?;
+  writer.finish()
+}
+/// Copy the text between two positions (either order) to the system clipboard
+/// through a clip file, so it is never held in memory. `linewise` marks a copy of
+/// whole lines with no selection. `OfferFailed` also covers every error.
+/// `reservation` is the one the window made for this copy; it is released when the
+/// copy ends, however it ends.
+#[tauri::command(async)]
+pub fn clip_copy_session(
+  app: AppHandle,
+  state: State<WindowedState>,
+  session_id: u64,
+  anchor: Pos,
+  head: Pos,
+  linewise: bool,
+  reservation: Option<u64>,
+) -> ClipOutcome {
+  let _release = clipboard_store::ReleaseOnDrop(reservation);
+  clipboard_store::copy(&app, || {
+    clip_copy_session_core(
+      &state,
+      session_id,
+      &anchor,
+      &head,
+      linewise,
+      SCAN_CHUNK,
+      CHECKPOINT_INTERVAL,
+      &mut |_| {},
+    )
+  })
+}
+/// Where CodeMirror's `ChangeDesc.mapPos(pos, assoc)` puts `pos` after `[start,
+/// end)` became `ins` bytes.
+fn map_pos(pos: u64, assoc: i8, start: u64, end: u64, ins: u64) -> u64 {
+  if pos < start {
+    pos
+  } else if end > pos {
+    if pos == start || assoc < 0 {
+      start
+    } else {
+      start + ins
+    }
+  } else if end == pos && assoc < 0 && start == end {
+    start
+  } else {
+    pos - (end - start) + ins
+  }
+}
+/// `pos` after edits that apply one after another, each in the frame the one
+/// before it left. A `fill` edit moves nothing.
+fn map_through_edits(pos: u64, assoc: i8, edits: &[AppliedEdit]) -> u64 {
+  edits.iter().fold(pos, |pos, e| {
+    if e.fill.is_some() {
+      return pos;
+    }
+    map_pos(
+      pos,
+      assoc,
+      e.start,
+      e.end,
+      e.len.unwrap_or(e.text.len() as u64),
+    )
+  })
+}
+/// A selection's two ends (anchor, head) after a change, as `SelectionRange.map`
+/// maps them: a cursor with assoc -1; otherwise the lower end with assoc 1 and the
+/// upper with assoc -1, each end keeping its role.
+fn map_selection(
+  ends: [u64; 2],
+  mut map: impl FnMut(u64, i8) -> Result<u64, String>,
+) -> Result<[u64; 2], String> {
+  let [anchor, head] = ends;
+  if anchor == head {
+    let at = map(anchor, -1)?;
+    return Ok([at, at]);
+  }
+  let (low, high) = (map(anchor.min(head), 1)?, map(anchor.max(head), -1)?);
+  Ok(if anchor < head {
+    [low, high]
+  } else {
+    [high, low]
+  })
+}
+/// The offsets of a tracked selection, found without holding the lock.
+fn track_offsets<D: Doc + ?Sized>(
+  doc: &D,
+  track: &[Pos; 2],
+  chunk: usize,
+) -> Result<[u64; 2], String> {
+  Ok([
+    pos_to_offset_chunked(doc, &track[0], chunk)?,
+    pos_to_offset_chunked(doc, &track[1], chunk)?,
+  ])
+}
+/// The positions of a tracked selection's ends in the content as it is now.
+fn tracked_pos<D: Doc + ?Sized>(doc: &D, ends: [u64; 2], chunk: usize) -> Result<[Pos; 2], String> {
+  Ok([
+    pos_chunked(doc, ends[0], chunk)?,
+    pos_chunked(doc, ends[1], chunk)?,
+  ])
+}
+/// Core of `windowed_undo` / `windowed_redo` with a `track` selection: the
+/// session is busy; the selection is converted with the lock released; the step
+/// is undone or redone under a short lock and the selection mapped through what
+/// it did; the result is converted back with the lock released.
+fn history_tracked_core(
+  state: &WindowedState,
+  session_id: u64,
+  redo: bool,
+  track: &[Pos; 2],
+  chunk: usize,
+  interval: u64,
+  between: &mut dyn FnMut(usize),
+) -> Result<UndoResult, String> {
+  let ctx = state.pass_ctx(chunk, interval);
+  let (generation, _busy) = begin_pass(state, state.lock_idle(session_id)?, session_id)?;
+  let doc = Unlocked::new(state, session_id, generation, between);
+  let ends = track_offsets(&doc, track, chunk)?;
+  let (mut result, mapped) = install(state, session_id, generation, |s| {
+    let result = if redo {
+      s.redo(ctx.as_ref())
+    } else {
+      s.undo(ctx.as_ref())
+    }?;
+    let mapped = match result.token {
+      Some(token) => {
+        let (list, dir) = s
+          .replace_tokens
+          .get(&token)
+          .ok_or_else(|| UNKNOWN_TOKEN.to_string())?;
+        map_selection(ends, |p, assoc| list.map_offset_assoc(*dir, p, assoc))?
+      }
+      None => map_selection(ends, |p, assoc| {
+        Ok(map_through_edits(p, assoc, &result.edits))
+      })?,
+    };
+    Ok((result, mapped))
+  })?;
+  doc.moved_to(result.generation);
+  result.tracked = Some(tracked_pos(&doc, mapped, chunk)?);
+  Ok(result)
 }
 
 #[cfg(test)]
@@ -2215,7 +4651,6 @@ mod tests {
   use super::*;
   use std::io::{Cursor, Write};
   use tempfile::tempdir;
-
   /// Force `path`'s mtime back to `fingerprint`'s, so a rewritten file keeps a
   /// colliding size+mtime fingerprint and a test can isolate what the sampled
   /// digest adds on top of it.
@@ -2241,7 +4676,6 @@ mod tests {
       "size and mtime must collide for this test to isolate the digest's effect"
     );
   }
-
   /// Naive reference: replace the byte ranges of `edits` (each in pre-apply
   /// coordinates, non-overlapping) against a plain buffer, back to front.
   fn ref_apply(content: &[u8], edits: &[(u64, u64, &str)]) -> Vec<u8> {
@@ -2253,14 +4687,12 @@ mod tests {
     }
     v
   }
-
   /// A `Session` built directly over a file path, bypassing managed state, for
   /// exercising the table + save helpers without a Tauri runtime.
   fn open_session(path: &Path) -> Session {
     let (table, _, fingerprint, index, digest) = build_table(path).unwrap();
     Session::new(table, path.to_path_buf(), fingerprint, index, digest)
   }
-
   /// Build a global-byte `Edit` from a triple, for the journal tests.
   fn edit(start: u64, end: u64, text: &str) -> Edit {
     Edit {
@@ -2271,12 +4703,10 @@ mod tests {
       cascade: false,
     }
   }
-
   /// Full document bytes of a session (for comparing against a reference model).
   fn whole(session: &Session) -> Vec<u8> {
     session.table.read(0, session.table.len()).unwrap()
   }
-
   /// Read a session window and return its text as bytes.
   fn read_window(session: &Session, start_line: u64, end_line: u64) -> Vec<u8> {
     let table = &session.table;
@@ -2287,7 +4717,6 @@ mod tests {
     let b = line_offset(table, end_line).unwrap();
     table.read(a, b).unwrap()
   }
-
   /// Apply a batch to a session table the same way `windowed_apply` does.
   fn apply(session: &mut Session, edits: &[(u64, u64, &str)]) -> Result<(), String> {
     let len = session.table.len();
@@ -2304,7 +4733,6 @@ mod tests {
     }
     Ok(())
   }
-
   /// Save a session to its own path via the production `save_session`, and
   /// unwrap the result. For tests that only care about the write, not the
   /// guard or save-as behaviour.
@@ -2397,10 +4825,8 @@ mod tests {
     let content = "line0\nline1\nline2\nline3\n";
     fs::write(&path, content).unwrap();
     let mut session = open_session(&path);
-
     // Read a middle window: lines [1, 3) -> "line1\nline2\n".
     assert_eq!(read_window(&session, 1, 3), b"line1\nline2\n");
-
     // Batch of two non-overlapping edits in pre-apply coordinates:
     // replace "line0" (0..5) with "HEAD" and "line2" (12..17) with "MIDDLE".
     let edits = [(0u64, 5u64, "HEAD"), (12u64, 17u64, "MIDDLE")];
@@ -2423,11 +4849,9 @@ mod tests {
     let content = b"alpha\r\nbeta\r\ngamma\r\n";
     fs::write(&path, content).unwrap();
     let mut session = open_session(&path);
-
     // Reading a window returns the CRLF bytes verbatim.
     let win = read_window(&session, 0, 1);
     assert_eq!(win, b"alpha\r\n");
-
     // Replace "beta" (bytes 7..11) with "BB"; untouched CRLFs stay byte-exact.
     let edits = [(7u64, 11u64, "BB")];
     apply(&mut session, &edits).unwrap();
@@ -2442,20 +4866,16 @@ mod tests {
     fs::write(&path, b"original").unwrap();
     let mut session = open_session(&path);
     let stale = session.fingerprint.clone();
-
     // An external write changes size and mtime after the session was opened.
     fs::write(&path, b"changed on disk!!").unwrap();
     assert_ne!(fingerprint_of(&path).unwrap(), stale);
-
     // Replace the whole (8-byte) session document with "EDIT".
     apply(&mut session, &[(0, 8, "EDIT")]).unwrap();
-
     // A stale expected fingerprint rejects the save and writes nothing: the
     // external content is still on disk.
     let err = save_session(&mut session, Some(stale), None).unwrap_err();
     assert_eq!(err, FINGERPRINT_MISMATCH);
     assert_eq!(fs::read(&path).unwrap(), b"changed on disk!!");
-
     // With expected = None the save writes through.
     save_session(&mut session, None, None).unwrap();
     assert_eq!(fs::read(&path).unwrap(), b"EDIT");
@@ -2470,7 +4890,6 @@ mod tests {
     fs::write(&dest, b"dest content").unwrap();
     let mut session = open_session(&source);
     let dest_fingerprint = fingerprint_of(&dest).unwrap();
-
     // `expected` matches the destination (not the source): the save-as succeeds.
     save_session(&mut session, Some(dest_fingerprint), Some(dest.clone())).unwrap();
     assert_eq!(fs::read(&dest).unwrap(), b"source content");
@@ -2486,7 +4905,6 @@ mod tests {
     let source_fingerprint = session.fingerprint.clone();
     fs::write(&dest, b"an unrelated, differently-sized destination").unwrap();
     assert_ne!(fingerprint_of(&dest).unwrap(), source_fingerprint);
-
     // The source's own fingerprint still matches the source, but the check
     // must run against `dest` (the file about to be overwritten), so this is
     // rejected even though `expected` is perfectly valid for `session.path`.
@@ -2507,13 +4925,11 @@ mod tests {
     let mut session = open_session(&source);
     let some_fingerprint = session.fingerprint.clone();
     assert!(!dest.exists());
-
     // A destination that does not exist yet cannot match any `expected`
     // fingerprint: this is a mismatch, not a raw I/O error.
     let err = save_session(&mut session, Some(some_fingerprint), Some(dest.clone())).unwrap_err();
     assert_eq!(err, FINGERPRINT_MISMATCH);
     assert!(!dest.exists());
-
     // With expected = None (today's only save-as path) a brand-new destination
     // still saves through untouched.
     save_session(&mut session, None, Some(dest.clone())).unwrap();
@@ -2527,7 +4943,6 @@ mod tests {
     fs::write(&path, b"abcdef").unwrap();
     let mut session = open_session(&path);
     let before = read_window(&session, 0, session.table.line_count());
-
     // Second edit reaches past EOF: the whole batch must be refused and the
     // table left untouched.
     let edits = [(0u64, 2u64, "XY"), (4u64, 99u64, "ZZ")];
@@ -2543,14 +4958,12 @@ mod tests {
     let content = "one\ntwo\nthree\n";
     fs::write(&path, content).unwrap();
     let mut session = open_session(&path);
-
     // First round: insert a line, save (rebasing the session onto the output).
     let e1 = [(4u64, 4u64, "TWO-AND-A-HALF\n")];
     apply(&mut session, &e1).unwrap();
     let after1 = ref_apply(content.as_bytes(), &e1);
     save(&mut session);
     assert_eq!(fs::read(&path).unwrap(), after1);
-
     // Second round runs on the rebased session: coordinates are against the
     // freshly written file. Replace "three" in the new content.
     let idx = after1.windows(5).position(|w| w == b"three").unwrap() as u64;
@@ -2570,7 +4983,7 @@ mod tests {
     // A destination whose parent does not exist forces staging to fail before
     // any swap, exercising the cleanup path.
     let unreachable = dir.path().join("missing-subdir").join("x.txt");
-    assert!(write_document(&session, ".windowed-test", &unreachable).is_err());
+    assert!(write_document(&session, ".windowed-test", &unreachable, SCAN_BUF, None).is_err());
     // Nothing was written over the original, and no temp leaked into the dir.
     assert_eq!(fs::read(&path).unwrap(), b"content");
     let leftovers: Vec<_> = fs::read_dir(dir.path())
@@ -2593,7 +5006,6 @@ mod tests {
     }
     fs::write(&path, &content).unwrap();
     let mut session = open_session(&path);
-
     // Insert at the very start and near the end (non-overlapping, pre-apply).
     let len = content.len() as u64;
     let edits = [(0u64, 0u64, "HEAD\n"), (len, len, "TAIL\n")];
@@ -2602,7 +5014,6 @@ mod tests {
     save(&mut session);
     assert_eq!(fs::read(&path).unwrap(), expected);
   }
-
   /// The third writer used to finish with a plain rename, which detaches every
   /// link the user had on the file it replaced. These three hold it to the same
   /// rule as the other two.
@@ -2718,11 +5129,9 @@ mod tests {
 
     let new_path = dir.path().join("saved-as.txt");
     save_session(&mut session, None, Some(new_path.clone())).unwrap();
-
     // New path holds the edited bytes; the original file is untouched.
     assert_eq!(fs::read(&new_path).unwrap(), expected1);
     assert_eq!(fs::read(&orig_path).unwrap(), orig_content.as_bytes());
-
     // The session now tracks the new path: a further edit + plain save
     // (no override, no expected) writes to the new path, not the original.
     apply(&mut session, &[(0u64, 0u64, "HEAD\n")]).unwrap();
@@ -2740,7 +5149,6 @@ mod tests {
     fs::write(&orig_path, b"original").unwrap();
     let mut session = open_session(&orig_path);
     let stale = session.fingerprint.clone();
-
     // External edit to the *original* path after the session was opened.
     fs::write(&orig_path, b"changed on disk!!").unwrap();
     assert_ne!(fingerprint_of(&orig_path).unwrap(), stale);
@@ -2750,7 +5158,6 @@ mod tests {
 
     let err = save_session(&mut session, Some(stale), Some(new_path.clone())).unwrap_err();
     assert_eq!(err, FINGERPRINT_MISMATCH);
-
     // Nothing landed at the new path, and the original keeps the external edit.
     assert!(!new_path.exists());
     assert_eq!(fs::read(&orig_path).unwrap(), b"changed on disk!!");
@@ -2762,7 +5169,6 @@ mod tests {
     let path = dir.path().join("f.txt");
     fs::write(&path, b"content").unwrap();
     let mut session = open_session(&path);
-
     // Target is an existing *non-empty* directory: create_new on the temp
     // (a sibling file inside `dir`) succeeds, but the final rename over a
     // non-empty directory fails, exercising the "temp created, then
@@ -2771,8 +5177,7 @@ mod tests {
     fs::create_dir(&target_dir).unwrap();
     fs::write(target_dir.join("occupant.txt"), b"keep").unwrap();
 
-    assert!(write_document(&session, ".windowed-test", &target_dir).is_err());
-
+    assert!(write_document(&session, ".windowed-test", &target_dir, SCAN_BUF, None).is_err());
     // No temp leaked in the parent dir, and the occupied directory is intact.
     assert!(!dir
       .path()
@@ -2785,12 +5190,10 @@ mod tests {
       .collect();
     assert!(leftovers.is_empty());
     assert!(target_dir.join("occupant.txt").exists());
-
     // The session can still save normally to a writable path.
     save(&mut session);
     assert_eq!(fs::read(&path).unwrap(), b"content");
   }
-
   /// Build a session over freshly-written `content` in a fresh temp dir.
   fn session_with(dir: &tempfile::TempDir, content: &[u8]) -> Session {
     let path = dir.path().join("journal.txt");
@@ -2803,22 +5206,22 @@ mod tests {
     let dir = tempdir().unwrap();
     // Insert.
     let mut s = session_with(&dir, b"abc");
-    s.apply(vec![edit(1, 1, "XY")], true).unwrap();
+    s.apply(vec![edit(1, 1, "XY")], true, None).unwrap();
     assert_eq!(whole(&s), b"aXYbc");
-    s.undo().unwrap();
+    s.undo(None).unwrap();
     assert_eq!(whole(&s), b"abc");
     // Delete.
-    s.apply(vec![edit(0, 2, "")], true).unwrap();
+    s.apply(vec![edit(0, 2, "")], true, None).unwrap();
     assert_eq!(whole(&s), b"c");
-    s.undo().unwrap();
+    s.undo(None).unwrap();
     assert_eq!(whole(&s), b"abc");
     // Replace, multi-byte on both sides.
     let mut m = session_with(&dir, "café中".as_bytes());
     let before = whole(&m);
     // Replace "fé中" (bytes 2..8, "f"=1 "é"=2 "中"=3) with "日本" (6 bytes).
-    m.apply(vec![edit(2, 8, "日本")], true).unwrap();
+    m.apply(vec![edit(2, 8, "日本")], true, None).unwrap();
     assert_eq!(whole(&m), "ca日本".as_bytes());
-    m.undo().unwrap();
+    m.undo(None).unwrap();
     assert_eq!(whole(&m), before);
   }
 
@@ -2837,19 +5240,19 @@ mod tests {
         e.text.bytes().collect::<Vec<_>>(),
       );
       let _ = removed;
-      s.apply(vec![e], true).unwrap();
+      s.apply(vec![e], true, None).unwrap();
       reference = next;
       states.push(reference.clone());
       assert_eq!(whole(&s), reference);
     }
     // Undo back to the start, matching each recorded prior state.
     for expected in states.iter().rev().skip(1) {
-      s.undo().unwrap();
+      s.undo(None).unwrap();
       assert_eq!(whole(&s), *expected);
     }
     // Redo forward again, matching each recorded later state.
     for expected in states.iter().skip(1) {
-      s.redo().unwrap();
+      s.redo(None).unwrap();
       assert_eq!(whole(&s), *expected);
     }
   }
@@ -2859,12 +5262,12 @@ mod tests {
     let dir = tempdir().unwrap();
     let mut s = session_with(&dir, b"0123456789");
     // Two non-overlapping edits in one batch (one shared pre-apply frame).
-    s.apply(vec![edit(1, 3, "AB"), edit(6, 8, "CDE")], true)
+    s.apply(vec![edit(1, 3, "AB"), edit(6, 8, "CDE")], true, None)
       .unwrap();
     assert_eq!(whole(&s), b"0AB345CDE89");
-    s.undo().unwrap();
+    s.undo(None).unwrap();
     assert_eq!(whole(&s), b"0123456789");
-    s.redo().unwrap();
+    s.redo(None).unwrap();
     assert_eq!(whole(&s), b"0AB345CDE89");
   }
 
@@ -2873,23 +5276,23 @@ mod tests {
     let dir = tempdir().unwrap();
     // Coalesced: two applies join one group, so a single undo reverts both.
     let mut s = session_with(&dir, b"");
-    s.apply(vec![edit(0, 0, "a")], true).unwrap();
-    s.apply(vec![edit(1, 1, "b")], false).unwrap();
+    s.apply(vec![edit(0, 0, "a")], true, None).unwrap();
+    s.apply(vec![edit(1, 1, "b")], false, None).unwrap();
     assert_eq!(whole(&s), b"ab");
     assert_eq!(s.undo_stack.len(), 1);
-    s.undo().unwrap();
+    s.undo(None).unwrap();
     assert_eq!(whole(&s), b"");
     // A single redo restores the whole coalesced step.
-    s.redo().unwrap();
+    s.redo(None).unwrap();
     assert_eq!(whole(&s), b"ab");
     // Separate groups: two applies with new_group = true need two undos.
     let mut t = session_with(&dir, b"");
-    t.apply(vec![edit(0, 0, "a")], true).unwrap();
-    t.apply(vec![edit(1, 1, "b")], true).unwrap();
+    t.apply(vec![edit(0, 0, "a")], true, None).unwrap();
+    t.apply(vec![edit(1, 1, "b")], true, None).unwrap();
     assert_eq!(t.undo_stack.len(), 2);
-    t.undo().unwrap();
+    t.undo(None).unwrap();
     assert_eq!(whole(&t), b"a");
-    t.undo().unwrap();
+    t.undo(None).unwrap();
     assert_eq!(whole(&t), b"");
   }
 
@@ -2900,28 +5303,28 @@ mod tests {
     let original = "你好世界".as_bytes().to_vec();
     let mut s = session_with(&dir, &original);
     // Insert "哈" right after "你好" (byte offset 6, start of a new group).
-    s.apply(vec![edit(6, 6, "哈")], true).unwrap();
+    s.apply(vec![edit(6, 6, "哈")], true, None).unwrap();
     let after_insert1 = whole(&s);
     assert_eq!(after_insert1, "你好哈世界".as_bytes());
     // Insert "囉" right after "哈" (coalesced into the same group).
-    s.apply(vec![edit(9, 9, "囉")], false).unwrap();
+    s.apply(vec![edit(9, 9, "囉")], false, None).unwrap();
     let after_insert2 = whole(&s);
     assert_eq!(after_insert2, "你好哈囉世界".as_bytes());
     // Backspace: delete "囉" again, same position, overlapping the prior
     // insert's range (still coalesced into the same group).
-    s.apply(vec![edit(9, 12, "")], false).unwrap();
+    s.apply(vec![edit(9, 12, "")], false, None).unwrap();
     let after_backspace = whole(&s);
     assert_eq!(after_backspace, "你好哈世界".as_bytes());
     // Whole coalesced group: only one undo step recorded.
     assert_eq!(s.undo_stack.len(), 1);
     // One undo restores the original document, whole-file byte compare.
-    s.undo().unwrap();
+    s.undo(None).unwrap();
     assert_eq!(whole(&s), original);
     // One redo restores the post-backspace state, whole-file byte compare.
-    s.redo().unwrap();
+    s.redo(None).unwrap();
     assert_eq!(whole(&s), after_backspace);
     // Undo again returns to the original.
-    s.undo().unwrap();
+    s.undo(None).unwrap();
     assert_eq!(whole(&s), original);
   }
 
@@ -2929,13 +5332,13 @@ mod tests {
   fn apply_clears_redo_stack() {
     let dir = tempdir().unwrap();
     let mut s = session_with(&dir, b"abc");
-    s.apply(vec![edit(0, 0, "X")], true).unwrap();
-    s.undo().unwrap();
+    s.apply(vec![edit(0, 0, "X")], true, None).unwrap();
+    s.undo(None).unwrap();
     assert_eq!(s.redo_stack.len(), 1);
     // A fresh edit invalidates the redo history.
-    s.apply(vec![edit(0, 0, "Y")], true).unwrap();
+    s.apply(vec![edit(0, 0, "Y")], true, None).unwrap();
     assert!(s.redo_stack.is_empty());
-    assert_eq!(s.redo().unwrap_err(), NOTHING_TO_REDO);
+    assert_eq!(s.redo(None).unwrap_err(), NOTHING_TO_REDO);
   }
 
   #[test]
@@ -2945,12 +5348,12 @@ mod tests {
     fs::write(&path, b"hello world\n").unwrap();
     let mut s = open_session(&path);
     // Edit, then save (rebases the piece table onto the written file).
-    s.apply(vec![edit(0, 5, "GOODBYE")], true).unwrap();
+    s.apply(vec![edit(0, 5, "GOODBYE")], true, None).unwrap();
     save(&mut s);
     assert_eq!(fs::read(&path).unwrap(), b"GOODBYE world\n");
     // The journal survives the rebase: undo still restores the original, and a
     // second save writes it back to disk byte-for-byte.
-    s.undo().unwrap();
+    s.undo(None).unwrap();
     assert_eq!(whole(&s), b"hello world\n");
     save(&mut s);
     assert_eq!(fs::read(&path).unwrap(), b"hello world\n");
@@ -2963,15 +5366,15 @@ mod tests {
     // One more group than the cap; the oldest must be dropped.
     for i in 0..(UNDO_LIMIT + 1) {
       let at = s.table.len();
-      s.apply(vec![edit(at, at, "x")], true).unwrap();
+      s.apply(vec![edit(at, at, "x")], true, None).unwrap();
       let _ = i;
     }
     assert_eq!(s.undo_stack.len(), UNDO_LIMIT);
     // Exactly UNDO_LIMIT undos succeed; the evicted group is gone.
     for _ in 0..UNDO_LIMIT {
-      s.undo().unwrap();
+      s.undo(None).unwrap();
     }
-    assert_eq!(s.undo().unwrap_err(), NOTHING_TO_UNDO);
+    assert_eq!(s.undo(None).unwrap_err(), NOTHING_TO_UNDO);
     // The first inserted 'x' was evicted, so one char remains.
     assert_eq!(whole(&s), b"x");
   }
@@ -2980,8 +5383,8 @@ mod tests {
   fn empty_stacks_return_protocol_errors() {
     let dir = tempdir().unwrap();
     let mut s = session_with(&dir, b"abc");
-    assert_eq!(s.undo().unwrap_err(), NOTHING_TO_UNDO);
-    assert_eq!(s.redo().unwrap_err(), NOTHING_TO_REDO);
+    assert_eq!(s.undo(None).unwrap_err(), NOTHING_TO_UNDO);
+    assert_eq!(s.redo(None).unwrap_err(), NOTHING_TO_REDO);
   }
   // --- the clean flag ----------------------------------------------------------
 
@@ -2996,55 +5399,55 @@ mod tests {
   fn an_empty_batch_keeps_the_session_clean() {
     let dir = tempdir().unwrap();
     let mut s = session_with(&dir, b"abc");
-    let stats = s.apply(Vec::new(), true).unwrap();
+    let stats = s.apply(Vec::new(), true, None).unwrap();
     assert!(stats.clean);
     assert_eq!(stats.generation, 0);
-    s.apply(vec![edit(0, 0, "X")], true).unwrap();
+    s.apply(vec![edit(0, 0, "X")], true, None).unwrap();
     save(&mut s);
-    assert!(s.apply(Vec::new(), true).unwrap().clean);
+    assert!(s.apply(Vec::new(), true, None).unwrap().clean);
   }
 
   #[test]
   fn an_edit_is_dirty_and_undoing_every_edit_is_clean_again() {
     let dir = tempdir().unwrap();
     let mut s = session_with(&dir, b"abc");
-    assert!(!s.apply(vec![edit(0, 0, "X")], true).unwrap().clean);
-    assert!(!s.apply(vec![edit(1, 1, "Y")], true).unwrap().clean);
-    assert!(!s.undo().unwrap().clean);
-    assert!(s.undo().unwrap().clean);
-    assert!(!s.redo().unwrap().clean);
-    assert!(!s.redo().unwrap().clean);
-    assert!(!s.undo().unwrap().clean);
-    assert!(s.undo().unwrap().clean);
+    assert!(!s.apply(vec![edit(0, 0, "X")], true, None).unwrap().clean);
+    assert!(!s.apply(vec![edit(1, 1, "Y")], true, None).unwrap().clean);
+    assert!(!s.undo(None).unwrap().clean);
+    assert!(s.undo(None).unwrap().clean);
+    assert!(!s.redo(None).unwrap().clean);
+    assert!(!s.redo(None).unwrap().clean);
+    assert!(!s.undo(None).unwrap().clean);
+    assert!(s.undo(None).unwrap().clean);
   }
 
   #[test]
   fn undoing_past_a_save_is_dirty_and_redoing_back_to_it_is_clean() {
     let dir = tempdir().unwrap();
     let mut s = session_with(&dir, b"abc");
-    s.apply(vec![edit(0, 0, "X")], true).unwrap();
+    s.apply(vec![edit(0, 0, "X")], true, None).unwrap();
     save(&mut s);
     assert!(s.clean());
-    assert!(!s.undo().unwrap().clean);
-    assert!(s.redo().unwrap().clean);
+    assert!(!s.undo(None).unwrap().clean);
+    assert!(s.redo(None).unwrap().clean);
   }
 
   #[test]
   fn typing_that_would_coalesce_after_a_save_still_undoes_to_the_saved_state() {
     let dir = tempdir().unwrap();
     let mut s = session_with(&dir, b"");
-    s.apply(vec![edit(0, 0, "a")], true).unwrap();
+    s.apply(vec![edit(0, 0, "a")], true, None).unwrap();
     save(&mut s);
     // Not a new group by the caller's rule, yet it must not join the saved one.
-    assert!(!s.apply(vec![edit(1, 1, "b")], false).unwrap().clean);
+    assert!(!s.apply(vec![edit(1, 1, "b")], false, None).unwrap().clean);
     assert_eq!(s.undo_stack.len(), 2);
-    assert!(s.undo().unwrap().clean);
+    assert!(s.undo(None).unwrap().clean);
     assert_eq!(whole(&s), b"a");
     // The next typing after that coalesces again.
-    s.apply(vec![edit(1, 1, "c")], false).unwrap();
-    s.apply(vec![edit(2, 2, "d")], false).unwrap();
+    s.apply(vec![edit(1, 1, "c")], false, None).unwrap();
+    s.apply(vec![edit(2, 2, "d")], false, None).unwrap();
     assert_eq!(s.undo_stack.len(), 2);
-    assert!(s.undo().unwrap().clean);
+    assert!(s.undo(None).unwrap().clean);
     assert_eq!(whole(&s), b"a");
   }
 
@@ -3052,12 +5455,12 @@ mod tests {
   fn typing_after_undoing_past_a_save_is_never_clean_before_the_next_save() {
     let dir = tempdir().unwrap();
     let mut s = session_with(&dir, b"");
-    s.apply(vec![edit(0, 0, "a")], true).unwrap();
+    s.apply(vec![edit(0, 0, "a")], true, None).unwrap();
     save(&mut s);
-    assert!(!s.undo().unwrap().clean);
-    assert!(!s.apply(vec![edit(0, 0, "z")], false).unwrap().clean);
-    assert!(!s.undo().unwrap().clean);
-    assert!(!s.redo().unwrap().clean);
+    assert!(!s.undo(None).unwrap().clean);
+    assert!(!s.apply(vec![edit(0, 0, "z")], false, None).unwrap().clean);
+    assert!(!s.undo(None).unwrap().clean);
+    assert!(!s.redo(None).unwrap().clean);
     // The saved content ("a") is no state this session can reach again.
     assert_eq!(whole(&s), b"z");
     save(&mut s);
@@ -3070,11 +5473,11 @@ mod tests {
     let mut s = session_with(&dir, b"");
     for _ in 0..(UNDO_LIMIT + 1) {
       let at = s.table.len();
-      s.apply(vec![edit(at, at, "x")], true).unwrap();
+      s.apply(vec![edit(at, at, "x")], true, None).unwrap();
     }
     let mut last = true;
     for _ in 0..UNDO_LIMIT {
-      last = s.undo().unwrap().clean;
+      last = s.undo(None).unwrap().clean;
     }
     assert!(!last, "the evicted step's edit is still in the document");
     assert_eq!(whole(&s), b"x");
@@ -3085,23 +5488,29 @@ mod tests {
   fn save_as_makes_the_session_clean() {
     let dir = tempdir().unwrap();
     let mut s = session_with(&dir, b"abc");
-    s.apply(vec![edit(0, 0, "X")], true).unwrap();
+    s.apply(vec![edit(0, 0, "X")], true, None).unwrap();
     assert!(!s.clean());
     let saved = save_session(&mut s, None, Some(dir.path().join("other.txt"))).unwrap();
     assert!(saved.clean);
     assert!(s.clean());
-    assert!(!s.undo().unwrap().clean);
-    assert!(s.redo().unwrap().clean);
+    assert!(!s.undo(None).unwrap().clean);
+    assert!(s.redo(None).unwrap().clean);
   }
 
   #[test]
   fn results_carry_a_generation_that_only_grows() {
     let dir = tempdir().unwrap();
     let mut s = session_with(&dir, b"abc");
-    let a = s.apply(vec![edit(0, 0, "X")], true).unwrap().generation;
-    let b = s.apply(vec![edit(1, 1, "Y")], false).unwrap().generation;
-    let c = s.undo().unwrap().generation;
-    let d = s.redo().unwrap().generation;
+    let a = s
+      .apply(vec![edit(0, 0, "X")], true, None)
+      .unwrap()
+      .generation;
+    let b = s
+      .apply(vec![edit(1, 1, "Y")], false, None)
+      .unwrap()
+      .generation;
+    let c = s.undo(None).unwrap().generation;
+    let d = s.redo(None).unwrap().generation;
     let e = save_session(&mut s, None, None).unwrap().generation;
     assert!(a < b && b < c && c < d && d < e, "{a} {b} {c} {d} {e}");
   }
@@ -3111,8 +5520,8 @@ mod tests {
     let dir = tempdir().unwrap();
     let mut s = session_with(&dir, b"L0\nL1\nL2\n");
     // Insert on line 1 (byte 3).
-    s.apply(vec![edit(3, 3, "X")], true).unwrap();
-    let r = s.undo().unwrap();
+    s.apply(vec![edit(3, 3, "X")], true, None).unwrap();
+    let r = s.undo(None).unwrap();
     // The undo removes the inserted "X": one edit deleting [3,4).
     assert_eq!(r.edits.len(), 1);
     assert_eq!(r.edits[0].start, 3);
@@ -3241,7 +5650,6 @@ mod tests {
     let fingerprint = fingerprint_of(&path).unwrap();
     let (_, _, _, real_index, real_digest) = build_table(&path).unwrap();
     assert_eq!(real_index.total_newlines, 1);
-
     // Same byte length, but the newline is gone: 0 newlines, still 8 bytes.
     fs::write(&path, "aaabbbbb").unwrap();
     pin_mtime(&path, &fingerprint);
@@ -3255,7 +5663,6 @@ mod tests {
       Some(real_digest),
     )
     .unwrap();
-
     // The digest mismatch (computed over the same checkpoint offsets, which
     // cover this whole small file) forces a rescan despite the matching
     // fingerprint, and the rescan finds the real, correct content.
@@ -3286,7 +5693,6 @@ mod tests {
       vec![(0, 0), (CHECKPOINT_INTERVAL, 0)]
     );
     assert_eq!(real_index.total_newlines, 0);
-
     // A byte roughly in the middle of the second interval: past the first
     // checkpoint's sampled block, past the second checkpoint's sampled block,
     // and well before the last-block sample near EOF.
@@ -3307,7 +5713,6 @@ mod tests {
       Some(real_digest),
     )
     .unwrap();
-
     // Trusted despite the real content now containing a newline the stale
     // index does not know about: the pinned residual blind spot.
     assert!(!result.rescanned);
@@ -3416,7 +5821,6 @@ mod tests {
     // persisted and handed back to `windowed_reopen`, permanently defeating
     // the fast path.
     let digest: u64 = 8_614_438_812_897_467_614;
-
     // What `response.json()` on the JS side does to a raw `u64` embedded as a
     // JSON number: decode as `f64`, the only numeric type JSON has.
     let via_f64 = digest as f64 as u64;
@@ -3425,7 +5829,6 @@ mod tests {
       "this digest must not survive an f64 round-trip, or the regression this \
        test exists to catch is not actually being exercised"
     );
-
     // What actually crosses the boundary now (see `IndexSnapshot::digest` and
     // `parse_digest`): a decimal string, parsed back into a `u64` with no
     // intermediate float at all.
@@ -3771,7 +6174,6 @@ mod tests {
     apply(&mut session, &[(0u64, 5u64, "HEAD")]).unwrap();
     save(&mut session);
     let _ = session_id;
-
     // Persist exactly what `windowed_index` would hand the frontend.
     let index = session.index.clone();
     let fingerprint = session.fingerprint.clone();
@@ -3847,7 +6249,7 @@ mod replace_tests {
     }
 
     fn edit(&self, edits: Vec<Edit>, new_group: bool) {
-      self.with(|s| s.apply(edits, new_group).unwrap());
+      self.with(|s| s.apply(edits, new_group, None).unwrap());
     }
 
     fn replace_with(
@@ -3890,11 +6292,11 @@ mod replace_tests {
     }
 
     fn undo(&self) -> UndoResult {
-      self.with(|s| s.undo().unwrap())
+      self.with(|s| s.undo(None).unwrap())
     }
 
     fn redo(&self) -> UndoResult {
-      self.with(|s| s.redo().unwrap())
+      self.with(|s| s.redo(None).unwrap())
     }
 
     fn save(&self) {
@@ -4708,6 +7110,31 @@ mod replace_tests {
     assert_eq!(fx.whole(), original);
   }
 
+  #[test]
+  fn a_replace_all_undo_whose_reload_fails_does_not_stack_another_layer() {
+    // The layer comes off first; the reload then fails, and the step is spent.
+    // A second undo finds nothing to undo instead of covering the table again.
+    let original = big_doc(2_000, 3);
+    let fx = fixture(&original);
+    fx.replace("tok", "TOKEN");
+    for path in fx.live_lists() {
+      fs::OpenOptions::new()
+        .write(true)
+        .open(path)
+        .unwrap()
+        .set_len(0)
+        .unwrap();
+    }
+    fx.with(|s| {
+      assert!(s.undo(None).is_err());
+      assert_eq!(layer_depth(&s.table), 0);
+      assert!(s.undo_stack.is_empty() && s.redo_stack.is_empty());
+      assert_eq!(s.undo(None).unwrap_err(), NOTHING_TO_UNDO);
+      assert_eq!(layer_depth(&s.table), 0);
+    });
+    assert_eq!(fx.whole(), original);
+  }
+
   fn assert_save_roundtrip(fx: &Fixture, original: &[u8]) {
     let (replaced, _) = flat_replace(original, b"tok", b"TOKEN-LONG", true, "\n");
     fx.replace("tok", "TOKEN-LONG");
@@ -5193,7 +7620,6 @@ mod replace_tests {
     assert_eq!(fx.state.lock_idle(404).err().unwrap(), UNKNOWN_SESSION);
   }
   // --- offsets through a replace-all -------------------------------------------
-
   /// Reference for `map_offset`: the hits of a leftmost non-overlapping scan,
   /// each as its pre-replace start.
   fn ref_hits(hay: &[u8], needle: &[u8]) -> Vec<u64> {
@@ -5205,7 +7631,6 @@ mod replace_tests {
     }
     hits
   }
-
   /// Where the reference puts `offset` of the pre frame (`forward`) or of the
   /// post frame (not forward).
   fn ref_map(hits: &[u64], n: i64, r: i64, forward: bool, offset: u64) -> u64 {
@@ -5384,6 +7809,152 @@ mod replace_tests {
       let pos = offset_to_pos(&s.table, 3).unwrap();
       assert_eq!((pos.line, pos.col), (1, 0));
     });
+  }
+  /// The end position of `flat` by the line rule, written out directly.
+  fn rule_end_pos(flat: &[u8]) -> (u64, u64) {
+    let mut line = 0u64;
+    let mut start = 0usize;
+    for i in 0..flat.len() {
+      if flat[i] == b'\n' || (flat[i] == b'\r' && flat.get(i + 1) != Some(&b'\n')) {
+        line += 1;
+        start = i + 1;
+      }
+    }
+    let col = String::from_utf8(flat[start..].to_vec())
+      .unwrap()
+      .encode_utf16()
+      .count() as u64;
+    (line, col)
+  }
+  #[test]
+  fn end_pos_is_the_last_line_and_its_length_for_every_break_style() {
+    let cases: &[(&[u8], u64, u64)] = &[
+      (b"", 0, 0),
+      (b"a", 0, 1),
+      (b"abc\n", 1, 0),
+      (b"abc\r\n", 1, 0),
+      (b"abc\r", 1, 0),
+      (b"\r", 1, 0),
+      (b"\r\n", 1, 0),
+      (b"ab\rcd", 1, 2),
+      (b"a\r\nbc", 1, 2),
+      (b"a\r\nb\r\n\r", 3, 0),
+      (b"a\n\n\nxyz", 3, 3),
+      ("é".as_bytes(), 0, 1),
+      ("日本語\nあ日".as_bytes(), 1, 2),
+      ("a😀b".as_bytes(), 0, 4),
+      ("😀\r😀😀".as_bytes(), 1, 4),
+    ];
+    for &(flat, line, col) in cases {
+      assert_eq!(rule_end_pos(flat), (line, col), "{flat:?}");
+      let fx = fixture(flat);
+      fx.with(|s| {
+        for chunk in [1usize, 2, 3, 4, 5, 7, 4096] {
+          let pos = end_pos(&s.table, chunk).unwrap();
+          assert_eq!((pos.line, pos.col), (line, col), "{flat:?} chunk {chunk}");
+          assert_eq!(
+            pos_to_offset(&s.table, pos.line, pos.col).unwrap(),
+            flat.len() as u64,
+            "{flat:?} chunk {chunk}"
+          );
+        }
+      });
+      assert_eq!(
+        end_pos_core(&fx.state, ID).map(|p| (p.line, p.col)),
+        Ok((line, col))
+      );
+    }
+  }
+  #[test]
+  fn end_pos_follows_edits_that_join_or_split_breaks() {
+    let fx = fixture(b"ab\ncd");
+    let check = |flat: &[u8]| {
+      let want = rule_end_pos(flat);
+      fx.with(|s| {
+        let pos = end_pos(&s.table, 3).unwrap();
+        assert_eq!((pos.line, pos.col), want, "{flat:?}");
+        assert_eq!(
+          pos_to_offset(&s.table, pos.line, pos.col).unwrap(),
+          flat.len() as u64
+        );
+      });
+    };
+    // A CR typed before the LF joins into one CRLF break.
+    fx.edit(vec![ed(2, 2, "\r")], true);
+    assert_eq!(fx.whole(), b"ab\r\ncd");
+    check(b"ab\r\ncd");
+    assert_eq!(rule_end_pos(b"ab\r\ncd"), (1, 2));
+    // A CR at the very end is a break of its own.
+    fx.edit(vec![ed(6, 6, "\r")], true);
+    assert_eq!(fx.whole(), b"ab\r\ncd\r");
+    check(b"ab\r\ncd\r");
+    assert_eq!(rule_end_pos(b"ab\r\ncd\r"), (2, 0));
+  }
+  #[test]
+  fn end_pos_of_an_unknown_session_is_an_error() {
+    let fx = fixture(b"a");
+    assert_eq!(end_pos_core(&fx.state, 404).unwrap_err(), UNKNOWN_SESSION);
+  }
+  /// Runs `last_line_col` over `flat`, returning the column and every read.
+  fn spy_last_line_col(flat: &[u8], chunk: usize) -> (u64, Vec<(u64, u64)>) {
+    let mut reads = Vec::new();
+    let col = last_line_col(flat.len() as u64, chunk, &mut |start, end| {
+      reads.push((start, end));
+      Ok(flat[start as usize..end as usize].to_vec())
+    })
+    .unwrap();
+    (col, reads)
+  }
+  #[test]
+  fn a_long_last_line_is_read_in_chunks_never_whole() {
+    let mut flat = b"head\n".to_vec();
+    flat.extend(std::iter::repeat_n(b'a', 1000));
+    let (col, reads) = spy_last_line_col(&flat, 64);
+    assert_eq!(col, 1000);
+    assert!(reads.iter().all(|&(a, b)| b - a <= 64), "{reads:?}");
+    // The line is 1000 bytes: at least ceil(1000 / 64) reads, and the scan
+    // stops at the break instead of going on through the earlier lines.
+    assert!(reads.len() >= 16, "{reads:?}");
+    assert!(reads.len() <= 17, "{reads:?}");
+    assert_eq!(reads.last().map(|r| r.0), Some(0));
+    // One line over the whole text.
+    let one = vec![b'b'; 1000];
+    let (col, reads) = spy_last_line_col(&one, 100);
+    assert_eq!(col, 1000);
+    assert_eq!(reads.len(), 10);
+    assert!(reads.iter().all(|&(a, b)| b - a <= 100));
+  }
+  #[test]
+  fn a_short_last_line_does_not_read_the_text_before_it() {
+    let mut flat = vec![b'a'; 1000];
+    flat.extend_from_slice(b"\nbc");
+    let (col, reads) = spy_last_line_col(&flat, 64);
+    assert_eq!(col, 2);
+    assert_eq!(reads.len(), 1);
+  }
+  #[test]
+  fn chunk_edges_inside_characters_and_between_cr_and_lf_do_not_change_the_column() {
+    let text = "x\r\n😀é日\r\n".repeat(3) + "é😀日a";
+    let flat = text.as_bytes();
+    let want = rule_end_pos(flat);
+    for chunk in 1..=12 {
+      let (col, _) = spy_last_line_col(flat, chunk);
+      assert_eq!(col, want.1, "chunk {chunk}");
+    }
+    // A CR whose LF is the first byte of the next chunk is no marker.
+    let flat = b"ab\r\ncd";
+    for chunk in 1..=4 {
+      assert_eq!(spy_last_line_col(flat, chunk).0, 2, "chunk {chunk}");
+    }
+    // A lone CR last in its chunk, followed by a byte that is not LF, is one.
+    let flat = b"ab\rcd";
+    for chunk in 1..=4 {
+      assert_eq!(spy_last_line_col(flat, chunk).0, 2, "chunk {chunk}");
+    }
+    // A final CR with nothing after it is a break: the last line is empty.
+    for chunk in 1..=4 {
+      assert_eq!(spy_last_line_col(b"abc\r", chunk).0, 0, "chunk {chunk}");
+    }
   }
   // --- The line rule: `\n`, and `\r` not followed by `\n` ----------------------
   /// Line starts of `flat` by the line rule, written out directly.
@@ -6672,13 +9243,13 @@ mod junction_tests {
     let dir = tempdir().unwrap();
     let mut s = open_at(&dir, content, interval);
     let after = flat(content, items);
-    s.apply(batch(items), true).unwrap();
+    s.apply(batch(items), true, None).unwrap();
     assert_is(&s, &after, full, &format!("{what}: apply"));
-    s.undo().unwrap();
+    s.undo(None).unwrap();
     assert_is(&s, content, full, &format!("{what}: undo"));
-    s.redo().unwrap();
+    s.redo(None).unwrap();
     assert_is(&s, &after, full, &format!("{what}: redo"));
-    s.undo().unwrap();
+    s.undo(None).unwrap();
     assert_is(&s, content, full, &format!("{what}: undo again"));
   }
 
@@ -6717,8 +9288,8 @@ mod junction_tests {
     // its start anchored.
     let dir = tempdir().unwrap();
     let mut s = open_at(&dir, b"x\ry", 3);
-    s.apply(batch(items), true).unwrap();
-    let undone = s.undo().unwrap();
+    s.apply(batch(items), true, None).unwrap();
+    let undone = s.undo(None).unwrap();
     assert_eq!(
       serde_json::to_value(&undone.edits).unwrap(),
       serde_json::json!([
@@ -6726,7 +9297,7 @@ mod junction_tests {
         { "start": 1, "end": 2, "text": "\r", "keep_start": true, "fill": null },
       ])
     );
-    let redone = s.redo().unwrap();
+    let redone = s.redo(None).unwrap();
     assert_eq!(
       serde_json::to_value(&redone.edits).unwrap(),
       serde_json::json!([
@@ -6844,7 +9415,7 @@ mod junction_tests {
     ] {
       let items: Vec<Item> = bad.iter().map(|&(a, b, t, r)| (a, b, t, r)).collect();
       let before = s.table.len();
-      assert!(s.apply(batch(&items), true).is_err(), "{items:?}");
+      assert!(s.apply(batch(&items), true, None).is_err(), "{items:?}");
       assert_eq!(s.table.len(), before, "the document is untouched");
       assert!(s.undo_stack.is_empty());
     }
@@ -6867,9 +9438,9 @@ mod junction_tests {
           {"start":3,"end":4,"text":"\n","keep_start":true,"cascade":true}]"#,
     )
     .unwrap();
-    s.apply(edits, true).unwrap();
+    s.apply(edits, true, None).unwrap();
     assert_eq!(s.table.read(0, s.table.len()).unwrap(), b"x\n\n\n\ny");
-    let undone = s.undo().unwrap();
+    let undone = s.undo(None).unwrap();
     assert_eq!(
       serde_json::to_string(&undone.edits).unwrap(),
       concat!(
@@ -6879,7 +9450,7 @@ mod junction_tests {
       )
     );
     assert_eq!(s.table.read(0, s.table.len()).unwrap(), b"x\r\r\ry");
-    let redone = s.redo().unwrap();
+    let redone = s.redo(None).unwrap();
     assert_eq!(
       serde_json::to_string(&redone.edits).unwrap(),
       concat!(
@@ -6907,6 +9478,7 @@ mod junction_tests {
       s.apply(
         batch(&[(at, at, "\n", false), (last, at, "\n", true)]),
         true,
+        None,
       )
       .unwrap();
       grown.push(s.table.add_len() - before);
@@ -6917,13 +9489,13 @@ mod junction_tests {
       else {
         panic!("one edit group");
       };
-      let held: usize = group.iter().map(|e| e.text.len()).sum();
+      let held: usize = group.iter().map(|e| e.removed.len() as usize).sum();
       assert!(held <= 2, "the group holds {held} bytes of text");
       assert_eq!(group.iter().filter(|e| e.fill.is_some()).count(), 1);
-      let undone = s.undo().unwrap();
+      let undone = s.undo(None).unwrap();
       assert_eq!(undone.edits.iter().map(|e| e.text.len()).sum::<usize>(), 1);
       assert_is(&s, &content, false, "undo");
-      s.redo().unwrap();
+      s.redo(None).unwrap();
       assert_eq!(s.table.len(), content.len() as u64 + 1);
       assert_eq!(s.table.line_count(), run as u64 + 3);
     }
@@ -6931,7 +9503,777 @@ mod junction_tests {
     assert_eq!(grown[0], 2);
   }
 }
+/// Removed content past the spill threshold goes to a file: the journal holds a
+/// reference, every step is streamed in blocks, and a failure puts the table back.
+#[cfg(test)]
+mod spill_tests {
+  use super::*;
+  use crate::spill::stats;
+  use tempfile::{tempdir, TempDir};
+  /// Block size and checkpoint interval of both the original and the spills.
+  const INTERVAL: u64 = 4;
+  const CHUNK: usize = 8;
 
+  fn ctx(dir: &TempDir, min: u64) -> SpillCtx {
+    SpillCtx {
+      dir: dir.path().join("spills"),
+      min,
+      interval: INTERVAL,
+      chunk: CHUNK,
+    }
+  }
+  fn spill_files(ctx: &SpillCtx) -> usize {
+    fs::read_dir(&ctx.dir).map_or(0, |entries| {
+      entries
+        .flatten()
+        .filter(|e| e.file_name().to_string_lossy().starts_with("sp-"))
+        .count()
+    })
+  }
+  /// A session over `content` whose original is indexed every `INTERVAL` bytes.
+  fn open_doc(dir: &TempDir, name: &str, content: &[u8]) -> Session {
+    let path = dir.path().join(name);
+    fs::write(&path, content).unwrap();
+    open_path(&path, INTERVAL)
+  }
+  fn open_path(path: &Path, interval: u64) -> Session {
+    let (total, checkpoints, newlines) =
+      scan_reader_at(File::open(path).unwrap(), 4096, interval).unwrap();
+    let index = OriginalIndex::new(
+      Src::File(File::open(path).unwrap()),
+      total,
+      newlines,
+      checkpoints.clone(),
+    );
+    let checkpoint_index = CheckpointIndex {
+      checkpoints,
+      total_newlines: newlines,
+      line_rule: LINE_RULE,
+    };
+    Session::new(
+      PieceTable::new(index),
+      path.to_path_buf(),
+      fingerprint_of(path).unwrap(),
+      checkpoint_index,
+      0,
+    )
+  }
+  /// Lines of CRLF and LF text with multi-byte characters.
+  fn doc(lines: usize) -> Vec<u8> {
+    (0..lines)
+      .map(|i| format!("行{i} café\r\nline {i}\n"))
+      .collect::<String>()
+      .into_bytes()
+  }
+  fn starts(c: &[u8]) -> Vec<u64> {
+    let mut starts = vec![0u64];
+    for i in 0..c.len() {
+      if c[i] == b'\n' || (c[i] == b'\r' && c.get(i + 1) != Some(&b'\n')) {
+        starts.push(i as u64 + 1);
+      }
+    }
+    starts
+  }
+  fn splice(flat: &[u8], start: u64, end: u64, text: &str) -> Vec<u8> {
+    let mut out = flat.to_vec();
+    out.splice(start as usize..end as usize, text.bytes());
+    out
+  }
+  fn whole(s: &Session) -> Vec<u8> {
+    s.table.read(0, s.table.len()).unwrap()
+  }
+  fn del(start: u64, end: u64) -> Vec<Edit> {
+    vec![Edit {
+      start,
+      end,
+      text: String::new(),
+      keep_start: false,
+      cascade: false,
+    }]
+  }
+  fn put(at: u64, text: &str) -> Vec<Edit> {
+    vec![Edit {
+      start: at,
+      end: at,
+      text: text.to_string(),
+      keep_start: false,
+      cascade: false,
+    }]
+  }
+  /// The table's line numbering equals a flat recomputation over `flat`.
+  fn assert_lines(s: &Session, flat: &[u8], what: &str) {
+    let st = starts(flat);
+    assert_eq!(whole(s), flat, "{what}: bytes");
+    assert_eq!(s.table.line_count(), st.len() as u64, "{what}: line_count");
+    for (line, &start) in st.iter().enumerate() {
+      assert_eq!(
+        s.table.line_to_offset(line as u64).unwrap(),
+        start,
+        "{what}: line_to_offset({line})"
+      );
+    }
+  }
+  fn json(edits: &[AppliedEdit]) -> String {
+    serde_json::to_string(edits).unwrap()
+  }
+
+  #[test]
+  fn a_big_delete_undoes_and_redoes_in_blocks_and_saves_the_same_bytes() {
+    let dir = tempdir().unwrap();
+    let ctx = ctx(&dir, 16);
+    let content = doc(40);
+    let st = starts(&content);
+    let (p, q) = (st[7], st[31]);
+    let deleted = splice(&content, p, q, "");
+    let mut s = open_doc(&dir, "a.txt", &content);
+    let add_before = s.table.add_len();
+    stats::reset();
+    s.apply(del(p, q), true, Some(&ctx)).unwrap();
+    let mut created = assert_blocks("apply");
+    assert_eq!(whole(&s), deleted);
+    assert_eq!(spill_files(&ctx), 1);
+    assert_eq!(
+      s.table.add_len(),
+      add_before,
+      "nothing typed, nothing in add"
+    );
+
+    stats::reset();
+    let undone = s.undo(Some(&ctx)).unwrap();
+    created += assert_blocks("undo");
+    assert_lines(&s, &content, "undone");
+    assert_eq!(
+      s.table.add_len(),
+      add_before,
+      "the text did not go through add"
+    );
+    assert_eq!(s.table.spill_piece_count(), 1);
+    assert!(undone.reload_only);
+    assert_eq!(undone.token, None);
+    assert_eq!(undone.edits.len(), 1);
+    assert_eq!(
+      (
+        undone.edits[0].start,
+        undone.edits[0].end,
+        undone.edits[0].text.as_str()
+      ),
+      (p, p, "")
+    );
+    assert_eq!(undone.edits[0].len, Some(q - p));
+    assert_eq!(undone.first_line, 7);
+    assert_eq!(
+      json(&undone.edits),
+      format!(
+        r#"[{{"start":{p},"end":{p},"text":"","keep_start":false,"fill":null,"len":{}}}]"#,
+        q - p
+      )
+    );
+
+    stats::reset();
+    let redone = s.redo(Some(&ctx)).unwrap();
+    created += assert_blocks("redo");
+    assert_lines(&s, &deleted, "redone");
+    assert!(redone.reload_only);
+    assert_eq!(redone.token, None);
+    assert_eq!(redone.edits.len(), 1);
+    assert_eq!((redone.edits[0].start, redone.edits[0].end), (p, q));
+    assert_eq!(redone.edits[0].len, None);
+    assert_eq!(redone.first_line, 7);
+    assert_eq!(spill_files(&ctx), 1, "the redo reused the file");
+
+    stats::reset();
+    s.undo(Some(&ctx)).unwrap();
+    created += assert_blocks("second undo");
+    // A save in blocks.
+    stats::reset();
+    let mut out = Vec::new();
+    s.table.write_all(&mut out, CHUNK).unwrap();
+    assert_eq!(out, content);
+    assert_blocks("write_all");
+    assert_eq!(created, 1, "one file for the whole round trip");
+    // Then undo and redo against the table a save rebuilds.
+    s.redo(Some(&ctx)).unwrap();
+    save_session(&mut s, None, None).unwrap();
+    assert_eq!(fs::read(&s.path).unwrap(), deleted);
+    s.undo(Some(&ctx)).unwrap();
+    assert_lines(&s, &content, "undone after the save");
+    save_session(&mut s, None, None).unwrap();
+    assert_eq!(fs::read(&s.path).unwrap(), content);
+    s.redo(Some(&ctx)).unwrap();
+    assert_lines(&s, &deleted, "redone after two saves");
+  }
+
+  #[test]
+  fn a_removal_up_to_the_threshold_stays_a_string() {
+    let dir = tempdir().unwrap();
+    let ctx = ctx(&dir, 16);
+    let content = doc(10);
+    let mut s = open_doc(&dir, "a.txt", &content);
+    s.apply(del(0, 16), true, Some(&ctx)).unwrap();
+    assert_eq!(spill_files(&ctx), 0);
+    let undone = s.undo(Some(&ctx)).unwrap();
+    assert!(!undone.reload_only);
+    assert_eq!(undone.edits[0].text.as_bytes(), &content[..16]);
+    assert_eq!(undone.edits[0].len, None);
+    assert_eq!(s.table.spill_piece_count(), 0);
+    assert_lines(&s, &content, "undone");
+    s.apply(del(0, 17), true, Some(&ctx)).unwrap();
+    assert_eq!(spill_files(&ctx), 1, "one byte over the threshold");
+    // No folder, nothing spills.
+    let mut plain = open_doc(&dir, "b.txt", &content);
+    plain.apply(del(0, 100), true, None).unwrap();
+    assert_eq!(plain.undo(None).unwrap().edits[0].text.len(), 100);
+  }
+
+  #[test]
+  fn a_big_insert_undoes_into_a_spill_and_redoes_from_it() {
+    let dir = tempdir().unwrap();
+    let ctx = ctx(&dir, 16);
+    let content = doc(10);
+    let st = starts(&content);
+    let text = "新しい行\r\nsecond\rthird\n".repeat(3);
+    let mut s = open_doc(&dir, "a.txt", &content);
+    s.apply(put(st[3], &text), true, Some(&ctx)).unwrap();
+    let typed = splice(&content, st[3], st[3], &text);
+    assert_lines(&s, &typed, "typed");
+    let add_typed = s.table.add_len();
+    let undone = s.undo(Some(&ctx)).unwrap();
+    assert_lines(&s, &content, "undone");
+    assert!(undone.reload_only, "the removed text went to a spill");
+    assert_eq!(undone.edits[0].text, "");
+    assert_eq!(undone.edits[0].len, None);
+    assert_eq!(s.table.spill_piece_count(), 0, "and not into the table");
+    assert!(matches!(
+      s.redo_stack.last().map(|step| &step.entry),
+      Some(JournalEntry::Edits(group)) if group.iter().all(|e| e.removed.is_spill())
+    ));
+    assert_eq!(spill_files(&ctx), 1);
+    let redone = s.redo(Some(&ctx)).unwrap();
+    assert_lines(&s, &typed, "redone");
+    assert!(redone.reload_only);
+    assert_eq!(redone.edits[0].text, "");
+    assert_eq!(redone.edits[0].len, Some(text.len() as u64));
+    assert_eq!(s.table.add_len(), add_typed, "the redo did not grow add");
+    assert_eq!(s.table.spill_piece_count(), 1);
+    s.undo(Some(&ctx)).unwrap();
+    assert_lines(&s, &content, "undone again");
+  }
+
+  #[test]
+  fn a_group_of_several_steps_undoes_and_redoes_in_shifted_and_overlapping_frames() {
+    let dir = tempdir().unwrap();
+    let ctx = ctx(&dir, 16);
+    let content = doc(30);
+    let st = starts(&content);
+    let big = "grown text\r\nwith lines\n".repeat(2);
+    // Shifted: each later step lies past the text an earlier one added or took.
+    let steps: [Vec<Edit>; 3] = [
+      put(st[4], &big),
+      del(st[12] + big.len() as u64, st[20] + big.len() as u64),
+      put(3, "xy"),
+    ];
+    let mut flat = content.clone();
+    for (n, edits) in steps.iter().enumerate() {
+      let e = &edits[0];
+      flat = splice(&flat, e.start, e.end, &e.text);
+      let mut s = open_doc(&dir, &format!("shift{n}.txt"), &content);
+      for (k, step) in steps.iter().take(n + 1).enumerate() {
+        let edits = step
+          .iter()
+          .map(|e| Edit {
+            start: e.start,
+            end: e.end,
+            text: e.text.clone(),
+            keep_start: false,
+            cascade: false,
+          })
+          .collect();
+        s.apply(edits, k == 0, Some(&ctx)).unwrap();
+      }
+      assert_lines(&s, &flat, "applied");
+      s.undo(Some(&ctx)).unwrap();
+      assert_lines(&s, &content, "undone");
+      s.redo(Some(&ctx)).unwrap();
+      assert_lines(&s, &flat, "redone");
+    }
+    // Overlapping: a later step deletes across the text an earlier one inserted.
+    let mut s = open_doc(&dir, "overlap.txt", &content);
+    s.apply(put(st[5], &big), true, Some(&ctx)).unwrap();
+    let after_insert = splice(&content, st[5], st[5], &big);
+    let (a, b) = (st[4], st[7] + big.len() as u64);
+    s.apply(del(a, b), false, Some(&ctx)).unwrap();
+    let after_delete = splice(&after_insert, a, b, "");
+    s.apply(put(a, &big), false, Some(&ctx)).unwrap();
+    let after_second_insert = splice(&after_delete, a, a, &big);
+    assert_lines(&s, &after_second_insert, "applied");
+    assert_eq!(s.undo_stack.len(), 1, "one group");
+    s.undo(Some(&ctx)).unwrap();
+    assert_lines(&s, &content, "undone");
+    s.redo(Some(&ctx)).unwrap();
+    assert_lines(&s, &after_second_insert, "redone");
+    s.undo(Some(&ctx)).unwrap();
+    assert_lines(&s, &content, "undone again");
+  }
+  /// What the read and write paths asked of the disk since the last call must
+  /// fit the block size; returns the spill files created meanwhile.
+  fn assert_blocks(what: &str) -> usize {
+    let seen = stats::get();
+    stats::reset();
+    assert!(
+      seen.max_read <= CHUNK,
+      "{what}: asked for {} at once",
+      seen.max_read
+    );
+    assert!(
+      seen.max_buf <= CHUNK,
+      "{what}: held {} at once",
+      seen.max_buf
+    );
+    assert!(
+      seen.max_write <= CHUNK,
+      "{what}: wrote {} at once",
+      seen.max_write
+    );
+    assert!(seen.max_open <= 1, "{what}: {} handles open", seen.max_open);
+    seen.created
+  }
+  /// Everything a failed step must leave alone.
+  fn marks(s: &Session) -> (usize, usize, u64, u64, usize, usize, usize) {
+    (
+      s.undo_stack.len(),
+      s.redo_stack.len(),
+      s.generation,
+      s.state_id,
+      s.table.add_len(),
+      s.table.piece_count(),
+      s.table.spills_registered(),
+    )
+  }
+
+  #[test]
+  fn a_removal_inside_a_restored_spill_reuses_it_and_one_across_pieces_builds_a_new_one() {
+    let dir = tempdir().unwrap();
+    let ctx = ctx(&dir, 16);
+    let content = doc(40);
+    let st = starts(&content);
+    let (p, q) = (st[7], st[31]);
+    let mut s = open_doc(&dir, "a.txt", &content);
+    s.apply(del(p, q), true, Some(&ctx)).unwrap();
+    s.undo(Some(&ctx)).unwrap();
+    stats::reset();
+    // Inside the spill piece: the same file, a smaller run.
+    s.apply(del(st[10], st[19]), true, Some(&ctx)).unwrap();
+    assert_eq!(stats::get().created, 0);
+    let inner = splice(&content, st[10], st[19], "");
+    assert_lines(&s, &inner, "deleted inside");
+    s.undo(Some(&ctx)).unwrap();
+    assert_lines(&s, &content, "undone inside");
+    // Across the original and the spill piece: streamed into a new file.
+    s.apply(del(st[5], st[19]), true, Some(&ctx)).unwrap();
+    assert_eq!(stats::get().created, 1);
+    assert_lines(&s, &splice(&content, st[5], st[19], ""), "deleted across");
+    s.undo(Some(&ctx)).unwrap();
+    assert_lines(&s, &content, "undone across");
+    assert_eq!(s.table.spill_piece_count(), 2);
+  }
+
+  #[test]
+  fn a_failure_on_the_second_step_of_a_group_leaves_the_table_and_stacks_alone() {
+    let dir = tempdir().unwrap();
+    let ctx = ctx(&dir, 16);
+    let content = doc(30);
+    let st = starts(&content);
+    let big = "inserted text\r\nmore\n".repeat(2);
+    let mut s = open_doc(&dir, "a.txt", &content);
+    s.apply(put(st[4], &big), true, Some(&ctx)).unwrap();
+    s.apply(put(st[20] + big.len() as u64, &big), false, Some(&ctx))
+      .unwrap();
+    let typed = whole(&s);
+    let before = marks(&s);
+    // Undo builds one spill per step; the second one fails.
+    stats::fail_create_at(2);
+    assert_eq!(s.undo(Some(&ctx)).unwrap_err(), "injected spill failure");
+    assert_eq!(marks(&s), before);
+    assert_lines(&s, &typed, "after the failed undo");
+    assert_eq!(spill_files(&ctx), 0, "nothing was left behind");
+    // The step was not lost: it undoes once the disk allows it.
+    let undone = s.undo(Some(&ctx)).unwrap();
+    assert!(undone.reload_only || !undone.edits.is_empty());
+    assert_lines(&s, &content, "undone");
+    // The same for a redo: it reads its spills back, and the one it needs for
+    // its second step is gone from the disk.
+    let Some(Step {
+      entry: JournalEntry::Edits(group),
+      ..
+    }) = s.redo_stack.last()
+    else {
+      panic!("one group to redo");
+    };
+    let files: Vec<PathBuf> = group
+      .iter()
+      .map(|e| match &e.removed {
+        Removed::Spill(run) => run.file.path().to_path_buf(),
+        Removed::Inline(_) => panic!("both inserts went to spills"),
+      })
+      .collect();
+    fs::remove_file(&files[0]).unwrap();
+    let before = marks(&s);
+    assert!(s.redo(Some(&ctx)).is_err());
+    assert_eq!(marks(&s), before);
+    assert_lines(&s, &content, "after the failed redo");
+  }
+
+  #[test]
+  fn a_failure_while_applying_a_batch_leaves_the_table_untouched() {
+    let dir = tempdir().unwrap();
+    let ctx = ctx(&dir, 16);
+    let content = doc(30);
+    let st = starts(&content);
+    let mut s = open_doc(&dir, "a.txt", &content);
+    let before = marks(&s);
+    let batch = vec![
+      Edit {
+        start: st[2],
+        end: st[8],
+        text: String::new(),
+        keep_start: false,
+        cascade: false,
+      },
+      Edit {
+        start: st[12],
+        end: st[20],
+        text: String::new(),
+        keep_start: false,
+        cascade: false,
+      },
+    ];
+    stats::fail_create_at(2);
+    assert_eq!(
+      s.apply(batch, true, Some(&ctx)).err().unwrap(),
+      "injected spill failure"
+    );
+    assert_eq!(marks(&s), before);
+    assert_lines(&s, &content, "after the failed apply");
+    assert_eq!(
+      spill_files(&ctx),
+      0,
+      "the first spill went with the failure"
+    );
+  }
+  /// A file whose first or last byte is the half of a `\r\n`; once it is saved
+  /// the table is rebuilt and has not read those bytes yet.
+  fn flags_survive_a_failed_undo(content: &[u8], at: u64, extra: &str, extra_at: u64) {
+    let dir = tempdir().unwrap();
+    let ctx = ctx(&dir, 16);
+    let st = starts(content);
+    let big = "inserted text\n".repeat(3);
+    let mut s = open_doc(&dir, "a.txt", content);
+    s.apply(put(st[1], &big), true, Some(&ctx)).unwrap();
+    s.apply(put(at, &big), false, Some(&ctx)).unwrap();
+    save_session(&mut s, None, None).unwrap();
+    let saved = whole(&s);
+    let rebuilt = open_path(&s.path, INTERVAL);
+    s.table = rebuilt.table;
+    stats::fail_create_at(2);
+    assert!(s.undo(Some(&ctx)).is_err());
+    assert_lines(&s, &saved, "after the failed undo");
+    let at = if extra_at == u64::MAX {
+      s.table.len()
+    } else {
+      extra_at
+    };
+    s.apply(put(at, extra), true, Some(&ctx)).unwrap();
+    assert_lines(&s, &splice(&saved, at, at, extra), "after the next edit");
+  }
+
+  #[test]
+  fn a_failed_undo_keeps_the_break_flags_of_the_first_piece() {
+    // Ends with a `\r`: a `\n` typed after it joins it.
+    let ends = b"head\nbody\nmiddle\nend\r";
+    flags_survive_a_failed_undo(ends, 10, "\n", u64::MAX);
+    // Starts with a `\n`: a `\r` typed before it joins it.
+    let starts_lf = b"\nhead\nbody\nmiddle\nend";
+    flags_survive_a_failed_undo(starts_lf, 12, "\r", 0);
+  }
+
+  #[test]
+  fn a_range_with_a_fill_piece_over_the_threshold_streams_in_blocks() {
+    let dir = tempdir().unwrap();
+    let ctx = ctx(&dir, 16);
+    let run = 300usize;
+    let mut content = b"h\n".to_vec();
+    content.extend(std::iter::repeat_n(b'\r', run));
+    content.extend_from_slice(b"tail\nmore text\n");
+    let mut s = open_doc(&dir, "a.txt", &content);
+    let (last, at) = ((run + 1) as u64, (run + 2) as u64);
+    let rewrite = vec![
+      Edit {
+        start: at,
+        end: at,
+        text: "\n".into(),
+        keep_start: false,
+        cascade: false,
+      },
+      Edit {
+        start: last,
+        end: at,
+        text: "\n".into(),
+        keep_start: true,
+        cascade: true,
+      },
+    ];
+    s.apply(rewrite, true, None).unwrap();
+    let flat = whole(&s);
+    assert!(flat[2..run + 1].iter().all(|&b| b == b'\n'));
+    stats::reset();
+    s.apply(del(1, flat.len() as u64 - 3), true, Some(&ctx))
+      .unwrap();
+    let seen = stats::get();
+    assert!(
+      seen.max_read <= CHUNK && seen.max_buf <= CHUNK && seen.max_write <= CHUNK,
+      "{seen:?}"
+    );
+    assert_eq!(spill_files(&ctx), 1);
+    s.undo(Some(&ctx)).unwrap();
+    assert_lines(&s, &flat, "undone");
+    s.redo(Some(&ctx)).unwrap();
+    assert_lines(&s, &splice(&flat, 1, flat.len() as u64 - 3, ""), "redone");
+  }
+
+  #[test]
+  fn spill_files_go_with_the_last_reference() {
+    let dir = tempdir().unwrap();
+    let ctx = ctx(&dir, 16);
+    let content = doc(20);
+    let st = starts(&content);
+    let big = "inserted text\r\nmore\n".repeat(2);
+    // The undo stack drops its oldest step past the limit.
+    let mut s = open_doc(&dir, "a.txt", &content);
+    s.apply(del(st[2], st[9]), true, Some(&ctx)).unwrap();
+    assert_eq!(spill_files(&ctx), 1);
+    for _ in 0..UNDO_LIMIT {
+      s.apply(put(0, "x"), true, Some(&ctx)).unwrap();
+    }
+    assert_eq!(s.undo_stack.len(), UNDO_LIMIT);
+    assert_eq!(spill_files(&ctx), 0, "the pushed-out step took its file");
+    // A fresh edit clears the redo stack.
+    let mut s = open_doc(&dir, "b.txt", &content);
+    s.apply(put(st[3], &big), true, Some(&ctx)).unwrap();
+    s.undo(Some(&ctx)).unwrap();
+    assert_eq!(spill_files(&ctx), 1, "held by the redo step");
+    s.apply(put(0, "x"), true, Some(&ctx)).unwrap();
+    assert_eq!(spill_files(&ctx), 0);
+    // A step undone back into the table is held by the table's registry, and
+    // taking it out again releases the number.
+    let mut s = open_doc(&dir, "c.txt", &content);
+    s.apply(del(st[2], st[9]), true, Some(&ctx)).unwrap();
+    s.undo(Some(&ctx)).unwrap();
+    assert_eq!(s.table.spills_registered(), 1);
+    let len = s.table.len();
+    s.apply(del(0, len), true, Some(&ctx)).unwrap();
+    assert_eq!(s.table.spills_registered(), 0, "the number is free again");
+    // Closing the document drops its steps and the table.
+    let state = WindowedState::new(Some(ctx.dir.clone()));
+    let mut d = open_doc(&dir, "d.txt", &content);
+    d.apply(del(st[2], st[9]), true, Some(&ctx)).unwrap();
+    d.undo(Some(&ctx)).unwrap();
+    d.apply(del(st[1], st[4]), true, Some(&ctx)).unwrap();
+    state.sessions.lock().unwrap().insert(7, d);
+    assert!(spill_files(&ctx) >= 1);
+    drop(s);
+    close_core(&state, 7);
+    assert_eq!(spill_files(&ctx), 0);
+  }
+  /// Saves with a spill in the journal: the file the save writes and the spill
+  /// both survive, and the undo that follows is exact.
+  fn save_with_spill_in_the_journal(open: &Path, check: impl Fn(&[u8])) {
+    let dir = tempdir().unwrap();
+    let ctx = ctx(&dir, 16);
+    let content = fs::read(open).unwrap();
+    let st = starts(&content);
+    let mut s = open_path(open, INTERVAL);
+    s.apply(del(st[2], st[9]), true, Some(&ctx)).unwrap();
+    let deleted = splice(&content, st[2], st[9], "");
+    save_session(&mut s, None, None).unwrap();
+    check(&deleted);
+    assert_eq!(spill_files(&ctx), 1, "the save left the spill alone");
+    s.undo(Some(&ctx)).unwrap();
+    assert_lines(&s, &content, "undone after the save");
+    save_session(&mut s, None, None).unwrap();
+    check(&content);
+    s.redo(Some(&ctx)).unwrap();
+    assert_lines(&s, &deleted, "redone");
+  }
+
+  #[test]
+  fn saving_over_the_file_keeps_a_spill_and_its_undo_exact() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("doc.txt");
+    fs::write(&path, doc(30)).unwrap();
+    save_with_spill_in_the_journal(&path, |expect| assert_eq!(fs::read(&path).unwrap(), expect));
+  }
+
+  #[test]
+  fn saving_through_a_hard_link_or_a_symlink_keeps_a_spill_and_its_undo_exact() {
+    let dir = tempdir().unwrap();
+    let a = dir.path().join("a.log");
+    fs::write(&a, doc(30)).unwrap();
+    let b = dir.path().join("b.log");
+    fs::hard_link(&a, &b).unwrap();
+    save_with_spill_in_the_journal(&a, |expect| {
+      assert_eq!(crate::fs_ops::linktest::links(&a), 2);
+      assert_eq!(fs::read(&b).unwrap(), expect);
+    });
+    let real = dir.path().join("real.log");
+    fs::write(&real, doc(30)).unwrap();
+    let link = dir.path().join("link.log");
+    if !crate::fs_ops::linktest::symlink(&real, &link) {
+      return;
+    }
+    save_with_spill_in_the_journal(&link, |expect| {
+      assert!(fs::symlink_metadata(&link)
+        .unwrap()
+        .file_type()
+        .is_symlink());
+      assert_eq!(fs::read(&real).unwrap(), expect);
+    });
+  }
+
+  #[test]
+  fn a_save_as_keeps_a_spill_and_its_undo_exact() {
+    let dir = tempdir().unwrap();
+    let ctx = ctx(&dir, 16);
+    let content = doc(30);
+    let st = starts(&content);
+    let mut s = open_doc(&dir, "a.txt", &content);
+    s.apply(del(st[2], st[9]), true, Some(&ctx)).unwrap();
+    let deleted = splice(&content, st[2], st[9], "");
+    let elsewhere = dir.path().join("elsewhere.txt");
+    save_session(&mut s, None, Some(elsewhere.clone())).unwrap();
+    assert_eq!(fs::read(&elsewhere).unwrap(), deleted);
+    assert_eq!(fs::read(dir.path().join("a.txt")).unwrap(), content);
+    assert_eq!(spill_files(&ctx), 1);
+    s.undo(Some(&ctx)).unwrap();
+    assert_lines(&s, &content, "undone after the save as");
+    save_session(&mut s, None, None).unwrap();
+    assert_eq!(fs::read(&elsewhere).unwrap(), content);
+    s.redo(Some(&ctx)).unwrap();
+    assert_lines(&s, &deleted, "redone");
+  }
+
+  #[test]
+  fn the_state_carries_the_folder_and_the_threshold_into_each_command() {
+    let app_data = Path::new("data");
+    assert_eq!(windowed_tmp_dir(app_data), app_data.join("windowed-tmp"));
+    let dir = tempdir().unwrap();
+    let state = WindowedState::new(Some(windowed_tmp_dir(dir.path())));
+    assert_eq!(
+      state.tmp_dir.as_deref(),
+      Some(dir.path().join("windowed-tmp").as_path())
+    );
+    let made = state.spill_ctx().unwrap();
+    assert_eq!(made.dir, dir.path().join("windowed-tmp"));
+    assert_eq!(made.min, crate::spill::SPILL_MIN);
+    assert_eq!(state.replace_tmp_dir().unwrap(), made.dir);
+    // Without a folder: nothing spills, and a replace-all fails as an unresolved
+    // app data dir does.
+    for state in [WindowedState::default(), WindowedState::new(None)] {
+      assert!(state.spill_ctx().is_none());
+      assert_eq!(
+        state.replace_tmp_dir().unwrap_err(),
+        tauri::Error::UnknownPath.to_string()
+      );
+    }
+  }
+
+  #[test]
+  fn the_commands_hand_the_state_folder_to_apply_undo_and_redo() {
+    let dir = tempdir().unwrap();
+    let mut state = WindowedState::new(Some(windowed_tmp_dir(dir.path())));
+    state.spill_min = Some(16);
+    let content = doc(20);
+    let st = starts(&content);
+    state
+      .sessions
+      .lock()
+      .unwrap()
+      .insert(3, open_doc(&dir, "a.txt", &content));
+    let made = state.spill_ctx();
+    let mut map = state.sessions.lock().unwrap();
+    let s = map.get_mut(&3).unwrap();
+    s.apply(del(st[2], st[9]), true, made.as_ref()).unwrap();
+    assert_eq!(spill_files(made.as_ref().unwrap()), 1);
+    assert!(s.undo(made.as_ref()).unwrap().reload_only);
+  }
+  /// Session 1 over `content` in a state that spills to `ctx.dir` past 16 bytes,
+  /// or does not spill at all with `spill`: false.
+  fn state_with(
+    dir: &TempDir,
+    name: &str,
+    content: &[u8],
+    spill: bool,
+  ) -> (WindowedState, SpillCtx) {
+    let ctx = ctx(dir, 16);
+    let mut state = WindowedState::new(spill.then(|| ctx.dir.clone()));
+    state.spill_min = Some(ctx.min);
+    let session = open_doc(dir, name, content);
+    state.sessions.lock().unwrap().insert(1, session);
+    (state, ctx)
+  }
+  fn session_bytes(state: &WindowedState) -> Vec<u8> {
+    whole(state.sessions.lock().unwrap().get(&1).unwrap())
+  }
+
+  #[test]
+  fn the_commands_pass_the_spill_context_when_a_big_delete_is_applied_undone_and_redone() {
+    let dir = tempdir().unwrap();
+    let content = doc(40);
+    let st = starts(&content);
+    let (p, q) = (st[7], st[31]);
+    let deleted = splice(&content, p, q, "");
+    let (state, ctx) = state_with(&dir, "a.txt", &content, true);
+    apply_core(&state, 1, del(p, q), true).unwrap();
+    assert_eq!(spill_files(&ctx), 1, "apply_core passed the context");
+    assert_eq!(session_bytes(&state), deleted);
+    undo_core(&state, 1).unwrap();
+    assert_eq!(session_bytes(&state), content);
+    let redone = redo_core(&state, 1).unwrap();
+    assert!(redone.reload_only, "redo_core passed the context");
+    assert_eq!(session_bytes(&state), deleted);
+  }
+
+  #[test]
+  fn the_commands_pass_the_spill_context_when_a_big_insert_is_undone() {
+    let dir = tempdir().unwrap();
+    let content = doc(10);
+    let (state, ctx) = state_with(&dir, "a.txt", &content, true);
+    let text = "x".repeat(64);
+    apply_core(&state, 1, put(0, &text), true).unwrap();
+    assert_eq!(spill_files(&ctx), 0, "typed text is not a spill");
+    let undone = undo_core(&state, 1).unwrap();
+    assert!(undone.reload_only, "undo_core passed the context");
+    assert_eq!(spill_files(&ctx), 1);
+    assert_eq!(session_bytes(&state), content);
+  }
+
+  #[test]
+  fn the_commands_without_a_folder_keep_every_removal_in_the_table() {
+    let dir = tempdir().unwrap();
+    let content = doc(40);
+    let st = starts(&content);
+    let (p, q) = (st[7], st[31]);
+    let deleted = splice(&content, p, q, "");
+    let (state, ctx) = state_with(&dir, "a.txt", &content, false);
+    apply_core(&state, 1, del(p, q), true).unwrap();
+    undo_core(&state, 1).unwrap();
+    assert_eq!(session_bytes(&state), content);
+    let redone = redo_core(&state, 1).unwrap();
+    assert!(!redone.reload_only);
+    assert!(!redone.edits.is_empty());
+    assert_eq!(session_bytes(&state), deleted);
+    assert_eq!(spill_files(&ctx), 0);
+  }
+}
 /// Guards the broader "heavy file I/O must not run on the UI thread" rule (see
 /// the doc comment on `windows.rs`'s window-builder rule, which this extends).
 /// Same technique as `window_command_threading_tests` in `windows.rs`: reads its
@@ -6957,6 +10299,17 @@ mod heavy_io_command_threading_tests {
     "windowed_map_replace",
     "windowed_release_replace",
     "windowed_offset_line",
+    "windowed_end_pos",
+    "windowed_replace_range",
+    "windowed_enter",
+    "windowed_indent_range",
+    "clip_copy_session",
+    "windowed_paste_clip",
+    "windowed_paste_system",
+    "clip_read_chunk",
+    "windowed_open_converted",
+    "windowed_reopen_converted",
+    "windowed_set_encoding",
   ];
 
   #[test]
@@ -6979,12 +10332,8 @@ mod heavy_io_command_threading_tests {
   fn every_command_that_touches_a_session_waits_for_a_running_pass() {
     // A replace-all marks its session busy; these take the session through
     // `lock_idle`, which waits, so none lands between two chunks of the pass.
-    for name in [
-      "windowed_read",
-      "windowed_apply",
-      "windowed_undo",
-      "windowed_redo",
-    ] {
+    {
+      let name = "windowed_read";
       let at = SOURCE
         .find(&format!("pub fn {name}"))
         .unwrap_or_else(|| panic!("{name} is gone"));
@@ -6996,14 +10345,25 @@ mod heavy_io_command_threading_tests {
       );
     }
     for core in [
+      "fn apply_core",
+      "fn undo_core",
+      "fn redo_core",
       "fn save_core",
       "fn set_path_core",
       "fn close_core",
       "fn map_replace_core",
       "fn release_replace_core",
       "fn offset_line_core",
+      "fn end_pos_core",
       "fn find_once",
       "fn search_core",
+      "fn replace_range_core",
+      "fn enter_core",
+      "fn indent_range_core",
+      "fn history_tracked_core",
+      "fn clip_copy_session_core",
+      "fn paste_core",
+      "fn set_encoding_core",
     ] {
       let at = SOURCE
         .find(core)
@@ -7026,5 +10386,3462 @@ mod heavy_io_command_threading_tests {
     let attribute = SOURCE[..at].trim_end();
     assert!(attribute.ends_with("#[tauri::command]"));
     assert!(!attribute.ends_with("#[tauri::command(async)]"));
+  }
+}
+/// The range commands: replace between two positions, Enter, Tab and Shift+Tab.
+#[cfg(test)]
+mod range_tests {
+  use super::*;
+  use crate::spill::stats;
+  use tempfile::{tempdir, TempDir};
+
+  const ID: u64 = 1;
+  const OTHER: u64 = 2;
+  const CHUNK: usize = 16;
+  /// Checkpoint interval of the spill files.
+  const INTERVAL: u64 = 32;
+  /// Checkpoint interval of the opened file: a segment of it is read at once.
+  const ORIGINAL_INTERVAL: u64 = 8;
+
+  fn open_session(path: &Path, interval: u64) -> Session {
+    let (total, checkpoints, newlines) =
+      scan_reader_at(File::open(path).unwrap(), 4096, interval).unwrap();
+    let index = OriginalIndex::new(
+      Src::File(File::open(path).unwrap()),
+      total,
+      newlines,
+      checkpoints.clone(),
+    );
+    let checkpoint_index = CheckpointIndex {
+      checkpoints,
+      total_newlines: newlines,
+      line_rule: LINE_RULE,
+    };
+    Session::new(
+      PieceTable::new(index),
+      path.to_path_buf(),
+      fingerprint_of(path).unwrap(),
+      checkpoint_index,
+      0,
+    )
+  }
+  /// A state with one session over a file, spilling past `min` bytes into a
+  /// folder of its own (or nowhere).
+  struct Rig {
+    dir: TempDir,
+    state: WindowedState,
+  }
+
+  impl Rig {
+    fn new(content: &[u8], min: u64) -> Rig {
+      Rig::build(content, Some(min))
+    }
+    fn without_folder(content: &[u8]) -> Rig {
+      Rig::build(content, None)
+    }
+    fn build(content: &[u8], min: Option<u64>) -> Rig {
+      let dir = tempdir().unwrap();
+      let state = WindowedState {
+        tmp_dir: min.map(|_| dir.path().join("spills")),
+        spill_min: min,
+        ..Default::default()
+      };
+      let rig = Rig { dir, state };
+      rig.open(ID, "a.txt", content);
+      rig
+    }
+    fn open(&self, id: u64, name: &str, content: &[u8]) {
+      let path = self.dir.path().join(name);
+      fs::write(&path, content).unwrap();
+      let session = open_session(&path, ORIGINAL_INTERVAL);
+      self.state.sessions.lock().unwrap().insert(id, session);
+    }
+    fn with<R>(&self, f: impl FnOnce(&mut Session) -> R) -> R {
+      let mut map = self.state.sessions.lock().unwrap();
+      f(map.get_mut(&ID).unwrap())
+    }
+    fn whole(&self) -> Vec<u8> {
+      self.with(|s| s.table.read(0, s.table.len()).unwrap())
+    }
+    fn marks(&self) -> (usize, usize, u64, u64, usize, bool) {
+      self.with(|s| {
+        (
+          s.undo_stack.len(),
+          s.redo_stack.len(),
+          s.generation,
+          s.state_id,
+          s.table.piece_count(),
+          s.busy,
+        )
+      })
+    }
+    fn range(&self, a: (u64, u64), h: (u64, u64), text: &str, sep: &str) -> RangeResult {
+      self.try_range(a, h, text, sep).unwrap()
+    }
+    fn try_range(
+      &self,
+      a: (u64, u64),
+      h: (u64, u64),
+      text: &str,
+      sep: &str,
+    ) -> Result<RangeResult, String> {
+      replace_range_core(
+        &self.state,
+        ID,
+        &pos(a),
+        &pos(h),
+        text,
+        sep,
+        true,
+        CHUNK,
+        INTERVAL,
+        &mut |_| {},
+      )
+    }
+    fn enter(&self, a: (u64, u64), h: (u64, u64), sep: &str) -> RangeResult {
+      enter_core(
+        &self.state,
+        ID,
+        &pos(a),
+        &pos(h),
+        sep,
+        true,
+        CHUNK,
+        INTERVAL,
+        &mut |_| {},
+      )
+      .unwrap()
+    }
+    fn indent(
+      &self,
+      a: (u64, u64),
+      h: (u64, u64),
+      outdent: bool,
+      sep: &str,
+      window: (u64, u64),
+    ) -> IndentResult {
+      self
+        .try_indent(a, h, outdent, sep, window, &mut |_| {})
+        .unwrap()
+    }
+    fn try_indent(
+      &self,
+      a: (u64, u64),
+      h: (u64, u64),
+      outdent: bool,
+      sep: &str,
+      window: (u64, u64),
+      between: &mut dyn FnMut(usize),
+    ) -> Result<IndentResult, String> {
+      indent_range_core(
+        &self.state,
+        ID,
+        &pos(a),
+        &pos(h),
+        outdent,
+        sep,
+        window,
+        true,
+        CHUNK,
+        INTERVAL,
+        between,
+      )
+    }
+    fn undo(&self) -> UndoResult {
+      self.with(|s| s.undo(self.state.spill_ctx().as_ref()).unwrap())
+    }
+    fn redo(&self) -> UndoResult {
+      self.with(|s| s.redo(self.state.spill_ctx().as_ref()).unwrap())
+    }
+    fn save(&self) {
+      save_core(&self.state, ID, None, None).unwrap();
+    }
+    fn saved(&self) -> Vec<u8> {
+      fs::read(self.dir.path().join("a.txt")).unwrap()
+    }
+    fn spill_files(&self) -> usize {
+      fs::read_dir(self.dir.path().join("spills")).map_or(0, |entries| {
+        entries
+          .flatten()
+          .filter(|e| e.file_name().to_string_lossy().starts_with("sp-"))
+          .count()
+      })
+    }
+  }
+  fn pos(p: (u64, u64)) -> Pos {
+    Pos {
+      line: p.0,
+      col: p.1,
+    }
+  }
+  // --- a flat model -----------------------------------------------------------
+  /// The text with every line break written `\n`, as UTF-16 units: what
+  /// CodeMirror holds.
+  fn norm(flat: &[u8]) -> Vec<u16> {
+    let text = std::str::from_utf8(flat).unwrap();
+    let mut out = String::new();
+    let mut chars = text.chars().peekable();
+    while let Some(c) = chars.next() {
+      if c == '\r' {
+        if chars.peek() == Some(&'\n') {
+          chars.next();
+        }
+        out.push('\n');
+      } else {
+        out.push(c);
+      }
+    }
+    out.encode_utf16().collect()
+  }
+  /// The CodeMirror position of `(line, col)`, the column cut at the line end.
+  fn at(units: &[u16], line: u64, col: u64) -> usize {
+    let mut start = 0;
+    for _ in 0..line {
+      match units[start..].iter().position(|&u| u == 10) {
+        Some(p) => start += p + 1,
+        None => break,
+      }
+    }
+    let end = units[start..]
+      .iter()
+      .position(|&u| u == 10)
+      .map_or(units.len(), |p| start + p);
+    (start + col as usize).min(end)
+  }
+  fn where_is(units: &[u16], index: usize) -> (u64, u64) {
+    let before = &units[..index];
+    let line = before.iter().filter(|&&u| u == 10).count() as u64;
+    let col = before
+      .iter()
+      .rev()
+      .position(|&u| u == 10)
+      .unwrap_or(before.len()) as u64;
+    (line, col)
+  }
+  /// Byte offsets at which each line starts, by the line rule.
+  fn starts(c: &[u8]) -> Vec<u64> {
+    let mut starts = vec![0u64];
+    for i in 0..c.len() {
+      if c[i] == b'\n' || (c[i] == b'\r' && c.get(i + 1) != Some(&b'\n')) {
+        starts.push(i as u64 + 1);
+      }
+    }
+    starts
+  }
+  /// The session holds `flat`, with the line numbering of a flat recount.
+  fn assert_doc(rig: &Rig, flat: &[u8], what: &str) {
+    assert_eq!(rig.whole(), flat, "{what}: bytes");
+    let st = starts(flat);
+    rig.with(|s| {
+      assert_eq!(s.table.line_count(), st.len() as u64, "{what}: line_count");
+      for (line, &start) in st.iter().enumerate() {
+        assert_eq!(
+          s.table.line_to_offset(line as u64).unwrap(),
+          start,
+          "{what}: line_to_offset({line})"
+        );
+      }
+    });
+  }
+  /// Lines of CRLF and LF text with multi-byte characters.
+  fn doc(lines: usize) -> Vec<u8> {
+    (0..lines)
+      .map(|i| format!("行{i} café\r\nline {i}\n"))
+      .collect::<String>()
+      .into_bytes()
+  }
+  // --- helpers shared by the tests ---------------------------------------------
+  /// `mapOffset` of the frontend (`windowedEdit.ts`): where a byte offset goes
+  /// through one edit.
+  fn front_map(offset: u64, e: &AppliedEdit) -> u64 {
+    if offset < e.start || e.fill.is_some() {
+      return offset;
+    }
+    let inserted = e.len.unwrap_or(e.text.len() as u64);
+    if e.keep_start && (offset == e.start || inserted == e.end - e.start) {
+      return offset;
+    }
+    if offset >= e.end {
+      offset + inserted - (e.end - e.start)
+    } else {
+      e.start + inserted
+    }
+  }
+  fn front_through(offset: u64, edits: &[AppliedEdit]) -> u64 {
+    edits.iter().fold(offset, front_map)
+  }
+  /// CodeMirror's `ChangeDesc.mapPos`, transcribed: `sections` are `(len, ins)`
+  /// pairs of a change set, `ins` of `None` for a stretch left alone.
+  fn cm_map_pos(sections: &[(u64, Option<u64>)], pos: u64, assoc: i8) -> u64 {
+    let (mut pos_a, mut pos_b) = (0u64, 0u64);
+    for &(len, ins) in sections {
+      let end_a = pos_a + len;
+      match ins {
+        None => {
+          if end_a > pos {
+            return pos_b + (pos - pos_a);
+          }
+          pos_b += len;
+        }
+        Some(ins) => {
+          if end_a > pos || (end_a == pos && assoc < 0 && len == 0) {
+            return if pos == pos_a || assoc < 0 {
+              pos_b
+            } else {
+              pos_b + ins
+            };
+          }
+          pos_b += ins;
+        }
+      }
+      pos_a = end_a;
+    }
+    assert!(pos <= pos_a, "position past the change set");
+    pos_b
+  }
+  /// A change set from replaces `(start, end, ins)` ascending in one frame.
+  fn sections_of(replaces: &[(u64, u64, u64)], total: u64) -> Vec<(u64, Option<u64>)> {
+    let mut out = Vec::new();
+    let mut at = 0;
+    for &(start, end, ins) in replaces {
+      if start > at {
+        out.push((start - at, None));
+      }
+      out.push((end - start, Some(ins)));
+      at = end;
+    }
+    if total > at {
+      out.push((total - at, None));
+    }
+    out
+  }
+  /// `SelectionRange.map`: a cursor with assoc -1, else the lower end with assoc 1
+  /// and the upper with -1, each end keeping its role.
+  fn cm_map_selection(sections: &[(u64, Option<u64>)], anchor: u64, head: u64) -> [u64; 2] {
+    if anchor == head {
+      let at = cm_map_pos(sections, anchor, -1);
+      return [at, at];
+    }
+    let low = cm_map_pos(sections, anchor.min(head), 1);
+    let high = cm_map_pos(sections, anchor.max(head), -1);
+    if anchor < head {
+      [low, high]
+    } else {
+      [high, low]
+    }
+  }
+  /// The line breaks of `flat`, in order.
+  fn breaks(flat: &[u8]) -> Vec<&'static str> {
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < flat.len() {
+      match flat[i] {
+        b'\n' => out.push("\n"),
+        b'\r' if flat.get(i + 1) == Some(&b'\n') => {
+          out.push("\r\n");
+          i += 1;
+        }
+        b'\r' => out.push("\r"),
+        _ => {}
+      }
+      i += 1;
+    }
+    out
+  }
+  /// `text` with its line breaks written as `sep`.
+  fn with_sep(text: &str, sep: &str) -> String {
+    text.replace('\n', sep)
+  }
+  /// The frontend's sentence "no lone `\r` before a `\n`": every `\n` after a
+  /// `\r` is part of a `\r\n` the document meant.
+  fn assert_all_crlf(flat: &[u8]) {
+    for (i, &b) in flat.iter().enumerate() {
+      if b == b'\n' {
+        assert!(i > 0 && flat[i - 1] == b'\r', "lone LF at {i}");
+      }
+      if b == b'\r' {
+        assert_eq!(flat.get(i + 1), Some(&b'\n'), "lone CR at {i}");
+      }
+    }
+  }
+  // --- position conversion -----------------------------------------------------
+
+  const MIXED: &str = "ab\r\ncd\ref\n日本😀x\r\r\n\nlast";
+
+  #[test]
+  fn chunked_conversions_equal_the_whole_line_ones() {
+    let rig = Rig::new(MIXED.as_bytes(), 1 << 20);
+    rig.with(|s| {
+      let lines = s.table.line_count();
+      for chunk in [1usize, 2, 3, 5, 8, 1000] {
+        for line in 0..lines + 2 {
+          for col in 0..14 {
+            let want = pos_to_offset(&s.table, line, col).unwrap();
+            let got = pos_to_offset_chunked(&s.table, &Pos { line, col }, chunk).unwrap();
+            assert_eq!(got, want, "chunk {chunk} line {line} col {col}");
+          }
+        }
+        let bytes = MIXED.as_bytes();
+        for offset in 0..=bytes.len() {
+          let inside_char = bytes.get(offset).is_some_and(|b| (0x80..0xC0).contains(b));
+          let inside_crlf =
+            offset > 0 && bytes[offset - 1] == b'\r' && bytes.get(offset) == Some(&b'\n');
+          if inside_char || inside_crlf {
+            continue;
+          }
+          let want = offset_to_pos(&s.table, offset as u64).unwrap();
+          let got = pos_chunked(&s.table, offset as u64, chunk).unwrap();
+          assert_eq!(got, want, "chunk {chunk} offset {offset}");
+        }
+      }
+    });
+  }
+  #[test]
+  fn a_column_past_the_line_end_stops_before_the_break_and_never_inside_a_crlf() {
+    let rig = Rig::new(b"ab\r\ncd\ref\n", 1 << 20);
+    rig.with(|s| {
+      let far = |line| pos_to_offset_chunked(&s.table, &Pos { line, col: 99 }, 4).unwrap();
+      assert_eq!(far(0), 2);
+      assert_eq!(far(1), 6);
+      assert_eq!(far(2), 9);
+      assert_eq!(far(3), 10, "the empty last line");
+      assert_eq!(far(9), 10, "a line past the last is the last");
+    });
+  }
+  #[test]
+  fn a_very_long_line_is_never_read_whole() {
+    let content = format!("a\n{}日{}\nend", "x".repeat(5000), "y".repeat(5000));
+    let rig = Rig::new(content.as_bytes(), 1 << 20);
+    rig.with(|s| {
+      stats::reset();
+      let offset = pos_to_offset_chunked(&s.table, &Pos { line: 1, col: 7000 }, 64).unwrap();
+      assert!(
+        stats::get().max_read <= 64,
+        "read {}",
+        stats::get().max_read
+      );
+      assert_eq!(offset, 2 + 5000 + 3 + 1999);
+      stats::reset();
+      let pos = pos_chunked(&s.table, offset, 64).unwrap();
+      assert!(
+        stats::get().max_read <= 64,
+        "read {}",
+        stats::get().max_read
+      );
+      assert_eq!(pos, Pos { line: 1, col: 7000 });
+    });
+  }
+  // --- windowed_replace_range ---------------------------------------------------
+  /// A name, the two ends and the text of a replace.
+  type Case<'a> = (&'a str, (u64, u64), (u64, u64), &'a str);
+  /// A content, a name, the two ends and the text of a replace.
+  type JunctionCase<'a> = (&'a str, &'a str, (u64, u64), (u64, u64), &'a str);
+  /// `rig` after replacing `a..h` with `text` (written with `\n`), against the
+  /// flat model; returns the result.
+  fn check_replace(
+    rig: &Rig,
+    a: (u64, u64),
+    h: (u64, u64),
+    text: &str,
+    sep: &str,
+    what: &str,
+  ) -> RangeResult {
+    let before = rig.whole();
+    let units = norm(&before);
+    let (x, y) = (at(&units, a.0, a.1), at(&units, h.0, h.1));
+    let (lo, hi) = (x.min(y), x.max(y));
+    let mut want = units.clone();
+    let inserted: Vec<u16> = text.encode_utf16().collect();
+    want.splice(lo..hi, inserted.iter().copied());
+    let result = rig.range(a, h, &with_sep(text, sep), sep);
+    let after = rig.whole();
+    assert_eq!(norm(&after), want, "{what}: text");
+    assert_doc(rig, &after, what);
+    let cursor = where_is(&want, lo + inserted.len());
+    assert_eq!(
+      (result.cursor.line, result.cursor.col),
+      cursor,
+      "{what}: cursor"
+    );
+    assert_eq!(
+      result.total_bytes,
+      after.len() as u64,
+      "{what}: total_bytes"
+    );
+    assert_eq!(
+      result.total_lines,
+      starts(&after).len() as u64,
+      "{what}: lines"
+    );
+    result
+  }
+
+  #[test]
+  fn replace_range_matches_the_model_over_a_thousand_lines() {
+    let content = doc(700);
+    let cases: [Case; 8] = [
+      ("insert", (5, 3), (5, 3), "ins"),
+      ("insert lines", (6, 0), (6, 0), "a\nb\n"),
+      ("delete across", (2, 1), (1300, 4), ""),
+      ("replace across", (7, 2), (1250, 1), "X\nY"),
+      ("reversed", (1300, 2), (4, 1), "R"),
+      ("cjk", (3, 1), (1100, 0), "日本😀\n"),
+      ("replace one line", (10, 0), (10, 5), "x"),
+      ("delete to the end", (10, 2), (9999, 9999), ""),
+    ];
+    for sep in ["\n", "\r\n"] {
+      for (name, a, h, text) in cases {
+        let rig = Rig::new(&content, CHUNK as u64);
+        let what = format!("{name} {sep:?}");
+        check_replace(&rig, a, h, text, sep, &what);
+        let done = rig.whole();
+        rig.undo();
+        assert_doc(&rig, &content, &format!("{what}: undone"));
+        rig.redo();
+        assert_doc(&rig, &done, &format!("{what}: redone"));
+      }
+    }
+  }
+  #[test]
+  fn an_empty_text_over_an_empty_range_changes_nothing() {
+    let rig = Rig::new(&doc(20), CHUNK as u64);
+    let before = rig.marks();
+    let result = rig.range((3, 2), (3, 2), "", "\n");
+    assert_eq!(rig.marks(), before);
+    assert!(result.edits.is_empty());
+    assert_eq!(result.generation, before.2);
+    assert_eq!((result.cursor.line, result.cursor.col), (3, 2));
+  }
+  #[test]
+  fn a_separator_that_is_not_lf_or_crlf_is_refused_and_nothing_changes() {
+    let rig = Rig::new(&doc(20), CHUNK as u64);
+    let before = rig.marks();
+    for sep in ["\r", "", "\n\n", " ", "\r\n\r\n"] {
+      assert_eq!(
+        rig.try_range((1, 0), (2, 0), "x", sep).unwrap_err(),
+        "invalid insert separator"
+      );
+    }
+    assert_eq!(rig.marks(), before);
+    assert_eq!(rig.whole(), doc(20));
+  }
+  #[test]
+  fn a_rewrite_of_a_lone_cr_keeps_the_lines_and_moves_the_cursor_with_it() {
+    let cases: [JunctionCase; 6] = [
+      ("x\r12\ny", "delete the line", (1, 0), (1, 2), ""),
+      ("x\r\r\r12\ny", "a run of CR", (3, 0), (3, 2), ""),
+      ("x\rfoo\nbar", "a newline in front", (1, 0), (1, 0), "\nfoo"),
+      ("a\rb\r\rc\r\nd\n", "mixed", (2, 0), (2, 1), ""),
+      (
+        "p\r\r12\nq\r\nr",
+        "replace with an empty line",
+        (2, 0),
+        (2, 2),
+        "\n",
+      ),
+      (
+        "x\r12\ny\rz",
+        "delete up to the next line",
+        (1, 0),
+        (2, 0),
+        "",
+      ),
+    ];
+    for sep in ["\n", "\r\n"] {
+      for (content, name, a, h, text) in cases {
+        let rig = Rig::new(content.as_bytes(), 1 << 20);
+        let what = format!("{name} {sep:?}");
+        check_replace(&rig, a, h, text, sep, &what);
+      }
+    }
+    // The cursor of the CRLF rewrite lies after the two bytes.
+    let rig = Rig::new(b"x\r12\ny", 1 << 20);
+    let result = rig.range((1, 0), (1, 2), "", "\r\n");
+    assert_eq!(rig.whole(), b"x\r\n\ny");
+    assert_eq!((result.cursor.line, result.cursor.col), (1, 0));
+    let rig = Rig::new(b"x\r12\ny", 1 << 20);
+    let result = rig.range((1, 0), (1, 2), "", "\n");
+    assert_eq!(rig.whole(), b"x\n\ny");
+    assert_eq!((result.cursor.line, result.cursor.col), (1, 0));
+  }
+  #[test]
+  fn a_crlf_file_and_an_lf_file_keep_their_breaks() {
+    let crlf = "one\r\ntwo\r\nthree\r\nfour\r\n";
+    let rig = Rig::new(crlf.as_bytes(), 1 << 20);
+    rig.range((1, 1), (2, 2), "A\r\nB\r\nC", "\r\n");
+    rig.save();
+    assert_eq!(rig.saved(), b"one\r\ntA\r\nB\r\nCree\r\nfour\r\n");
+    assert_all_crlf(&rig.saved());
+    let lf = "one\ntwo\nthree\nfour\n";
+    let rig = Rig::new(lf.as_bytes(), 1 << 20);
+    rig.range((1, 1), (2, 2), "A\nB\nC", "\n");
+    rig.save();
+    assert_eq!(rig.saved(), b"one\ntA\nB\nCree\nfour\n");
+  }
+  #[test]
+  fn a_removal_past_the_threshold_spills_and_its_undo_reloads() {
+    let content = doc(300);
+    let rig = Rig::new(&content, CHUNK as u64);
+    let removal = rig.range((10, 0), (400, 0), "", "\n");
+    assert_eq!(rig.spill_files(), 1);
+    assert_eq!(removal.edits.len(), 1);
+    let undone = rig.undo();
+    assert!(undone.reload_only);
+    assert_doc(&rig, &content, "undone");
+    // At the threshold the text stays a string.
+    let small = Rig::new(&content, 1 << 20);
+    small.range((10, 0), (30, 0), "", "\n");
+    assert_eq!(small.spill_files(), 0);
+    let undone = small.undo();
+    assert!(!undone.reload_only);
+    assert_doc(&small, &content, "undone small");
+  }
+  #[test]
+  fn the_returned_edits_map_offsets_like_the_change() {
+    let content = doc(200);
+    for sep in ["\n", "\r\n"] {
+      let rig = Rig::new(&content, CHUNK as u64);
+      let (s, e) = rig.with(|t| {
+        (
+          pos_to_offset(&t.table, 12, 2).unwrap(),
+          pos_to_offset(&t.table, 160, 1).unwrap(),
+        )
+      });
+      let text = with_sep("one\ntwo", sep);
+      let result = rig.range((12, 2), (160, 1), &text, sep);
+      let moved = text.len() as i64 - (e - s) as i64;
+      for p in [
+        0,
+        s - 1,
+        s,
+        s + 1,
+        e - 1,
+        e,
+        e + 1,
+        e + 500,
+        content.len() as u64,
+      ] {
+        let want = if p < s {
+          p
+        } else if p >= e {
+          (p as i64 + moved) as u64
+        } else {
+          s + text.len() as u64
+        };
+        assert_eq!(front_through(p, &result.edits), want, "{sep:?} offset {p}");
+      }
+    }
+    // A rewrite before the range: offsets from the range on move by it.
+    let rig = Rig::new(b"x\r12\ny", 1 << 20);
+    let result = rig.range((1, 0), (1, 2), "", "\r\n");
+    assert_eq!(result.edits.len(), 2);
+    for (p, want) in [(0, 0), (1, 1), (2, 3), (3, 3), (4, 3), (5, 4)] {
+      assert_eq!(front_through(p, &result.edits), want, "offset {p}");
+    }
+  }
+  #[test]
+  fn deleting_sixty_four_mebibytes_holds_a_few_buffers() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("big.txt");
+    let line = format!("{}\n", "x".repeat(63));
+    fs::write(&path, line.repeat(1 << 20)).unwrap();
+    let (table, _, fingerprint, index, digest) = build_table(&path).unwrap();
+    let state = WindowedState::new(Some(dir.path().join("spills")));
+    state.sessions.lock().unwrap().insert(
+      ID,
+      Session::new(table, path.clone(), fingerprint, index, digest),
+    );
+    let before = crate::test_alloc::live();
+    crate::test_alloc::reset_peak();
+    let result = replace_range_core(
+      &state,
+      ID,
+      &pos((10, 0)),
+      &pos(((1 << 20) - 5, 0)),
+      "",
+      "\n",
+      true,
+      SCAN_CHUNK,
+      CHECKPOINT_INTERVAL,
+      &mut |_| {},
+    )
+    .unwrap();
+    let peak = crate::test_alloc::peak() - before;
+    assert!(peak <= 4 << 20, "peak {peak}");
+    assert_eq!(result.total_lines, 10 + 5 + 1);
+    assert_eq!((result.cursor.line, result.cursor.col), (10, 0));
+  }
+  // --- the shared fixture --------------------------------------------------------
+
+  #[derive(serde::Deserialize)]
+  struct FixturePos {
+    line: u64,
+    col: u64,
+  }
+  #[derive(serde::Deserialize)]
+  struct FixtureRow {
+    name: String,
+    op: String,
+    input: String,
+    anchor: FixturePos,
+    head: FixturePos,
+    lines: Vec<String>,
+    #[serde(rename = "resultAnchor")]
+    result_anchor: FixturePos,
+    #[serde(rename = "resultHead")]
+    result_head: FixturePos,
+  }
+  fn fixture() -> Vec<FixtureRow> {
+    serde_json::from_str(include_str!(
+      "../../src/lib/util/__fixtures__/cm-indent-enter.json"
+    ))
+    .unwrap()
+  }
+  fn xy(p: &FixturePos) -> (u64, u64) {
+    (p.line, p.col)
+  }
+  /// The breaks of the result against the breaks before: the same, bar a lone `\r`
+  /// rewritten to the separator.
+  fn assert_breaks_kept(before: &[&str], after: &[&str], sep: &str, what: &str) {
+    assert_eq!(before.len(), after.len(), "{what}: break count");
+    for (i, (b, a)) in before.iter().zip(after).enumerate() {
+      assert!(
+        b == a || (*b == "\r" && *a == sep),
+        "{what}: break {i} was {b:?}, is {a:?}"
+      );
+    }
+  }
+  /// The fixture rows of `ops`, run through the core with each separator.
+  fn run_fixture(ops: &[&str], min: u64) {
+    for row in fixture().iter().filter(|r| ops.contains(&r.op.as_str())) {
+      for sep in ["\n", "\r\n"] {
+        let what = format!("{} {sep:?}", row.name);
+        let rig = Rig::new(row.input.as_bytes(), min);
+        let before = breaks(&rig.whole());
+        let (a, h) = (xy(&row.anchor), xy(&row.head));
+        let (end_anchor, end_head) = if row.op == "enter" {
+          let r = rig.enter(a, h, sep);
+          ((r.cursor.line, r.cursor.col), (r.cursor.line, r.cursor.col))
+        } else {
+          let r = rig.indent(a, h, row.op == "outdent", sep, (0, 100_000));
+          ((r.anchor.line, r.anchor.col), (r.head.line, r.head.col))
+        };
+        let after = rig.whole();
+        let want = row.lines.join("\n");
+        assert_eq!(
+          String::from_utf16(&norm(&after)).unwrap(),
+          want,
+          "{what}: lines"
+        );
+        assert_doc(&rig, &after, &what);
+        assert_eq!(end_anchor, xy(&row.result_anchor), "{what}: anchor");
+        assert_eq!(end_head, xy(&row.result_head), "{what}: head");
+        let now = breaks(&after);
+        if row.op == "enter" {
+          // The new break is the separator; the rest are the ones that were left.
+          let at = end_head.0 as usize - 1;
+          assert_eq!(now[at], sep, "{what}: the new break");
+          let tail = &now[at + 1..];
+          assert_eq!(tail, &before[before.len() - tail.len()..], "{what}: tail");
+          assert_breaks_kept(
+            &before[..at.min(before.len())],
+            &now[..at.min(before.len())],
+            sep,
+            &what,
+          );
+        } else {
+          assert_breaks_kept(&before, &now, sep, &what);
+        }
+        assert_eq!(rig.with(|s| s.table.line_count()), row.lines.len() as u64);
+      }
+    }
+  }
+  #[test]
+  fn indent_and_outdent_match_codemirror_for_every_fixture_row() {
+    run_fixture(&["indent", "outdent"], 1 << 20);
+    run_fixture(&["indent", "outdent"], 4);
+  }
+  #[test]
+  fn enter_matches_codemirror_for_every_fixture_row() {
+    run_fixture(&["enter"], 1 << 20);
+    run_fixture(&["enter"], 4);
+  }
+  #[test]
+  fn the_fixture_has_all_the_rows_the_rules_need() {
+    let names: Vec<String> = fixture().into_iter().map(|r| r.name).collect();
+    for needle in [
+      "byte 0 takes no indentation",
+      "the lower bound",
+      "the upper bound",
+      "exact count moves",
+      "exact count does not move",
+      "column 100",
+      "U+3000, U+00A0 and U+FEFF",
+      "U+0085",
+      "empty lines",
+      "lone CR",
+      "ending at column 0",
+    ] {
+      assert!(names.iter().any(|n| n.contains(needle)), "no row {needle}");
+    }
+  }
+  // --- windowed_enter ------------------------------------------------------------
+  /// Bytes read by an Enter on the line of 5000 spaces after `head`, which is
+  /// 400 lines.
+  fn enter_reads(head: &str, spaces: usize) -> (u64, Rig) {
+    let tail = "y\n".repeat(30_000);
+    let content = format!("{head}{}x\n{tail}", " ".repeat(spaces));
+    let rig = Rig::new(content.as_bytes(), 1 << 20);
+    stats::reset();
+    rig.enter((400, 1), (402, 0), "\n");
+    (stats::get().total_read, rig)
+  }
+  #[test]
+  fn the_exact_count_reads_no_more_than_three_times_the_whitespace() {
+    // 400 lines of 10 CJK characters, then a line of 5000 spaces and `x`: between
+    // the bounds, so the text before the line is counted.
+    let head = "日日日日日日日日日日\n".repeat(400);
+    let spaces = 5000u64;
+    let b = head.len() as u64;
+    assert!(spaces > b.div_ceil(3) && spaces <= b, "inside the bounds");
+    let (exact, rig) = enter_reads(&head, spaces as usize);
+    // The same Enter after short lines is above the upper bound: no count.
+    // The twin cancels the other reads (whitespace scan, cursor, removal).
+    let (plain, _) = enter_reads(&"a\n".repeat(400), spaces as usize);
+    let counted = exact - plain;
+    assert!(
+      counted >= b,
+      "the count read the text before the line: {counted}"
+    );
+    assert!(
+      counted <= 3 * spaces + CHUNK as u64,
+      "counted with {counted} bytes"
+    );
+    // 4401 <= 5000: the start moved to the line start.
+    let whole = rig.whole();
+    assert!(whole.starts_with(head.as_bytes()));
+    assert_eq!(whole[head.len()], b'\n');
+  }
+  #[test]
+  fn enter_in_a_crlf_file_saves_only_crlf() {
+    let rig = Rig::new(b"x\r\n  y\r\nz\r\nw\r\n", 1 << 20);
+    rig.enter((1, 1), (3, 0), "\r\n");
+    rig.save();
+    assert_all_crlf(&rig.saved());
+    assert_eq!(rig.saved(), b"x\r\n \r\n  w\r\n");
+  }
+  #[test]
+  fn an_enormous_indent_goes_through_a_spill() {
+    let indent = 5000usize;
+    let content = format!("{}x\nabc\nde\n", " ".repeat(indent));
+    let rig = Rig::new(content.as_bytes(), 64);
+    stats::reset();
+    let result = rig.enter((0, 50), (2, 1), "\r\n");
+    let seen = stats::get();
+    assert!(seen.max_write <= CHUNK, "wrote {}", seen.max_write);
+    assert_eq!(rig.spill_files(), 2, "the removal and the new text");
+    assert_eq!(result.edits[0].text, "");
+    assert_eq!(result.edits[0].len, Some(2 + indent as u64));
+    let want = format!("\r\n{}e\n", " ".repeat(indent));
+    assert_eq!(rig.whole(), want.as_bytes());
+    assert_eq!(
+      result.cursor,
+      Pos {
+        line: 1,
+        col: indent as u64
+      }
+    );
+    let undone = rig.undo();
+    assert!(undone.reload_only);
+    assert_doc(&rig, content.as_bytes(), "undone");
+    rig.redo();
+    assert_eq!(rig.whole(), want.as_bytes());
+  }
+  // --- windowed_indent_range -----------------------------------------------------
+
+  fn is_js_space(c: char) -> bool {
+    matches!(
+      c,
+      '\t' | '\u{b}' | '\u{c}' | ' ' | '\u{a0}' | '\u{1680}' | '\u{2000}'
+        ..='\u{200a}' | '\u{2028}' | '\u{2029}' | '\u{202f}' | '\u{205f}' | '\u{3000}' | '\u{feff}'
+    )
+  }
+  /// One line after `indentMore` or `indentLess`.
+  fn ref_line(line: &str, outdent: bool) -> String {
+    if !outdent {
+      return format!("  {line}");
+    }
+    let space: String = line.chars().take_while(|&c| is_js_space(c)).collect();
+    if space.is_empty() {
+      return line.to_string();
+    }
+    let mut col = 0usize;
+    for c in space.chars() {
+      col += if c == '\t' { 4 - col % 4 } else { 1 };
+    }
+    format!(
+      "{}{}",
+      " ".repeat(col.saturating_sub(2)),
+      &line[space.len()..]
+    )
+  }
+  /// `text` (breaks as `\n`) with lines `first..=last` indented or outdented.
+  fn ref_indent(text: &str, outdent: bool, first: usize, last: usize) -> String {
+    text
+      .split('\n')
+      .enumerate()
+      .map(|(i, line)| {
+        if (first..=last).contains(&i) {
+          ref_line(line, outdent)
+        } else {
+          line.to_string()
+        }
+      })
+      .collect::<Vec<_>>()
+      .join("\n")
+  }
+  fn end_of(rig: &Rig) -> (u64, u64) {
+    let end = rig.with(|s| end_pos(&s.table, CHUNK)).unwrap();
+    (end.line, end.col)
+  }
+  /// A document whose lines carry assorted indentation.
+  fn indented(lines: usize) -> Vec<u8> {
+    let pads = [
+      "",
+      "  ",
+      "    ",
+      "\t",
+      "\t\t",
+      " \t",
+      "   ",
+      "\u{3000}",
+      "\u{a0}\u{a0}x",
+    ];
+    (0..lines)
+      .map(|i| {
+        let end = ["\r\n", "\n", "\n", "\r\n"][i % 4];
+        format!("{}row {i} 日本{end}", pads[i % pads.len()])
+      })
+      .collect::<String>()
+      .into_bytes()
+  }
+
+  #[test]
+  fn indent_and_outdent_a_whole_file_match_the_model_and_undo_and_redo() {
+    let content = indented(400);
+    for min in [CHUNK as u64, 1 << 20] {
+      for outdent in [false, true] {
+        for sep in ["\n", "\r\n"] {
+          let rig = Rig::new(&content, min);
+          let what = format!("min {min} outdent {outdent} {sep:?}");
+          let before = String::from_utf16(&norm(&content)).unwrap();
+          let last_line = starts(&content).len() - 1;
+          let result = rig.indent((0, 0), end_of(&rig), outdent, sep, (0, 20));
+          let after = rig.whole();
+          // The last line is empty and the range ends at its column 0: left alone.
+          let want = ref_indent(&before, outdent, 0, last_line - 1);
+          assert_eq!(String::from_utf16(&norm(&after)).unwrap(), want, "{what}");
+          assert_doc(&rig, &after, &what);
+          assert_eq!(rig.with(|s| s.table.line_count()), (last_line + 1) as u64);
+          assert_eq!(result.total_bytes, after.len() as u64);
+          assert!(!result.clean);
+          assert_eq!(rig.with(|s| s.undo_stack.len()), 1, "{what}");
+          let undone = rig.undo();
+          assert_eq!(undone.reload_only, min == CHUNK as u64, "{what}: reload");
+          assert_doc(&rig, &content, &format!("{what}: undone"));
+          assert!(undone.clean);
+          rig.redo();
+          assert_doc(&rig, &after, &format!("{what}: redone"));
+        }
+      }
+    }
+  }
+  #[test]
+  fn the_range_is_read_and_written_in_blocks() {
+    let content = indented(500);
+    let rig = Rig::new(&content, CHUNK as u64);
+    stats::reset();
+    rig.indent((0, 0), end_of(&rig), false, "\n", (0, 20));
+    let seen = stats::get();
+    assert!(
+      seen.max_read <= CHUNK,
+      "asked for {} at once",
+      seen.max_read
+    );
+    assert!(seen.max_buf <= CHUNK, "held {} at once", seen.max_buf);
+    assert!(seen.max_write <= CHUNK, "wrote {} at once", seen.max_write);
+    assert!(seen.max_open <= 1, "{} handles open", seen.max_open);
+    assert!(rig.spill_files() >= 2);
+  }
+  #[test]
+  fn indenting_sixteen_mebibytes_holds_a_few_buffers() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("big.txt");
+    let line = format!("{}\n", "x".repeat(63));
+    fs::write(&path, line.repeat(1 << 18)).unwrap();
+    for outdent in [false, true] {
+      let (table, _, fingerprint, index, digest) = build_table(&path).unwrap();
+      let state = WindowedState::new(Some(dir.path().join("spills")));
+      state.sessions.lock().unwrap().insert(
+        ID,
+        Session::new(table, path.clone(), fingerprint, index, digest),
+      );
+      let before = crate::test_alloc::live();
+      crate::test_alloc::reset_peak();
+      let result = indent_range_core(
+        &state,
+        ID,
+        &pos((0, 0)),
+        &pos((1 << 18, 0)),
+        outdent,
+        "\n",
+        (0, 2000),
+        true,
+        SCAN_CHUNK,
+        CHECKPOINT_INTERVAL,
+        &mut |_| {},
+      )
+      .unwrap();
+      let peak = crate::test_alloc::peak() - before;
+      assert!(peak <= 4 << 20, "outdent {outdent}: peak {peak}");
+      if outdent {
+        assert_eq!(result.generation, 0, "no line had a leading space");
+      } else {
+        assert_eq!(result.total_bytes, 64 * (1 << 18) + 2 * (1 << 18));
+      }
+    }
+  }
+  #[test]
+  fn a_hundred_thousand_emptied_lines_after_lone_crs_are_one_piece_and_one_step() {
+    let content = "\r  \n".repeat(100_000);
+    for (sep, unit) in [("\n", "\n\n"), ("\r\n", "\r\n\n")] {
+      let rig = Rig::new(content.as_bytes(), CHUNK as u64);
+      let end = end_of(&rig);
+      let result = rig.indent((0, 0), end, true, sep, (0, 10));
+      let want = unit.repeat(100_000);
+      assert_eq!(rig.whole(), want.as_bytes(), "{sep:?}");
+      let pieces = rig.with(|s| (s.table.piece_count(), s.undo_stack.len(), s.table.add_len()));
+      assert!(pieces.0 <= 3, "{} pieces", pieces.0);
+      assert_eq!(pieces.1, 1);
+      assert_eq!(pieces.2, 0);
+      assert_eq!(result.total_lines, 200_001);
+      assert_eq!(rig.with(|s| s.table.line_count()), 200_001);
+      rig.undo();
+      assert_eq!(rig.whole(), content.as_bytes());
+    }
+  }
+  #[test]
+  fn outdent_with_nothing_to_remove_changes_nothing() {
+    let content = b"a\nb\r\nc\rd\n";
+    let rig = Rig::new(content, CHUNK as u64);
+    let before = rig.marks();
+    let result = rig.indent((0, 0), (3, 1), true, "\n", (0, 10));
+    assert_eq!(rig.marks(), before);
+    assert_eq!(result.generation, before.2);
+    assert!(result.edits.is_empty());
+    assert_eq!((result.anchor.line, result.anchor.col), (0, 0));
+    assert_eq!((result.head.line, result.head.col), (3, 1));
+    assert!(result.clean);
+    assert_eq!(rig.whole(), content);
+    assert_eq!(rig.spill_files(), 0, "the unused spill is gone");
+    // The same in a file big enough to spill.
+    let big = doc(300);
+    let rig = Rig::new(&big, CHUNK as u64);
+    let before = rig.marks();
+    rig.indent((0, 0), end_of(&rig), true, "\n", (0, 10));
+    assert_eq!(rig.marks(), before);
+    assert_eq!(rig.spill_files(), 0);
+  }
+  #[test]
+  fn an_indent_makes_the_session_dirty_and_a_save_and_an_undo_clean_it() {
+    for min in [CHUNK as u64, 1 << 20] {
+      let content = doc(120);
+      let rig = Rig::new(&content, min);
+      assert!(rig.with(|s| s.clean()));
+      let result = rig.indent((0, 0), end_of(&rig), false, "\n", (0, 10));
+      assert!(!result.clean);
+      assert!(!rig.with(|s| s.clean()));
+      rig.save();
+      assert!(rig.with(|s| s.clean()));
+      let saved = rig.whole();
+      let again = rig.indent((0, 0), end_of(&rig), false, "\n", (0, 10));
+      assert!(!again.clean);
+      let undone = rig.undo();
+      assert!(undone.clean, "back at the saved state");
+      assert_eq!(rig.whole(), saved);
+      let undone = rig.undo();
+      assert!(!undone.clean);
+      assert_eq!(rig.whole(), content);
+    }
+  }
+  #[test]
+  fn the_first_indent_after_a_save_holds_its_rewrite_in_one_undo_step() {
+    // The range starts after a lone CR and its first line is emptied.
+    let content = format!("head\r{}", "  \n".repeat(60)).into_bytes();
+    for sep in ["\n", "\r\n"] {
+      let rig = Rig::new(&content, CHUNK as u64);
+      rig.range((0, 4), (0, 4), "!", sep);
+      rig.save();
+      let saved = rig.whole();
+      let depth = rig.with(|s| s.undo_stack.len());
+      let result = rig.with(|s| s.generation);
+      let end = end_of(&rig);
+      let out = indent_range_core(
+        &rig.state,
+        ID,
+        &pos((1, 0)),
+        &pos(end),
+        true,
+        sep,
+        (0, 10),
+        false,
+        CHUNK,
+        INTERVAL,
+        &mut |_| {},
+      )
+      .unwrap();
+      assert!(out.generation > result);
+      let after = rig.whole();
+      let want = ref_indent(&String::from_utf16(&norm(&saved)).unwrap(), true, 1, 60);
+      assert_eq!(String::from_utf16(&norm(&after)).unwrap(), want, "{sep:?}");
+      assert_doc(&rig, &after, "indented");
+      assert_eq!(
+        rig.with(|s| s.undo_stack.len()),
+        depth + 1,
+        "a step of its own"
+      );
+      rig.undo();
+      assert_doc(&rig, &saved, "one undo");
+      assert!(rig.with(|s| s.clean()));
+    }
+  }
+  #[test]
+  fn the_edits_of_an_indent_map_the_offsets_of_the_window_exactly() {
+    let content = indented(200);
+    for outdent in [false, true] {
+      for sep in ["\n", "\r\n"] {
+        let rig = Rig::new(&content, CHUNK as u64);
+        let (w0, w1) = (50usize, 60usize);
+        let st = starts(&content);
+        let result = rig.indent((20, 0), (180, 3), outdent, sep, (w0 as u64, w1 as u64));
+        let after = rig.whole();
+        let new_st = starts(&after);
+        assert!(
+          result.edits.len() <= (w1 - w0) + 2,
+          "{} edits",
+          result.edits.len()
+        );
+        for line in w0..w1 {
+          let old = String::from_utf8_lossy(&content[st[line] as usize..]).to_string();
+          let ws: usize = old
+            .chars()
+            .take_while(|&c| is_js_space(c))
+            .map(char::len_utf8)
+            .sum();
+          let fresh = String::from_utf8_lossy(&after[new_st[line] as usize..]).to_string();
+          // The first byte that is no indentation, before and after.
+          let (from, to) = if outdent {
+            let spaces = fresh.chars().take_while(|&c| c == ' ').count();
+            (st[line] + ws as u64, new_st[line] + spaces as u64)
+          } else {
+            (st[line], new_st[line] + 2)
+          };
+          for p in from..from + 10 {
+            assert_eq!(
+              front_through(p, &result.edits),
+              to + (p - from),
+              "outdent {outdent} {sep:?} line {line} offset {p}"
+            );
+          }
+        }
+        // Outside the range everything moves by what the range grew by.
+        let grew = after.len() as i64 - content.len() as i64;
+        let past = st[181] + 1;
+        assert_eq!(
+          front_through(past, &result.edits),
+          (past as i64 + grew) as u64
+        );
+        assert_eq!(front_through(st[5], &result.edits), st[5]);
+      }
+    }
+  }
+  // --- the phases ----------------------------------------------------------------
+  /// Run `pass` with `between` stopped just before block `at`, run `other` on a
+  /// thread of its own meanwhile, and say whether `other` had finished by the time
+  /// the pass was let go.
+  fn paused<T: Send, R: Send>(
+    at: usize,
+    pass: impl FnOnce(&mut dyn FnMut(usize)) -> T + Send,
+    other: impl FnOnce() -> R + Send,
+  ) -> (T, R, bool) {
+    let (done, r, early, ()) = paused_probe(at, pass, other, || ());
+    (done, r, early)
+  }
+  /// `paused`, and `probe` run on this thread while the pass is stopped.
+  fn paused_probe<T: Send, R: Send, Q>(
+    at: usize,
+    pass: impl FnOnce(&mut dyn FnMut(usize)) -> T + Send,
+    other: impl FnOnce() -> R + Send,
+    probe: impl FnOnce() -> Q,
+  ) -> (T, R, bool, Q) {
+    let (paused_tx, paused_rx) = std::sync::mpsc::channel::<()>();
+    let (resume_tx, resume_rx) = std::sync::mpsc::channel::<()>();
+    let finished = AtomicBool::new(false);
+    std::thread::scope(|scope| {
+      let pass = scope.spawn(move || {
+        let mut hook = |block: usize| {
+          if block == at {
+            paused_tx.send(()).unwrap();
+            resume_rx.recv().unwrap();
+          }
+        };
+        pass(&mut hook)
+      });
+      let reached = paused_rx
+        .recv_timeout(std::time::Duration::from_secs(20))
+        .is_ok();
+      if !reached {
+        let _ = resume_tx.send(());
+      }
+      assert!(reached, "the pass never stopped before block {at}");
+      let seen = probe();
+      let finished = &finished;
+      let waiter = scope.spawn(move || {
+        let r = other();
+        finished.store(true, Ordering::SeqCst);
+        r
+      });
+      std::thread::sleep(std::time::Duration::from_millis(300));
+      let early = finished.load(Ordering::SeqCst);
+      resume_tx.send(()).unwrap();
+      let done = pass.join().unwrap();
+      (done, waiter.join().unwrap(), early, seen)
+    })
+  }
+  /// The generation of session `ID` now, or `None` while its lock is held.
+  fn generation_now(rig: &Rig) -> Option<u64> {
+    let map = rig.state.sessions.try_lock().ok()?;
+    Some(map.get(&ID).unwrap().generation)
+  }
+  fn read_other(rig: &Rig) -> u64 {
+    let map = rig.state.lock_idle(OTHER).unwrap();
+    let session = map.get(&OTHER).unwrap();
+    read_window_result(&session.table, 0, 3)
+      .unwrap()
+      .total_bytes
+  }
+  fn wait_on_session(rig: &Rig) {
+    drop(rig.state.lock_idle(ID).unwrap());
+  }
+
+  #[test]
+  fn another_session_reads_while_a_removal_is_copied_and_this_one_waits() {
+    let content = doc(300);
+    let rig = Rig::new(&content, CHUNK as u64);
+    rig.open(OTHER, "b.txt", b"other\nfile\n");
+    let (result, total, early) = paused(
+      4,
+      |between| {
+        replace_range_core(
+          &rig.state,
+          ID,
+          &pos((10, 0)),
+          &pos((400, 0)),
+          "",
+          "\n",
+          true,
+          CHUNK,
+          INTERVAL,
+          between,
+        )
+      },
+      || read_other(&rig),
+    );
+    result.unwrap();
+    assert_eq!(total, 11);
+    assert!(early, "the other session must not wait for the copy");
+    let (result, (), early) = paused(
+      4,
+      |between| {
+        indent_range_core(
+          &rig.state,
+          ID,
+          &pos((0, 0)),
+          &pos((50, 0)),
+          false,
+          "\n",
+          (0, 10),
+          true,
+          CHUNK,
+          INTERVAL,
+          between,
+        )
+      },
+      || wait_on_session(&rig),
+    );
+    result.unwrap();
+    assert!(!early, "this session waits for the pass");
+    // The same for Enter.
+    let (result, total, early) = paused(
+      4,
+      |between| {
+        enter_core(
+          &rig.state,
+          ID,
+          &pos((0, 0)),
+          &pos((60, 0)),
+          "\n",
+          true,
+          CHUNK,
+          INTERVAL,
+          between,
+        )
+      },
+      || read_other(&rig),
+    );
+    result.unwrap();
+    assert_eq!(total, 11);
+    assert!(early);
+  }
+  #[test]
+  fn another_session_reads_while_an_indent_copies_its_removal() {
+    // 100 lines of 8 bytes: one block locates the anchor, 50 blocks stream the
+    // range, and the next 50 copy it to the removal spill; stop in the copy.
+    let content = "abcdefg\n".repeat(100);
+    let rig = Rig::new(content.as_bytes(), CHUNK as u64);
+    rig.open(OTHER, "b.txt", b"other\nfile\n");
+    let before = generation_now(&rig);
+    let (result, total, early, at_pause) = paused_probe(
+      60,
+      |between| {
+        indent_range_core(
+          &rig.state,
+          ID,
+          &pos((0, 0)),
+          &pos((100, 0)),
+          false,
+          "\n",
+          (0, 10),
+          true,
+          CHUNK,
+          INTERVAL,
+          between,
+        )
+      },
+      || read_other(&rig),
+      || (generation_now(&rig), rig.spill_files()),
+    );
+    result.unwrap();
+    assert_eq!(total, 11);
+    assert!(
+      early,
+      "the other session must not wait for the removal copy"
+    );
+    assert_eq!(
+      at_pause.0, before,
+      "stopped before the install, with the lock free"
+    );
+    assert_eq!(
+      at_pause.1, 2,
+      "the result spill is written and the removal file is open"
+    );
+  }
+  /// A document with one very long line, `line`, and where in it a position sits.
+  fn long_line_rig() -> Rig {
+    let content = format!("first\n{}\nlast\n", "日x".repeat(900));
+    let rig = Rig::new(content.as_bytes(), 1 << 20);
+    rig.open(OTHER, "b.txt", b"other\nfile\n");
+    rig
+  }
+  #[test]
+  fn converting_a_position_in_a_long_line_does_not_hold_the_lock() {
+    // The first block read while converting is block 0; stop at the third.
+    let rig = long_line_rig();
+    let far = (1u64, 1500u64);
+    let before = generation_now(&rig);
+    let (result, total, early, at_pause) = paused_probe(
+      2,
+      |between| {
+        replace_range_core(
+          &rig.state,
+          ID,
+          &pos(far),
+          &pos((2, 2)),
+          "z",
+          "\n",
+          true,
+          CHUNK,
+          INTERVAL,
+          between,
+        )
+      },
+      || read_other(&rig),
+      || generation_now(&rig),
+    );
+    result.unwrap();
+    assert_eq!(total, 11);
+    assert!(early, "replace_range converts without the lock");
+    assert_eq!(
+      at_pause, before,
+      "replace_range: stopped before the install, with the lock free"
+    );
+    let rig = long_line_rig();
+    let before = generation_now(&rig);
+    let (result, total, early, at_pause) = paused_probe(
+      2,
+      |between| {
+        enter_core(
+          &rig.state,
+          ID,
+          &pos(far),
+          &pos((2, 2)),
+          "\n",
+          true,
+          CHUNK,
+          INTERVAL,
+          between,
+        )
+      },
+      || read_other(&rig),
+      || generation_now(&rig),
+    );
+    result.unwrap();
+    assert_eq!(total, 11);
+    assert!(early, "enter converts without the lock");
+    assert_eq!(
+      at_pause, before,
+      "enter: stopped before the install, with the lock free"
+    );
+    let rig = long_line_rig();
+    rig.with(|s| s.apply(put(0, "x"), true, None).unwrap());
+    let before = generation_now(&rig);
+    let (result, total, early, at_pause) = paused_probe(
+      2,
+      |between| {
+        history_tracked_core(
+          &rig.state,
+          ID,
+          false,
+          &[pos(far), pos((2, 2))],
+          CHUNK,
+          INTERVAL,
+          between,
+        )
+      },
+      || read_other(&rig),
+      || generation_now(&rig),
+    );
+    result.unwrap();
+    assert_eq!(total, 11);
+    assert!(early, "a tracked undo converts without the lock");
+    assert_eq!(
+      at_pause, before,
+      "a tracked undo: stopped before the install, with the lock free"
+    );
+    let rig = long_line_rig();
+    let before = generation_now(&rig);
+    let (result, total, early, at_pause) = paused_probe(
+      2,
+      |between| {
+        indent_range_core(
+          &rig.state,
+          ID,
+          &pos(far),
+          &pos((2, 2)),
+          false,
+          "\n",
+          (0, 3),
+          true,
+          CHUNK,
+          INTERVAL,
+          between,
+        )
+      },
+      || read_other(&rig),
+      || generation_now(&rig),
+    );
+    result.unwrap();
+    assert_eq!(total, 11);
+    assert!(early, "indent converts without the lock");
+    assert_eq!(
+      at_pause, before,
+      "indent: stopped before the install, with the lock free"
+    );
+  }
+  #[test]
+  fn every_block_of_the_conversions_goes_through_between() {
+    // The far end lies 3000 bytes into a line: finding it takes that many blocks,
+    // and converting it back after the change takes as many again.
+    let far = (1u64, 1500u64);
+    let far_blocks = 3001usize.div_ceil(CHUNK);
+    let rig = long_line_rig();
+    let mut n = 0;
+    replace_range_core(
+      &rig.state,
+      ID,
+      &pos(far),
+      &pos((2, 2)),
+      "z",
+      "\n",
+      true,
+      CHUNK,
+      INTERVAL,
+      &mut |_| n += 1,
+    )
+    .unwrap();
+    assert!(n >= 2 * far_blocks, "replace_range: {n} blocks");
+    let rig = long_line_rig();
+    let mut n = 0;
+    enter_core(
+      &rig.state,
+      ID,
+      &pos(far),
+      &pos((2, 2)),
+      "\n",
+      true,
+      CHUNK,
+      INTERVAL,
+      &mut |_| n += 1,
+    )
+    .unwrap();
+    assert!(n >= far_blocks, "enter: {n} blocks");
+    let rig = long_line_rig();
+    rig.with(|s| s.apply(put(0, "x"), true, None).unwrap());
+    let mut n = 0;
+    history_tracked_core(
+      &rig.state,
+      ID,
+      false,
+      &[pos(far), pos((2, 2))],
+      CHUNK,
+      INTERVAL,
+      &mut |_| n += 1,
+    )
+    .unwrap();
+    assert!(n >= 2 * far_blocks, "tracked undo: {n} blocks");
+    // The range is 3606 bytes: its blocks come on top of both conversions.
+    let rig = long_line_rig();
+    let stream_blocks = 3606usize.div_ceil(CHUNK);
+    let mut n = 0;
+    indent_range_core(
+      &rig.state,
+      ID,
+      &pos(far),
+      &pos((2, 2)),
+      false,
+      "\n",
+      (0, 3),
+      true,
+      CHUNK,
+      INTERVAL,
+      &mut |_| n += 1,
+    )
+    .unwrap();
+    assert!(n >= 2 * far_blocks + stream_blocks, "indent: {n} blocks");
+  }
+  fn put(at: u64, text: &str) -> Vec<Edit> {
+    vec![Edit {
+      start: at,
+      end: at,
+      text: text.to_string(),
+      keep_start: false,
+      cascade: false,
+    }]
+  }
+  #[test]
+  fn the_result_is_converted_without_the_lock_too() {
+    // The cursor of the result lies far into a long line: its conversion takes
+    // blocks of its own, and the last block is read after the install.
+    let content = format!("a\n{}\n", "x".repeat(4000));
+    let rig = Rig::new(content.as_bytes(), 1 << 20);
+    rig.open(OTHER, "b.txt", b"other\nfile\n");
+    let (result, total, early) = paused(
+      100,
+      |between| {
+        replace_range_core(
+          &rig.state,
+          ID,
+          &pos((1, 10)),
+          &pos((1, 10)),
+          &"y".repeat(3000),
+          "\n",
+          true,
+          CHUNK,
+          INTERVAL,
+          between,
+        )
+      },
+      || read_other(&rig),
+    );
+    let result = result.unwrap();
+    assert_eq!(total, 11);
+    assert!(early, "the cursor is converted without the lock");
+    assert_eq!(result.cursor, Pos { line: 1, col: 3010 });
+    assert!(!rig.with(|s| s.busy));
+  }
+  // --- no folder to spill to -----------------------------------------------------
+
+  #[test]
+  fn without_a_folder_a_long_removal_is_refused_and_the_table_is_unchanged() {
+    let content = doc(120_000);
+    assert!(content.len() as u64 > spill::SPILL_MIN * 2);
+    let rig = Rig::without_folder(&content);
+    let before = rig.marks();
+    let live = crate::test_alloc::live();
+    crate::test_alloc::reset_peak();
+    let err = rig.try_range((10, 0), (200_000, 0), "", "\n").unwrap_err();
+    assert_eq!(err, no_folder());
+    let err = rig
+      .try_indent((0, 0), (200_000, 0), false, "\n", (0, 10), &mut |_| {})
+      .unwrap_err();
+    assert_eq!(err, no_folder());
+    assert!(crate::test_alloc::peak() - live <= 1 << 20);
+    assert_eq!(rig.marks(), before);
+    assert_eq!(rig.whole(), content);
+    // So is a text longer than that.
+    let rig = Rig::without_folder(&content);
+    let before = rig.marks();
+    let long = "x".repeat(spill::SPILL_MIN as usize + 1);
+    assert_eq!(
+      rig.try_range((1, 0), (1, 0), &long, "\n").unwrap_err(),
+      no_folder()
+    );
+    assert_eq!(rig.marks(), before);
+    // An Enter whose indent would not fit in memory is refused as well.
+    let wide = format!("{}x\nabc\n", " ".repeat(spill::SPILL_MIN as usize + 10));
+    let rig = Rig::without_folder(wide.as_bytes());
+    let before = rig.marks();
+    let err = enter_core(
+      &rig.state,
+      ID,
+      &pos((0, 50)),
+      &pos((1, 1)),
+      "\n",
+      true,
+      CHUNK,
+      INTERVAL,
+      &mut |_| {},
+    )
+    .unwrap_err();
+    assert_eq!(err, no_folder());
+    assert_eq!(rig.marks(), before);
+    // Small changes still work.
+    let rig = Rig::without_folder(&doc(50));
+    rig.range((1, 0), (3, 0), "x", "\n");
+    rig.indent((0, 0), (20, 0), false, "\n", (0, 10));
+    rig.enter((2, 1), (4, 0), "\n");
+  }
+  // --- the selection a change carries along --------------------------------------
+  /// Hits of `needle` in `flat`, leftmost, non-overlapping: `(start, end)`.
+  fn hits_of(flat: &[u8], needle: &[u8]) -> Vec<(u64, u64)> {
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i + needle.len() <= flat.len() {
+      if &flat[i..i + needle.len()] == needle {
+        out.push((i as u64, (i + needle.len()) as u64));
+        i += needle.len();
+      } else {
+        i += 1;
+      }
+    }
+    out
+  }
+  fn pos_of(flat: &[u8], offset: u64) -> Pos {
+    let units = norm(&flat[..offset as usize]);
+    let (line, col) = where_is(&units, units.len());
+    Pos { line, col }
+  }
+  fn pair(p: &Pos) -> (u64, u64) {
+    (p.line, p.col)
+  }
+  fn offset_of(flat: &[u8], p: &Pos) -> u64 {
+    at(&norm(flat), p.line, p.col) as u64
+  }
+  /// The selections to follow: cursors, both directions, and ends inside a hit.
+  fn selections(flat: &[u8]) -> Vec<[u64; 2]> {
+    let hits = hits_of(flat, b"foo");
+    let (a, b) = (hits[1], hits[4]);
+    vec![
+      [3, 3],
+      [a.0, b.1],
+      [b.1, a.0],
+      [a.0 + 1, b.0 + 2],
+      [b.0 + 2, a.0 + 1],
+      [a.0 + 1, a.0 + 2],
+      [a.0 + 2, a.0 + 1],
+      [a.0 + 1, a.0 + 1],
+      [0, flat.len() as u64],
+    ]
+  }
+  fn tracked_doc() -> Vec<u8> {
+    "foo bar foo\nbaz foo foo\nqux foo\nfoo foo foo\nlast foo"
+      .as_bytes()
+      .to_vec()
+  }
+
+  #[test]
+  fn replace_all_returns_the_tracked_selection_as_selection_range_map_would() {
+    let content = tracked_doc();
+    let hits = hits_of(&content, b"foo");
+    for repl in ["quux\nX", "", "f", "foooo"] {
+      let replaces: Vec<(u64, u64, u64)> = hits
+        .iter()
+        .map(|&(s, e)| (s, e, repl.len() as u64))
+        .collect();
+      let sections = sections_of(&replaces, content.len() as u64);
+      for ends in selections(&content) {
+        let rig = Rig::new(&content, 1 << 20);
+        let tmp = rig.dir.path().join("lists");
+        let track = [pos_of(&content, ends[0]), pos_of(&content, ends[1])];
+        let out = replace_all_tracked_core(
+          &rig.state,
+          &tmp,
+          ID,
+          "foo",
+          true,
+          repl,
+          "\n",
+          CHUNK,
+          INTERVAL,
+          &mut |_| {},
+          Some(&track),
+        )
+        .unwrap();
+        let after = rig.whole();
+        let want = cm_map_selection(&sections, ends[0], ends[1]);
+        let tracked = out.tracked.expect("tracked");
+        assert_eq!(
+          [
+            offset_of(&after, &tracked[0]),
+            offset_of(&after, &tracked[1])
+          ],
+          want,
+          "repl {repl:?} selection {ends:?}"
+        );
+        // Undo and redo of the replace follow the selection the same way.
+        let map_back = |sections: &[(u64, Option<u64>)], ends: [u64; 2]| {
+          cm_map_selection(sections, ends[0], ends[1])
+        };
+        let post_hits: Vec<(u64, u64, u64)> = {
+          let mut shift = 0i64;
+          hits
+            .iter()
+            .map(|&(s, e)| {
+              let start = (s as i64 + shift) as u64;
+              shift += repl.len() as i64 - (e - s) as i64;
+              (start, start + repl.len() as u64, 3)
+            })
+            .collect()
+        };
+        let inverse = sections_of(&post_hits, after.len() as u64);
+        let now = [
+          offset_of(&after, &tracked[0]),
+          offset_of(&after, &tracked[1]),
+        ];
+        let undone = history_tracked_core(
+          &rig.state,
+          ID,
+          false,
+          &[tracked[0], tracked[1]],
+          CHUNK,
+          INTERVAL,
+          &mut |_| {},
+        )
+        .unwrap();
+        let back = undone.tracked.expect("tracked");
+        assert_eq!(
+          [
+            offset_of(&rig.whole(), &back[0]),
+            offset_of(&rig.whole(), &back[1])
+          ],
+          map_back(&inverse, now),
+          "undo repl {repl:?} selection {ends:?}"
+        );
+        let here = [
+          offset_of(&rig.whole(), &back[0]),
+          offset_of(&rig.whole(), &back[1]),
+        ];
+        let redone = history_tracked_core(
+          &rig.state,
+          ID,
+          true,
+          &[back[0], back[1]],
+          CHUNK,
+          INTERVAL,
+          &mut |_| {},
+        )
+        .unwrap();
+        let again = redone.tracked.expect("tracked");
+        assert_eq!(
+          [
+            offset_of(&rig.whole(), &again[0]),
+            offset_of(&rig.whole(), &again[1])
+          ],
+          cm_map_selection(&sections, here[0], here[1]),
+          "redo repl {repl:?} selection {ends:?}"
+        );
+      }
+    }
+  }
+  #[test]
+  fn undo_and_redo_of_a_spilled_group_return_the_tracked_selection() {
+    let content = tracked_doc();
+    for ends in selections(&content) {
+      let rig = Rig::new(&content, 8);
+      // Delete from the first line into the third.
+      let (s, e) = (4u64, 30u64);
+      rig.range((0, 4), pair(&pos_of(&content, e)), "", "\n");
+      assert!(rig.spill_files() > 0);
+      let gone = rig.whole();
+      // Undo puts the text back: an insertion at `s` of `e - s` bytes.
+      let sections = sections_of(&[(s, s, e - s)], gone.len() as u64);
+      let ends_now = [
+        ends[0].min(gone.len() as u64),
+        ends[1].min(gone.len() as u64),
+      ];
+      let track = [pos_of(&gone, ends_now[0]), pos_of(&gone, ends_now[1])];
+      let undone =
+        history_tracked_core(&rig.state, ID, false, &track, 8, INTERVAL, &mut |_| {}).unwrap();
+      assert!(undone.reload_only);
+      let back = undone.tracked.expect("tracked");
+      assert_eq!(
+        [
+          offset_of(&rig.whole(), &back[0]),
+          offset_of(&rig.whole(), &back[1])
+        ],
+        cm_map_selection(&sections, ends_now[0], ends_now[1]),
+        "undo {ends:?}"
+      );
+      // Redo takes it out again.
+      let sections = sections_of(&[(s, e, 0)], content.len() as u64);
+      let here = [
+        offset_of(&rig.whole(), &back[0]),
+        offset_of(&rig.whole(), &back[1]),
+      ];
+      let redone =
+        history_tracked_core(&rig.state, ID, true, &back, 8, INTERVAL, &mut |_| {}).unwrap();
+      let forth = redone.tracked.expect("tracked");
+      assert_eq!(
+        [
+          offset_of(&rig.whole(), &forth[0]),
+          offset_of(&rig.whole(), &forth[1])
+        ],
+        cm_map_selection(&sections, here[0], here[1]),
+        "redo {ends:?}"
+      );
+    }
+  }
+  #[test]
+  fn a_plain_undo_with_a_typed_group_maps_the_selection_through_its_edits() {
+    let content = tracked_doc();
+    let rig = Rig::new(&content, 1 << 20);
+    rig.with(|s| s.apply(put(4, "inserted"), true, None).unwrap());
+    let typed = rig.whole();
+    let track = [pos_of(&typed, 6), pos_of(&typed, 20)];
+    let out =
+      history_tracked_core(&rig.state, ID, false, &track, CHUNK, INTERVAL, &mut |_| {}).unwrap();
+    let sections = sections_of(&[(4, 12, 0)], typed.len() as u64);
+    let want = cm_map_selection(&sections, 6, 20);
+    let back = out.tracked.expect("tracked");
+    assert_eq!(
+      [
+        offset_of(&rig.whole(), &back[0]),
+        offset_of(&rig.whole(), &back[1])
+      ],
+      want
+    );
+    assert!(!out.reload_only);
+    // Without `track` the result has none.
+    let plain = rig.redo();
+    assert!(plain.tracked.is_none());
+    assert!(!rig.with(|s| s.busy));
+  }
+  #[test]
+  fn the_tracked_field_is_left_out_of_the_json_when_there_is_none() {
+    let rig = Rig::new(b"abc\n", 1 << 20);
+    rig.with(|s| s.apply(put(0, "x"), true, None).unwrap());
+    let json = serde_json::to_value(rig.undo()).unwrap();
+    assert!(json.get("tracked").is_none());
+  }
+  // --- replace_with_spill --------------------------------------------------------
+
+  fn spill_of(rig: &Rig, bytes: &[u8]) -> SpillRef {
+    let ctx = rig.state.pass_ctx(CHUNK, INTERVAL).unwrap();
+    let mut builder = ctx.builder().unwrap();
+    builder.write_all(bytes).unwrap();
+    SpillRef {
+      file: builder.finish().unwrap(),
+      start: 0,
+      len: bytes.len() as u64,
+    }
+  }
+  fn swap(rig: &Rig, start: u64, end: u64, bytes: &[u8]) -> SpillSwap {
+    SpillSwap {
+      start,
+      end,
+      inserted: spill_of(rig, bytes),
+      pre: None,
+      removed: None,
+    }
+  }
+  #[test]
+  fn replace_with_spill_gives_the_content_a_new_state_and_one_undo_step() {
+    let content = doc(100);
+    let rig = Rig::new(&content, 16);
+    let ctx = rig.state.pass_ctx(CHUNK, INTERVAL);
+    let (before, generation) = rig.with(|s| (s.state_id, s.generation));
+    assert!(rig.with(|s| s.clean()));
+    let new = "inserted text\r\nof several lines\n".repeat(3);
+    let st = starts(&content);
+    let stats_after = rig
+      .with(|s| {
+        s.replace_with_spill(
+          swap(&rig, st[1], st[20], new.as_bytes()),
+          true,
+          ctx.as_ref(),
+        )
+      })
+      .unwrap();
+    assert!(!stats_after.clean, "a changed content is not the saved one");
+    assert_eq!(stats_after.generation, generation + 1);
+    rig.with(|s| {
+      assert_ne!(s.state_id, before);
+      assert!(!s.seal_group);
+      assert_eq!(s.undo_stack.len(), 1);
+      assert!(s.redo_stack.is_empty());
+    });
+    let mut want = content.clone();
+    want.splice(st[1] as usize..st[20] as usize, new.bytes());
+    assert_doc(&rig, &want, "replaced");
+    rig.save();
+    assert!(rig.with(|s| s.clean()));
+    let undone = rig.undo();
+    assert!(!undone.clean);
+    assert_doc(&rig, &content, "undone");
+    let redone = rig.redo();
+    assert!(redone.clean, "back at the saved content");
+    assert_doc(&rig, &want, "redone");
+  }
+  #[test]
+  fn a_failure_to_build_the_removal_leaves_the_table_the_journal_and_the_state_alone() {
+    let content = doc(100);
+    let rig = Rig::new(&content, 16);
+    let ctx = rig.state.pass_ctx(CHUNK, INTERVAL);
+    rig.with(|s| s.apply(put(3, "typed"), true, None).unwrap());
+    let before = rig.marks();
+    let table = rig.with(|s| (s.table.add_len(), s.table.spills_registered()));
+    let typed = rig.whole();
+    // The run is the first spill file made, the removal the second.
+    let inserted = spill_of(&rig, b"0123456789abcdef0123456789abcdef");
+    stats::fail_create_at(1);
+    let err = rig
+      .with(|s| {
+        s.replace_with_spill(
+          SpillSwap {
+            start: starts(&typed)[2],
+            end: starts(&typed)[30],
+            inserted,
+            pre: None,
+            removed: None,
+          },
+          true,
+          ctx.as_ref(),
+        )
+      })
+      .unwrap_err();
+    stats::fail_create_at(0);
+    assert_eq!(err, "injected spill failure");
+    assert_eq!(rig.marks(), before);
+    assert_eq!(
+      rig.with(|s| (s.table.add_len(), s.table.spills_registered())),
+      table
+    );
+    assert_doc(&rig, &typed, "unchanged");
+    assert!(rig.with(|s| s.undo_stack.last().is_some()));
+    assert_eq!(rig.spill_files(), 0, "nothing left behind");
+  }
+  #[test]
+  fn an_indent_whose_second_spill_cannot_be_made_changes_nothing() {
+    let content = doc(300);
+    let rig = Rig::new(&content, 16);
+    let before = rig.marks();
+    // The result is the first file, the removal the second.
+    stats::fail_create_at(2);
+    let err = rig
+      .try_indent((0, 0), end_of(&rig), false, "\n", (0, 10), &mut |_| {})
+      .unwrap_err();
+    stats::fail_create_at(0);
+    assert_eq!(err, "injected spill failure");
+    assert_eq!(rig.marks(), before);
+    assert_doc(&rig, &content, "unchanged");
+    assert_eq!(rig.spill_files(), 0, "nothing left behind");
+  }
+  #[test]
+  fn an_empty_selection_and_a_selection_inside_one_line_indent_that_line() {
+    let rig = Rig::new(b"a\nb\nc\n", 1 << 20);
+    let result = rig.indent((1, 1), (1, 1), false, "\n", (0, 5));
+    assert_eq!(rig.whole(), b"a\n  b\nc\n");
+    assert_eq!((result.anchor.line, result.anchor.col), (1, 3));
+    assert_eq!((result.head.line, result.head.col), (1, 3));
+    let result = rig.indent((1, 2), (1, 3), true, "\n", (0, 5));
+    assert_eq!(rig.whole(), b"a\nb\nc\n");
+    assert_eq!((result.anchor.line, result.anchor.col), (1, 0));
+    assert_eq!((result.head.line, result.head.col), (1, 1));
+    // An empty last line is a line too.
+    let rig = Rig::new(b"a\n", 1 << 20);
+    rig.indent((1, 0), (1, 0), false, "\n", (0, 5));
+    assert_eq!(rig.whole(), b"a\n  ");
+  }
+  #[test]
+  fn a_tracked_replace_all_without_a_hit_keeps_the_selection_and_an_empty_undo_fails_cleanly() {
+    let content = tracked_doc();
+    let rig = Rig::new(&content, 1 << 20);
+    let track = [pos_of(&content, 5), pos_of(&content, 30)];
+    let out = replace_all_tracked_core(
+      &rig.state,
+      &rig.dir.path().join("lists"),
+      ID,
+      "nomatch",
+      true,
+      "x",
+      "\n",
+      CHUNK,
+      INTERVAL,
+      &mut |_| {},
+      Some(&track),
+    )
+    .unwrap();
+    assert_eq!(out.count, 0);
+    assert_eq!(out.tracked, Some(track));
+    let err = history_tracked_core(&rig.state, ID, false, &track, CHUNK, INTERVAL, &mut |_| {})
+      .unwrap_err();
+    assert_eq!(err, NOTHING_TO_UNDO);
+    assert!(!rig.with(|s| s.busy));
+    assert!(rig.state.lock_idle(ID).is_ok());
+  }
+  // --- clip_copy_session -----------------------------------------------------
+  /// Lines of CRLF and LF text with multi-byte characters, a lone CR, an emoji,
+  /// and a last line with no break.
+  fn clip_doc() -> Vec<u8> {
+    let mut content = doc(700);
+    content.extend_from_slice("lone\rcr \u{1F600} end\r".as_bytes());
+    content.extend_from_slice("tail".as_bytes());
+    content
+  }
+  fn clip_dir(rig: &Rig) -> std::path::PathBuf {
+    rig.dir.path().join("spills")
+  }
+  fn clip_files(rig: &Rig) -> Vec<std::path::PathBuf> {
+    fs::read_dir(clip_dir(rig)).map_or_else(
+      |_| Vec::new(),
+      |entries| {
+        entries
+          .flatten()
+          .filter(|e| e.file_name().to_string_lossy().starts_with("clip-"))
+          .map(|e| e.path())
+          .collect()
+      },
+    )
+  }
+  fn try_clip(
+    rig: &Rig,
+    a: (u64, u64),
+    h: (u64, u64),
+    linewise: bool,
+    between: &mut dyn FnMut(usize),
+  ) -> Result<Written, String> {
+    clip_copy_session_core(
+      &rig.state,
+      ID,
+      &pos(a),
+      &pos(h),
+      linewise,
+      CHUNK,
+      INTERVAL,
+      between,
+    )
+  }
+  /// The offsets of two ends, read the plain way.
+  fn offsets_of(rig: &Rig, a: (u64, u64), h: (u64, u64)) -> (usize, usize) {
+    rig.with(|s| {
+      let (x, y) = (
+        pos_to_offset(&s.table, a.0, a.1).unwrap(),
+        pos_to_offset(&s.table, h.0, h.1).unwrap(),
+      );
+      (x.min(y) as usize, x.max(y) as usize)
+    })
+  }
+  #[test]
+  fn a_clip_holds_the_text_between_the_ends_exactly() {
+    let content = clip_doc();
+    let rig = Rig::new(&content, 1 << 20);
+    let end = end_of(&rig);
+    let cases = [
+      ((0, 0), end),
+      (end, (0, 0)),
+      ((3, 2), (1400, 3)),
+      ((10, 0), (10, 0)),
+      ((1399, 4), (1401, 6)),
+      ((700, 0), (1300, 9)),
+      ((1400, 2), (1400, 8)),
+    ];
+    for (a, h) in cases {
+      let made = try_clip(&rig, a, h, false, &mut |_| {}).unwrap();
+      let (x, y) = offsets_of(&rig, a, h);
+      let want = &content[x..y];
+      assert_eq!(fs::read(&made.path).unwrap(), want, "{a:?} to {h:?}");
+      let text = String::from_utf8(want.to_vec()).unwrap();
+      assert_eq!(made.info.bytes, want.len() as u64);
+      assert_eq!(made.info.utf16_len, text.encode_utf16().count() as u64);
+      let lines = match want.len() {
+        0 => 0,
+        _ => crate::line_rule::count_breaks(want) + 1,
+      };
+      assert_eq!(made.info.lines, lines, "{a:?} to {h:?}");
+      assert!(!made.info.linewise);
+      let name = made
+        .path
+        .file_name()
+        .unwrap()
+        .to_string_lossy()
+        .into_owned();
+      assert!(name.starts_with(&format!("clip-{}-", std::process::id())));
+      fs::remove_file(&made.path).unwrap();
+    }
+    assert_eq!(rig.whole(), content, "the session is untouched");
+    let made = try_clip(&rig, (4, 0), (4, 5), true, &mut |_| {}).unwrap();
+    assert!(made.info.linewise);
+  }
+  #[test]
+  fn a_clip_leaves_the_session_idle_and_as_it_was() {
+    let content = clip_doc();
+    let rig = Rig::new(&content, 1 << 20);
+    let before = rig.marks();
+    try_clip(&rig, (0, 0), end_of(&rig), false, &mut |_| {}).unwrap();
+    assert_eq!(rig.marks(), before);
+    assert!(rig.state.lock_idle(ID).is_ok());
+    // An unknown session is refused, and leaves no file behind.
+    let err = clip_copy_session_core(
+      &rig.state,
+      OTHER,
+      &pos((0, 0)),
+      &pos((1, 0)),
+      false,
+      CHUNK,
+      INTERVAL,
+      &mut |_| {},
+    )
+    .unwrap_err();
+    assert_eq!(err, UNKNOWN_SESSION);
+    assert_eq!(clip_files(&rig).len(), 1);
+  }
+  #[test]
+  fn a_clip_is_read_in_blocks() {
+    let content = clip_doc();
+    let rig = Rig::new(&content, 1 << 20);
+    stats::reset();
+    try_clip(&rig, (0, 0), end_of(&rig), false, &mut |_| {}).unwrap();
+    let seen = stats::get();
+    assert!(
+      seen.max_read <= CHUNK,
+      "asked for {} at once",
+      seen.max_read
+    );
+    assert!(seen.total_read >= content.len() as u64);
+  }
+  #[test]
+  fn another_session_reads_while_a_clip_is_copied_and_this_one_waits() {
+    let content = doc(300);
+    let rig = Rig::new(&content, 1 << 20);
+    rig.open(OTHER, "b.txt", b"other\nfile\n");
+    let before = generation_now(&rig);
+    let (result, total, early, at_pause) = paused_probe(
+      6,
+      |between| try_clip(&rig, (0, 0), (500, 0), false, between),
+      || read_other(&rig),
+      || (generation_now(&rig), rig.with(|s| s.busy)),
+    );
+    result.unwrap();
+    assert_eq!(total, 11);
+    assert!(early, "the other session must not wait for the copy");
+    assert_eq!(at_pause.0, before, "stopped mid-copy with the lock free");
+    assert!(at_pause.1, "the session is busy while it is copied");
+    let (result, (), early) = paused(
+      6,
+      |between| try_clip(&rig, (0, 0), (500, 0), false, between),
+      || wait_on_session(&rig),
+    );
+    result.unwrap();
+    assert!(!early, "this session waits for the copy");
+    assert!(!rig.with(|s| s.busy), "and is idle again when it is done");
+  }
+  #[test]
+  fn converting_the_ends_of_a_clip_in_a_long_line_does_not_hold_the_lock() {
+    let rig = long_line_rig();
+    let before = generation_now(&rig);
+    let (result, total, early, at_pause) = paused_probe(
+      2,
+      |between| try_clip(&rig, (1, 1500), (1, 1502), false, between),
+      || read_other(&rig),
+      || generation_now(&rig),
+    );
+    let made = result.unwrap();
+    assert_eq!(total, 11);
+    assert!(early, "a clip converts without the lock");
+    assert_eq!(at_pause, before);
+    let (x, y) = offsets_of(&rig, (1, 1500), (1, 1502));
+    assert_eq!(fs::read(&made.path).unwrap(), rig.whole()[x..y].to_vec());
+  }
+  #[test]
+  fn a_change_during_a_clip_copy_fails_it_and_leaves_no_file() {
+    let content = doc(300);
+    let rig = Rig::new(&content, 1 << 20);
+    let mut changed = false;
+    let err = try_clip(&rig, (0, 0), (500, 0), false, &mut |block| {
+      if block == 3 && !changed {
+        changed = true;
+        rig.with(|s| s.apply(put(0, "x"), true, None).unwrap());
+      }
+    })
+    .unwrap_err();
+    assert_eq!(err, PASS_CHANGED);
+    assert!(clip_files(&rig).is_empty());
+    assert!(!rig.with(|s| s.busy));
+  }
+  #[test]
+  fn without_a_folder_a_clip_reads_nothing() {
+    let content = clip_doc();
+    let rig = Rig::without_folder(&content);
+    let before = rig.marks();
+    let end = end_of(&rig);
+    stats::reset();
+    let err = try_clip(&rig, (0, 0), end, false, &mut |_| {}).unwrap_err();
+    assert_eq!(err, no_folder());
+    assert_eq!(stats::get().total_read, 0);
+    assert_eq!(rig.marks(), before);
+  }
+  #[test]
+  fn copying_sixty_four_mebibytes_holds_a_few_buffers() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("big.txt");
+    let line = format!("{}\n", "x".repeat(63));
+    let content = line.repeat(1 << 20);
+    fs::write(&path, &content).unwrap();
+    let (table, _, fingerprint, index, digest) = build_table(&path).unwrap();
+    let state = WindowedState::new(Some(dir.path().join("spills")));
+    state.sessions.lock().unwrap().insert(
+      ID,
+      Session::new(table, path.clone(), fingerprint, index, digest),
+    );
+    let before = crate::test_alloc::live();
+    crate::test_alloc::reset_peak();
+    let made = clip_copy_session_core(
+      &state,
+      ID,
+      &pos((0, 0)),
+      &pos((1 << 20, 0)),
+      false,
+      SCAN_CHUNK,
+      CHECKPOINT_INTERVAL,
+      &mut |_| {},
+    )
+    .unwrap();
+    let peak = crate::test_alloc::peak() - before;
+    assert!(peak <= 4 << 20, "peak {peak}");
+    assert_eq!(made.info.bytes, content.len() as u64);
+    assert_eq!(made.info.lines, (1 << 20) + 1);
+    assert_eq!(fs::read(&made.path).unwrap(), content.as_bytes());
+  }
+  // --- windowed_paste_clip, windowed_paste_system, clip_read_chunk ----------------
+  /// `text` with every line break (`\r\n`, a lone `\r`, `\n`) written `sep`.
+  fn breaks_as(text: &[u8], sep: &str) -> Vec<u8> {
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < text.len() {
+      match text[i] {
+        b'\r' => {
+          out.extend_from_slice(sep.as_bytes());
+          if text.get(i + 1) == Some(&b'\n') {
+            i += 1;
+          }
+        }
+        b'\n' => out.extend_from_slice(sep.as_bytes()),
+        byte => out.push(byte),
+      }
+      i += 1;
+    }
+    out
+  }
+  /// `flat` with `[start, end)` replaced by `text`.
+  fn replaced(flat: &[u8], start: usize, end: usize, text: &[u8]) -> Vec<u8> {
+    [&flat[..start], text, &flat[end..]].concat()
+  }
+  const SOURCE_FILE: &str = include_str!("windowed.rs");
+  fn paste_file(rig: &Rig, text: &[u8]) -> std::path::PathBuf {
+    let path = rig.dir.path().join("paste.txt");
+    fs::write(&path, text).unwrap();
+    path
+  }
+  fn try_paste_with(
+    rig: &Rig,
+    a: (u64, u64),
+    h: (u64, u64),
+    text: &[u8],
+    linewise: bool,
+    sep: &str,
+    between: &mut dyn FnMut(usize),
+  ) -> Result<RangeResult, String> {
+    let path = paste_file(rig, text);
+    paste_clip_core(
+      &rig.state,
+      ID,
+      &pos(a),
+      &pos(h),
+      &|| Ok(Arc::new(File::open(&path).unwrap())),
+      linewise,
+      sep,
+      true,
+      CHUNK,
+      INTERVAL,
+      between,
+    )
+  }
+  fn try_paste(
+    rig: &Rig,
+    a: (u64, u64),
+    h: (u64, u64),
+    text: &[u8],
+    linewise: bool,
+    sep: &str,
+  ) -> Result<RangeResult, String> {
+    try_paste_with(rig, a, h, text, linewise, sep, &mut |_| {})
+  }
+  /// The byte offset of a position handed back, in the session as it is now.
+  fn offset_now(rig: &Rig, at: &Pos) -> u64 {
+    rig.with(|s| pos_to_offset(&s.table, at.line, at.col).unwrap())
+  }
+  /// Texts whose breaks fall on and around the 16 byte blocks they are read in.
+  fn paste_texts() -> Vec<Vec<u8>> {
+    let mut texts: Vec<Vec<u8>> = [
+      "plain",
+      "a\nb\nc",
+      "a\r\nb\r\n",
+      "a\rb\rc",
+      "x\r\ny\rz\nw",
+      "\nfirst",
+      "last\r",
+      "\r\n",
+      "0123456789abcde\r\nfg",
+      "0123456789abcd\r\r\nfg",
+      "0123456789abcdé\r\nfg",
+      "日本語のテキスト\r\n二行目\r三行目\n😀😀😀😀😀\r\n",
+    ]
+    .iter()
+    .map(|t| t.as_bytes().to_vec())
+    .collect();
+    // A break on every block edge, whatever the block.
+    for edge in 13..19 {
+      let mut text = "x".repeat(edge).into_bytes();
+      text.extend_from_slice(b"\r\nyy\r\n");
+      texts.push(text);
+    }
+    texts
+  }
+
+  #[test]
+  fn a_pasted_clip_takes_the_separator_of_the_file_whatever_its_own_breaks() {
+    let content = doc(40);
+    for sep in ["\n", "\r\n"] {
+      for text in paste_texts() {
+        for (a, h) in [
+          ((3, 2), (3, 2)),
+          ((5, 0), (9, 3)),
+          ((0, 0), (0, 0)),
+          ((79, 3), (80, 0)),
+        ] {
+          let rig = Rig::new(&content, 1 << 20);
+          let (x, y) = offsets_of(&rig, a, h);
+          let result = try_paste(&rig, a, h, &text, false, sep).unwrap();
+          let ins = breaks_as(&text, sep);
+          let want = replaced(&content, x, y, &ins);
+          let what = format!("{sep:?} {:?} {a:?}-{h:?}", String::from_utf8_lossy(&text));
+          assert_doc(&rig, &want, &what);
+          assert_eq!(
+            offset_now(&rig, &result.cursor),
+            (x + ins.len()) as u64,
+            "{what}: cursor"
+          );
+          assert_eq!(result.total_bytes, want.len() as u64, "{what}");
+          for p in [0, content.len() as u64] {
+            let moved = if p >= y as u64 {
+              p + ins.len() as u64 - (y - x) as u64
+            } else {
+              p
+            };
+            assert_eq!(front_through(p, &result.edits), moved, "{what}: offset {p}");
+          }
+          assert!(!rig.with(|s| s.busy));
+        }
+      }
+    }
+  }
+
+  #[test]
+  fn a_clip_beginning_with_a_break_after_a_lone_cr_rewrites_the_cr() {
+    let rig = Rig::new(b"ab\rcd", 1 << 20);
+    let result = try_paste(&rig, (1, 0), (1, 0), b"\nq", false, "\n").unwrap();
+    assert_eq!(rig.whole(), b"ab\n\nqcd");
+    assert_eq!(result.edits.len(), 2);
+    assert_eq!(offset_now(&rig, &result.cursor), 5);
+  }
+
+  #[test]
+  fn a_line_wise_clip_goes_above_the_caret_line_and_ends_in_a_break() {
+    let content = b"aa\nbb cc\r\ndd\n";
+    for sep in ["\n", "\r\n"] {
+      let rig = Rig::new(content, 1 << 20);
+      let (head, _) = offsets_of(&rig, (1, 3), (1, 3));
+      let result = try_paste(&rig, (1, 3), (1, 3), b"one\ntwo", true, sep).unwrap();
+      let ins = format!("one{sep}two{sep}");
+      let want = replaced(content, 3, 3, ins.as_bytes());
+      assert_doc(&rig, &want, "line-wise");
+      assert_eq!(
+        offset_now(&rig, &result.cursor),
+        (head + ins.len()) as u64,
+        "the caret moves down with its line"
+      );
+      assert_eq!(result.edits.len(), 1);
+      assert_eq!((result.edits[0].start, result.edits[0].end), (3, 3));
+      assert_eq!(result.edits[0].text, ins);
+      // A clip that already ends in a break keeps it and gets one more.
+      let rig = Rig::new(content, 1 << 20);
+      try_paste(&rig, (0, 1), (0, 1), b"x\n", true, sep).unwrap();
+      assert_eq!(
+        rig.whole(),
+        [format!("x{sep}{sep}").as_bytes(), content].concat()
+      );
+    }
+    // A selection is not a caret.
+    let rig = Rig::new(content, 1 << 20);
+    let before = rig.marks();
+    assert!(try_paste(&rig, (0, 0), (1, 0), b"x", true, "\n").is_err());
+    assert_eq!(rig.marks(), before);
+  }
+
+  #[test]
+  fn a_pasted_clip_past_the_threshold_is_a_spill_and_undoes_redoes_and_saves_exactly() {
+    let content = doc(60);
+    let rig = Rig::new(&content, 64);
+    let text = "新しい行\r\nsecond\rthird\nfourth line of it\r\n".repeat(6);
+    let (a, h) = ((2, 0), (30, 0));
+    let (x, y) = offsets_of(&rig, a, h);
+    stats::reset();
+    let result = try_paste(&rig, a, h, text.as_bytes(), false, "\r\n").unwrap();
+    let seen = stats::get();
+    assert!(seen.max_read <= CHUNK, "read {}", seen.max_read);
+    assert!(seen.max_write <= CHUNK, "wrote {}", seen.max_write);
+    let ins = breaks_as(text.as_bytes(), "\r\n");
+    let want = replaced(&content, x, y, &ins);
+    assert_doc(&rig, &want, "pasted");
+    assert_eq!(rig.with(|s| s.table.spill_piece_count()), 1);
+    assert_eq!(rig.spill_files(), 2, "the removal and the pasted text");
+    assert_eq!(result.edits.len(), 1);
+    assert_eq!(result.edits[0].text, "");
+    assert_eq!(result.edits[0].len, Some(ins.len() as u64));
+    assert_eq!(offset_now(&rig, &result.cursor), (x + ins.len()) as u64);
+    assert!(!result.clean);
+    let undone = rig.undo();
+    assert!(undone.reload_only);
+    assert_doc(&rig, &content, "undone");
+    let redone = rig.redo();
+    assert!(redone.reload_only);
+    assert_doc(&rig, &want, "redone");
+    rig.save();
+    assert_eq!(rig.saved(), want);
+  }
+
+  #[test]
+  fn a_clip_longer_than_the_threshold_without_a_folder_is_refused_and_changes_nothing() {
+    let rig = Rig::without_folder(&doc(10));
+    let before = rig.marks();
+    let big = vec![b'x'; spill::SPILL_MIN as usize + 1];
+    let err = try_paste(&rig, (0, 0), (0, 0), &big, false, "\n").unwrap_err();
+    assert_eq!(err, no_folder());
+    assert_eq!(rig.marks(), before);
+  }
+
+  #[test]
+  fn pasting_never_holds_the_clip_in_memory() {
+    let content = doc(20);
+    let rig = Rig::new(&content, 64);
+    let text = "a long line of pasted text\r\n".repeat(4000);
+    let path = paste_file(&rig, text.as_bytes());
+    crate::test_alloc::reset_largest();
+    paste_clip_core(
+      &rig.state,
+      ID,
+      &pos((3, 0)),
+      &pos((3, 0)),
+      &|| Ok(Arc::new(File::open(&path).unwrap())),
+      false,
+      "\n",
+      true,
+      CHUNK,
+      1 << 20,
+      &mut |_| {},
+    )
+    .unwrap();
+    let largest = crate::test_alloc::largest();
+    assert!(
+      largest < 8 * 1024,
+      "one allocation of {largest} bytes for a clip of {}",
+      text.len()
+    );
+    assert_eq!(rig.whole().len(), content.len() + text.len() - 4000);
+  }
+
+  #[test]
+  fn pasting_a_clip_of_thirty_two_mebibytes_holds_a_few_buffers() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("big.txt");
+    fs::write(&path, "start\n").unwrap();
+    let (table, _, fingerprint, index, digest) = build_table(&path).unwrap();
+    let state = WindowedState::new(Some(dir.path().join("spills")));
+    state.sessions.lock().unwrap().insert(
+      ID,
+      Session::new(table, path.clone(), fingerprint, index, digest),
+    );
+    let clip = dir.path().join("clip.txt");
+    let line = format!("{}\r\n", "x".repeat(62));
+    fs::write(&clip, line.repeat(1 << 19)).unwrap();
+    let before = crate::test_alloc::live();
+    crate::test_alloc::reset_peak();
+    let result = paste_clip_core(
+      &state,
+      ID,
+      &pos((1, 0)),
+      &pos((1, 0)),
+      &|| Ok(Arc::new(File::open(&clip).unwrap())),
+      false,
+      "\n",
+      true,
+      SCAN_CHUNK,
+      CHECKPOINT_INTERVAL,
+      &mut |_| {},
+    )
+    .unwrap();
+    let peak = crate::test_alloc::peak() - before;
+    assert!(peak <= 4 << 20, "peak {peak}");
+    assert_eq!(result.total_bytes, 6 + (1 << 19) * 63);
+    assert_eq!(result.total_lines, (1 << 19) + 2);
+  }
+
+  #[test]
+  fn a_paste_of_a_pin_that_is_gone_changes_nothing() {
+    let rig = Rig::new(&doc(20), 1 << 20);
+    let before = rig.marks();
+    let whole = rig.whole();
+    let err = paste_clip_core(
+      &rig.state,
+      ID,
+      &pos((1, 0)),
+      &pos((2, 0)),
+      &|| Err("pin-gone".to_string()),
+      false,
+      "\n",
+      true,
+      CHUNK,
+      INTERVAL,
+      &mut |_| {},
+    )
+    .unwrap_err();
+    assert_eq!(err, "pin-gone");
+    assert_eq!(rig.marks(), before);
+    assert_eq!(rig.whole(), whole);
+  }
+  /// A reader that fails every read.
+  struct Unreadable;
+
+  impl Read for Unreadable {
+    fn read(&mut self, _: &mut [u8]) -> std::io::Result<usize> {
+      Err(std::io::Error::new(
+        std::io::ErrorKind::PermissionDenied,
+        "no access",
+      ))
+    }
+  }
+
+  fn paste_from(rig: &Rig, source: &mut dyn Read) -> Result<RangeResult, String> {
+    paste_core(
+      &rig.state,
+      ID,
+      &pos((1, 0)),
+      &pos((2, 0)),
+      false,
+      source,
+      "\n",
+      true,
+      CHUNK,
+      INTERVAL,
+      &mut |_| {},
+    )
+  }
+
+  #[test]
+  fn a_clip_that_cannot_be_read_fails_with_the_read_prefix_and_changes_nothing() {
+    let rig = Rig::new(&doc(20), 1 << 20);
+    let before = rig.marks();
+    let whole = rig.whole();
+    let err = paste_from(&rig, &mut Unreadable).unwrap_err();
+    assert_eq!(err, "clip-read: no access");
+    assert_eq!(rig.marks(), before);
+    assert_eq!(rig.whole(), whole);
+    let mut half = (&b"some text\n"[..]).chain(Unreadable);
+    let err = paste_from(&rig, &mut half).unwrap_err();
+    assert_eq!(err, "clip-read: no access");
+    assert_eq!(rig.marks(), before);
+    assert_eq!(rig.whole(), whole);
+  }
+
+  #[test]
+  fn a_failed_write_of_a_paste_does_not_carry_the_read_prefix() {
+    let rig = Rig::without_folder(&doc(10));
+    let big = vec![b'x'; spill::SPILL_MIN as usize + 1];
+    let err = paste_from(&rig, &mut &big[..]).unwrap_err();
+    assert_eq!(err, no_folder());
+    assert!(!err.starts_with(CLIP_READ));
+  }
+
+  #[test]
+  fn a_piece_of_a_clip_that_cannot_be_read_fails_with_the_read_prefix() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("clip.txt");
+    fs::write(&path, "abc\r").unwrap();
+    let open = || Ok(Arc::new(File::open(&path).unwrap()));
+    let denied = |_: &File, _: &mut [u8], _: u64| -> std::io::Result<usize> {
+      Err(std::io::Error::other("no access"))
+    };
+    let err = read_chunk_with(&open, &denied, 0, 4).unwrap_err();
+    assert_eq!(err, "clip-read: no access");
+    // The look at the byte after a final cr is a read of its own.
+    let denied_peek = |file: &File, buf: &mut [u8], at: u64| {
+      if buf.len() == 1 {
+        Err(std::io::Error::other("no access"))
+      } else {
+        clipboard_store::read_at(file, buf, at)
+      }
+    };
+    let err = read_chunk_with(&open, &denied_peek, 0, 4).unwrap_err();
+    assert_eq!(err, "clip-read: no access");
+    let piece = read_chunk_with(&open, &clipboard_store::read_at, 0, 4).unwrap();
+    assert_eq!((piece.text.as_str(), piece.next), ("abc\n", 4));
+  }
+
+  #[test]
+  fn a_paste_waits_for_a_running_pass_and_lands_after_it() {
+    let content = doc(300);
+    let rig = Rig::new(&content, CHUNK as u64);
+    let (removed, pasted, early) = paused(
+      4,
+      |between| {
+        replace_range_core(
+          &rig.state,
+          ID,
+          &pos((10, 0)),
+          &pos((400, 0)),
+          "",
+          "\n",
+          true,
+          CHUNK,
+          INTERVAL,
+          between,
+        )
+      },
+      || try_paste(&rig, (0, 0), (0, 0), b"head\n", false, "\n"),
+    );
+    removed.unwrap();
+    pasted.unwrap();
+    assert!(!early, "the paste waits for the pass");
+    assert!(rig.whole().starts_with(b"head\n"));
+    assert!(!rig.with(|s| s.busy));
+  }
+
+  #[test]
+  fn another_session_reads_while_a_clip_is_pasted() {
+    let content = doc(300);
+    let rig = Rig::new(&content, CHUNK as u64);
+    rig.open(OTHER, "b.txt", b"other\nfile\n");
+    let text = "pasted line\r\n".repeat(50);
+    let (result, total, early) = paused(
+      3,
+      |between| {
+        try_paste_with(
+          &rig,
+          (10, 0),
+          (200, 0),
+          text.as_bytes(),
+          false,
+          "\n",
+          between,
+        )
+      },
+      || read_other(&rig),
+    );
+    result.unwrap();
+    assert_eq!(total, 11);
+    assert!(early, "the other session must not wait for the paste");
+  }
+
+  fn system_of(text: Option<&str>) -> impl Fn() -> Result<SystemText, String> {
+    let text = text.map(str::to_string);
+    move || Ok(SystemText::Text(text.clone()))
+  }
+  fn paste_system(
+    rig: &Rig,
+    a: (u64, u64),
+    h: (u64, u64),
+    system: &dyn Fn() -> Result<SystemText, String>,
+    sep: &str,
+  ) -> Result<RangeResult, String> {
+    paste_system_core(
+      &rig.state,
+      ID,
+      &pos(a),
+      &pos(h),
+      system,
+      sep,
+      true,
+      CHUNK,
+      INTERVAL,
+      &mut |_| {},
+    )
+  }
+
+  #[test]
+  fn pasted_system_text_takes_the_separator_of_the_file() {
+    let content = doc(40);
+    for sep in ["\n", "\r\n"] {
+      for text in paste_texts() {
+        let text = String::from_utf8(text).unwrap();
+        let rig = Rig::new(&content, 1 << 20);
+        let (x, y) = offsets_of(&rig, (5, 1), (9, 3));
+        let result = paste_system(&rig, (5, 1), (9, 3), &system_of(Some(&text)), sep).unwrap();
+        let ins = breaks_as(text.as_bytes(), sep);
+        assert_doc(
+          &rig,
+          &replaced(&content, x, y, &ins),
+          &format!("{sep:?} {text:?}"),
+        );
+        assert_eq!(offset_now(&rig, &result.cursor), (x + ins.len()) as u64);
+      }
+    }
+  }
+
+  #[test]
+  fn system_text_past_the_threshold_is_a_spill_read_in_blocks() {
+    let content = doc(30);
+    let rig = Rig::new(&content, 64);
+    let text = "from another app\r\nwith lines\r".repeat(40);
+    stats::reset();
+    crate::test_alloc::reset_largest();
+    let (x, y) = offsets_of(&rig, (4, 0), (4, 0));
+    paste_system(&rig, (4, 0), (4, 0), &system_of(Some(&text)), "\r\n").unwrap();
+    assert!(stats::get().max_write <= CHUNK);
+    let largest = crate::test_alloc::largest();
+    assert!(largest < 8 * 1024, "one allocation of {largest} bytes");
+    assert_eq!(rig.with(|s| s.table.spill_piece_count()), 1);
+    let ins = breaks_as(text.as_bytes(), "\r\n");
+    assert_doc(&rig, &replaced(&content, x, y, &ins), "pasted");
+  }
+
+  #[test]
+  fn pasting_system_text_of_thirty_two_mebibytes_adds_a_few_buffers() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("big.txt");
+    fs::write(&path, "start\n").unwrap();
+    let (table, _, fingerprint, index, digest) = build_table(&path).unwrap();
+    let state = WindowedState::new(Some(dir.path().join("spills")));
+    state.sessions.lock().unwrap().insert(
+      ID,
+      Session::new(table, path.clone(), fingerprint, index, digest),
+    );
+    let text = std::cell::RefCell::new(Some(format!("{}\r\n", "x".repeat(62)).repeat(1 << 19)));
+    let before = crate::test_alloc::live();
+    crate::test_alloc::reset_peak();
+    let result = paste_system_core(
+      &state,
+      ID,
+      &pos((1, 0)),
+      &pos((1, 0)),
+      &|| Ok(SystemText::Text(text.borrow_mut().take())),
+      "\n",
+      true,
+      SCAN_CHUNK,
+      CHECKPOINT_INTERVAL,
+      &mut |_| {},
+    )
+    .unwrap();
+    let peak = crate::test_alloc::peak() - before;
+    assert!(peak <= 4 << 20, "peak {peak} on top of the text itself");
+    assert_eq!(result.total_bytes, 6 + (1 << 19) * 63);
+  }
+
+  #[test]
+  fn no_system_text_changes_nothing_and_a_clip_of_ours_is_refused_to_be_text() {
+    let rig = Rig::new(&doc(20), 1 << 20);
+    let before = rig.marks();
+    let whole = rig.whole();
+    for none in [None, Some("")] {
+      let result = paste_system(&rig, (1, 1), (3, 2), &system_of(none), "\n").unwrap();
+      assert!(result.edits.is_empty());
+      assert_eq!(result.total_bytes, whole.len() as u64);
+      assert_eq!(rig.whole(), whole, "the selection is not deleted");
+      assert_eq!(rig.marks(), before);
+    }
+    let err = paste_system(&rig, (1, 1), (3, 2), &|| Ok(SystemText::Ours), "\n").unwrap_err();
+    assert_eq!(err, "ours");
+    assert_eq!(rig.marks(), before);
+    let err = paste_system(&rig, (1, 1), (3, 2), &|| Err("no".to_string()), "\n").unwrap_err();
+    assert_eq!(err, "no");
+    assert_eq!(rig.marks(), before);
+  }
+  /// All of a clip as `clip_read_chunk` hands it out, `max` bytes at most per piece.
+  fn read_all(path: &Path, len: usize, max: usize) -> String {
+    let mut text = String::new();
+    let mut offset = 0u64;
+    while offset < len as u64 {
+      let piece =
+        read_chunk_core(&|| Ok(Arc::new(File::open(path).unwrap())), offset, max).unwrap();
+      assert!(
+        piece.text.len() <= max,
+        "{} bytes of {max}",
+        piece.text.len()
+      );
+      assert!(piece.next > offset, "no progress at {offset}");
+      text.push_str(&piece.text);
+      offset = piece.next;
+    }
+    text
+  }
+
+  #[test]
+  fn a_clip_read_in_pieces_joins_to_the_clip_with_every_break_a_lf() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("clip.txt");
+    let mut texts = paste_texts();
+    texts.push("é日😀".repeat(30).into_bytes());
+    texts.push(b"abcdefg\r\nxyz\r\r\n\r".to_vec());
+    texts.push(b"\r".to_vec());
+    texts.push(Vec::new());
+    for text in texts {
+      fs::write(&path, &text).unwrap();
+      let want = String::from_utf8(breaks_as(&text, "\n")).unwrap();
+      for max in (4..=11).chain([64, 1 << 20]) {
+        let got = read_all(&path, text.len(), max);
+        assert_eq!(
+          got,
+          want,
+          "{:?} in pieces of {max}",
+          String::from_utf8_lossy(&text)
+        );
+      }
+    }
+  }
+
+  #[test]
+  fn a_piece_of_a_clip_ends_where_a_character_ends_and_takes_the_lf_of_its_cr() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("clip.txt");
+    let open = || Ok(Arc::new(File::open(&path).unwrap()));
+    fs::write(&path, "ab日日cd").unwrap();
+    let piece = read_chunk_core(&open, 0, 4).unwrap();
+    assert_eq!(
+      (piece.text.as_str(), piece.next),
+      ("ab", 2),
+      "日 does not fit"
+    );
+    let piece = read_chunk_core(&open, 2, 4).unwrap();
+    assert_eq!((piece.text.as_str(), piece.next), ("日", 5));
+    fs::write(&path, "abc\r\nd\re").unwrap();
+    let piece = read_chunk_core(&open, 0, 4).unwrap();
+    assert_eq!(
+      (piece.text.as_str(), piece.next),
+      ("abc\n", 5),
+      "the cr ends the piece and its lf goes with it"
+    );
+    let piece = read_chunk_core(&open, 5, 4).unwrap();
+    assert_eq!((piece.text.as_str(), piece.next), ("d\ne", 8));
+    let piece = read_chunk_core(&open, 8, 4).unwrap();
+    assert_eq!((piece.text.as_str(), piece.next), ("", 8), "past the end");
+    fs::write(&path, "abc\r\r").unwrap();
+    let piece = read_chunk_core(&open, 0, 4).unwrap();
+    assert_eq!((piece.text.as_str(), piece.next), ("abc\n", 4), "a lone cr");
+  }
+
+  #[test]
+  fn a_piece_of_a_pin_that_is_gone_reads_nothing() {
+    let err = read_chunk_core(&|| Err("pin-gone".to_string()), 0, CLIP_CHUNK).unwrap_err();
+    assert_eq!(err, "pin-gone");
+    assert_eq!(CLIP_CHUNK, 1024 * 1024);
+  }
+
+  #[test]
+  fn a_pinned_clip_is_read_whole_after_its_file_is_gone_and_by_readers_at_once() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("clip.txt");
+    let text = "line \u{1F600}\r\n".repeat(400);
+    fs::write(&path, &text).unwrap();
+    let file = Arc::new(File::open(&path).unwrap());
+    // The clipboard moved on and the clip went with it.
+    fs::remove_file(&path).unwrap();
+    let want = breaks_as(text.as_bytes(), "\n");
+    std::thread::scope(|scope| {
+      let readers: Vec<_> = (0..4)
+        .map(|_| {
+          scope.spawn(|| {
+            let mut got = String::new();
+            let mut offset = 0u64;
+            while offset < text.len() as u64 {
+              let piece = read_chunk_core(&|| Ok(Arc::clone(&file)), offset, 37).unwrap();
+              got.push_str(&piece.text);
+              offset = piece.next;
+            }
+            got
+          })
+        })
+        .collect();
+      for reader in readers {
+        assert_eq!(reader.join().unwrap().as_bytes(), want);
+      }
+    });
+  }
+
+  #[test]
+  fn the_commands_of_a_paste_read_the_pin_and_never_check_the_clipboard_again() {
+    for name in ["pub fn clip_read_chunk(", "pub fn windowed_paste_clip("] {
+      let at = SOURCE_FILE.find(name).unwrap();
+      let body = &SOURCE_FILE[at..];
+      let body = &body[..body.find("\n}\n").unwrap()];
+      assert!(body.contains("clipboard_store::pinned(pin)"), "{name}");
+      assert!(!body.contains("open_clip"), "{name} must not check again");
+      assert!(!body.contains("AppHandle"), "{name}");
+    }
+  }
+  #[test]
+  fn both_clip_copies_let_go_of_their_reservation_however_they_end() {
+    for (source, name) in [
+      (include_str!("windowed.rs"), "pub fn clip_copy_session("),
+      (include_str!("large_file.rs"), "pub fn clip_copy_file("),
+    ] {
+      let at = source.find(name).unwrap();
+      let body = &source[at..];
+      let body = &body[..body.find("\n}\n").unwrap()];
+      let release = body.find("ReleaseOnDrop(reservation)").unwrap();
+      let copy = body.find("clipboard_store::copy(").unwrap();
+      assert!(
+        release < copy,
+        "{name} must hold the release before it copies"
+      );
+      assert!(body.contains("reservation: Option<u64>"));
+    }
+  }
+}
+/// Sessions over a conversion file: a paste that outgrew a document, or a file
+/// restored from one, saved in the encoding the document had.
+#[cfg(test)]
+mod converted_tests {
+  use super::*;
+  use crate::encoding::encode_text;
+  use tempfile::{tempdir, TempDir};
+
+  const ID: u64 = 1;
+  /// Small enough that a save cuts multi-byte characters at its block edges.
+  const BUF: usize = 5;
+  const TEXT: &str = "日本語のテキスト\r\n二行目 abc\r\n三行目\r\n";
+
+  struct Rig {
+    dir: TempDir,
+    state: WindowedState,
+    converts: ConvertStore,
+  }
+
+  impl Rig {
+    fn new() -> Rig {
+      let dir = tempdir().unwrap();
+      let tmp = dir.path().join("windowed-tmp");
+      Rig {
+        state: WindowedState::new(Some(tmp.clone())),
+        converts: ConvertStore::new(Some(tmp)),
+        dir,
+      }
+    }
+    fn target(&self, name: &str) -> PathBuf {
+      let path = self.dir.path().join(name);
+      fs::write(&path, "the old file").unwrap();
+      path
+    }
+    /// A finished conversion of `text`.
+    fn convert(&self, text: &str) -> String {
+      let id = self.converts.begin(None, "\r\n").unwrap();
+      self.converts.append(&id, text).unwrap();
+      self.converts.finish(&id).unwrap();
+      id
+    }
+    /// A session over a conversion of `text`, as session `ID`.
+    fn open(
+      &self,
+      text: &str,
+      target: Option<&Path>,
+      encoding: &str,
+      bom: bool,
+      dirty: bool,
+    ) -> OpenResult {
+      let tmp = self.converts.take(&self.convert(text)).unwrap();
+      let (id, session, result) = open_converted_session(
+        &AtomicU64::new(ID),
+        tmp,
+        target.map(Path::to_path_buf),
+        encoding.to_string(),
+        bom,
+        dirty,
+      )
+      .unwrap();
+      self.state.sessions.lock().unwrap().insert(id, session);
+      result
+    }
+    fn with<R>(&self, f: impl FnOnce(&mut Session) -> R) -> R {
+      f(self.state.sessions.lock().unwrap().get_mut(&ID).unwrap())
+    }
+    fn save(
+      &self,
+      expected: Option<Fingerprint>,
+      path: Option<&Path>,
+    ) -> Result<SaveResult, String> {
+      self.with(|s| save_session_with(s, expected, path.map(Path::to_path_buf), BUF))
+    }
+    fn whole(&self) -> Vec<u8> {
+      self.with(|s| s.table.read(0, s.table.len()).unwrap())
+    }
+    fn type_at_start(&self, text: &str) {
+      apply_core(
+        &self.state,
+        ID,
+        vec![Edit {
+          start: 0,
+          end: 0,
+          text: text.to_string(),
+          keep_start: false,
+          cascade: false,
+        }],
+        true,
+      )
+      .unwrap();
+    }
+    fn cv_files(&self) -> usize {
+      fs::read_dir(self.dir.path().join("windowed-tmp"))
+        .map(|entries| {
+          entries
+            .flatten()
+            .filter(|e| e.file_name().to_string_lossy().starts_with("cv-"))
+            .count()
+        })
+        .unwrap_or(0)
+    }
+  }
+
+  #[test]
+  fn a_dirty_conversion_is_not_clean_and_a_restored_one_is() {
+    let rig = Rig::new();
+    let target = rig.target("a.txt");
+    rig.open(TEXT, Some(&target), "UTF-8", false, true);
+    assert!(!rig.with(|s| s.clean()));
+    rig.state.sessions.lock().unwrap().clear();
+    rig.open(TEXT, Some(&target), "UTF-8", false, false);
+    assert!(rig.with(|s| s.clean()));
+  }
+
+  #[test]
+  fn a_session_has_the_targets_path_and_fingerprint_or_the_files() {
+    let rig = Rig::new();
+    let target = rig.target("a.txt");
+    let result = rig.open(TEXT, Some(&target), "Shift_JIS", false, true);
+    assert_eq!(result.fingerprint, fingerprint_of(&target).unwrap());
+    assert_eq!(result.total_bytes, TEXT.len() as u64);
+    rig.with(|s| {
+      assert_eq!(s.path, target);
+      assert!(s.conv.as_ref().unwrap().in_place);
+    });
+    rig.state.sessions.lock().unwrap().clear();
+    let result = rig.open(TEXT, None, "UTF-8", false, true);
+    rig.with(|s| {
+      let conv = s.conv.as_ref().unwrap();
+      assert!(!conv.in_place);
+      assert_eq!(s.path, conv.tmp.path());
+      assert_eq!(result.fingerprint, s.fingerprint);
+    });
+  }
+
+  #[test]
+  fn a_conversion_without_a_target_refuses_an_in_place_save() {
+    let rig = Rig::new();
+    rig.open(TEXT, None, "UTF-8", false, true);
+    let before = rig.with(|s| (s.generation, s.state_id, s.saved_state_id));
+    assert_eq!(rig.save(None, None).unwrap_err(), NO_TARGET);
+    assert_eq!(
+      rig.with(|s| (s.generation, s.state_id, s.saved_state_id)),
+      before
+    );
+    assert_eq!(rig.cv_files(), 1);
+    // Another path is fine, and from then on the session has a target.
+    let elsewhere = rig.dir.path().join("elsewhere.txt");
+    let saved = rig.save(None, Some(&elsewhere)).unwrap();
+    assert!(saved.clean);
+    assert_eq!(fs::read(&elsewhere).unwrap(), TEXT.as_bytes());
+    rig.type_at_start("x");
+    rig.save(None, None).unwrap();
+    assert_eq!(
+      fs::read(&elsewhere).unwrap(),
+      [b"x", TEXT.as_bytes()].concat()
+    );
+  }
+
+  #[test]
+  fn a_conversion_with_a_target_saves_to_it_and_compares_the_fingerprint() {
+    let rig = Rig::new();
+    let target = rig.target("a.txt");
+    let result = rig.open(TEXT, Some(&target), "UTF-8", true, true);
+    let stale = Fingerprint {
+      size: 1,
+      mtime_ms: 1,
+    };
+    assert_eq!(
+      rig.save(Some(stale), None).unwrap_err(),
+      FINGERPRINT_MISMATCH
+    );
+    assert_eq!(fs::read(&target).unwrap(), b"the old file");
+    let saved = rig.save(Some(result.fingerprint), None).unwrap();
+    assert_eq!(saved.fingerprint, fingerprint_of(&target).unwrap());
+    assert!(rig.with(|s| s.clean()));
+  }
+
+  #[test]
+  fn every_encoding_is_written_byte_for_byte_as_encode_text_writes_it() {
+    for (label, bom) in [
+      ("Shift_JIS", false),
+      ("UTF-16LE", true),
+      ("UTF-16BE", true),
+      ("UTF-8", true),
+      ("EUC-JP", false),
+    ] {
+      let rig = Rig::new();
+      let target = rig.target("a.txt");
+      rig.open(TEXT, Some(&target), label, bom, true);
+      let saved = rig.save(None, None).unwrap();
+      assert_eq!(
+        fs::read(&target).unwrap(),
+        encode_text(TEXT, label, bom).unwrap(),
+        "{label} bom {bom}"
+      );
+      // CRLF stays CRLF in the file.
+      assert!(saved.clean);
+      assert_eq!(
+        rig.whole(),
+        TEXT.as_bytes(),
+        "{label}: the text is unchanged"
+      );
+      assert_eq!(
+        saved.conv,
+        Some(ConvState {
+          encoding: label.to_string(),
+          bom,
+          in_place: true
+        })
+      );
+    }
+  }
+
+  #[test]
+  fn text_with_a_character_the_encoding_lacks_is_unmappable_and_changes_nothing() {
+    let rig = Rig::new();
+    let target = rig.target("a.txt");
+    rig.open("日本語 😀 tail", Some(&target), "Shift_JIS", false, true);
+    let before = rig.with(|s| (s.generation, s.state_id, s.saved_state_id));
+    assert_eq!(rig.save(None, None).unwrap_err(), convert::UNMAPPABLE);
+    assert_eq!(fs::read(&target).unwrap(), b"the old file");
+    assert_eq!(
+      rig.with(|s| (s.generation, s.state_id, s.saved_state_id)),
+      before
+    );
+    assert_eq!(rig.cv_files(), 1, "no copy was left");
+    // Nothing is staged before the check: a target that is not reachable is not
+    // the reason.
+    let nowhere = rig.dir.path().join("no").join("out.txt");
+    assert_eq!(
+      rig.save(None, Some(&nowhere)).unwrap_err(),
+      convert::UNMAPPABLE
+    );
+    assert!(!rig.dir.path().join("no").exists());
+  }
+
+  #[test]
+  fn changing_the_encoding_to_utf8_lets_the_same_text_save() {
+    let rig = Rig::new();
+    let target = rig.target("a.txt");
+    rig.open("日本語 😀 tail", Some(&target), "Shift_JIS", false, true);
+    assert!(rig.save(None, None).is_err());
+    let state = set_encoding_core(&rig.state, ID, "UTF-8", false).unwrap();
+    assert_eq!(
+      state,
+      ConvState {
+        encoding: "UTF-8".to_string(),
+        bom: false,
+        in_place: true
+      }
+    );
+    let saved = rig.save(None, None).unwrap();
+    assert_eq!(fs::read_to_string(&target).unwrap(), "日本語 😀 tail");
+    assert_eq!(saved.conv, None);
+  }
+
+  #[test]
+  fn setting_the_encoding_of_a_session_that_is_not_converted_is_refused() {
+    let rig = Rig::new();
+    let path = rig.dir.path().join("plain.txt");
+    fs::write(&path, "plain\n").unwrap();
+    let (id, session, _) = open_new_session(&rig.state.next_id, path).unwrap();
+    rig.state.sessions.lock().unwrap().insert(id, session);
+    assert_eq!(
+      set_encoding_core(&rig.state, id, "UTF-8", false).unwrap_err(),
+      NOT_CONVERTED
+    );
+    assert_eq!(
+      set_encoding_core(&rig.state, 99, "UTF-8", false).unwrap_err(),
+      UNKNOWN_SESSION
+    );
+    rig.open(TEXT, None, "UTF-8", false, true);
+    assert!(set_encoding_core(&rig.state, ID, "Nope", false).is_err());
+  }
+
+  #[test]
+  fn saving_again_after_an_edit_stays_consistent_with_one_mark() {
+    for (label, bom) in [("UTF-8", true), ("Shift_JIS", false), ("UTF-16LE", true)] {
+      let rig = Rig::new();
+      let target = rig.target("a.txt");
+      rig.open(TEXT, Some(&target), label, bom, true);
+      rig.save(None, None).unwrap();
+      assert_eq!(rig.whole(), TEXT.as_bytes());
+      assert_eq!(rig.cv_files(), 1, "{label}: one conversion file at a time");
+      // The session reads the new file, so an edit and a save go on from it.
+      rig.type_at_start("先頭 ");
+      assert!(!rig.with(|s| s.clean()));
+      let edited = format!("先頭 {TEXT}");
+      rig.save(None, None).unwrap();
+      assert_eq!(
+        fs::read(&target).unwrap(),
+        encode_text(&edited, label, bom).unwrap(),
+        "{label}"
+      );
+      assert_eq!(rig.whole(), edited.as_bytes());
+      assert_eq!(rig.cv_files(), 1);
+      if bom {
+        let written = fs::read(&target).unwrap();
+        let mark: &[u8] = if label == "UTF-8" {
+          &[0xEF, 0xBB, 0xBF]
+        } else {
+          &[0xFF, 0xFE]
+        };
+        assert!(written.starts_with(mark));
+        assert!(
+          !written[mark.len()..].starts_with(mark),
+          "{label}: two marks"
+        );
+      }
+    }
+  }
+
+  #[test]
+  fn a_plain_utf8_save_deletes_the_conversion_file_and_leaves_an_ordinary_session() {
+    let rig = Rig::new();
+    let target = rig.target("a.txt");
+    rig.open(TEXT, Some(&target), "UTF-8", false, true);
+    assert_eq!(rig.cv_files(), 1);
+    let saved = rig.save(None, None).unwrap();
+    assert_eq!(saved.conv, None);
+    assert!(rig.with(|s| s.conv.is_none()));
+    assert_eq!(rig.cv_files(), 0);
+    assert_eq!(fs::read(&target).unwrap(), TEXT.as_bytes());
+    // The table reads the target now, and later saves are ordinary.
+    rig.type_at_start("x");
+    rig.save(None, None).unwrap();
+    assert_eq!(fs::read(&target).unwrap(), [b"x", TEXT.as_bytes()].concat());
+    assert_eq!(rig.cv_files(), 0);
+    assert_eq!(
+      set_encoding_core(&rig.state, ID, "UTF-8", false).unwrap_err(),
+      NOT_CONVERTED
+    );
+  }
+
+  #[test]
+  fn a_save_that_fails_leaves_the_session_and_its_files_as_they_were() {
+    let rig = Rig::new();
+    // The encoding can write the text; the place cannot be written to.
+    rig.open("日本語", None, "Shift_JIS", false, true);
+    let nowhere = rig.dir.path().join("no").join("such").join("out.txt");
+    assert!(rig.save(None, Some(&nowhere)).is_err());
+    assert_eq!(rig.cv_files(), 1);
+    assert!(rig.with(|s| !s.conv.as_ref().unwrap().in_place));
+    assert!(!rig.with(|s| s.clean()));
+  }
+
+  #[test]
+  fn closing_a_session_deletes_its_conversion_file_whatever_became_of_it() {
+    // Never saved.
+    let rig = Rig::new();
+    rig.open(TEXT, None, "UTF-8", false, true);
+    assert_eq!(rig.cv_files(), 1);
+    close_core(&rig.state, ID);
+    assert_eq!(rig.cv_files(), 0);
+    // Saved as Shift_JIS: the file it reads is a newer one.
+    let target = rig.target("a.txt");
+    rig.open(TEXT, Some(&target), "Shift_JIS", false, true);
+    rig.save(None, None).unwrap();
+    rig.type_at_start("x");
+    assert_eq!(rig.cv_files(), 1);
+    close_core(&rig.state, ID);
+    assert_eq!(rig.cv_files(), 0);
+    // Discarded: closed, and a new session over the file as saved takes its place.
+    rig.open(TEXT, Some(&target), "Shift_JIS", false, true);
+    rig.save(None, None).unwrap();
+    rig.type_at_start("unsaved change");
+    close_core(&rig.state, ID);
+    let again = rig
+      .converts
+      .decode_file(None, &target, "Shift_JIS", false)
+      .unwrap();
+    let tmp = rig.converts.take(&again).unwrap();
+    let (id, session, _) = open_converted_session(
+      &AtomicU64::new(ID),
+      tmp,
+      Some(target.clone()),
+      "Shift_JIS".to_string(),
+      false,
+      false,
+    )
+    .unwrap();
+    rig.state.sessions.lock().unwrap().insert(id, session);
+    assert_eq!(rig.cv_files(), 1);
+    assert_eq!(rig.whole(), TEXT.as_bytes());
+    close_core(&rig.state, ID);
+    assert_eq!(rig.cv_files(), 0);
+    assert!(target.exists(), "the document itself is never deleted");
+  }
+
+  #[test]
+  fn a_conversion_that_cannot_be_opened_is_deleted_with_no_session() {
+    let rig = Rig::new();
+    let id = rig.convert(TEXT);
+    let tmp = rig.converts.take(&id).unwrap();
+    let err = open_converted_session(
+      &AtomicU64::new(ID),
+      tmp,
+      None,
+      "Nope".to_string(),
+      false,
+      false,
+    )
+    .err()
+    .unwrap();
+    assert!(err.contains("unsupported"));
+    assert_eq!(rig.cv_files(), 0);
+  }
+
+  #[test]
+  fn a_conversion_whose_target_vanished_opens_and_saves_like_any_vanished_file() {
+    let rig = Rig::new();
+    let target = rig.target("a.txt");
+    fs::remove_file(&target).unwrap();
+    let result = rig.open(TEXT, Some(&target), "Shift_JIS", false, true);
+    assert_eq!(
+      result.fingerprint,
+      Fingerprint {
+        size: 0,
+        mtime_ms: 0
+      }
+    );
+    assert!(rig.with(|s| s.conv.as_ref().unwrap().in_place));
+    // The in-place save with the fingerprint it was given is the mismatch the
+    // existing code gives a file that vanished; nothing is written.
+    assert_eq!(
+      rig
+        .save(Some(result.fingerprint.clone()), None)
+        .unwrap_err(),
+      FINGERPRINT_MISMATCH
+    );
+    assert!(!target.exists());
+    assert!(!rig.with(|s| s.clean()));
+    // Save As works, and the session follows it.
+    let elsewhere = rig.dir.path().join("elsewhere.txt");
+    rig
+      .save(Some(result.fingerprint), Some(&elsewhere))
+      .unwrap_err();
+    rig.save(None, Some(&elsewhere)).unwrap();
+    assert_eq!(
+      fs::read(&elsewhere).unwrap(),
+      encode_text(TEXT, "Shift_JIS", false).unwrap()
+    );
+    assert!(rig.with(|s| s.clean()));
+  }
+
+  #[test]
+  fn files_in_another_encoding_or_with_a_mark_open_as_sessions_without_not_utf8() {
+    let rig = Rig::new();
+    for (label, bom) in [("Shift_JIS", false), ("UTF-8", true), ("UTF-16BE", true)] {
+      let target = rig.dir.path().join("saved.txt");
+      fs::write(&target, encode_text(TEXT, label, bom).unwrap()).unwrap();
+      // The file itself is not UTF-8.
+      if label != "UTF-8" {
+        assert_eq!(build_table(&target).err(), Some(NOT_UTF8.to_string()));
+      }
+      let id = rig.converts.decode_file(None, &target, label, bom).unwrap();
+      let tmp = rig.converts.take(&id).unwrap();
+      let (sid, session, result) = open_converted_session(
+        &AtomicU64::new(ID),
+        tmp,
+        Some(target.clone()),
+        label.to_string(),
+        bom,
+        false,
+      )
+      .unwrap();
+      rig.state.sessions.lock().unwrap().insert(sid, session);
+      assert_eq!(rig.whole(), TEXT.as_bytes(), "{label}");
+      assert_eq!(result.fingerprint, fingerprint_of(&target).unwrap());
+      assert!(rig.with(|s| s.clean()));
+      // Saved untouched, it is the same file again.
+      rig.save(None, None).unwrap();
+      assert_eq!(
+        fs::read(&target).unwrap(),
+        encode_text(TEXT, label, bom).unwrap(),
+        "{label}"
+      );
+      close_core(&rig.state, ID);
+    }
+    assert_eq!(rig.cv_files(), 0);
+  }
+
+  #[test]
+  fn the_conversion_file_is_released_before_it_is_deleted() {
+    // Declared right after the table: the table lets go of the handle first.
+    let source = include_str!("windowed.rs");
+    let at = source.find("struct Session {").unwrap();
+    let body = &source[at..source[at..].find("\n}\n").unwrap() + at];
+    let lines: Vec<&str> = body.lines().map(str::trim).collect();
+    let table = lines.iter().position(|l| *l == "table: Table,").unwrap();
+    let conv = lines
+      .iter()
+      .position(|l| *l == "conv: Option<Converted>,")
+      .unwrap();
+    assert!(lines[table + 1..conv].iter().all(|l| l.starts_with("//")));
+    assert!(table < conv);
   }
 }

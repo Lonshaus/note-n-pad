@@ -29,6 +29,7 @@
   import {
     settingsState,
     type LargeOpenMode,
+    type LargeSelectAll,
     type OpenTarget,
   } from './lib/state/settings.svelte';
   import { revealWhenThemed } from './lib/util/reveal';
@@ -84,6 +85,7 @@
     documentWindow,
     LARGE_EDIT_MAX,
     RANGE_SPLICED_EVENT,
+    type ClaimedHandoff,
     type DocTab,
   } from './lib/state/documentWindow.svelte';
   import { CloseGate } from './lib/state/closeGate.svelte';
@@ -99,6 +101,10 @@
   import { isOrdinaryTab } from './lib/state/heldTab';
   import { remountTopLine } from './lib/util/largeIndex';
   import { platform } from './lib/state/platform.svelte';
+  import { installPasteWindow } from './lib/util/pasteEnv';
+  import ConvertDialogs from './lib/ConvertDialogs.svelte';
+  import { convertController } from './lib/state/convertController.svelte';
+  import { pasteLocks } from './lib/util/pasteLock';
   import { shortcutsState } from './lib/state/shortcuts.svelte';
   import { matchWindowShortcut } from './lib/util/windowShortcut';
   import { settleViewComposition } from './lib/editor/composition';
@@ -127,7 +133,6 @@
   const initialTab = parseInitialTab(params.get('tab'));
   // A window made by New Window starts with one blank tab.
   const startBlank = params.get('blank') === '1';
-
   // The gate before a quit, a window close or a tab close that would lose what no
   // snapshot can carry; see CloseGate. Its host callbacks are function
   // declarations below, so they are ready by the time a handshake runs.
@@ -156,7 +161,12 @@
 
   const active = $derived(documentWindow.activeTab);
   const title = $derived(active ? tabName(active.path) : t('doc.untitled'));
-  const openIds = $derived(documentWindow.tabs.map((t) => t.id));
+  // Only the tabs the ordinary editor shows keep a state in it: a tab that a
+  // paste made a large file, and that is discarded back to an ordinary tab,
+  // starts from what it is then.
+  const openIds = $derived(
+    documentWindow.tabs.filter((t) => isOrdinaryTab(t)).map((t) => t.id),
+  );
   // Whether the active tab renders through the ordinary editor.
   const activeOrdinary = $derived(
     documentWindow.ready && active !== null && isOrdinaryTab(active),
@@ -166,7 +176,6 @@
   const heldTab = $derived(
     documentWindow.ready ? documentWindow.heldTab : null,
   );
-
   // Honest long-line status for the status bar: shown only for a normal editor
   // tab whose long-line gate is active. `workerColoring` is true when worker
   // highlighting will actually run (the setting is on and a Lezer parser covers
@@ -187,7 +196,6 @@
         }
       : null,
   );
-
   // Report this window's open tabs to the core so the Dock menu can list and
   // mark them and the app menu's Format/File items can track the active tab.
   // Untitled tabs are never persisted, so this live report is the only source
@@ -211,7 +219,6 @@
     const active = documentWindow.activeTab?.tabIndex ?? null;
     void invoke('report_doc_tabs', { group, active, tabs });
   });
-
   // Large-file open confirm: the state layer stages the pending open; this
   // window renders the modal and collapses an empty window on cancel.
   const pendingLarge = $derived(documentWindow.pendingLargeOpen);
@@ -230,7 +237,6 @@
         })
       : '',
   );
-
   // The mounted large-file view (only while a large tab is active) and its live
   // status, mirrored into the status bar and the DEV surface.
   let largeRef = $state<{
@@ -251,6 +257,7 @@
     largeRangeEdit: () => void;
     largeRangeSaveAs: (path: string) => Promise<boolean>;
     selectAllVisible: () => void;
+    largeWholeFile: () => boolean;
   } | null>(null);
   // The mounted windowed editor (only while a windowed tab is active), exposing
   // its window/goto surface to the DEV automation hooks.
@@ -265,6 +272,40 @@
     undo: () => void;
     redo: () => void;
     selectAllVisible: () => void;
+    globalSelection: () => {
+      anchor: { line: number; col: number };
+      head: { line: number; col: number };
+    };
+    endPos: () => Promise<{ line: number; col: number }>;
+    replayLength: () => number;
+    imeState: () => {
+      capturing: boolean;
+      locked: boolean;
+      outside: boolean | null;
+      selectAllPending: boolean;
+      swapping: boolean;
+      replaySwapActive: boolean;
+      draining: boolean;
+      holds: number;
+      wanted: boolean;
+      replayLength: number;
+    };
+    globalInfo: () => {
+      globalSel: {
+        anchor: { line: number; col: number };
+        head: { line: number; col: number };
+      };
+      windowStartLine: number;
+      swapping: boolean;
+      settled: boolean;
+      keepsInput: boolean;
+      ownGlobalOp: boolean;
+      windowInstalls: number;
+      applies: number;
+      globalOps: number;
+    };
+    pointerSelect: (offset: number) => boolean;
+    swapKeepsInputNow: () => boolean;
     focus: () => void;
     endComposition: () => Promise<void>;
     isComposing: () => boolean;
@@ -316,7 +357,6 @@
       void collapseWindow();
     }
   }
-
   // The open dialog: the staged over-long-line open, and its cancel (mirroring
   // the large-file confirm — a window opened solely for this file collapses).
   const pendingLongLine = $derived(documentWindow.pendingLongLineOpen);
@@ -327,7 +367,6 @@
       void collapseWindow();
     }
   }
-
   // Same collapse as the two confirms above: a window opened solely for a file
   // that could not be read has nothing left to show once the report is closed.
   function onOpenFailedClose(): void {
@@ -336,7 +375,6 @@
       void collapseWindow();
     }
   }
-
   // Same collapse: a restored window whose every tab was unreadable has nothing
   // left once the report is closed.
   function onRestoreUnreadableClose(): void {
@@ -350,7 +388,6 @@
   function onEncodingFailedClose(): void {
     documentWindow.dismissEncodingFailed();
   }
-
   // The pencil after a large-file tab's name: the action that starts editing
   // it. Four states: editable (title Edit, clickable), oversized (disabled,
   // view-only), a lazy restore still in flight (disabled, its own wording —
@@ -380,7 +417,6 @@
     }
     return { disabled: false, title: t('doc.lock.edit') };
   }
-
   // Unlock the active large tab in place, continuing from the line at the top of
   // its viewport. Returns null on success or a short reason on refusal (the tab
   // stays read-only and its lock reflects the reason).
@@ -393,7 +429,6 @@
       Math.max(0, largeStatus.firstLine - 1),
     );
   }
-
   // Whether the active tab's lock can unlock (DEV surface + status). Mirrors the
   // enabled state of largeLock for the active tab.
   function activeLargeUnlockAvailable(): boolean {
@@ -407,7 +442,6 @@
       tab?.windowedRestore === undefined
     );
   }
-
   // Tab-lock click. A background tab's lock switches to that tab first, then
   // unlocks from its top; the active tab's lock unlocks from the viewed line.
   async function unlockTab(i: number): Promise<void> {
@@ -422,12 +456,10 @@
       await unlockActiveLarge();
     }
   }
-
   // Per-tab view mode, keyed by tab id. Runtime-only (never persisted); the
   // starting mode comes from the file's extension. A SvelteMap keeps it
   // reactive, and `finishTabClose` drops the entry when the tab goes away.
   const viewModes = new SvelteMap<string, ViewMode>();
-
   // Modes this app can actually render. A mode listed by `viewModesFor` but
   // missing here is filtered out entirely rather than offered as a dead option.
   const IMPLEMENTED_MODES: readonly ViewMode[] = [
@@ -437,7 +469,6 @@
     'xml',
     'markdown',
   ];
-
   // The active tab's delimiter (',' / '\t') or null when it is not tabular.
   const activeDelimiter = $derived(
     active !== null ? dsvDelimiterFor(active.path) : null,
@@ -560,7 +591,6 @@
       void tick().then(() => liveView()?.focus());
     }
   }
-
   // Table mutations operate on the active tab's buffer through the same pure
   // csv engine the TableView uses, so DEV hooks and the UI stay in lockstep.
   function tableRows(): string[][] {
@@ -589,7 +619,6 @@
       },
     ]);
   }
-
   // Push table-side changes through the still-mounted (but hidden) CM view so
   // they land in CM's undo history as one step and fire the change listener →
   // updateActiveContent → buffer/table redraw along the normal reaction chain.
@@ -615,7 +644,6 @@
     }
     view.dispatch({ changes });
   }
-
   // Table-view undo/redo drive CM's history so table edits and source edits
   // share one timeline. Selection indices may be stale after the doc changes, so
   // clear any selection first (the deselect convention used by every mutation).
@@ -707,7 +735,6 @@
     }
     return null;
   }
-
   /** The folder holding `path`, or null when there is none (an unsaved tab, or
    *  a bare file name). There is no dirname helper in this codebase; this
    *  splits on the same `[/\\]` as `tabName`. */
@@ -722,18 +749,15 @@
     const dir = path.slice(0, cut);
     return dir === '' || dir.endsWith(':') ? path.slice(0, cut + 1) : dir;
   }
-
   // CotEditor-style: the window title follows the active tab's file name.
   $effect(() => {
     void win.setTitle(title);
   });
-
   // Reflect the editor theme and the interface chrome onto the document root.
   $effect(() => {
     applyTheme(settingsState.themeId);
     applyChrome(settingsState.interfaceMode, settingsState.prefersDark);
   });
-
   // Cmd+O / File > Open. The current open-target setting is read live so a
   // change takes effect on the next open with no broadcast handling. "window"
   // opens each picked file in its own document window (multi-select allowed);
@@ -777,7 +801,6 @@
   // failed scan used to leave the status bar spinning "indexing…" forever
   // with no other sign anything had gone wrong.
   let indexFailed = $state<string | null>(null);
-
   // Any dialog/modal currently up. The automatic focus handoff is suppressed
   // while one is open so a gate/confirm keeps the keyboard.
   const anyModalOpen = $derived(
@@ -788,6 +811,7 @@
       pendingLongLine !== null ||
       windowedError !== null ||
       documentWindow.openFailed !== null ||
+      documentWindow.discardFailed !== null ||
       documentWindow.restoreUnreadable.length > 0 ||
       documentWindow.saveFailed !== null ||
       documentWindow.rangeBox !== null ||
@@ -796,7 +820,6 @@
       revealFailed !== null ||
       indexFailed !== null,
   );
-
   // Hand keyboard focus to the active editor when the window regains focus, so a
   // programmatically opened or restored window types without a click. Large
   // read-only viewer tabs have no editor to focus, so they are skipped.
@@ -943,7 +966,6 @@
       document.removeEventListener('copy', onOverlayCopy);
     };
   });
-
   // Find/replace acts on the CM view, which any other view is drawn on top of.
   // Switching the active tab back to source first is the least-surprising
   // fallback (the panel then opens on the real editor), so all find entry
@@ -966,7 +988,6 @@
       openSearchPanel(view);
     }
   }
-
   // Same panel as Find (CM's default panel always carries the replace row); focus
   // the replace field so Find and Replace lands the caret there.
   function openFindReplace(): void {
@@ -1029,7 +1050,6 @@
     const view = liveView();
     return view !== null && searchPanelOpen(view.state);
   }
-
   // Copy the active tab's file path to the clipboard (File > Copy File Path).
   function copyActivePath(): void {
     const path = active?.path;
@@ -1037,7 +1057,6 @@
       void navigator.clipboard.writeText(path);
     }
   }
-
   // Reveal the active tab's file in the OS file browser (File > Show in Finder).
   function showActiveInFinder(): void {
     const path = active?.path;
@@ -1073,7 +1092,6 @@
         break;
     }
   }
-
   // Route a menu accelerator (emitted from the Rust menu to the focused window)
   // to its handler. Parameterized Format actions (set-line-ending / set-encoding
   // / set-language) carry their argument after a colon. Unknown actions ignored.
@@ -1161,10 +1179,11 @@
       } else if (surface === 'viewer') {
         largeRef?.selectAllVisible();
       } else if (surface === 'editor' && view !== null) {
-        if (action === 'undo') {
-          undo(view);
-        } else if (action === 'redo') {
-          redo(view);
+        // A paste in flight holds the tab: neither history step may run.
+        if (action === 'undo' || action === 'redo') {
+          if (boxOpen || active === null || !pasteLocks.has(active.id)) {
+            (action === 'undo' ? undo : redo)(view);
+          }
         } else if (action === 'select-all') {
           selectAll(view);
         } else if (action === 'copy') {
@@ -1219,7 +1238,6 @@
         break;
     }
   }
-
   // Close the current active tab; its store entry is removed and the window
   // closes when it was the last tab, unless a held-back quit or close is about
   // to end it (`keepWindow`).
@@ -1240,6 +1258,32 @@
   function closeActive(): void {
     missing.requestClose();
   }
+  // A sticky note handed over as a tab: the window claims the handoff, opens the
+  // tab over the file the note's text was written to, and says it is done. A
+  // window the handoff does not fit (late, taken, sent elsewhere) is refused and
+  // does nothing. A window that was opened only for it and cannot show it closes.
+  async function openHandoff(handoffId: number): Promise<void> {
+    let claimed: ClaimedHandoff;
+    try {
+      claimed = await invoke<ClaimedHandoff>('convert_claim', { handoffId });
+    } catch {
+      return;
+    }
+    let tabId: string | null = null;
+    try {
+      tabId = await documentWindow.openClaimed(claimed);
+    } catch {
+      tabId = null;
+    }
+    if (tabId === null) {
+      await invoke('convert_failed', { handoffId }).catch(() => {});
+      if (documentWindow.tabs.length === 0) {
+        void collapseWindow();
+      }
+      return;
+    }
+    await invoke('convert_done', { handoffId, tabId }).catch(() => {});
+  }
 
   async function requestCloseTab(index: number): Promise<void> {
     if (missing.navigationLocked()) {
@@ -1248,11 +1292,11 @@
     await documentWindow.switchTo(index);
     closeActive();
   }
-
   // Finish closing this window: clean tabs leave the store (a closed document
   // must not reopen on the next launch), dirty ones keep their snapshot, then
   // the backend destroys the window.
   async function finishWindowClose(): Promise<void> {
+    convertController.cancelAll();
     await documentWindow.dropClosedTabs(win.label);
     await invoke('confirm_close', { label: win.label });
   }
@@ -1284,11 +1328,17 @@
     // Announce the window to the core and open the files it queued meanwhile.
     // Each path opens on its own, so one failure leaves the rest.
     const announceReady = async (): Promise<void> => {
-      const queued = await invoke<string[]>('doc_window_ready', {
+      const queued = await invoke<
+        ({ kind: 'path'; value: string } | { kind: 'handoff'; value: number })[]
+      >('doc_window_ready', {
         label: win.label,
       });
-      for (const path of queued) {
-        await documentWindow.openTab(path).catch((err: unknown) => {
+      for (const item of queued) {
+        if (item.kind === 'handoff') {
+          await openHandoff(item.value);
+          continue;
+        }
+        await documentWindow.openTab(item.value).catch((err: unknown) => {
           console.error('opening a queued file failed', err);
         });
       }
@@ -1338,7 +1388,6 @@
         }
       }
     })();
-
     // New Tab / Open / Save / Find and New Sticky are all menu accelerators now,
     // so each fires exactly once through the menu path. Only tab cycling stays
     // keydown-only (it is deliberately not a menu item); its keys are the
@@ -1382,7 +1431,6 @@
         documentWindow.cycle(-1);
       }
     };
-
     // Persist logical bounds after the user finishes moving or resizing.
     const captureBounds = debounce(() => {
       void (async (): Promise<void> => {
@@ -1392,7 +1440,6 @@
         documentWindow.setBounds(pos.x, pos.y, size.width, size.height);
       })();
     }, 300);
-
     // Window close handshake. The OS close of a document window is intercepted
     // in Rust, which asks this webview to flush before destroying it, so unsaved
     // edits are never dropped. Dirty tabs are snapshotted (a restart restores
@@ -1404,7 +1451,6 @@
     );
     const unlistenMoved = win.onMoved(() => captureBounds());
     const unlistenResized = win.onResized(() => captureBounds());
-
     // When the window regains OS focus, keyboard focus can be left on BODY (the
     // WebView then silently drops keystrokes); hand it back to the active editor
     // unless a dialog or an input field is holding it.
@@ -1425,15 +1471,12 @@
         documentWindow.retargetPaths(event.payload.from, event.payload.to);
       },
     );
-
     // Cmd+W (routed from the app menu) closes the active tab, not the window.
     const unlistenMenuClose = win.listen('menu-close', () => closeActive());
-
     // File/Edit menu accelerators arrive here as a single string payload.
     const unlistenMenuAction = win.listen<string>('menu-action', (event) =>
       runMenuAction(event.payload),
     );
-
     // Workspace click: focus the tab whose stored tabIndex matches (controller
     // tabs carry tabIndex, which is not the array position after closes/reorders).
     const unlistenSwitchTab = win.listen<number>(
@@ -1450,7 +1493,6 @@
         }
       },
     );
-
     // Workspace context menu → Close Tab: close the tab whose stored tabIndex
     // matches, running the same dirty-confirm flow as its own close button.
     const unlistenCloseTab = win.listen<number>(
@@ -1467,7 +1509,26 @@
         }
       },
     );
-
+    // A sticky note handed over, to a ready window.
+    const unlistenOpenConverted = win.listen<{ handoff_id: number }>(
+      'open-converted',
+      (event) => {
+        void openHandoff(event.payload.handoff_id);
+      },
+    );
+    // The tab a handed-over sticky note became, asked for (the note's row of the
+    // workspace, the Dock or the Jump List): the window is raised already.
+    const unlistenFocusTab = win.listen<{ tab_id: string }>(
+      'convert-focus-tab',
+      (event) => {
+        const index = documentWindow.tabs.findIndex(
+          (t) => t.id === event.payload.tab_id,
+        );
+        if (index !== -1) {
+          void documentWindow.switchTo(index);
+        }
+      },
+    );
     // Open a path as a tab in this window. Two producers: the workspace project
     // tree, and the shell handing over a file when the open target is "tab".
     const unlistenOpenFile = win.listen<string>('open-file-here', (event) => {
@@ -1485,13 +1546,11 @@
         );
       },
     );
-
     // A splice rewrote a source file (this window or another): if a large-file
     // viewer of that path is open here, rebuild its stale line index.
     const unlistenSpliced = listen<string>(RANGE_SPLICED_EVENT, (event) => {
       documentWindow.refreshLargeTabs(event.payload);
     });
-
     // Quit handshake: flush every dirty tab, then ack. Quit stays silent;
     // restore reopens unsaved tabs afterward.
     const unlistenFlush = win.listen('flush-request', () =>
@@ -1505,6 +1564,8 @@
     );
 
     window.addEventListener('keydown', onKeydown);
+    const uninstallPaste = installPasteWindow();
+    convertController.attachDoc(documentWindow.convertHost());
     // A tab switch waits for the active editor's IME composition to end.
     documentWindow.endComposition = (): Promise<void> => {
       const view = liveView();
@@ -1524,6 +1585,9 @@
           getTitle: () => title,
           getTabs: () =>
             documentWindow.tabs.map((t, i) => ({
+              id: t.id,
+              windowed: t.windowed !== undefined,
+              converted: t.converted ?? null,
               path: t.path,
               dirty: documentWindow.isDirty(t),
               active: i === documentWindow.activeIndex,
@@ -1568,6 +1632,18 @@
           },
           setDocSelection: (from: number, to: number) => {
             liveView()?.dispatch({ selection: { anchor: from, head: to } });
+          },
+          getDocSelection: () => {
+            const view = liveView();
+            if (view === null) {
+              return null;
+            }
+            const main = view.state.selection.main;
+            const at = (pos: number): { line: number; col: number } => {
+              const line = view.state.doc.lineAt(pos);
+              return { line: line.number - 1, col: pos - line.from };
+            };
+            return { anchor: at(main.anchor), head: at(main.head) };
           },
           getViewMode: () => activeViewMode,
           setViewMode: (m: ViewMode) => setViewMode(m),
@@ -1692,6 +1768,20 @@
             };
           },
           windowedGoto: (line: number) => windowedRef?.goto(line),
+          windowedGlobalSel: () => windowedRef?.globalSelection() ?? null,
+          windowedEndPos: () => windowedRef?.endPos() ?? Promise.resolve(null),
+          windowedReplayLength: () => windowedRef?.replayLength() ?? 0,
+          windowedImeState: () => windowedRef?.imeState() ?? null,
+          windowedGlobalInfo: () => windowedRef?.globalInfo() ?? null,
+          windowedPointerSelect: (offset: number) =>
+            windowedRef?.pointerSelect(offset) ?? false,
+          windowedSwapKeepsInput: () =>
+            windowedRef?.swapKeepsInputNow() ?? false,
+          largeWholeFile: () => largeRef?.largeWholeFile() ?? false,
+          menuAction: (action: string) => runMenuAction(action),
+          largeSelectAllMode: () => settingsState.largeSelectAll,
+          setLargeSelectAll: (m: LargeSelectAll) =>
+            settingsState.setLargeSelectAll(m),
           windowedTrace: () => windowedRef?.windowedTrace() ?? [],
           windowedUndo: () => windowedRef?.undo(),
           windowedRedo: () => windowedRef?.redo(),
@@ -1700,6 +1790,7 @@
           windowedDiscard: () => documentWindow.discardWindowedActive(),
           windowedConflictVisible: () =>
             documentWindow.windowedConflictVisible(),
+          convertTabInfo: () => documentWindow.convertTabInfo(),
           setWorkerHighlight: (on: boolean) =>
             settingsState.setWorkerHighlight(on),
           getWorkerHighlight: () => isWorkerHighlightEnabled(),
@@ -1725,6 +1816,8 @@
     }
     return () => {
       window.removeEventListener('keydown', onKeydown);
+      uninstallPaste();
+      convertController.attachDoc(null);
       documentWindow.endComposition = null;
       documentWindow.windowedPending = null;
       documentWindow.windowedFlushed = null;
@@ -1744,6 +1837,8 @@
       void unlistenSwitchTab.then((u) => u());
       void unlistenCloseTab.then((u) => u());
       void unlistenOpenFile.then((u) => u());
+      void unlistenOpenConverted.then((u) => u());
+      void unlistenFocusTab.then((u) => u());
       void unlistenRebound.then((u) => u());
       void unlistenSpliced.then((u) => u());
       void unlistenFlush.then((u) => u());
@@ -2009,6 +2104,11 @@
           reloadSeq={documentWindow.reloadSeq}
           reloadTarget={documentWindow.reloadTargetId}
           onchange={(v) => documentWindow.updateContentById(held.id, v)}
+          oncontentof={(id, v) => documentWindow.updateContentById(id, v)}
+          lineEndingOf={(id) =>
+            documentWindow.tabs.find((t) => t.id === id)?.lineEnding === 'CRLF'
+              ? '\r\n'
+              : '\n'}
           onselection={(line, col) => {
             if (activeOrdinary) {
               documentWindow.setCursor(line, col);
@@ -2140,6 +2240,18 @@
       })}
       cancelLabel={t('common.close')}
       oncancel={onOpenFailedClose}
+    />
+  {/if}
+
+  {#if documentWindow.discardFailed !== null}
+    <!-- Report only: the tab was left as it was. -->
+    <ConfirmModal
+      message={t('doc.discardFailed', {
+        name: documentWindow.discardFailed.name,
+        error: documentWindow.discardFailed.error,
+      })}
+      cancelLabel={t('common.close')}
+      oncancel={() => documentWindow.dismissDiscardFailed()}
     />
   {/if}
 
@@ -2310,6 +2422,8 @@
       onsecondary={() => missing.discard()}
     />
   {/if}
+
+  <ConvertDialogs />
 
   {#if documentWindow.saveFailed !== null}
     <!-- Report only, and deliberately the last dialog in this section. Every

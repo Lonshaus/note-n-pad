@@ -57,6 +57,7 @@ function backend(): void {
             editor_line_numbers: true,
             worker_highlight: false,
             large_open_mode: 'ask',
+            large_select_all: 'visible',
             ask_long_line_open: false,
             preview_local_resources: false,
             open_target: 'tab',

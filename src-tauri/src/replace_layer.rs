@@ -339,6 +339,12 @@ impl ChangeList {
   /// come from the checkpoints and a binary search over the hit records, so the
   /// cost does not depend on line length.
   pub fn map_offset(&self, dir: Dir, offset: u64) -> Result<u64, String> {
+    self.map_offset_assoc(dir, offset, 1)
+  }
+  /// `map_offset` with CodeMirror's `assoc`: a negative one puts an offset inside
+  /// a hit at the start of that hit's output, and one at an empty input hit
+  /// before its output.
+  pub fn map_offset_assoc(&self, dir: Dir, offset: u64, assoc: i8) -> Result<u64, String> {
     let growth = self.repl.len() as i128 - self.needle_len as i128;
     let out_len = match dir {
       Dir::Forward => self.post_len,
@@ -370,7 +376,8 @@ impl ChangeList {
     while lo < hi {
       let mid = lo + (hi - lo) / 2;
       let (in_start, in_len, _, _) = spans(mid, &self.hit_at(mid)?);
-      if in_start + in_len > at {
+      let in_end = in_start + in_len;
+      if in_end > at || (assoc < 0 && in_end == at && in_len == 0) {
         hi = mid;
       } else {
         lo = mid + 1;
@@ -384,7 +391,11 @@ impl ChangeList {
     if lo < self.hits {
       let (in_start, _, out_start, out_hit) = spans(lo, &self.hit_at(lo)?);
       if at > in_start {
-        mapped = out_start + out_hit;
+        mapped = if assoc < 0 {
+          out_start
+        } else {
+          out_start + out_hit
+        };
       }
     }
     Ok(mapped.clamp(0, out_len as i128) as u64)
@@ -1316,8 +1327,8 @@ impl Builder {
     Ok(self.list)
   }
 }
-/// Delete the change-list files a previous run left in `dir`. Only files this
-/// module names are touched.
+/// Delete the change-list, spill and conversion files a previous run left in
+/// `dir`. Only files named like ours are touched.
 pub fn cleanup_tmp(dir: &Path) {
   let Ok(entries) = fs::read_dir(dir) else {
     return;
@@ -1325,7 +1336,11 @@ pub fn cleanup_tmp(dir: &Path) {
   for entry in entries.flatten() {
     let name = entry.file_name();
     let name = name.to_string_lossy();
-    if name.starts_with(FILE_PREFIX) && name.ends_with(FILE_SUFFIX) {
+    let list = name.starts_with(FILE_PREFIX) || name.starts_with(crate::spill::FILE_PREFIX);
+    let ours = (list && name.ends_with(FILE_SUFFIX))
+      || (name.starts_with(crate::convert::FILE_PREFIX)
+        && name.ends_with(crate::convert::FILE_SUFFIX));
+    if ours {
       let _ = fs::remove_file(entry.path());
     }
   }
@@ -1350,6 +1365,38 @@ mod tests {
     assert!(other.exists());
     // A folder that does not exist is not an error.
     cleanup_tmp(&dir.path().join("missing"));
+  }
+
+  #[test]
+  fn cleanup_removes_conversion_files_and_not_clips() {
+    let dir = tempfile::tempdir().unwrap();
+    let ours = dir.path().join("cv-1-2-3.txt");
+    let wrong_suffix = dir.path().join("cv-1-2-3.bin");
+    let clip = dir.path().join("clip-1-2-3.txt");
+    let theirs = dir.path().join("cvs.txt");
+    for p in [&ours, &wrong_suffix, &clip, &theirs] {
+      fs::write(p, b"x").unwrap();
+    }
+    cleanup_tmp(dir.path());
+    assert!(!ours.exists());
+    assert!(wrong_suffix.exists());
+    assert!(clip.exists());
+    assert!(theirs.exists());
+  }
+
+  #[test]
+  fn cleanup_removes_spill_files_and_nothing_else() {
+    let dir = tempfile::tempdir().unwrap();
+    let ours = dir.path().join("sp-1-2-3.bin");
+    let wrong_suffix = dir.path().join("sp-1-2-3.txt");
+    let theirs = dir.path().join("spy.bin");
+    for p in [&ours, &wrong_suffix, &theirs] {
+      fs::write(p, b"x").unwrap();
+    }
+    cleanup_tmp(dir.path());
+    assert!(!ours.exists());
+    assert!(wrong_suffix.exists());
+    assert!(theirs.exists());
   }
 
   #[test]

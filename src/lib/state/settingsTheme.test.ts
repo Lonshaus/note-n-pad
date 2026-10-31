@@ -53,6 +53,7 @@ function payload(storedTheme: string, interfaceMode = 'system'): unknown {
       editor_line_numbers: true,
       worker_highlight: false,
       large_open_mode: 'ask',
+      large_select_all: 'visible',
       ask_long_line_open: true,
       preview_local_resources: false,
       open_target: 'tab',

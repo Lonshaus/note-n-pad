@@ -1098,8 +1098,9 @@ if [ "$BIG_SIZE" -le 104857600 ]; then
   exit 1
 fi
 
+trap 'quit_app' EXIT
+trap 'exit 1' INT TERM
 launch
-trap 'quit_app' EXIT INT TERM
 open_doc
 
 echo "=== A. three tabs, each with a remembered mode ==="
@@ -1305,7 +1306,8 @@ restore_mode() {
       && mv "$APPDIR/settings.json.tmp" "$APPDIR/settings.json"
   fi
 }
-trap 'quit_app; restore_mode' EXIT INT TERM
+trap 'quit_app; restore_mode' EXIT
+trap 'exit 1' INT TERM
 evl "$DL" "__auto.setLargeOpenMode('view')" >/dev/null
 e2e_wait_setting large_open_mode "view"
 evl "$DL" "__auto.openTab('$WORK/big.json')" >/dev/null

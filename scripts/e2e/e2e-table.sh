@@ -201,7 +201,8 @@ cleanup() {
   rm -rf "$WORK"
   e2e_kill_owned_ports
 }
-trap cleanup EXIT INT TERM
+trap cleanup EXIT
+trap 'exit 1' INT TERM
 
 launch
 BOOT=$(boot_label)
