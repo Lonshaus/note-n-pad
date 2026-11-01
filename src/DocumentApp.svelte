@@ -97,6 +97,7 @@
   import { textFromString } from './lib/util/text';
   import { focusEditorIfIdle } from './lib/util/editorFocus';
   import { focusTopmostModal, isModalOpen } from './lib/ConfirmModal.svelte';
+  import type { WindowedViewGeometry } from './lib/dev/auto';
   import { t } from './lib/i18n';
   import { isOrdinaryTab } from './lib/state/heldTab';
   import { remountTopLine } from './lib/util/largeIndex';
@@ -304,6 +305,7 @@
       applies: number;
       globalOps: number;
     };
+    viewGeometry: () => WindowedViewGeometry | null;
     pointerSelect: (offset: number) => boolean;
     swapKeepsInputNow: () => boolean;
     focus: () => void;
@@ -1768,6 +1770,7 @@
             };
           },
           windowedGoto: (line: number) => windowedRef?.goto(line),
+          windowedViewGeometry: () => windowedRef?.viewGeometry() ?? null,
           windowedGlobalSel: () => windowedRef?.globalSelection() ?? null,
           windowedEndPos: () => windowedRef?.endPos() ?? Promise.resolve(null),
           windowedReplayLength: () => windowedRef?.replayLength() ?? 0,

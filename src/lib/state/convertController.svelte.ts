@@ -153,6 +153,8 @@ export class ConvertController {
   private jobs = new Map<string, Job>();
   /** How the last run ended, for the automation hooks. */
   lastExit: string | null = null;
+  /** DEV only: the next conversion fails once after its confirmation. */
+  devFailNext = false;
   /** The notes handed to a document window and not yet taken over, by note id. */
   private handoffs = new Map<string, Job>();
   private docHost: DocConvertHost | null = null;
@@ -325,6 +327,10 @@ export class ConvertController {
       if (answer !== 'primary') {
         exit = `answer: ${answer}`;
         return;
+      }
+      if (import.meta.env.DEV && this.devFailNext) {
+        this.devFailNext = false;
+        throw new Error('dev: injected conversion failure');
       }
       this.check(job);
       const info = this.info(job);

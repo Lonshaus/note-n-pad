@@ -3132,7 +3132,9 @@ pub fn run() {
       request_exit,
       confirm_close,
       #[cfg(debug_assertions)]
-      automation::automation_result
+      automation::automation_result,
+      #[cfg(debug_assertions)]
+      automation::dev_trace
     ])
     .build(tauri::generate_context!())
     .expect("error while building tauri application")

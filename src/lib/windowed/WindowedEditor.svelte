@@ -4,6 +4,7 @@
 
   import { onMount } from 'svelte';
   import { invoke } from '@tauri-apps/api/core';
+  import { devTrace } from '../dev/devTrace';
   import { listen, type UnlistenFn } from '@tauri-apps/api/event';
   import {
     Annotation,
@@ -1922,6 +1923,7 @@
   }
 
   function startReplaySwap(): void {
+    devTrace('startReplaySwap');
     replayTimer = undefined;
     replayPending = true;
     const action = replayStartAction({
@@ -2646,6 +2648,7 @@
       return;
     }
     draining = true;
+    devTrace(`drainReplay start queue=${replayQueue.length}`);
     let resume = false;
     let global: { action: GlobalAction; item: ReplayItem } | null = null;
     try {
@@ -2795,6 +2798,7 @@
       dropReplay();
       throw e;
     } finally {
+      devTrace(`drainReplay end queue=${replayQueue.length}`);
       draining = false;
       notifySettled();
       notifyFlushWaiters();
@@ -2940,6 +2944,7 @@
     sh.g.endLine = sh.g.startLine + sh.view.state.doc.lines;
   }
   function createShadow(res: WindowRead): Shadow {
+    devTrace(`createShadow start=${res.start_line} chars=${res.text.length}`);
     const host = document.createElement('div');
     const size = view?.dom.getBoundingClientRect();
     host.style.cssText =
@@ -2976,6 +2981,7 @@
     return sh;
   }
   function destroyShadow(sh: Shadow): void {
+    devTrace('destroyShadow');
     if (shadow === sh) {
       shadow = null;
     }
@@ -3819,6 +3825,9 @@
       windowStartLine,
       want: w.startLine,
     });
+    devTrace(
+      `loadWindow enter mode=${mode} target=${target} rows=${w.endLine - w.startLine}`,
+    );
     if (op !== undefined) {
       // Like the swap back to the caret: the editor stays open to a composition.
       replaySwapActive = true;
@@ -3962,6 +3971,9 @@
       });
       globalSel = swapped.global;
       lastLive = swapped.live;
+      devTrace(
+        `loadWindow setState before lines=${fresh.doc.lines} chars=${fresh.doc.length}`,
+      );
       view.setState(
         fresh.update({
           selection: {
@@ -3970,6 +3982,7 @@
           },
         }).state,
       );
+      devTrace('loadWindow setState after');
       windowEndLine = windowStartLine + view.state.doc.lines;
       windowInstalls += 1;
       traceSwap({
@@ -4007,6 +4020,10 @@
       // limping on with silently misaligned coordinates.
       lock(t('editor.locked.swap', { detail: String(e) }));
       endSwap();
+    } finally {
+      devTrace(
+        `loadWindow end mode=${mode} start=${windowStartLine} chars=${view?.state.doc.length ?? -1}`,
+      );
     }
   }
   /** Global 0-based line at the top of the viewport, and how many pixels its top is
@@ -4074,6 +4091,7 @@
   // IME composition defers the swap (full handling lands next segment): a swap
   // mid-composition would tear the composing text out from under the input.
   async function maybeSwap(): Promise<void> {
+    devTrace('maybeSwap');
     if (
       view === undefined ||
       swapInFlight ||
@@ -4292,6 +4310,7 @@
   }
   // Read the window again where it is: the content under it changed.
   function reloadWindow(): Promise<void> {
+    devTrace('reloadWindow');
     return loadWindow(windowStartLine + MARGIN_LINES, 'reload');
   }
 
@@ -4685,6 +4704,7 @@
   }
 
   onMount(() => {
+    devTrace('onMount start');
     let disposed = false;
     // The reservations of the copies and cuts in the queue are renewed by the
     // window's timer for as long as this editor holds them.
@@ -4788,6 +4808,7 @@
       if (import.meta.env.DEV) {
         void import('../dev/editorRegistry').then((m) => m.setActiveView(v));
       }
+      devTrace('onMount end');
     })();
     void listenForResults(() => disposed);
     return () => {
@@ -5015,6 +5036,28 @@
       windowInstalls,
       applies: applyCalls,
       globalOps: globalCalls,
+    };
+  }
+  // DEV/automation: what the view has drawn, and how far it is scrolled.
+  export function viewGeometry(): {
+    viewport: { from: number; to: number };
+    lines: number;
+    scrollTop: number;
+    clientHeight: number;
+    scrollHeight: number;
+    visible: { from: number; to: number } | null;
+  } | null {
+    if (view === undefined) {
+      return null;
+    }
+    const el = view.scrollDOM;
+    return {
+      viewport: { from: view.viewport.from, to: view.viewport.to },
+      lines: view.state.doc.lines,
+      scrollTop: el.scrollTop,
+      clientHeight: el.clientHeight,
+      scrollHeight: el.scrollHeight,
+      visible: visibleSpan(view),
     };
   }
   // DEV/automation: a click at global byte `offset`, which lies in the loaded

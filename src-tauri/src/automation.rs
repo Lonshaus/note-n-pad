@@ -244,6 +244,19 @@ fn window_number(_app: &AppHandle, _req: &Request) -> Result<Value, String> {
 pub fn automation_result(correlator: State<'_, Correlator>, id: u64, value: Value) {
   correlator.resolve(id, value);
 }
+/// The most characters of a page's trace message that reach the log.
+const TRACE_MAX_CHARS: usize = 300;
+/// The log line for a trace message from the page of window `label`.
+fn trace_line(label: &str, msg: &str) -> String {
+  let msg: String = msg.chars().take(TRACE_MAX_CHARS).collect();
+  format!("[page {label}] {msg}")
+}
+/// The webview-invoked sink of the page's trace messages. Async, so a busy main
+/// thread does not hold it back.
+#[tauri::command(async)]
+pub fn dev_trace(webview: tauri::Webview, msg: String) {
+  log::info!("{}", trace_line(webview.label(), &msg));
+}
 
 /// Serve one client at a time: read request lines, write one response line each.
 fn handle_client(app: &AppHandle, stream: TcpStream) {
@@ -323,6 +336,32 @@ mod tests {
     assert_eq!(req.cmd, "list_windows");
     assert_eq!(req.label, None);
     assert_eq!(req.js, None);
+  }
+
+  #[test]
+  fn trace_line_names_the_window() {
+    assert_eq!(trace_line("doc-1", "beat"), "[page doc-1] beat");
+  }
+
+  #[test]
+  fn trace_line_cuts_a_long_message() {
+    let line = trace_line("doc-1", &"x".repeat(TRACE_MAX_CHARS + 50));
+    assert_eq!(
+      line,
+      format!("[page doc-1] {}", "x".repeat(TRACE_MAX_CHARS))
+    );
+    let exact = "y".repeat(TRACE_MAX_CHARS);
+    assert_eq!(trace_line("doc-1", &exact), format!("[page doc-1] {exact}"));
+  }
+
+  #[test]
+  fn trace_line_cuts_between_characters() {
+    // 3 bytes each: a cut by bytes would land inside a character.
+    let line = trace_line("doc-1", &"あ".repeat(TRACE_MAX_CHARS + 1));
+    assert_eq!(
+      line,
+      format!("[page doc-1] {}", "あ".repeat(TRACE_MAX_CHARS))
+    );
   }
 
   #[test]

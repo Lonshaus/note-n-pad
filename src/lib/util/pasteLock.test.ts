@@ -5,7 +5,12 @@ import { describe, expect, it } from 'vitest';
 import { Compartment, EditorState } from '@codemirror/state';
 import { EditorView } from '@codemirror/view';
 import { history, redo, undo } from '@codemirror/commands';
-import { PasteLocks, editableWith, pasteLockOwner } from './pasteLock';
+import {
+  PasteLocks,
+  editableWith,
+  pasteLockOwner,
+  refocusAfterUnlock,
+} from './pasteLock';
 /** A state with the lock on, after one typed edit that history can undo; the
  *  lock goes in through the compartment the editors use. */
 function locked(phase: 'wait' | 'full', editable = true) {
@@ -146,5 +151,39 @@ describe('PasteLocks', () => {
     locks.begin('t1', 'full');
     locks.drop('t1');
     expect(locks.any()).toBe(false);
+  });
+});
+
+describe('refocusAfterUnlock', () => {
+  const all = {
+    hadFocus: true,
+    mounted: true,
+    editable: true,
+    focusOnBody: true,
+    modalOpen: false,
+  };
+
+  it('takes the focus back when every condition holds', () => {
+    expect(refocusAfterUnlock(all)).toBe(true);
+  });
+
+  it('does not when the editor had no focus before the lock', () => {
+    expect(refocusAfterUnlock({ ...all, hadFocus: false })).toBe(false);
+  });
+
+  it('does not when the editor is gone', () => {
+    expect(refocusAfterUnlock({ ...all, mounted: false })).toBe(false);
+  });
+
+  it('does not when the editor is hidden or covered', () => {
+    expect(refocusAfterUnlock({ ...all, editable: false })).toBe(false);
+  });
+
+  it('does not when the focus went somewhere other than the body', () => {
+    expect(refocusAfterUnlock({ ...all, focusOnBody: false })).toBe(false);
+  });
+
+  it('does not while a dialog is open', () => {
+    expect(refocusAfterUnlock({ ...all, modalOpen: true })).toBe(false);
   });
 });

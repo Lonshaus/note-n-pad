@@ -62,7 +62,13 @@
     registerPasteTarget,
     type PasteHost,
   } from '../util/pasteFlow';
-  import { editableWith, pasteLocks, type PasteLock } from '../util/pasteLock';
+  import {
+    editableWith,
+    pasteLocks,
+    refocusAfterUnlock,
+    type PasteLock,
+  } from '../util/pasteLock';
+  import { isModalOpen, whenNoModal } from '../ConfirmModal.svelte';
 
   interface Props {
     activeId: string;
@@ -196,6 +202,24 @@
   // does not show it and a capture must use this record instead.
   let pendingScroll: { id: string; snap: StateEffect<unknown> } | null = null;
   let mountedId = '';
+  // Tabs whose paste lock went on while the editor had the focus.
+  const refocusIds = new Set<string>();
+  // The focus an unlocked editor lost is taken back unless it went elsewhere.
+  function refocusEditor(id: string): void {
+    const active = document.activeElement;
+    if (
+      view !== undefined &&
+      refocusAfterUnlock({
+        hadFocus: true,
+        mounted: id === mountedId,
+        editable: !hidden && !overlay,
+        focusOnBody: active === null || active === document.body,
+        modalOpen: isModalOpen(),
+      })
+    ) {
+      view.focus();
+    }
+  }
   // A paste into a tab: it stops the event, asks the core what the clipboard
   // holds, and pastes in one transaction. The tab may have been switched away
   // from by then, so it reaches the tab's state wherever it is.
@@ -214,13 +238,26 @@
       const effects = editableCompartment.reconfigure(
         editableWith(!hidden && !overlay, lock),
       );
+      if (
+        lock !== undefined &&
+        id === mountedId &&
+        view !== undefined &&
+        document.activeElement === view.contentDOM
+      ) {
+        refocusIds.add(id);
+      }
       if (id === mountedId) {
         view?.dispatch({ effects });
-        return;
+      } else {
+        const saved = states.get(id);
+        if (saved !== undefined) {
+          states.set(id, saved.update({ effects }).state);
+        }
       }
-      const saved = states.get(id);
-      if (saved !== undefined) {
-        states.set(id, saved.update({ effects }).state);
+      if (lock === undefined && refocusIds.delete(id)) {
+        setTimeout(() => {
+          whenNoModal(() => refocusEditor(id));
+        }, 0);
       }
     },
     eolOf: (id) => lineEndingOf(id),

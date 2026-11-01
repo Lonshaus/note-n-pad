@@ -184,6 +184,11 @@ focus_window() {
   auto "{\"id\":2,\"cmd\":\"focus\",\"label\":\"$1\"}" >/dev/null
   sleep 1
 }
+# A beat every 250 ms into the app log in window $1 (dev_trace): where the beats
+# stop is where the page got stuck.
+start_beat() {
+  evl "$1" "clearInterval(window.__beat);window.__beat=setInterval(()=>{window.__TAURI_INTERNALS__.invoke('dev_trace',{msg:'beat'}).catch(()=>{});},250);1" >/dev/null
+}
 # Whether the list of notes (list_notes) names the sticky note $CREATED_STICKY.
 # Asked in window $1.
 note_listed() {
@@ -635,6 +640,7 @@ restore_state() {
     if [ -n "${ORIG_TARGET:-}" ]; then
       evl "$dl" "__auto.setOpenTarget('$ORIG_TARGET')" >/dev/null 2>&1
     fi
+    evl "$dl" "clearInterval(window.__beat);1" >/dev/null 2>&1
     if [ -n "$CREATED_STICKY" ]; then
       evl "$dl" "window.__TAURI_INTERNALS__.invoke('delete_note',{id:'$CREATED_STICKY'})" >/dev/null 2>&1
     fi
@@ -690,21 +696,64 @@ sleep 1
 check "setup: the window has OS focus" "$(e2e_read "$DL" "String(document.hasFocus())")" "true"
 evl "$DL" "$HELPERS" >/dev/null
 check "helpers installed" "$(e2e_read "$DL" "typeof __t")" "object"
+start_beat "$DL"
+
+echo "=== 1a. [all] a sticky note pasted too much asks first; cancel gives the focus back to the note ==="
+# The note stays open: section 6 pastes into it too, and delete_note does not
+# close its window.
+CREATED_STICKY="$(auto '{"id":5,"cmd":"new_sticky"}' | jq -r '.data.id // empty' | tr -d '\r')"
+e2e_wait_until 60 note_exists
+STICKY="$(note_label)"
+if [ -z "$STICKY" ]; then
+  echo "FATAL: no sticky window"
+  exit 1
+fi
+evl "$STICKY" "$HELPERS" >/dev/null
+focus_window "$STICKY"
+check "1a: the note has the OS focus" "$(e2e_read "$STICKY" "String(document.hasFocus())")" "true"
+evl "$STICKY" "document.querySelector('.cm-content').focus()" >/dev/null
+e2e_wait_eval "$STICKY" "String(document.activeElement===document.querySelector('.cm-content'))" "true"
+do_paste "$STICKY" note
+wait_dialog "$STICKY" confirm
+evl "$STICKY" "__t.answer(-1)" >/dev/null
+e2e_wait_eval "$STICKY" "String(__auto.pasteLocked())" "false"
+e2e_wait_eval "$STICKY" "String(document.activeElement===document.querySelector('.cm-content'))" "true"
+check "cancel gave the focus back to the note" "$(e2e_read "$STICKY" "String(document.activeElement===document.querySelector('.cm-content'))")" "true"
 
 echo "=== 1. [all] a document pasted too much into asks first; cancel changes nothing, continue converts ==="
 open_fresh plain.txt
 caret_end
+focus_window "$DL"
+check "1: the document window has the OS focus" "$(e2e_read "$DL" "String(document.hasFocus())")" "true"
+evl "$DL" "__t.focus()" >/dev/null
+e2e_wait_eval "$DL" "String(document.activeElement===__t.content())" "true"
 do_paste "$DL" ok
 wait_dialog "$DL" confirm
 check "the tab is locked while the question is up" "$(e2e_read "$DL" "String(__auto.pasteLocked())")" "true"
 check "the question is the one of D8" "$(e2e_read "$DL" "__auto.convertDialog().message")" "There is too much content. It will be converted to a large file. Continue?"
 evl "$DL" "__t.answer(-1)" >/dev/null
 e2e_wait_eval "$DL" "String(__auto.pasteLocked())" "false"
+e2e_wait_eval "$DL" "String(document.activeElement===__t.content())" "true"
+check "cancel gave the focus back to the editor" "$(e2e_read "$DL" "String(document.activeElement===__t.content())")" "true"
 check "cancel left the document as it was" "$(e2e_read "$DL" "__auto.getContent()")" "abc"
 check "cancel left the tab ordinary" "$(e2e_read "$DL" "String(__auto.isWindowedTab())")" "false"
 check "cancel wrote no conversion file" "$(cv_files)" "0"
 do_paste "$DL" ok
 wait_dialog "$DL" confirm
+evl "$DL" "__auto.failNextConvert()" >/dev/null
+evl "$DL" "__t.answer(0)" >/dev/null
+wait_dialog "$DL" error
+check "the failure is reported while the editor waits" "$(e2e_read "$DL" "String(document.activeElement!==__t.content())")" "true"
+evl "$DL" "__t.answer(-1)" >/dev/null
+wait_dialog "$DL" none
+e2e_wait_eval "$DL" "String(document.activeElement===__t.content())" "true"
+check "closing the report gave the focus back to the editor" "$(e2e_read "$DL" "String(document.activeElement===__t.content())")" "true"
+check "the failure left the document as it was" "$(e2e_read "$DL" "__auto.getContent()")" "abc"
+check "the failure wrote no conversion file" "$(cv_files)" "0"
+do_paste "$DL" ok
+wait_dialog "$DL" confirm
+check "the paste asks again" "$(e2e_read "$DL" "__t.kind()")" "confirm"
+check "the paste started a conversion" "$(e2e_read "$DL" "String(__auto.convertJobs().length)")" "1"
 diag_convert_state "1 before Continue"
 evl "$DL" "__t.answer(0)" >/dev/null
 diag_convert "1"
@@ -830,8 +879,10 @@ e2e_wait_eval "$DL" "String(__auto.pasteLocked())" "false"
 back_to_seed
 
 echo "=== 6. [all] a sticky note pasted too much becomes a tab of a document window ==="
-# A sticky note of its own for this suite.
-CREATED_STICKY="$(auto '{"id":5,"cmd":"new_sticky"}' | jq -r '.data.id // empty' | tr -d '\r')"
+# The sticky note of section 1a, or one of its own for this suite.
+if [ -z "$CREATED_STICKY" ]; then
+  CREATED_STICKY="$(auto '{"id":5,"cmd":"new_sticky"}' | jq -r '.data.id // empty' | tr -d '\r')"
+fi
 e2e_wait_until 60 note_exists
 STICKY="$(note_label)"
 if [ -z "$STICKY" ]; then
@@ -845,6 +896,8 @@ for mode in tab window; do
   STICKY="$(note_label)"
   BEFORE_LABELS="$(doc_labels)"
   evl "$STICKY" "$HELPERS" >/dev/null
+  focus_window "$STICKY"
+  check "6 $mode: the note has the OS focus" "$(e2e_read "$STICKY" "String(document.hasFocus())")" "true"
   evl "$STICKY" "document.querySelector('.cm-content').focus()" >/dev/null
   sleep 1
   do_paste "$STICKY" note
@@ -863,6 +916,7 @@ for mode in tab window; do
     check "a window of its own opened for the note" "$([ -n "$NEW_DL" ] && echo yes || echo no)" "yes"
     DL="${NEW_DL:-$DL}"
     evl "$DL" "$HELPERS" >/dev/null
+    start_beat "$DL"
   fi
   e2e_wait_eval "$DL" "String(typeof __auto!=='undefined' && typeof __auto.isWindowedTab==='function' && __auto.isWindowedTab())" "true"
   check "the note is a tab with no file yet" "$(ctinfo | jq -r '.converted.target')" "null"
@@ -889,6 +943,9 @@ for mode in tab window; do
     back_to_seed
   fi
 done
+# The note and the window it opened took the OS focus; the clip pastes below need it.
+focus_window "$BASE_DL"
+check "after 6: the document window has the OS focus" "$(e2e_read "$BASE_DL" "String(document.hasFocus())")" "true"
 
 echo "=== 7. [macOS, Windows] a clip of 110 MB is pasted from its file, never read by the page ==="
 if has_clipboard; then

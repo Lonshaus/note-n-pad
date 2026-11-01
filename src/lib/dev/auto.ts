@@ -10,6 +10,7 @@ import {
   type LargeSelectAll,
   type OpenTarget,
 } from '../state/settings.svelte';
+import { rearmStats } from '../editor/offscreenArrow';
 import { convertController } from '../state/convertController.svelte';
 import type { NoteSnapshot } from '../state/stickyNote.svelte';
 import type { ClipInfo } from '../util/clipRouting';
@@ -111,6 +112,10 @@ const pasteHooks = {
   convertJobs: (): string[] => convertController.jobTabIds(),
   /** How the last conversion's run ended. */
   lastConvertExit: (): string | null => convertController.lastExit,
+  /** Makes the next conversion fail once, after its question is answered. */
+  failNextConvert: (): void => {
+    convertController.devFailNext = true;
+  },
   /** Presses a button of that question by its label; false when there is none. */
   convertAnswer: (label: string): boolean => {
     const d = convertController.dialog;
@@ -147,6 +152,15 @@ export function installStickyAuto(hooks: StickyHooks): void {
     setPaper: hooks.setPaper,
     openCloseFlow: hooks.openCloseFlow,
   };
+}
+/** What the windowed editor's view has drawn and how far it is scrolled. */
+export interface WindowedViewGeometry {
+  viewport: { from: number; to: number };
+  lines: number;
+  scrollTop: number;
+  clientHeight: number;
+  scrollHeight: number;
+  visible: { from: number; to: number } | null;
 }
 /** Document-window actions wired to the tabbed DocumentApp controller. */
 export interface DocumentHooks {
@@ -284,6 +298,8 @@ export interface DocumentHooks {
     dirty: boolean;
   };
   windowedGoto: (line: number) => void;
+  /** The windowed editor's view geometry, or null without one. */
+  windowedViewGeometry: () => WindowedViewGeometry | null;
   /** The windowed editor's global selection ends, or null without one. */
   windowedGlobalSel: () => {
     anchor: { line: number; col: number };
@@ -623,6 +639,7 @@ export function installDocumentAuto(hooks: DocumentHooks): void {
     setWordWrap: (on: boolean) => settingsState.setWordWrap(on),
     getLanguage: () => settingsState.language,
     setLanguage: (l: Language) => settingsState.setLanguage(l),
+    rearmStats,
     holdWindowedResults,
     heldWindowedResults,
     releaseWindowedResults,

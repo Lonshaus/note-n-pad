@@ -6,6 +6,8 @@
   const mounted = new Set<HTMLElement>();
   // What held focus before the first modal opened.
   let restoreTo: Element | null = null;
+  // Callbacks waiting for the last dialog to close.
+  let afterClose: (() => void)[] = [];
 
   function topmost(): HTMLElement | undefined {
     let top: HTMLElement | undefined;
@@ -30,6 +32,15 @@
   /** True while any dialog is mounted; outer Esc handlers yield to it. */
   export function isModalOpen(): boolean {
     return mounted.size > 0;
+  }
+  /** Runs `run` at once when no dialog is mounted, otherwise once after the
+   *  last one has closed and its focus is restored. */
+  export function whenNoModal(run: () => void): void {
+    if (mounted.size === 0) {
+      run();
+    } else {
+      afterClose.push(run);
+    }
   }
   /** Put keyboard focus inside the topmost dialog. Returns false when no dialog
    *  is mounted. Focus already inside it stays put (a button reached with Tab
@@ -146,6 +157,11 @@
           restoreTo.focus();
         }
         restoreTo = null;
+        const queued = afterClose;
+        afterClose = [];
+        for (const run of queued) {
+          run();
+        }
       } else if (!next.contains(document.activeElement)) {
         defaultButton(next)?.focus();
       }

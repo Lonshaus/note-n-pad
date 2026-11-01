@@ -163,6 +163,10 @@ with open(f'{w}/small.csv', 'w', newline='') as f:
     f.write('col a,col b,col c\n')
     for i in range(50):
         f.write(f'{i},value {i},another {i}\n')
+with open(f'{w}/fresh.csv', 'w', newline='') as f:
+    f.write('col a,col b,col c\n')
+    for i in range(50):
+        f.write(f'{i},value {i},another {i}\n')
 with open(f'{w}/huge.csv', 'w', newline='') as f:
     f.write('n,v\n')
     for i in range(1600000):
@@ -584,7 +588,7 @@ e2e_wait_eval "$DL" "String(document.querySelector('.cell[data-r=\"270000\"][dat
 # Premise: the tab we are leaving really is scrolled to the bottom.
 check "the long file is scrolled to its end" \
   "$(e2e_read "$DL" "String(document.querySelector('.grid-scroll').scrollTop > 6000000)")" "true"
-evl "$DL" "__auto.openTab('$WORK/small.csv')" >/dev/null
+evl "$DL" "__auto.openTab('$WORK/fresh.csv')" >/dev/null
 e2e_wait_eval "$DL" "String(__auto.tableDims().rows)" "51"
 check "the new tab starts at the top" \
   "$(e2e_read "$DL" "String(document.querySelector('.grid-scroll').scrollTop)")" "0"
