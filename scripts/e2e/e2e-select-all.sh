@@ -196,7 +196,7 @@ collapse_selection() {
 # warnings CodeMirror gave. $1 names the moment.
 diag_view() {
   # Held in a variable: bash 3.2 brace-expands {a,b} in a double-quoted string nested in "$( )".
-  local js='JSON.stringify({info:__auto.windowedInfo(),geometry:__auto.windowedViewGeometry(),rearm:__auto.rearmStats(),warns:window.__cmWarns})'
+  local js='JSON.stringify({info:__auto.windowedInfo(),geometry:__auto.windowedViewGeometry(),rearm:__auto.rearmStats(),warns:window.__cmWarns,cursor:__auto.getCursor(),sel:__auto.windowedGlobalSel()})'
   echo "DIAG $1: $(e2e_read "$DL" "$js")"
 }
 # The same, with the selection, the lines of the loaded window and the last ten
@@ -539,7 +539,9 @@ check "the saved file equals the reference: the undone content plus x, no y" "$(
 echo "=== 7. a Select All made during the swap back to the caret ==="
 evl "$DL" "__auto.windowedGoto(1)" >/dev/null
 e2e_wait_eval "$DL" "String(__auto.getContent().startsWith('0000000001 ') && __auto.windowedInfo().windowStartLine===0)" "true"
+diag_view "7 before focus"
 evl "$DL" "__t.focus()" >/dev/null
+diag_view "7 after focus"
 tries=0
 until [ "$(e2e_read "$DL" "String(__auto.windowedInfo().windowStartLine > 5000)")" = "true" ]; do
   evl "$DL" "(()=>{const s=document.querySelector('.cm-scroller');s.scrollTop=s.scrollHeight;return 1;})()" >/dev/null

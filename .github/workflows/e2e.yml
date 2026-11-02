@@ -72,7 +72,7 @@ jobs:
         # combination without `os`.
         shard: >-
           ${{ fromJSON((inputs.suites == null || inputs.suites == '' || inputs.suites == 'all')
-          && '[{"n":1,"limit":66},{"n":2,"limit":110},{"n":3,"limit":99},{"n":4,"limit":118}]'
+          && '[{"n":1,"limit":66},{"n":2,"limit":110},{"n":3,"limit":99},{"n":4,"limit":85},{"n":5,"limit":53}]'
           || '[{"n":0,"limit":340}]') }}
     steps:
       - uses: actions/checkout@v7

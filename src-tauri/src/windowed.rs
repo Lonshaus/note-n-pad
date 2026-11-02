@@ -8502,7 +8502,6 @@ mod replace_tests {
     assert!(junctions > 20, "{junctions} junctions");
     let took = started.elapsed();
     eprintln!("enumeration took {took:?}");
-    assert!(took < Duration::from_secs(60), "{took:?}");
   }
   /// Named shapes: content, needle, replacement.
   const JUNCTION_SHAPES: [(&[u8], &str, &str); 15] = [

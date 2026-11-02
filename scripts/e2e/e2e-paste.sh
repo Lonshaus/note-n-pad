@@ -85,6 +85,18 @@ echo "environment: $ENV_NAME"
 has_clipboard() {
   [ "$ENV_NAME" != "linux" ]
 }
+# The line ending of a new document: the setting, else the platform default.
+default_eol() {
+  local v
+  v="$(jq -r '.default_line_ending // empty' "$APPDIR/settings.json" 2>/dev/null)"
+  if [ -n "$v" ]; then
+    echo "$v"
+  elif [ "$ENV_NAME" = "windows" ]; then
+    echo CRLF
+  else
+    echo LF
+  fi
+}
 
 ok() {
   PASS=$((PASS + 1))
@@ -390,15 +402,16 @@ wait_dialog() {
 }
 # The text of the paste: the file it is on the clipboard from, and the
 # JavaScript that makes the same text in the page (where there are no clips the
-# event carries it).
-#   ok:    OK_N x, a break, "end"          emoji: OK_N x and an emoji
-#   big:   BIG_N x                          note:  NOTE_N x
+# event carries it). body(n) is n characters, every 1024th a line break.
+#   ok:    body(OK_N), a break, "end"      emoji: body(OK_N) and an emoji
+#   big:   body(BIG_N)                      note:  body(NOTE_N)
 js_paste() {
+  local body="((n)=>'x'.repeat(1023).concat('\\n').repeat(Math.floor(n/1024))+'x'.repeat(n%1024))"
   case "$1" in
-    ok) echo "'x'.repeat($OK_N)+'\\nend'" ;;
-    emoji) echo "'x'.repeat($OK_N)+'😀'" ;;
-    big) echo "'x'.repeat($BIG_N)" ;;
-    note) echo "'x'.repeat($NOTE_N)" ;;
+    ok) echo "$body($OK_N)+'\\nend'" ;;
+    emoji) echo "$body($OK_N)+'😀'" ;;
+    big) echo "$body($BIG_N)" ;;
+    note) echo "$body($NOTE_N)" ;;
   esac
 }
 # Paste the text $2 into window $1.
@@ -575,19 +588,24 @@ fi
 echo "=== fixtures ==="
 rm -rf "$WORK"
 mkdir -p "$WORK"
+DEFAULT_EOL="$(default_eol)"
 python3 - <<PYEOF
 import os
 w = '$WORK'
 ok_n, big_n, note_n = $OK_N, $BIG_N, $NOTE_N
+eol = b'\r\n' if '$DEFAULT_EOL' == 'CRLF' else b'\n'
+def body(n):
+    return ('x' * 1023 + '\n') * (n // 1024) + 'x' * (n % 1024)
 def put(name, data):
     with open(os.path.join(w, name), 'wb') as f:
         f.write(data)
-paste_ok = ('x' * ok_n + '\nend').encode()
-paste_emoji = ('x' * ok_n + '\U0001F600').encode()
+paste_ok = (body(ok_n) + '\nend').encode()
+paste_emoji = (body(ok_n) + '\U0001F600').encode()
 put('paste-ok.txt', paste_ok)
 put('paste-emoji.txt', paste_emoji)
-put('paste-big.txt', ('x' * big_n).encode())
-put('paste-note.txt', ('x' * note_n).encode())
+put('paste-big.txt', body(big_n).encode())
+put('paste-note.txt', body(note_n).encode())
+put('paste-ok-default.txt', paste_ok.replace(b'\n', eol))
 put('seed.txt', b'seed\n')
 put('plain.txt', b'abc')
 put('crlf.txt', b'one\r\ntwo')
@@ -598,8 +616,9 @@ put('ref-crlf.txt', b'one\r\ntwo' + paste_ok.replace(b'\n', b'\r\n'))
 put('ref-sjis.txt', 'あいう'.encode('shift_jis') + paste_ok)
 put('ref-bom.txt', b'\xef\xbb\xbfbom' + paste_ok)
 put('ref-sjis-utf8.txt', 'あいう'.encode('utf-8') + paste_emoji)
-put('ref-big.txt', b'abc' + ('x' * big_n).encode())
-put('ref-note.txt', ('x' * note_n).encode())
+put('ref-big.txt', b'abc' + body(big_n).encode())
+put('ref-note.txt', body(note_n).encode())
+put('ref-note-default.txt', body(note_n).encode().replace(b'\n', eol))
 def write(path, n):
     with open(path, 'w', newline='') as f:
         buf = []
@@ -709,8 +728,10 @@ if [ -z "$STICKY" ]; then
   exit 1
 fi
 evl "$STICKY" "$HELPERS" >/dev/null
-focus_window "$STICKY"
-check "1a: the note has the OS focus" "$(e2e_read "$STICKY" "String(document.hasFocus())")" "true"
+if has_clipboard; then
+  focus_window "$STICKY"
+  check "1a: the note has the OS focus" "$(e2e_read "$STICKY" "String(document.hasFocus())")" "true"
+fi
 evl "$STICKY" "document.querySelector('.cm-content').focus()" >/dev/null
 e2e_wait_eval "$STICKY" "String(document.activeElement===document.querySelector('.cm-content'))" "true"
 do_paste "$STICKY" note
@@ -784,7 +805,7 @@ SAVE_DIAG="2" save_to "$SAVED_TO"
 evl "$DL" "clearInterval(window.__tickTimer);1" >/dev/null
 diag_line "2 save result" "$(e2e_read "$DL" "String(window.__sv)")"
 diag_line "2 tabs" "$(e2e_read "$DL" "JSON.stringify(__auto.getTabs())")"
-check "the saved file is the pasted text (SHA-256)" "$(file_sha256 "$SAVED_TO")" "$(file_sha256 "$WORK/paste-ok.txt")"
+check "the saved file is the pasted text (SHA-256)" "$(file_sha256 "$SAVED_TO")" "$(file_sha256 "$WORK/paste-ok-default.txt")"
 check "the tab has the path now" "$(e2e_read "$DL" "__auto.getTabs().find((t)=>t.active).path")" "$SAVED_TO"
 back_to_seed
 
@@ -896,8 +917,10 @@ for mode in tab window; do
   STICKY="$(note_label)"
   BEFORE_LABELS="$(doc_labels)"
   evl "$STICKY" "$HELPERS" >/dev/null
-  focus_window "$STICKY"
-  check "6 $mode: the note has the OS focus" "$(e2e_read "$STICKY" "String(document.hasFocus())")" "true"
+  if has_clipboard; then
+    focus_window "$STICKY"
+    check "6 $mode: the note has the OS focus" "$(e2e_read "$STICKY" "String(document.hasFocus())")" "true"
+  fi
   evl "$STICKY" "document.querySelector('.cm-content').focus()" >/dev/null
   sleep 1
   do_paste "$STICKY" note
@@ -935,7 +958,7 @@ for mode in tab window; do
     # Saved: the record is gone.
     NOTE_SAVED="$WORK/note-saved.txt"
     save_to "$NOTE_SAVED"
-    check "the note's text is the file (SHA-256)" "$(file_sha256 "$NOTE_SAVED")" "$(file_sha256 "$WORK/ref-note.txt")"
+    check "the note's text is the file (SHA-256)" "$(file_sha256 "$NOTE_SAVED")" "$(file_sha256 "$WORK/ref-note-default.txt")"
     check "the note's record is deleted by the first save" "$([ -e "$STORE/$CREATED_STICKY.json" ] && echo yes || echo no)" "no"
     check "the list of notes has no such note after the save" "$(note_listed "$DL")" "false"
     CREATED_STICKY=""

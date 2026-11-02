@@ -62,6 +62,7 @@ boot_label() {
 doc_label() {
   auto '{"id":3,"cmd":"list_windows"}' | jq -r '.data[]|select(.label|startswith("doc-"))|.label' | head -1
 }
+doc_label_ready() { [ -n "$(doc_label)" ]; }
 evl() {
   auto "{\"id\":$(e2e_next_id),\"cmd\":\"eval\",\"label\":\"$1\",\"js\":$(jq -Rn --arg js "$2" '$js')}" | jq -r '.data'
 }
@@ -217,7 +218,7 @@ fi
 # A plain host window: every case below runs through its in-window openTab, and
 # a tab that stays open keeps the window alive between cases.
 evl "$BOOT" "window.__TAURI_INTERNALS__.invoke('open_document_window',{path:'$WORK/host.txt'})" >/dev/null
-e2e_wait_until 60 test -n "$(doc_label)"
+e2e_wait_until 60 doc_label_ready
 DL=$(doc_label)
 if [ -z "$DL" ]; then
   echo "FATAL: no document window"

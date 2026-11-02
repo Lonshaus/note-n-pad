@@ -29,7 +29,7 @@
     type Command,
     type ViewUpdate,
   } from '@codemirror/view';
-  import { toggleTabFocusMode } from '@codemirror/commands';
+  import { selectAll, toggleTabFocusMode } from '@codemirror/commands';
   import { varEditorTheme } from '../editor/editorTheme';
   import { buildKeymap, keymapExtension } from '../editor/keymap';
   import {
@@ -389,6 +389,7 @@
     anchor: { line: 0, col: 0 },
     head: { line: 0, col: 0 },
   };
+  let globalSelSeq = 0;
   let lastLive: LineSelection = globalSel;
   let windowStartOffset = 0;
   let windowEndOffset = 0;
@@ -701,10 +702,12 @@
     }),
     EditorState.transactionFilter.of(narrowNativeSelectAll),
   ];
+  // Without a full visible line Select All takes the whole loaded window.
+  const selectVisibleKey: Command = (v) => selectVisible(v) || selectAll(v);
   const coreKeys: Extension = keymap.of(
     coreKeyBindings({
       closeBox,
-      selectVisible,
+      selectVisible: selectVisibleKey,
       undo: undoCommand,
       redo: redoCommand,
     }),
@@ -840,13 +843,13 @@
           }
           if (act.track && !settingSelection) {
             if (heldCaret === null) {
-              trackSelection(update.state, update.docChanged);
+              trackSelection(update.state, update.docChanged, 'listener');
             } else if (update.docChanged) {
               heldCaret = {
                 anchor: update.changes.mapPos(heldCaret.anchor),
                 head: update.changes.mapPos(heldCaret.head),
               };
-              trackSelection(update.state, true, {
+              trackSelection(update.state, true, 'listenerHeld', {
                 anchor: livePos(update.state.doc, heldCaret.anchor),
                 head: livePos(update.state.doc, heldCaret.head),
               });
@@ -877,20 +880,35 @@
       head: livePos(state.doc, main.head),
     };
   }
+  // The one writer of globalSel; DEV builds trace every write.
+  function setGlobalSel(next: LineSelection, tag: string): void {
+    const prev = globalSel;
+    globalSel = next;
+    if (import.meta.env.DEV) {
+      globalSelSeq += 1;
+      devTrace(
+        `globalSel#${globalSelSeq} ${tag} anchor ${prev.anchor.line}->${next.anchor.line} head ${prev.head.line}->${next.head.line}`,
+      );
+    }
+  }
   // Fold the state's live selection into the global one: a document change
   // replaces it, a selection change replaces the ends the user moved.
   function trackSelection(
     state: EditorState,
     docChanged: boolean,
+    tag: string,
     liveOverride?: LineSelection,
   ): void {
     const live = liveOverride ?? liveSelection(state);
-    globalSel = selectionAfterChange(
-      globalSel,
-      lastLive,
-      live,
-      windowStartLine,
-      docChanged,
+    setGlobalSel(
+      selectionAfterChange(
+        globalSel,
+        lastLive,
+        live,
+        windowStartLine,
+        docChanged,
+      ),
+      tag,
     );
     lastLive = live;
   }
@@ -1291,7 +1309,7 @@
   function jumpAfterUndo(res: UndoResult): void {
     const jump = undoSelection({ tracked: res.tracked, branch: 'goto' });
     if (jump.sel !== null) {
-      globalSel = jump.sel;
+      setGlobalSel(jump.sel, 'undoJump');
       void loadWindow(jump.sel.head.line, 'reveal');
     } else {
       void loadWindow(res.first_line, 'goto');
@@ -1320,7 +1338,7 @@
         branch: 'reload_only',
       });
       if (reloaded.sel !== null) {
-        globalSel = reloaded.sel;
+        setGlobalSel(reloaded.sel, 'undoReload');
       }
       if (res.token !== null) {
         logChange({ token: res.token }, false);
@@ -1373,7 +1391,7 @@
     // tracked one.
     const mirrored = undoSelection({ tracked: res.tracked, branch: 'mirror' });
     if (mirrored.sel !== null) {
-      globalSel = mirrored.sel;
+      setGlobalSel(mirrored.sel, 'undoMirror');
       alignViewToGlobal(view);
     }
     if (
@@ -1440,7 +1458,7 @@
         capture === null &&
         !queueHasSelect()
       ) {
-        trackSelection(view.state, false);
+        trackSelection(view.state, false, 'endSwapFold');
       }
       const active = document.activeElement;
       if (
@@ -2118,9 +2136,9 @@
     if (place.doc !== null) {
       setViewSelection(v, place.doc.anchor, place.doc.head);
       lastLive = liveSelection(v.state);
-      globalSel = toGlobalSelection(lastLive, windowStartLine);
+      setGlobalSel(toGlobalSelection(lastLive, windowStartLine), 'runSelectA');
     } else {
-      globalSel = place.global;
+      setGlobalSel(place.global, 'runSelectB');
     }
   }
   // --- Global operations -----------------------------------------------------
@@ -2131,7 +2149,7 @@
   // no other way to know.
   const ownCommands: OwnCommands = {
     closeBox,
-    selectVisible,
+    selectVisible: selectVisibleKey,
     undo: undoCommand,
     redo: redoCommand,
   };
@@ -2167,7 +2185,7 @@
     return routeOf(item, globalSel).type !== 'normal';
   }
   function restoreMainSelection(sel: LineSelection): void {
-    globalSel = sel;
+    setGlobalSel(sel, 'restoreMain');
     if (view !== undefined) {
       alignViewToGlobal(view);
     }
@@ -2548,7 +2566,7 @@
     logChange({ edits: res.edits }, false);
     editSeq += 1;
     scheduleResultsRefresh();
-    globalSel = res.sel;
+    setGlobalSel(res.sel, 'globalResult');
     heldCaret = null;
     reportSelection();
   }
@@ -2623,7 +2641,7 @@
     }
     const out = globalSelectAction(spec, globalSel, end);
     heldCaret = null;
-    globalSel = out.sel;
+    setGlobalSel(out.sel, 'keySelect');
     takeSelectOutcome(item, out);
     if (!out.replay && replayWindowReady(v)) {
       alignViewToGlobal(v);
@@ -2689,13 +2707,16 @@
           if (swapStreak > 2) {
             // The swap cannot bring the selection inside: use what is there.
             swapStreak = 0;
-            globalSel = toGlobalSelection(
-              toLiveSelection(globalSel, {
-                startLine: windowStartLine,
-                lineCount: v.state.doc.lines,
-                lineLength: (local) => v.state.doc.line(local + 1).length,
-              }),
-              windowStartLine,
+            setGlobalSel(
+              toGlobalSelection(
+                toLiveSelection(globalSel, {
+                  startLine: windowStartLine,
+                  lineCount: v.state.doc.lines,
+                  lineLength: (local) => v.state.doc.line(local + 1).length,
+                }),
+                windowStartLine,
+              ),
+              'drainClamp',
             );
             continue;
           }
@@ -2875,7 +2896,7 @@
         keymap.of(
           coreKeyBindings({
             closeBox: () => false,
-            selectVisible: () => false,
+            selectVisible: selectAll,
             undo: () => {
               startKeyUndo('undo');
               return true;
@@ -3274,7 +3295,7 @@
       }
     } finally {
       sh.busy = false;
-      globalSel = sh.sel;
+      setGlobalSel(sh.sel, 'shadow');
       notifyFlushWaiters();
     }
   }
@@ -3331,7 +3352,7 @@
       offscreen,
       coreKeyBindings({
         closeBox,
-        selectVisible,
+        selectVisible: selectVisibleKey,
         undo: undoCommand,
         redo: redoCommand,
       }),
@@ -3386,7 +3407,7 @@
         selectAllGate.request();
         return true;
       }
-      // CodeMirror's own Select All would take the whole loaded window. With
+      // Select All of the key chain would take the whole loaded window. With
       // input queued the key waits its turn behind it instead.
       if (
         !swapping &&
@@ -3444,7 +3465,7 @@
       const dir = parkedUndoKey(
         coreKeyBindings({
           closeBox,
-          selectVisible,
+          selectVisible: selectVisibleKey,
           undo: undoCommand,
           redo: redoCommand,
         }),
@@ -3932,7 +3953,7 @@
         capture === null &&
         !queueHasSelect()
       ) {
-        trackSelection(view.state, docChangedDuringSwap);
+        trackSelection(view.state, docChangedDuringSwap, 'swapFold');
       }
       docChangedDuringSwap = false;
 
@@ -3959,9 +3980,12 @@
       // global selection is intersected with the new window; the global one is
       // kept so a later swap can bring a clamped end back.
       if (mode === 'goto') {
-        globalSel = gotoSelection(
-          windowStartLine +
-            clamp(target - windowStartLine, 0, fresh.doc.lines - 1),
+        setGlobalSel(
+          gotoSelection(
+            windowStartLine +
+              clamp(target - windowStartLine, 0, fresh.doc.lines - 1),
+          ),
+          'gotoLoad',
         );
       }
       const swapped = selectionAfterSwap(globalSel, {
@@ -3969,7 +3993,7 @@
         lineCount: fresh.doc.lines,
         lineLength: (local) => fresh.doc.line(local + 1).length,
       });
-      globalSel = swapped.global;
+      setGlobalSel(swapped.global, 'selectionAfterSwap');
       lastLive = swapped.live;
       devTrace(
         `loadWindow setState before lines=${fresh.doc.lines} chars=${fresh.doc.length}`,
@@ -4290,7 +4314,7 @@
         docPos(doc, whole.live.anchor),
         docPos(doc, whole.live.head),
       );
-      globalSel = whole.globalSel;
+      setGlobalSel(whole.globalSel, 'runSelectAll');
       lastLive = whole.lastLive;
       heldCaret = null;
       reportSelection();
@@ -4412,7 +4436,7 @@
   }
   // Select a hit: the global selection, then the window that shows it.
   async function showHit(hit: FindHit): Promise<void> {
-    globalSel = hitSelection(hit);
+    setGlobalSel(hitSelection(hit), 'findHit');
     await loadWindow(hit.start.line, 'reveal');
   }
   // Find the next (or previous) hit from the caret, over the content as the core
@@ -4572,7 +4596,10 @@
       if (res.count > 0) {
         editSeq += 1;
         if (res.tracked !== undefined) {
-          globalSel = { anchor: res.tracked[0], head: res.tracked[1] };
+          setGlobalSel(
+            { anchor: res.tracked[0], head: res.tracked[1] },
+            'replaceAll',
+          );
         }
         await reloadWindow();
       }
@@ -4666,11 +4693,14 @@
       return;
     }
     if (target.kind === 'line') {
-      globalSel = gotoSelection(target.line);
+      setGlobalSel(gotoSelection(target.line), 'gotoPanelA');
       await loadWindow(target.line, 'reveal');
     } else {
       // A range is selected only as far as one window holds.
-      globalSel = gotoRangeSelection(target.range.start, target.range.end);
+      setGlobalSel(
+        gotoRangeSelection(target.range.start, target.range.end),
+        'gotoPanelB',
+      );
       await loadWindow(target.range.start, 'reveal');
     }
   }
@@ -4758,7 +4788,7 @@
       view = v;
       windowEndLine = windowStartLine + v.state.doc.lines;
       lastLive = liveSelection(v.state);
-      globalSel = toGlobalSelection(lastLive, windowStartLine);
+      setGlobalSel(toGlobalSelection(lastLive, windowStartLine), 'mount');
       // Continue from the line the user was viewing: place the caret there and
       // scroll it to the top so the unlock feels like the same view kept its place.
       if (target > windowStartLine || caret !== undefined) {

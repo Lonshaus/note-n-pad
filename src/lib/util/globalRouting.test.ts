@@ -796,6 +796,20 @@ describe('the command table', () => {
     }
   });
 
+  it('classifies Mod-a of the core layer as normal once Select All is gone', () => {
+    for (const os of OSES) {
+      const e =
+        os === 'macos'
+          ? ev('a', 65, { metaKey: true })
+          : ev('a', 65, { ctrlKey: true });
+      const chain = commandChain(layersFor(os), e, os);
+      expect(chain, os).toEqual([own.selectVisible]);
+      expect(classifyCommand(chain[0] as Command, own), os).toEqual({
+        type: 'normal',
+      });
+    }
+  });
+
   it('has a row for every command a user can bind in the windowed editor', () => {
     for (const command of REBINDABLE) {
       if (command.profiles.includes('windowed')) {
