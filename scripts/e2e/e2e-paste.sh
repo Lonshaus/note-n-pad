@@ -451,6 +451,9 @@ js_paste() {
 do_paste() {
   local label="$1" kind="$2"
   if has_clipboard; then
+    # A paste through the system clipboard goes to the focused window.
+    focus_window "$label"
+    e2e_wait_eval "$label" "String(document.hasFocus())" "true"
     clip_set_file "$WORK/paste-$kind.txt"
     evl "$label" "window.__pr=undefined;window.__pr=__auto.pasteText('');1" >/dev/null
   else
