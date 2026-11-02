@@ -807,7 +807,13 @@
             view === undefined
               ? null
               : { from: view.viewport.from, to: view.viewport.to },
-          request: () => selectAllGate.request(),
+          // A swap that starts while the editor has no focus moves the DOM
+          // selection over the whole window; only a focused editor asks.
+          request: () => {
+            if (view?.hasFocus) {
+              selectAllGate.request();
+            }
+          },
         }),
         EditorView.updateListener.of((update) => {
           // A click made while input is queued, or a composition is open,
