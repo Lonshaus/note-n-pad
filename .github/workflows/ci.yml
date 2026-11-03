@@ -1,9 +1,12 @@
 name: CI
-# Pull requests rather than pushes: a branch is pushed many times while it is
-# being worked on, and only the state that is about to be merged has to be
-# green.
+# Pull requests rather than pushes to work branches: a branch is pushed many
+# times while it is being worked on, and only the state that is about to be
+# merged has to be green. Pushes to develop and master run too, so the state
+# that several merges leave behind is checked as a whole.
 on:
   pull_request:
+  push:
+    branches: [develop, master]
   workflow_dispatch:
 # Cancel superseded runs on the same ref to save CI minutes.
 concurrency:
