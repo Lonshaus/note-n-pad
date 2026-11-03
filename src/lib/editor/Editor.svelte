@@ -37,7 +37,13 @@
     registerPasteTarget,
     type PasteHost,
   } from '../util/pasteFlow';
-  import { editableWith, pasteLocks, type PasteLock } from '../util/pasteLock';
+  import {
+    editableWith,
+    pasteLocks,
+    refocusAfterUnlock,
+    type PasteLock,
+  } from '../util/pasteLock';
+  import { isModalOpen, whenNoModal } from '../ConfirmModal.svelte';
 
   interface Props {
     value: string;
@@ -94,6 +100,24 @@
   const editableCompartment = new Compartment();
   // Phrases baked into the state so far; a reconfigure is skipped when equal.
   let appliedPhrases = cmPhraseSignature();
+  // Keys of the locks that went on while the editor had the focus.
+  const refocusIds = new Set<string>();
+  // The focus an unlocked editor lost is taken back unless it went elsewhere.
+  function refocusEditor(): void {
+    const active = document.activeElement;
+    if (
+      view !== undefined &&
+      refocusAfterUnlock({
+        hadFocus: true,
+        mounted: true,
+        editable: true,
+        focusOnBody: active === null || active === document.body,
+        modalOpen: isModalOpen(),
+      })
+    ) {
+      view.focus();
+    }
+  }
   // A paste into the note: it stops the event, asks the core what the
   // clipboard holds, and pastes in one transaction.
   const pasteHost: PasteHost = {
@@ -102,10 +126,22 @@
     apply: (_id: string, spec: TransactionSpec) => {
       view?.dispatch(spec);
     },
-    showLock: (_id: string, lock: PasteLock | undefined) => {
+    showLock: (id: string, lock: PasteLock | undefined) => {
+      if (
+        lock !== undefined &&
+        view !== undefined &&
+        document.activeElement === view.contentDOM
+      ) {
+        refocusIds.add(id);
+      }
       view?.dispatch({
         effects: editableCompartment.reconfigure(editableWith(true, lock)),
       });
+      if (lock === undefined && refocusIds.delete(id)) {
+        setTimeout(() => {
+          whenNoModal(refocusEditor);
+        }, 0);
+      }
     },
     eolOf: () => '\n',
   };

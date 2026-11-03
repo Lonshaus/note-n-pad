@@ -52,11 +52,11 @@ concurrency:
 
 jobs:
   e2e:
-    name: e2e (${{ matrix.os }})
+    name: e2e (${{ matrix.os }}, ${{ matrix.shard.n }})
     runs-on: ${{ matrix.os }}
-    # The suites' limits below add up to 295 minutes, their 60 s grace periods
-    # to 18, and installing and building takes about 20.
-    timeout-minutes: 340
+    # A group's limit is its suites' limits from minutes_for, 1 minute of grace
+    # for each, and 20 for installing and building.
+    timeout-minutes: ${{ matrix.shard.limit }}
     strategy:
       fail-fast: false
       matrix:
@@ -67,6 +67,13 @@ jobs:
           || inputs.runners == 'macos' && '["macos-latest"]'
           || inputs.runners == 'windows' && '["windows-latest"]'
           || '["ubuntu-24.04","macos-latest","windows-latest"]') }}
+        # Group 0 is a named suite, run alone. A list of objects rather than
+        # `include`, which turns an entry that matches nothing into a new
+        # combination without `os`.
+        shard: >-
+          ${{ fromJSON((inputs.suites == null || inputs.suites == '' || inputs.suites == 'all')
+          && '[{"n":1,"limit":66},{"n":2,"limit":110},{"n":3,"limit":99},{"n":4,"limit":85},{"n":5,"limit":53}]'
+          || '[{"n":0,"limit":340}]') }}
     steps:
       - uses: actions/checkout@v7
 
@@ -94,11 +101,31 @@ jobs:
         uses: Swatinem/rust-cache@v2
         with:
           workspaces: src-tauri
+          cache-on-failure: true
+          save-if: ${{ matrix.shard.n <= 1 }}
+      - name: Restore the licence tool
+        id: licence-tool
+        uses: actions/cache/restore@v6
+        with:
+          path: |
+            ~/.cargo/bin/cargo-bundle-licenses
+            ~/.cargo/bin/cargo-bundle-licenses.exe
+          key: licence-tool-${{ runner.os }}-4.2.0
+      - name: Install the licence tool
+        if: steps.licence-tool.outputs.cache-hit != 'true'
+        run: cargo install cargo-bundle-licenses --version 4.2.0 --locked
+      # Saved at once, so a later failure does not lose it; one group saves for its platform.
+      - name: Save the licence tool
+        if: steps.licence-tool.outputs.cache-hit != 'true' && matrix.shard.n <= 1
+        uses: actions/cache/save@v6
+        with:
+          path: |
+            ~/.cargo/bin/cargo-bundle-licenses
+            ~/.cargo/bin/cargo-bundle-licenses.exe
+          key: licence-tool-${{ runner.os }}-4.2.0
       # tauri-build refuses to compile without the index.
       - name: Generate third-party licence index
-        run: |
-          cargo install cargo-bundle-licenses --version 4.2.0 --locked
-          npm run licenses
+        run: npm run licenses
       # tauri-build fails without the clipboard helper on Windows.
       - name: Build the clipboard helper
         run: node scripts/build-cliphelper.mjs
@@ -114,13 +141,20 @@ jobs:
         env:
           # Through the environment, never interpolated into the script.
           SUITES: ${{ inputs.suites }}
+          SHARD: ${{ matrix.shard.n }}
         run: |
           set -u -o pipefail
           # The dropdown's "all" option and an API dispatch's empty string both mean everything.
           if [ "$SUITES" = all ]; then
             SUITES=''
           fi
-          if [ -z "$SUITES" ]; then
+          if [ "$SHARD" != 0 ]; then
+            bash scripts/e2e/shards.sh check || exit 1
+            scripts=""
+            for name in $(bash scripts/e2e/shards.sh "$SHARD"); do
+              scripts="$scripts scripts/e2e/$name.sh"
+            done
+          elif [ -z "$SUITES" ]; then
             scripts="$(ls scripts/e2e/e2e-*.sh)"
           else
             scripts=""
@@ -250,6 +284,6 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v7
         with:
-          name: e2e-logs-${{ matrix.os }}
+          name: e2e-logs-${{ matrix.os }}-${{ matrix.shard.n }}
           path: e2e-logs/
           retention-days: 7

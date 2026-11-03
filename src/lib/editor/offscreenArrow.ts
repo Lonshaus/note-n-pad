@@ -14,6 +14,7 @@ import {
   type SelectionRange,
 } from '@codemirror/state';
 import { EditorView, type Command, type KeyBinding } from '@codemirror/view';
+import { devTrace } from '../dev/devTrace';
 /** A text line's document offsets. */
 export interface TextLine {
   from: number;
@@ -36,6 +37,14 @@ interface DeferredMove {
   settle: () => void;
 }
 const deferred = new WeakMap<EditorView, DeferredMove>();
+// The frame loops of afterMeasure still running, and the frames they have asked
+// for since the page began.
+let liveRearms = 0;
+let rearmFrames = 0;
+/** DEV/E2E: the frame loops running now and the frames asked for in all. */
+export function rearmStats(): { live: number; frames: number } {
+  return { live: liveRearms, frames: rearmFrames };
+}
 /** Resolves once every move deferred on `view` has run, or undefined when none
  *  is waiting. */
 export function deferredMove(view: EditorView): Promise<void> | undefined {
@@ -219,6 +228,7 @@ function afterMeasure(view: EditorView, run: () => void, waits = 0): void {
     read: () => null,
     write: () => {
       written = true;
+      devTrace(`afterMeasure write waits=${waits}`);
       if (
         waits < MAX_MEASURE_WAITS &&
         !isRendered(view.viewport, view.state.selection.main)
@@ -234,11 +244,17 @@ function afterMeasure(view: EditorView, run: () => void, waits = 0): void {
   // queued and no frame scheduled, so ask again each frame until it has run.
   const rearm = (): void => {
     if (written || !view.dom.isConnected) {
+      liveRearms -= 1;
       return;
+    }
+    rearmFrames += 1;
+    if (rearmFrames % 60 === 0) {
+      devTrace(`rearm frames=${rearmFrames} live=${liveRearms}`);
     }
     view.requestMeasure();
     requestAnimationFrame(rearm);
   };
+  liveRearms += 1;
   requestAnimationFrame(rearm);
 }
 

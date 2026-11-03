@@ -3,7 +3,8 @@
 // Builds the editors' key bindings from the shortcuts the Rust core says are
 // in effect. Every command the user can rebind is taken out of CodeMirror's
 // stock keymaps and bound again at the key the registry holds; everything else
-// in those keymaps stays exactly as CodeMirror ships it.
+// in those keymaps stays exactly as CodeMirror ships it, except that the
+// windowed profile has no CodeMirror Select All (the editor binds its own).
 
 import { Prec, type Extension } from '@codemirror/state';
 import {
@@ -32,6 +33,7 @@ import {
   moveLineDown,
   moveLineUp,
   redoSelection,
+  selectAll,
   selectLine,
   selectMatchingBracket,
   selectParentSyntax,
@@ -224,6 +226,7 @@ function withoutShift(binding: KeyBinding): KeyBinding {
 function strip(
   sources: readonly (readonly KeyBinding[])[],
   removable: ReadonlySet<Command>,
+  dropped?: Command,
 ): { kept: KeyBinding[]; origin: Map<Command, KeyBinding> } {
   const kept: KeyBinding[] = [];
   const origin = new Map<Command, KeyBinding>();
@@ -234,6 +237,8 @@ function strip(
         if (!origin.has(run)) {
           origin.set(run, binding);
         }
+      } else if (dropped !== undefined && run === dropped) {
+        continue;
       } else if (
         run === cursorLineStart &&
         binding.mac === 'Ctrl-a' &&
@@ -288,7 +293,11 @@ export function buildKeymap(
 ): KeymapBindings {
   const mine = REBINDABLE.filter((c) => c.profiles.includes(profile));
   const removable = new Set(mine.map((c) => c.run));
-  const rest = strip(SOURCES[profile], removable);
+  const rest = strip(
+    SOURCES[profile],
+    removable,
+    profile === 'windowed' ? selectAll : undefined,
+  );
   const completion =
     profile === 'document'
       ? strip([completionKeymap], removable)

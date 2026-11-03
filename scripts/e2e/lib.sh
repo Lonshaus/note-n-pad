@@ -128,10 +128,13 @@ e2e_wait_until() {
       shift
       ;;
   esac
-  local started
+  local started what
   started="$(date +%s)"
   while ! "$@"; do
     if [ "$(($(date +%s) - started))" -ge "$timeout" ]; then
+      # stderr only: callers capture stdout, so no compared value changes.
+      what="$*"
+      printf 'wait: gave up after %s s: %s\n' "$timeout" "${what:0:200}" >&2
       return 1
     fi
     sleep 1

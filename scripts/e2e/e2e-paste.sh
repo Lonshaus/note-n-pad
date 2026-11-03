@@ -85,6 +85,18 @@ echo "environment: $ENV_NAME"
 has_clipboard() {
   [ "$ENV_NAME" != "linux" ]
 }
+# The line ending of a new document: the setting, else the platform default.
+default_eol() {
+  local v
+  v="$(jq -r '.default_line_ending // empty' "$APPDIR/settings.json" 2>/dev/null)"
+  if [ -n "$v" ]; then
+    echo "$v"
+  elif [ "$ENV_NAME" = "windows" ]; then
+    echo CRLF
+  else
+    echo LF
+  fi
+}
 
 ok() {
   PASS=$((PASS + 1))
@@ -130,7 +142,7 @@ auto() {
   node scripts/auto.mjs "$1" </dev/null
 }
 doc_labels() {
-  auto '{"id":3,"cmd":"list_windows"}' | jq -r '.data[]|select(.label|startswith("doc-"))|.label'
+  auto '{"id":3,"cmd":"list_windows"}' | jq -r '.data[]|select(.label|startswith("doc-"))|.label' | tr -d '\r'
 }
 doc_label() {
   doc_labels | head -1
@@ -138,14 +150,16 @@ doc_label() {
 doc_label_ready() {
   [ -n "$(doc_label)" ]
 }
-note_label() {
-  auto '{"id":4,"cmd":"list_windows"}' | jq -r '.data[]|select(.label|startswith("note-"))|.label' | head -1
+# The window of the sticky note this suite created (CREATED_STICKY); the app
+# opens a sticky of its own at the first start, so "any note- window" is not it.
+sticky_label() {
+  printf 'note-%s' "$CREATED_STICKY"
 }
-note_gone() {
-  [ -z "$(note_label)" ]
+sticky_exists() {
+  auto '{"id":4,"cmd":"list_windows"}' | jq -r '.data[].label' | tr -d '\r' | grep -qx "$(sticky_label)"
 }
-note_exists() {
-  [ -n "$(note_label)" ]
+sticky_gone() {
+  ! sticky_exists
 }
 # The document window that is not in the list $1 (labels, one a line).
 new_doc_label() {
@@ -166,10 +180,33 @@ $l
 }
 # Opens seed.txt in a window of its own, asked from window $1; sets WIN_B once
 # the window has its page, and gives it the helpers.
+# Parks the swap back to the caret in window $1: the caret stays on line 1, the
+# window is scrolled away from it, the reads are held, and a Right key brings the
+# window back. The editor keeps the focus, so a copy made now waits in the queue.
+park_swap() {
+  local tries=0
+  evl "$1" "__t.focus()" >/dev/null
+  # WebKit stops measuring a window without the OS focus, and the window would
+  # stop moving; the focus is given back before every scroll and the key.
+  until [ "$(e2e_read "$1" "String(__auto.windowedInfo().windowStartLine > 5000)")" = "true" ] || [ "$tries" -gt 60 ]; do
+    focus_window "$1"
+    evl "$1" "(()=>{const s=document.querySelector('.cm-scroller');s.scrollTop=s.scrollHeight;return 1;})()" >/dev/null
+    sleep 2
+    tries=$((tries + 1))
+  done
+  evl "$1" "__auto.holdWindowedReads(true)" >/dev/null
+  focus_window "$1"
+  evl "$1" "__t.focus();__t.key('ArrowRight')" >/dev/null
+  e2e_wait_eval "$1" "String(__auto.heldWindowedReads()===1 && __auto.windowedSwapKeepsInput()===true && document.activeElement===__t.content())" "true"
+}
+SECOND_N=0
 open_second() {
   local before tries=0
+  SECOND_N=$((SECOND_N + 1))
+  # A file no window has open: one that is open is switched to, not opened.
+  cp "$WORK/seed.txt" "$WORK/second-$SECOND_N.txt"
   before="$(doc_labels)"
-  evl "$1" "window.__TAURI_INTERNALS__.invoke('open_document_window',{path:'$WORK/seed.txt'})" >/dev/null
+  evl "$1" "window.__TAURI_INTERNALS__.invoke('open_document_window',{path:'$WORK/second-$SECOND_N.txt'})" >/dev/null
   WIN_B=""
   while [ -z "$WIN_B" ] && [ "$tries" -lt 60 ]; do
     WIN_B="$(new_doc_label "$before")"
@@ -183,6 +220,11 @@ open_second() {
 focus_window() {
   auto "{\"id\":2,\"cmd\":\"focus\",\"label\":\"$1\"}" >/dev/null
   sleep 1
+}
+# A beat every 250 ms into the app log in window $1 (dev_trace): where the beats
+# stop is where the page got stuck.
+start_beat() {
+  evl "$1" "clearInterval(window.__beat);window.__beat=setInterval(()=>{window.__TAURI_INTERNALS__.invoke('dev_trace',{msg:'beat'}).catch(()=>{});},250);1" >/dev/null
 }
 # Whether the list of notes (list_notes) names the sticky note $CREATED_STICKY.
 # Asked in window $1.
@@ -253,6 +295,14 @@ window.__t = (() => {
     return all.find((el) => el.getClientRects().length > 0) || all[0];
   };
   const press = (k, mods) => __auto.windowedPressKey(k, mods || {});
+  // A keydown the editor's DOM handles, as a real key would arrive.
+  const codes = { ArrowRight: 39, End: 35 };
+  const key = (k, mods) => {
+    const e = new KeyboardEvent('keydown', Object.assign({ key: k, bubbles: true, cancelable: true }, mods || {}));
+    Object.defineProperty(e, 'keyCode', { get: () => codes[k] || 0 });
+    content().dispatchEvent(e);
+    return e.defaultPrevented;
+  };
   const mod = (k, extra) => press(k, Object.assign({ __MOD__: true }, extra || {}));
   const searchInput = () => document.querySelector('.search-panel input.cm-textfield');
   // The buttons of the question on screen, or null.
@@ -264,7 +314,7 @@ window.__t = (() => {
     const g = __auto.windowedGlobalSel();
     return g !== null && g.anchor.line === 0 && g.anchor.col === 0 && g.head.line === line && g.head.col === col;
   };
-  return { content, press, mod, searchInput, buttons, kind, answer, isAll, focus: () => content().focus() };
+  return { content, press, key, mod, searchInput, buttons, kind, answer, isAll, focus: () => content().focus() };
 })();
 'ok'
 JS
@@ -385,21 +435,25 @@ wait_dialog() {
 }
 # The text of the paste: the file it is on the clipboard from, and the
 # JavaScript that makes the same text in the page (where there are no clips the
-# event carries it).
-#   ok:    OK_N x, a break, "end"          emoji: OK_N x and an emoji
-#   big:   BIG_N x                          note:  NOTE_N x
+# event carries it). body(n) is n characters, every 1024th a line break.
+#   ok:    body(OK_N), a break, "end"      emoji: body(OK_N) and an emoji
+#   big:   body(BIG_N)                      note:  body(NOTE_N)
 js_paste() {
+  local body="((n)=>'x'.repeat(1023).concat('\\n').repeat(Math.floor(n/1024))+'x'.repeat(n%1024))"
   case "$1" in
-    ok) echo "'x'.repeat($OK_N)+'\\nend'" ;;
-    emoji) echo "'x'.repeat($OK_N)+'😀'" ;;
-    big) echo "'x'.repeat($BIG_N)" ;;
-    note) echo "'x'.repeat($NOTE_N)" ;;
+    ok) echo "$body($OK_N)+'\\nend'" ;;
+    emoji) echo "$body($OK_N)+'😀'" ;;
+    big) echo "$body($BIG_N)" ;;
+    note) echo "$body($NOTE_N)" ;;
   esac
 }
 # Paste the text $2 into window $1.
 do_paste() {
   local label="$1" kind="$2"
   if has_clipboard; then
+    # A paste through the system clipboard goes to the focused window.
+    focus_window "$label"
+    e2e_wait_eval "$label" "String(document.hasFocus())" "true"
     clip_set_file "$WORK/paste-$kind.txt"
     evl "$label" "window.__pr=undefined;window.__pr=__auto.pasteText('');1" >/dev/null
   else
@@ -570,19 +624,24 @@ fi
 echo "=== fixtures ==="
 rm -rf "$WORK"
 mkdir -p "$WORK"
+DEFAULT_EOL="$(default_eol)"
 python3 - <<PYEOF
 import os
 w = '$WORK'
 ok_n, big_n, note_n = $OK_N, $BIG_N, $NOTE_N
+eol = b'\r\n' if '$DEFAULT_EOL' == 'CRLF' else b'\n'
+def body(n):
+    return ('x' * 1023 + '\n') * (n // 1024) + 'x' * (n % 1024)
 def put(name, data):
     with open(os.path.join(w, name), 'wb') as f:
         f.write(data)
-paste_ok = ('x' * ok_n + '\nend').encode()
-paste_emoji = ('x' * ok_n + '\U0001F600').encode()
+paste_ok = (body(ok_n) + '\nend').encode()
+paste_emoji = (body(ok_n) + '\U0001F600').encode()
 put('paste-ok.txt', paste_ok)
 put('paste-emoji.txt', paste_emoji)
-put('paste-big.txt', ('x' * big_n).encode())
-put('paste-note.txt', ('x' * note_n).encode())
+put('paste-big.txt', body(big_n).encode())
+put('paste-note.txt', body(note_n).encode())
+put('paste-ok-default.txt', paste_ok.replace(b'\n', eol))
 put('seed.txt', b'seed\n')
 put('plain.txt', b'abc')
 put('crlf.txt', b'one\r\ntwo')
@@ -593,8 +652,9 @@ put('ref-crlf.txt', b'one\r\ntwo' + paste_ok.replace(b'\n', b'\r\n'))
 put('ref-sjis.txt', 'あいう'.encode('shift_jis') + paste_ok)
 put('ref-bom.txt', b'\xef\xbb\xbfbom' + paste_ok)
 put('ref-sjis-utf8.txt', 'あいう'.encode('utf-8') + paste_emoji)
-put('ref-big.txt', b'abc' + ('x' * big_n).encode())
-put('ref-note.txt', ('x' * note_n).encode())
+put('ref-big.txt', b'abc' + body(big_n).encode())
+put('ref-note.txt', body(note_n).encode())
+put('ref-note-default.txt', body(note_n).encode().replace(b'\n', eol))
 def write(path, n):
     with open(path, 'w', newline='') as f:
         buf = []
@@ -635,6 +695,7 @@ restore_state() {
     if [ -n "${ORIG_TARGET:-}" ]; then
       evl "$dl" "__auto.setOpenTarget('$ORIG_TARGET')" >/dev/null 2>&1
     fi
+    evl "$dl" "clearInterval(window.__beat);1" >/dev/null 2>&1
     if [ -n "$CREATED_STICKY" ]; then
       evl "$dl" "window.__TAURI_INTERNALS__.invoke('delete_note',{id:'$CREATED_STICKY'})" >/dev/null 2>&1
     fi
@@ -690,21 +751,67 @@ sleep 1
 check "setup: the window has OS focus" "$(e2e_read "$DL" "String(document.hasFocus())")" "true"
 evl "$DL" "$HELPERS" >/dev/null
 check "helpers installed" "$(e2e_read "$DL" "typeof __t")" "object"
+start_beat "$DL"
+
+echo "=== 1a. [all] a sticky note pasted too much asks first; cancel gives the focus back to the note ==="
+# The note stays open: section 6 pastes into it too, and delete_note does not
+# close its window.
+CREATED_STICKY="$(auto '{"id":5,"cmd":"new_sticky"}' | jq -r '.data.id // empty' | tr -d '\r')"
+e2e_wait_until 60 sticky_exists
+STICKY="$(sticky_label)"
+echo "DIAG 1a sticky: $STICKY created: $CREATED_STICKY"
+if [ -z "$CREATED_STICKY" ]; then
+  echo "FATAL: no sticky window"
+  exit 1
+fi
+evl "$STICKY" "$HELPERS" >/dev/null
+if has_clipboard; then
+  focus_window "$STICKY"
+  check "1a: the note has the OS focus" "$(e2e_read "$STICKY" "String(document.hasFocus())")" "true"
+fi
+evl "$STICKY" "document.querySelector('.cm-content').focus()" >/dev/null
+e2e_wait_eval "$STICKY" "String(document.activeElement===document.querySelector('.cm-content'))" "true"
+do_paste "$STICKY" note
+wait_dialog "$STICKY" confirm
+evl "$STICKY" "__t.answer(-1)" >/dev/null
+e2e_wait_eval "$STICKY" "String(__auto.pasteLocked())" "false"
+e2e_wait_eval "$STICKY" "String(document.activeElement===document.querySelector('.cm-content'))" "true"
+check "cancel gave the focus back to the note" "$(e2e_read "$STICKY" "String(document.activeElement===document.querySelector('.cm-content'))")" "true"
 
 echo "=== 1. [all] a document pasted too much into asks first; cancel changes nothing, continue converts ==="
 open_fresh plain.txt
 caret_end
+focus_window "$DL"
+check "1: the document window has the OS focus" "$(e2e_read "$DL" "String(document.hasFocus())")" "true"
+evl "$DL" "__t.focus()" >/dev/null
+e2e_wait_eval "$DL" "String(document.activeElement===__t.content())" "true"
 do_paste "$DL" ok
 wait_dialog "$DL" confirm
 check "the tab is locked while the question is up" "$(e2e_read "$DL" "String(__auto.pasteLocked())")" "true"
 check "the question is the one of D8" "$(e2e_read "$DL" "__auto.convertDialog().message")" "There is too much content. It will be converted to a large file. Continue?"
 evl "$DL" "__t.answer(-1)" >/dev/null
 e2e_wait_eval "$DL" "String(__auto.pasteLocked())" "false"
+e2e_wait_eval "$DL" "String(document.activeElement===__t.content())" "true"
+check "cancel gave the focus back to the editor" "$(e2e_read "$DL" "String(document.activeElement===__t.content())")" "true"
 check "cancel left the document as it was" "$(e2e_read "$DL" "__auto.getContent()")" "abc"
 check "cancel left the tab ordinary" "$(e2e_read "$DL" "String(__auto.isWindowedTab())")" "false"
 check "cancel wrote no conversion file" "$(cv_files)" "0"
 do_paste "$DL" ok
 wait_dialog "$DL" confirm
+evl "$DL" "__auto.failNextConvert()" >/dev/null
+evl "$DL" "__t.answer(0)" >/dev/null
+wait_dialog "$DL" error
+check "the failure is reported while the editor waits" "$(e2e_read "$DL" "String(document.activeElement!==__t.content())")" "true"
+evl "$DL" "__t.answer(-1)" >/dev/null
+wait_dialog "$DL" none
+e2e_wait_eval "$DL" "String(document.activeElement===__t.content())" "true"
+check "closing the report gave the focus back to the editor" "$(e2e_read "$DL" "String(document.activeElement===__t.content())")" "true"
+check "the failure left the document as it was" "$(e2e_read "$DL" "__auto.getContent()")" "abc"
+check "the failure wrote no conversion file" "$(cv_files)" "0"
+do_paste "$DL" ok
+wait_dialog "$DL" confirm
+check "the paste asks again" "$(e2e_read "$DL" "__t.kind()")" "confirm"
+check "the paste started a conversion" "$(e2e_read "$DL" "String(__auto.convertJobs().length)")" "1"
 diag_convert_state "1 before Continue"
 evl "$DL" "__t.answer(0)" >/dev/null
 diag_convert "1"
@@ -735,7 +842,7 @@ SAVE_DIAG="2" save_to "$SAVED_TO"
 evl "$DL" "clearInterval(window.__tickTimer);1" >/dev/null
 diag_line "2 save result" "$(e2e_read "$DL" "String(window.__sv)")"
 diag_line "2 tabs" "$(e2e_read "$DL" "JSON.stringify(__auto.getTabs())")"
-check "the saved file is the pasted text (SHA-256)" "$(file_sha256 "$SAVED_TO")" "$(file_sha256 "$WORK/paste-ok.txt")"
+check "the saved file is the pasted text (SHA-256)" "$(file_sha256 "$SAVED_TO")" "$(file_sha256 "$WORK/paste-ok-default.txt")"
 check "the tab has the path now" "$(e2e_read "$DL" "__auto.getTabs().find((t)=>t.active).path")" "$SAVED_TO"
 back_to_seed
 
@@ -830,11 +937,13 @@ e2e_wait_eval "$DL" "String(__auto.pasteLocked())" "false"
 back_to_seed
 
 echo "=== 6. [all] a sticky note pasted too much becomes a tab of a document window ==="
-# A sticky note of its own for this suite.
-CREATED_STICKY="$(auto '{"id":5,"cmd":"new_sticky"}' | jq -r '.data.id // empty' | tr -d '\r')"
-e2e_wait_until 60 note_exists
-STICKY="$(note_label)"
-if [ -z "$STICKY" ]; then
+# The sticky note of section 1a, or one of its own for this suite.
+if [ -z "$CREATED_STICKY" ]; then
+  CREATED_STICKY="$(auto '{"id":5,"cmd":"new_sticky"}' | jq -r '.data.id // empty' | tr -d '\r')"
+fi
+e2e_wait_until 60 sticky_exists
+STICKY="$(sticky_label)"
+if [ -z "$CREATED_STICKY" ]; then
   echo "FATAL: no sticky window"
   exit 1
 fi
@@ -842,16 +951,20 @@ for mode in tab window; do
   echo "--- open target: $mode ---"
   evl "$DL" "__auto.setOpenTarget('$mode')" >/dev/null
   e2e_wait_setting open_target "$mode"
-  STICKY="$(note_label)"
+  STICKY="$(sticky_label)"
   BEFORE_LABELS="$(doc_labels)"
   evl "$STICKY" "$HELPERS" >/dev/null
+  if has_clipboard; then
+    focus_window "$STICKY"
+    check "6 $mode: the note has the OS focus" "$(e2e_read "$STICKY" "String(document.hasFocus())")" "true"
+  fi
   evl "$STICKY" "document.querySelector('.cm-content').focus()" >/dev/null
   sleep 1
   do_paste "$STICKY" note
   wait_dialog "$STICKY" confirm
   evl "$STICKY" "__t.answer(0)" >/dev/null
-  e2e_wait_until 180 note_gone
-  check "the window of the note closed" "$(note_label)" ""
+  e2e_wait_until 180 sticky_gone
+  check "the window of the note closed" "$(sticky_gone && echo yes || echo no)" "yes"
   if [ "$mode" = "window" ]; then
     NEW_DL=""
     tries=0
@@ -863,6 +976,7 @@ for mode in tab window; do
     check "a window of its own opened for the note" "$([ -n "$NEW_DL" ] && echo yes || echo no)" "yes"
     DL="${NEW_DL:-$DL}"
     evl "$DL" "$HELPERS" >/dev/null
+    start_beat "$DL"
   fi
   e2e_wait_eval "$DL" "String(typeof __auto!=='undefined' && typeof __auto.isWindowedTab==='function' && __auto.isWindowedTab())" "true"
   check "the note is a tab with no file yet" "$(ctinfo | jq -r '.converted.target')" "null"
@@ -871,8 +985,8 @@ for mode in tab window; do
   if [ "$mode" = "tab" ]; then
     # Changes discarded: the note comes back.
     evl "$DL" "__auto.windowedDiscard();1" >/dev/null
-    e2e_wait_until 60 note_exists
-    check "the note is back after the changes are discarded" "$(note_exists && echo yes || echo no)" "yes"
+    e2e_wait_until 60 sticky_exists
+    check "the note is back after the changes are discarded" "$(sticky_exists && echo yes || echo no)" "yes"
     check "the note is not handed off any more" "$(note_handed_off "$DL")" "false"
     check "the list of notes has the note again" "$(note_listed "$DL")" "true"
     DL="$BASE_DL"
@@ -881,7 +995,7 @@ for mode in tab window; do
     # Saved: the record is gone.
     NOTE_SAVED="$WORK/note-saved.txt"
     save_to "$NOTE_SAVED"
-    check "the note's text is the file (SHA-256)" "$(file_sha256 "$NOTE_SAVED")" "$(file_sha256 "$WORK/ref-note.txt")"
+    check "the note's text is the file (SHA-256)" "$(file_sha256 "$NOTE_SAVED")" "$(file_sha256 "$WORK/ref-note-default.txt")"
     check "the note's record is deleted by the first save" "$([ -e "$STORE/$CREATED_STICKY.json" ] && echo yes || echo no)" "no"
     check "the list of notes has no such note after the save" "$(note_listed "$DL")" "false"
     CREATED_STICKY=""
@@ -889,6 +1003,9 @@ for mode in tab window; do
     back_to_seed
   fi
 done
+# The note and the window it opened took the OS focus; the clip pastes below need it.
+focus_window "$BASE_DL"
+check "after 6: the document window has the OS focus" "$(e2e_read "$BASE_DL" "String(document.hasFocus())")" "true"
 
 echo "=== 7. [macOS, Windows] a clip of 110 MB is pasted from its file, never read by the page ==="
 if has_clipboard; then
@@ -1027,7 +1144,7 @@ if has_clipboard; then
   evl "$DL" "__auto.holdWindowedReads(true)" >/dev/null
   # The caret is at (0, 0), where windowedOpen leaves it. The clip is pasted by
   # the core and waits in the queue behind the a; the b waits behind the paste.
-  evl "$DL" "(()=>{document.execCommand('insertText',false,'a');window.__pr=__auto.pasteText('');document.execCommand('insertText',false,'b');return 1;})()" >/dev/null
+  evl "$DL" "(()=>{document.execCommand('insertText',false,'a');window.__pr=__auto.pasteText('');__auto.windowedPressKey('b');return 1;})()" >/dev/null
   evl "$DL" "__auto.holdWindowedReads(false);__auto.releaseWindowedReads()" >/dev/null
   e2e_wait_until 600 _e2e_eval_equals "$DL" "String(__auto.windowedInfo().totalBytes)" "$ORDER_SIZE"
   check "the file is as long as a, the clip, b and seed" "$(e2e_read "$DL" "String(__auto.windowedInfo().totalBytes)")" "$ORDER_SIZE"
@@ -1088,7 +1205,7 @@ if has_clipboard; then
   check "a large file (the window holds the selection) got it too" "$(e2e_read "$DL" "String(__auto.windowedInfo().totalBytes)")" "$((BASE_SIZE + 8))"
   # A selection no window holds is replaced by the text.
   evl "$DL" "__t.focus();__t.mod('a')" >/dev/null
-  e2e_wait_until 600 _e2e_eval_equals "$DL" "String(__t.isAll($END_LINE,$END_COL + 8))" "true"
+  e2e_wait_until 600 _e2e_eval_equals "$DL" "String(__t.isAll($END_LINE,$END_COL))" "true"
   evl "$DL" "window.__pr=__auto.pasteText('');1" >/dev/null
   e2e_wait_until 600 _e2e_eval_equals "$DL" "String(__auto.windowedInfo().totalBytes)" "8"
   check "a selection past the window was replaced by it" "$(e2e_read "$DL" "String(__auto.windowedInfo().totalBytes)")" "8"
@@ -1101,18 +1218,19 @@ echo "=== 13. [macOS, Windows] a copy that waits in one window is pasted in anot
 if has_clipboard; then
   open_fresh base.log windowed
   WIN_A="$DL"
-  evl "$WIN_A" "__t.focus();__t.mod('a')" >/dev/null
-  e2e_wait_until 600 _e2e_eval_equals "$WIN_A" "String(__t.isAll($END_LINE,$END_COL))" "true"
-  evl "$WIN_A" "__auto.holdWindowedReads(true)" >/dev/null
+  park_swap "$WIN_A"
+  # No selection: the copy is the text of the caret line. The other window
+  # holds no line-wise copy, so it pastes the text alone, without a break.
   evl "$WIN_A" "__auto.windowedCopy()" >/dev/null
+  e2e_wait_eval "$WIN_A" "String(__auto.clipReservations())" "1"
   check "the copy is reserved" "$(e2e_read "$WIN_A" "String(__auto.clipReservations())")" "1"
   open_second "$WIN_A"
   focus_window "$WIN_B"
   evl "$WIN_B" "__t.focus();__auto.setDocSelection(0,0)" >/dev/null
   evl "$WIN_B" "window.__pr=__auto.pasteText('');1" >/dev/null
   evl "$WIN_A" "__auto.holdWindowedReads(false);__auto.releaseWindowedReads()" >/dev/null
-  e2e_wait_until 120 _e2e_eval_equals "$WIN_B" "String(__auto.getContent().length)" "$((BASE_SIZE + 5))"
-  check "the other window got the copy of this one" "$(e2e_read "$WIN_B" "String(__auto.getContent().length)")" "$((BASE_SIZE + 5))"
+  e2e_wait_until 120 _e2e_eval_equals "$WIN_B" "String(__auto.getContent().length)" "$((LINE_BYTES - 1 + 5))"
+  check "the other window got the copy of this one" "$(e2e_read "$WIN_B" "String(__auto.getContent().length)")" "$((LINE_BYTES - 1 + 5))"
   check "and did not read it by itself" "$(e2e_read "$WIN_B" "String(window.__pr.getDataCalls)")" "0"
   DL="$WIN_A"
   back_to_seed
@@ -1124,19 +1242,19 @@ echo "=== 13b. [macOS, Windows] a copy queued behind a select key copies what th
 if has_clipboard; then
   open_fresh base.log windowed
   WIN_A="$DL"
-  evl "$WIN_A" "__t.focus();__t.mod('Home')" >/dev/null
-  # The reads are held: the select key and the copy wait in the queue, and the
-  # selection is still the caret, which one window holds, when the copy is queued.
-  evl "$WIN_A" "__auto.holdWindowedReads(true)" >/dev/null
-  evl "$WIN_A" "(()=>{__t.mod('End',{shiftKey:true});__auto.windowedCopy();return 1;})()" >/dev/null
+  park_swap "$WIN_A"
+  # The select key and the copy wait in the queue behind the swap; the caret is
+  # at (0, 1) when the key is queued.
+  evl "$WIN_A" "(()=>{__t.key('End',{$MODPROP:true,shiftKey:true});__auto.windowedCopy();return 1;})()" >/dev/null
+  e2e_wait_eval "$WIN_A" "String(__auto.clipReservations())" "1"
   check "the copy is reserved" "$(e2e_read "$WIN_A" "String(__auto.clipReservations())")" "1"
   open_second "$WIN_A"
   focus_window "$WIN_B"
   evl "$WIN_B" "__t.focus();__auto.setDocSelection(0,0)" >/dev/null
   evl "$WIN_B" "window.__pr=__auto.pasteText('');1" >/dev/null
   evl "$WIN_A" "__auto.holdWindowedReads(false);__auto.releaseWindowedReads()" >/dev/null
-  e2e_wait_until 120 _e2e_eval_equals "$WIN_B" "String(__auto.getContent().length)" "$((BASE_SIZE + 5))"
-  check "the other window got the whole file the key selected, as one clip" "$(e2e_read "$WIN_B" "String(__auto.getContent().length)")" "$((BASE_SIZE + 5))"
+  e2e_wait_until 120 _e2e_eval_equals "$WIN_B" "String(__auto.getContent().length)" "$((BASE_SIZE - 1 + 5))"
+  check "the other window got what the key selected, as one clip" "$(e2e_read "$WIN_B" "String(__auto.getContent().length)")" "$((BASE_SIZE - 1 + 5))"
   check "and did not read it by itself" "$(e2e_read "$WIN_B" "String(window.__pr.getDataCalls)")" "0"
   DL="$WIN_A"
   back_to_seed
@@ -1198,6 +1316,8 @@ if [ "$ENV_NAME" = "macos" ]; then
   WIN_A="$DL"
   open_second "$WIN_A"
   focus_window "$WIN_A"
+  evl "$WIN_A" "__t.focus()" >/dev/null
+  e2e_wait_eval "$WIN_A" "String(document.activeElement===__t.content())" "true"
   clip_set "NOT-FOR-B"
   evl "$WIN_A" "__auto.holdClipStatus(true)" >/dev/null
   evl "$WIN_A" "window.__pr=__auto.pasteText('');1" >/dev/null
@@ -1216,11 +1336,14 @@ fi
 echo "=== 15. [macOS, Windows] a whole line copied with no selection is pasted above the caret line ==="
 if has_clipboard; then
   open_fresh base.log windowed
+  focus_window "$DL"
   evl "$DL" "__t.focus();__t.mod('Home')" >/dev/null
-  PREV_ID=$(clip_id)
   evl "$DL" "(()=>{__t.press('ArrowDown',{});return 1;})()" >/dev/null
-  evl "$DL" "__auto.windowedCopy()" >/dev/null
-  evl "$DL" "__t.press('ArrowDown',{});__t.press('ArrowDown',{});window.__pr=__auto.pasteText('');1" >/dev/null
+  # The copy event carries the line; the system clipboard gets it from here.
+  e2e_read "$DL" "JSON.stringify(__auto.windowedCopy().data)" | jq -j . >"$WORK/line15.txt"
+  clip_set_file "$WORK/line15.txt"
+  focus_window "$DL"
+  evl "$DL" "__t.focus();__t.press('ArrowDown',{});__t.press('ArrowDown',{});window.__pr=__auto.pasteText('');1" >/dev/null
   e2e_wait_until 600 _e2e_eval_equals "$DL" "String(__auto.windowedInfo().totalLines)" "$((N_LINES + 1))"
   check "the file has a line more" "$(e2e_read "$DL" "String(__auto.windowedInfo().totalLines)")" "$((N_LINES + 1))"
   back_to_seed

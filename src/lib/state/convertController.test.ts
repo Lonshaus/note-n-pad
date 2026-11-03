@@ -641,6 +641,22 @@ describe('a conversion that fails', () => {
     expect(s.unlock).toHaveBeenCalledTimes(1);
     expect(s.controller.dialog).toBeNull();
   });
+  it('fails once on request in DEV, before the core is asked, and not the next time', async () => {
+    const c = core();
+    const s = setup();
+    s.controller.devFailNext = true;
+    await go(s);
+    expect(s.controller.lastExit).toBe('t1: error, cancelled=false');
+    expect(c.named('convert_begin')).toHaveLength(0);
+    expect(s.unlock).toHaveBeenCalledTimes(1);
+    expect(s.controller.dialog?.kind).toBe('error');
+    expect(s.controller.devFailNext).toBe(false);
+    s.controller.answer('cancel');
+    await flush();
+    await go(s);
+    expect(s.controller.lastExit).toBe('t1: completed, cancelled=false');
+    expect(s.doc.install).toHaveBeenCalledTimes(1);
+  });
 });
 
 describe('the record of a run', () => {

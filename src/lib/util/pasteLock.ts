@@ -81,3 +81,15 @@ export class PasteLocks {
 }
 /** The locks of this window. */
 export const pasteLocks = new PasteLocks();
+/** Whether the editor takes the focus back once its lock is off: it had the
+ *  focus when the lock went on, is still shown and editable, and the focus
+ *  fell to the page body with no dialog open to hold it. */
+export function refocusAfterUnlock(s: {
+  hadFocus: boolean;
+  mounted: boolean;
+  editable: boolean;
+  focusOnBody: boolean;
+  modalOpen: boolean;
+}): boolean {
+  return s.hadFocus && s.mounted && s.editable && s.focusOnBody && !s.modalOpen;
+}

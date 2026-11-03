@@ -1141,22 +1141,25 @@ diag_ime_compose() {
   diag_line "15 $1 around compositionstart" "$(e2e_read "$DL" "JSON.stringify(window.__imeAt)")"
   diag_line "15 $1 after the composition" "$(e2e_read "$DL" "JSON.stringify(__auto.windowedImeState())")"
 }
-# The head is outside the window; Shift+End is queued and its swap is held at
-# the read, a composition begins and ends, the read is released.
+# Select-all leaves the head outside the window. Shift+ArrowLeft queues the swap
+# to it (held at its read in the held run), Shift+End queues behind that, a
+# composition begins and ends, the read is released.
 queued_run() {
   # $1 held or plain; sets QUEUED_SHA.
   begin_doc
   select_all
-  press ArrowLeft '{shiftKey:true}'
-  settle
   if [ "$1" = "held" ]; then
     hold_reads
+    press ArrowLeft '{shiftKey:true}'
+    e2e_wait_until 30 _e2e_eval_equals "$DL" "String(__auto.heldWindowedReads()===1)" "true"
+    check "15 held: the swap for the selection keys is parked at its read" \
+      "$(e2e_read "$DL" "String(__auto.heldWindowedReads()===1)")" "true"
     press End '{shiftKey:true}'
-    e2e_wait_eval "$DL" "String(__auto.heldWindowedReads()===1)" "true"
     diag_ime_compose "$1"
     release_reads
     settle
   else
+    press ArrowLeft '{shiftKey:true}'
     press End '{shiftKey:true}'
     settle
     diag_ime_compose "$1"

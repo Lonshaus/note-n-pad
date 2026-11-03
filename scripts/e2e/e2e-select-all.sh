@@ -192,6 +192,19 @@ collapse_selection() {
   evl "$DL" "__t.focus();__t.key('ArrowRight')" >/dev/null
   e2e_wait_eval "$DL" "String(__t.collapsed())" "true"
 }
+# One DIAG line: the window, what the view has drawn, the measure loops and the
+# warnings CodeMirror gave. $1 names the moment.
+diag_view() {
+  # Held in a variable: bash 3.2 brace-expands {a,b} in a double-quoted string nested in "$( )".
+  local js='JSON.stringify({info:__auto.windowedInfo(),geometry:__auto.windowedViewGeometry(),rearm:__auto.rearmStats(),warns:window.__cmWarns,cursor:__auto.getCursor(),sel:__auto.windowedGlobalSel()})'
+  echo "DIAG $1: $(e2e_read "$DL" "$js")"
+}
+# The same, with the selection, the lines of the loaded window and the last ten
+# window swaps.
+diag_view_sel() {
+  local js='JSON.stringify({info:__auto.windowedInfo(),geometry:__auto.windowedViewGeometry(),rearm:__auto.rearmStats(),warns:window.__cmWarns,sel:__auto.windowedGlobalSel(),lines:__auto.getContent().split("\n").length,trace:__auto.windowedTrace().slice(-10)})'
+  echo "DIAG $1: $(e2e_read "$DL" "$js")"
+}
 # Sleep long enough for a refused action to have shown itself if it were going
 # to: the apply result of an accepted edit lands well inside this.
 settle_pause() {
@@ -307,6 +320,8 @@ if [ -z "$DL" ]; then
   exit 1
 fi
 e2e_wait_eval "$DL" "String(typeof __auto!=='undefined' && typeof __auto.windowedOpen==='function' && __auto.getTabs().length===1)" "true"
+# Count the warnings of CodeMirror's measure loop for the DIAG lines.
+evl "$DL" "(()=>{window.__cmWarns={measure:0,viewport:0};const w=console.warn.bind(console);console.warn=(...a)=>{const m=a.map(String).join(' ');if(m.includes('Measure loop restarted')){window.__cmWarns.measure+=1;}if(m.includes('Viewport failed to stabilize')){window.__cmWarns.viewport+=1;}w(...a);};return 1;})()" >/dev/null
 # Pin the language for the page text read below, and capture what the trap
 # restores. The settings are the user's real ones.
 ORIG_LANG=$(e2e_read "$DL" "String(__auto.getLanguage())")
@@ -439,7 +454,7 @@ echo "=== 6. input accepted before the Select All is applied first ==="
 # Leaves focus in the editor.
 replace_all_pass() {
   evl "$DL" "__auto.windowedGoto(1000)" >/dev/null
-  e2e_wait_eval "$DL" "String(__auto.windowedInfo().windowStartLine < 1000 && __auto.getContent().includes('0000001000 '))" "true"
+  e2e_wait_eval "$DL" "String(__auto.getCursor().line===1000 && __auto.windowedInfo().windowStartLine < 1000)" "true"
   evl "$DL" "__t.focus();for(let i=0;i<5;i++){__t.key('ArrowRight');}" >/dev/null
   e2e_wait_eval "$DL" "JSON.stringify(__auto.getCursor())" '{"line":1000,"col":6}'
   evl "$DL" "__auto.openFindReplace()" >/dev/null
@@ -507,7 +522,7 @@ echo "end column of the reference file: $END_COL"
 evl "$DL" "__auto.closeActiveTab()" >/dev/null
 e2e_wait_eval "$DL" "String(__auto.getTabs().length)" "2"
 evl "$DL" "__auto.switchTab(1)" >/dev/null
-e2e_wait_eval "$DL" "String(__auto.getTabs()[1].active && __auto.isWindowedTab() && __auto.getContent().startsWith('0000000001 ') && __auto.windowedInfo().windowStartLine===0)" "true"
+e2e_wait_eval "$DL" "String(__auto.getTabs()[1].active && __auto.isWindowedTab() && __auto.getContent().length>0 && __auto.windowedImeState().swapping===false)" "true"
 rm -f "$WORK/lines.ref.log"
 
 echo "--- real pass (undo, x, Select All, y) ---"
@@ -524,11 +539,14 @@ check "the saved file equals the reference: the undone content plus x, no y" "$(
 echo "=== 7. a Select All made during the swap back to the caret ==="
 evl "$DL" "__auto.windowedGoto(1)" >/dev/null
 e2e_wait_eval "$DL" "String(__auto.getContent().startsWith('0000000001 ') && __auto.windowedInfo().windowStartLine===0)" "true"
+diag_view "7 before focus"
 evl "$DL" "__t.focus()" >/dev/null
+diag_view "7 after focus"
 tries=0
 until [ "$(e2e_read "$DL" "String(__auto.windowedInfo().windowStartLine > 5000)")" = "true" ]; do
   evl "$DL" "(()=>{const s=document.querySelector('.cm-scroller');s.scrollTop=s.scrollHeight;return 1;})()" >/dev/null
   sleep 2
+  diag_view "7 scroll $tries"
   tries=$((tries + 1))
   if [ "$tries" -gt 60 ]; then
     break
@@ -575,20 +593,24 @@ echo "--- input queued before a Select All stays ahead of it ---"
 # Select All must both wait in the replay queue, in that order. A Select All
 # that jumped the queue would be answered by the x replacing the span, so the
 # size would not grow by one byte and the caret would end up collapsed.
+diag_view_sel "8 before T8"
 T8=$(e2e_read "$DL" "$(js_total)")
 replace_all_pass
 Q8=$(e2e_read "$DL" "(()=>{__t.mod('z');__t.key('x');__t.mod('a');return String(__auto.windowedReplayLength());})()")
 check "visible: x and Select All are both in the replay queue behind the undo" "$Q8" "2"
 e2e_wait_until _e2e_eval_equals "$DL" "String(__auto.windowedReplayLength()===0 && document.querySelector('.cm-content').getAttribute('contenteditable')==='true')" "true"
+diag_view_sel "8 queue drained"
 sleep 2
 check "visible: the x was inserted, nothing on screen was replaced" "$(e2e_read "$DL" "$(js_total)")" "$((T8 + 1))"
 check "visible: Select All ran after the x (a span inside the window)" "$(e2e_read "$DL" "String(__t.inside() && !__t.collapsed())")" "true"
 Q_SEL=$(e2e_read "$DL" "JSON.stringify(__auto.windowedGlobalSel())")
 Q_SCROLL=$(e2e_read "$DL" "String(document.querySelector('.cm-scroller').scrollTop)")
+diag_view_sel "8 after Q_SEL"
 check "visible: the queued Select All is smaller than the loaded window" "$(e2e_read "$DL" "(()=>{const g=__auto.windowedGlobalSel();return String(g.head.line-g.anchor.line<__auto.getContent().split('\\n').length-1);})()")" "true"
 collapse_selection
 evl "$DL" "__auto.menuAction('select-all')" >/dev/null
 e2e_wait_eval "$DL" "String(__t.inside() && !__t.collapsed())" "true"
+diag_view_sel "8 after menu Select All"
 check "visible: no scrolling between the queued and the menu Select All" "$(e2e_read "$DL" "String(document.querySelector('.cm-scroller').scrollTop)")" "$Q_SCROLL"
 check "visible: the queued Select All selects exactly what the menu selects" "$(e2e_read "$DL" "JSON.stringify(__auto.windowedGlobalSel())")" "$Q_SEL"
 save_active

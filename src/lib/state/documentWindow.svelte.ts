@@ -4,6 +4,7 @@
 import { invoke } from '@tauri-apps/api/core';
 import { emit } from '@tauri-apps/api/event';
 import { save } from '@tauri-apps/plugin-dialog';
+import { devTrace } from '../dev/devTrace';
 import { debounce } from '../util/debounce';
 import { nextSeq } from '../util/seq';
 import {
@@ -1814,11 +1815,18 @@ export class DocumentWindowState {
    *  document as it was before the paste. Rejects with the reason, and the tab is
    *  then untouched. */
   async installConverted(tabId: string, convertId: string): Promise<void> {
-    const tab = this.tabs.find((t) => t.id === tabId);
-    if (tab === undefined) {
-      throw new Error('the tab is gone');
+    devTrace(`installConverted enter tab=${tabId}`);
+    try {
+      const tab = this.tabs.find((t) => t.id === tabId);
+      if (tab === undefined) {
+        throw new Error('the tab is gone');
+      }
+      return await this.runTabOp(tab, () =>
+        this.installConvertedNow(tab, convertId),
+      );
+    } finally {
+      devTrace(`installConverted end tab=${tabId}`);
     }
-    return this.runTabOp(tab, () => this.installConvertedNow(tab, convertId));
   }
   private async installConvertedNow(
     tab: DocTab,
@@ -2639,11 +2647,13 @@ export class DocumentWindowState {
     await this.flushWindowedInput(tab);
     let saved: WindowedSaved;
     try {
+      devTrace('saveWindowed windowed_save before');
       saved = await invoke<WindowedSaved>('windowed_save', {
         sessionId: w.sessionId,
         expected: force ? null : w.fingerprint,
         pathOverride: null,
       });
+      devTrace('saveWindowed windowed_save after');
     } catch (e) {
       if (String(e).includes(WINDOWED_FINGERPRINT_MISMATCH)) {
         this.windowedConflict = tab;
@@ -2671,8 +2681,10 @@ export class DocumentWindowState {
     }
     this.applyWindowedSaved(live.windowed, saved);
     await this.afterConvertedSave(live, saved);
+    devTrace('saveWindowed afterConvertedSave after');
     this.windowedConflict = null;
     await this.upsertTab(live);
+    devTrace('saveWindowed upsertTab after');
     return 'ok';
   }
   /** Reports a discard that failed and leaves the tab as it is; false. */
@@ -3000,11 +3012,13 @@ export class DocumentWindowState {
     await this.flushWindowedInput(tab);
     let saved: WindowedSaved;
     try {
+      devTrace('windowedSaveTo windowed_save before');
       saved = await invoke<WindowedSaved>('windowed_save', {
         sessionId: w.sessionId,
         expected: null,
         pathOverride: chosen,
       });
+      devTrace('windowedSaveTo windowed_save after');
     } catch (e) {
       if (String(e) === UNMAPPABLE) {
         return (await this.resolveUnmappable(tab, chosen)) === 'ok';
@@ -3029,8 +3043,10 @@ export class DocumentWindowState {
     }
     this.applyWindowedSaved(live.windowed, saved);
     await this.afterConvertedSave(live, saved);
+    devTrace('windowedSaveTo afterConvertedSave after');
     this.windowedConflict = null;
     await this.upsertTab(live);
+    devTrace('windowedSaveTo upsertTab after');
     void invoke('add_recent_file', { path: chosen });
     return true;
   }

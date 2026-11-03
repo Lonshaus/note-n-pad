@@ -6,6 +6,7 @@ import {
   type Extension,
   type Text,
 } from '@codemirror/state';
+import { devTrace } from '../dev/devTrace';
 import { offscreenMove } from '../editor/offscreenArrow';
 import { capturedInput, outsideInputAction } from './imeCapture';
 import {
@@ -59,7 +60,14 @@ const BREAK_RE = /\r\n|\n|\r/g;
 export function scanBreaks(raw: string): LineBreak[] {
   return (raw.match(BREAK_RE) ?? []) as LineBreak[];
 }
-
+/** A scan slower than this many milliseconds is logged (DEV only). */
+const SLOW_SCAN_MS = 50;
+function traceSlow(name: string, since: number, length: number): void {
+  const ms = performance.now() - since;
+  if (ms > SLOW_SCAN_MS) {
+    devTrace(`${name} took ${Math.round(ms)} ms, doc.length=${length}`);
+  }
+}
 function countLf(doc: string, from: number, to: number): number {
   let n = 0;
   let i = doc.indexOf('\n', from);
@@ -76,6 +84,7 @@ export function charToByte(
   breaks: readonly string[],
   pos: number,
 ): number {
+  const started = performance.now();
   const lines = countLf(doc, 0, pos);
   let extra = 0;
   for (let k = 0; k < lines; k += 1) {
@@ -83,7 +92,9 @@ export function charToByte(
       extra += 1;
     }
   }
-  return byteLength(doc.slice(0, pos)) + extra;
+  const bytes = byteLength(doc.slice(0, pos)) + extra;
+  traceSlow('charToByte', started, doc.length);
+  return bytes;
 }
 /** Number of UTF-16 code units (a CodeMirror position) before byte offset
  *  `byteOffset` of the raw window whose normalized text is `doc` and whose line
@@ -94,6 +105,16 @@ export function charToByte(
  *  ponytail: re-encodes each code point (O(window)) but runs only per undo/redo,
  *  not per keystroke; add a per-line byte index if it ever shows on the profile. */
 export function byteToChar(
+  doc: string,
+  breaks: readonly string[],
+  byteOffset: number,
+): number | null {
+  const started = performance.now();
+  const chars = scanByteToChar(doc, breaks, byteOffset);
+  traceSlow('byteToChar', started, doc.length);
+  return chars;
+}
+function scanByteToChar(
   doc: string,
   breaks: readonly string[],
   byteOffset: number,
