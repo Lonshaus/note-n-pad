@@ -1,7 +1,8 @@
 // Copyright © 2026 Lonshaus
 // SPDX-License-Identifier: GPL-3.0-only
 
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
+import { Annotation, EditorState, Transaction } from '@codemirror/state';
 import {
   applyBreaks,
   byteLength,
@@ -13,6 +14,7 @@ import {
   dropSwapSelect,
   fullyVisibleLineSpan,
   fillBreaks,
+  globalFilters,
   inApplyOrder,
   junctionRewrites,
   mapChangesToEdits,
@@ -23,13 +25,18 @@ import {
   rejectDuringSwap,
   replaceBreaks,
   scanBreaks,
+  selectionFilters,
   swapTarget,
   SWAP_THRESHOLD_LINES,
   MARGIN_LINES,
   WINDOW_LINES,
   type ByteEdit,
+  type GlobalFilterDeps,
   type RawChange,
+  type SelectionFilterDeps,
 } from './windowedEdit';
+import type { LineSelection, SelectAllMode } from './windowSelection';
+import { offscreenMove } from '../editor/offscreenArrow';
 
 describe('byteLength', () => {
   it('counts ASCII as one byte each', () => {
@@ -707,6 +714,53 @@ describe('mapOffset', () => {
     );
   });
 });
+// The same edit with its text written out: `len` stands for that many bytes.
+const written = (e: ByteEdit): ByteEdit => {
+  const { len, ...rest } = e;
+  return len === undefined ? e : { ...rest, text: 'x'.repeat(len) };
+};
+describe('mapOffset with text put back from a spill file', () => {
+  const spilled: ByteEdit[] = [
+    { start: 10, end: 10, text: '', len: 5 },
+    { start: 10, end: 14, text: '', len: 6 },
+    { start: 10, end: 14, text: '', len: 2 },
+    { start: 10, end: 11, text: '', len: 1, keep_start: true },
+    { start: 10, end: 13, text: '', len: 3, keep_start: true },
+  ];
+  for (const edit of spilled) {
+    it(`maps every offset like ${edit.len} bytes of text for ${edit.start}..${edit.end}`, () => {
+      for (let offset = 0; offset <= 30; offset += 1) {
+        expect(mapOffset(offset, edit)).toBe(mapOffset(offset, written(edit)));
+      }
+    });
+  }
+  it('moves an offset before, inside and after the change by the put-back length', () => {
+    const edit: ByteEdit = { start: 10, end: 10, text: '', len: 5 };
+    expect(mapOffset(9, edit)).toBe(9);
+    expect(mapOffset(10, edit)).toBe(15);
+    expect(mapOffset(40, edit)).toBe(45);
+    const replace: ByteEdit = { start: 10, end: 14, text: '', len: 6 };
+    expect(mapOffset(12, replace)).toBe(16);
+    expect(mapOffset(14, replace)).toBe(16);
+    expect(mapOffset(20, replace)).toBe(22);
+  });
+  it('keeps an offset at the start of a same-length keep_start edit', () => {
+    const edit: ByteEdit = {
+      start: 10,
+      end: 11,
+      text: '',
+      len: 1,
+      keep_start: true,
+    };
+    expect(mapOffset(10, edit)).toBe(10);
+    expect(mapOffset(11, edit)).toBe(11);
+  });
+  it('is not confused by a len of zero', () => {
+    expect(mapOffset(20, { start: 10, end: 14, text: 'abcd', len: 0 })).toBe(
+      16,
+    );
+  });
+});
 
 describe('mapThrough', () => {
   it('applies the edits one after another, each in the frame the last left', () => {
@@ -718,6 +772,23 @@ describe('mapThrough', () => {
     expect(mapThrough(8, edits)).toBe(10);
     expect(mapThrough(20, edits)).toBe(22);
     expect(mapThrough(8, [])).toBe(8);
+  });
+  it('maps a queued offset through a mix of put-back and typed changes', () => {
+    // A spill put back at 0 (8 bytes), a replacement with text, another put-back
+    // inside the first, then typed text with a multi-byte character.
+    const mixed: ByteEdit[] = [
+      { start: 0, end: 0, text: '', len: 8 },
+      { start: 20, end: 24, text: 'xy' },
+      { start: 5, end: 5, text: '', len: 3 },
+      { start: 40, end: 40, text: 'é' },
+    ];
+    expect(mapThrough(30, mixed)).toBe(30 + 8 - 2 + 3);
+    expect(mapThrough(50, mixed)).toBe(50 + 8 - 2 + 3 + 2);
+    for (const offset of [0, 3, 5, 12, 19, 20, 22, 24, 30, 39, 40, 50]) {
+      expect(mapThrough(offset, mixed)).toBe(
+        mapThrough(offset, mixed.map(written)),
+      );
+    }
   });
   it('keeps the end of line 11 through a three-line indent (lines 10 to 12)', () => {
     // Lines of 9 characters plus the break; indent each of lines 10..12 by 2.
@@ -1307,5 +1378,396 @@ describe('mirroring the core fill edits', () => {
     expect(
       mirrorStep('a\nb', ['\r\n'], 0, { start: 1, end: 3, text: '\r' }),
     ).not.toBeNull();
+  });
+});
+
+describe('selectionFilters', () => {
+  const DOC = 'line\n'.repeat(99) + 'line';
+  function setup(over: Partial<SelectionFilterDeps> = {}) {
+    const request = vi.fn();
+    const deps: SelectionFilterDeps = {
+      swapping: () => false,
+      keep: () => false,
+      mode: () => 'file' as SelectAllMode,
+      keyActive: () => false,
+      replayingKey: () => false,
+      viewport: () => ({ from: 0, to: DOC.length }),
+      request,
+      ...over,
+    };
+    const state = EditorState.create({
+      doc: DOC,
+      extensions: selectionFilters(deps),
+    });
+    return { state, request };
+  }
+  const selectAll = (state: EditorState) =>
+    state.update({
+      selection: { anchor: 0, head: state.doc.length },
+      userEvent: 'select',
+    });
+
+  it('notes a native select-all once and lets the transaction pass', () => {
+    const { state, request } = setup();
+    const tr = selectAll(state);
+    expect(request).toHaveBeenCalledTimes(1);
+    expect(tr.selection?.main.to).toBe(DOC.length);
+  });
+  it('notes it during a swap, while the swap still empties the transaction', () => {
+    const { state, request } = setup({ swapping: () => true });
+    const tr = selectAll(state);
+    expect(request).toHaveBeenCalledTimes(1);
+    expect(tr.selection).toBeUndefined();
+    expect(tr.newSelection.main.to).toBe(0);
+  });
+  it('keeps the selection of a composition captured in a swap', () => {
+    const { state, request } = setup({
+      swapping: () => true,
+      keep: () => true,
+    });
+    const tr = selectAll(state);
+    expect(request).toHaveBeenCalledTimes(1);
+    expect(tr.newSelection.main.to).toBe(DOC.length);
+  });
+  it('drops a DOM selection sync in a swap and not outside one', () => {
+    const sync = (state: EditorState) =>
+      state.update({
+        selection: { anchor: 3 },
+        userEvent: 'select',
+      });
+    const during = setup({ swapping: () => true });
+    expect(sync(during.state).newSelection.main.head).toBe(0);
+    const idle = setup();
+    expect(sync(idle.state).newSelection.main.head).toBe(3);
+  });
+  it('does not note a pointer selection or one a key command made', () => {
+    const pointer = setup();
+    pointer.state.update({
+      selection: { anchor: 0, head: DOC.length },
+      userEvent: 'select.pointer',
+    });
+    expect(pointer.request).not.toHaveBeenCalled();
+    const key = setup({ keyActive: () => true });
+    selectAll(key.state);
+    expect(key.request).not.toHaveBeenCalled();
+  });
+  it('does not note the selection of a key command replayed from the queue', () => {
+    const { state, request } = setup({ replayingKey: () => true });
+    selectAll(state);
+    expect(request).not.toHaveBeenCalled();
+  });
+  it('does not note the selection of a move that ran after a measure', () => {
+    const { state, request } = setup();
+    state.update({
+      selection: { anchor: 0, head: DOC.length },
+      userEvent: 'select',
+      annotations: offscreenMove.of(true),
+    });
+    expect(request).not.toHaveBeenCalled();
+  });
+  it('does not note a selection that leaves part of the range out', () => {
+    const { state, request } = setup();
+    state.update({
+      selection: { anchor: 0, head: DOC.length - 1 },
+      userEvent: 'select',
+    });
+    expect(request).not.toHaveBeenCalled();
+  });
+  it('does not note a change of the document', () => {
+    const { state, request } = setup();
+    state.update({
+      changes: { from: 0, insert: 'x' },
+      selection: { anchor: 0, head: DOC.length },
+      userEvent: 'select',
+    });
+    expect(request).not.toHaveBeenCalled();
+  });
+  it('does not note it under the "visible" setting', () => {
+    const { state, request } = setup({ mode: () => 'visible' });
+    selectAll(state);
+    expect(request).not.toHaveBeenCalled();
+  });
+  it('does not note a selection that is already there', () => {
+    const request = vi.fn();
+    const state = EditorState.create({
+      doc: DOC,
+      selection: { anchor: 0, head: DOC.length },
+      extensions: selectionFilters({
+        swapping: () => false,
+        keep: () => false,
+        mode: () => 'file',
+        keyActive: () => false,
+        replayingKey: () => false,
+        viewport: () => ({ from: 0, to: DOC.length }),
+        request,
+      }),
+    });
+    state.update({
+      selection: { anchor: 0, head: DOC.length },
+      userEvent: 'select',
+    });
+    expect(request).not.toHaveBeenCalled();
+  });
+  it('does nothing without a view to read the range from', () => {
+    const { state, request } = setup({ viewport: () => null });
+    selectAll(state);
+    expect(request).not.toHaveBeenCalled();
+  });
+  it('leaves a transaction without a user event alone', () => {
+    const { state } = setup({ swapping: () => true });
+    const tr = state.update({ selection: { anchor: 5 } });
+    expect(tr.newSelection.main.head).toBe(5);
+    expect(tr.annotation(Transaction.userEvent)).toBeUndefined();
+  });
+});
+
+describe('globalFilters', () => {
+  interface Key {
+    chord: boolean;
+    bound: boolean;
+  }
+  const LARGE: LineSelection = {
+    anchor: { line: 0, col: 0 },
+    head: { line: 5000, col: 0 },
+  };
+  const SMALL: LineSelection = {
+    anchor: { line: 10, col: 0 },
+    head: { line: 12, col: 0 },
+  };
+  const exemptMark = Annotation.define<boolean>();
+  const DOC = 'hello world';
+  function setup(over: Partial<GlobalFilterDeps<Key>> = {}) {
+    const text: string[] = [];
+    const keys: Key[] = [];
+    const deps: GlobalFilterDeps<Key> = {
+      swapping: () => false,
+      locked: () => false,
+      holds: () => 0,
+      capturing: () => false,
+      pendingIme: () => false,
+      late: () => false,
+      replayPending: () => false,
+      draining: () => false,
+      keyActive: () => false,
+      keydown: () => undefined,
+      globalSel: () => LARGE,
+      outside: () => true,
+      exempt: (tr) => tr.annotation(exemptMark) === true,
+      captureMark: (tr) => tr.annotation(exemptMark) === true,
+      chord: (e) => e.chord,
+      bound: (e) => e.bound,
+      defer: (run) => run(),
+      queueText: (t) => text.push(t),
+      queueKey: (e) => keys.push(e),
+      ...over,
+    };
+    const state = EditorState.create({
+      doc: DOC,
+      selection: { anchor: 0, head: 5 },
+      extensions: globalFilters(deps),
+    });
+    return { state, text, keys };
+  }
+  const typed = (state: EditorState, userEvent: string): Transaction =>
+    state.update({
+      changes: { from: 5, insert: 'X' },
+      userEvent,
+    });
+
+  describe('under a selection too large for one window', () => {
+    it('refuses a deleted line', () => {
+      const { state, text, keys } = setup();
+      const tr = state.update({
+        changes: { from: 0, to: DOC.length },
+        userEvent: 'delete.line',
+      });
+      expect(tr.docChanged).toBe(false);
+      expect(text).toEqual([]);
+      expect(keys).toEqual([]);
+    });
+
+    it('accepts the text of a composition a capture covers', () => {
+      const { state, text } = setup({ capturing: () => true });
+      const tr = typed(state, 'input.type.compose');
+      expect(tr.docChanged).toBe(true);
+      expect(text).toEqual([]);
+    });
+
+    it('queues text that came with no keydown once, and refuses its transaction', () => {
+      const { state, text } = setup();
+      const tr = typed(state, 'input.type');
+      expect(tr.docChanged).toBe(false);
+      expect(text).toEqual(['X']);
+    });
+
+    it('queues text only after the filter, never inside it', () => {
+      const later: (() => void)[] = [];
+      const { state, text } = setup({ defer: (run) => later.push(run) });
+      typed(state, 'input.type');
+      expect(text).toEqual([]);
+      expect(later).toHaveLength(1);
+      later[0]?.();
+      expect(text).toEqual(['X']);
+    });
+
+    it('defers the late text of a composition too, while a swap runs', () => {
+      const later: (() => void)[] = [];
+      const { state, text } = setup({
+        swapping: () => true,
+        replayPending: () => true,
+        late: () => true,
+        defer: (run) => later.push(run),
+      });
+      typed(state, 'input.type.compose');
+      expect(text).toEqual([]);
+      expect(later).toHaveLength(1);
+      later[0]?.();
+      expect(text).toEqual(['X']);
+    });
+
+    it('queues the text of a composition no capture covers when it comes late', () => {
+      const { state, text } = setup({ late: () => true });
+      const tr = typed(state, 'input.type.compose');
+      expect(tr.docChanged).toBe(false);
+      expect(text).toEqual(['X']);
+    });
+
+    it('queues the late text of a composition once while a swap runs', () => {
+      const { state, text } = setup({
+        swapping: () => true,
+        replayPending: () => true,
+        late: () => true,
+      });
+      const tr = typed(state, 'input.type.compose');
+      expect(tr.docChanged).toBe(false);
+      expect(text).toEqual(['X']);
+    });
+
+    it('queues the text typed while a swap runs behind the queue and refuses it', () => {
+      const { state, text } = setup({
+        swapping: () => true,
+        replayPending: () => true,
+      });
+      const tr = typed(state, 'input.type');
+      expect(tr.docChanged).toBe(false);
+      expect(text).toEqual([]);
+    });
+
+    it('queues the key of a refused chord that moves the selection', () => {
+      const e: Key = { chord: true, bound: true };
+      const { state, keys } = setup({
+        keyActive: () => true,
+        keydown: () => e,
+      });
+      const tr = state.update({
+        selection: { anchor: 3 },
+        userEvent: 'select',
+      });
+      expect(tr.newSelection.main.head).toBe(5);
+      expect(keys).toEqual([e]);
+    });
+
+    it('queues the key of Escape, which is no chord', () => {
+      const e: Key = { chord: false, bound: true };
+      const { state, keys } = setup({
+        keyActive: () => true,
+        keydown: () => e,
+        replayPending: () => true,
+      });
+      state.update({ selection: { anchor: 5 }, userEvent: 'select' });
+      expect(keys).toEqual([e]);
+    });
+
+    it('leaves a key no binding answers', () => {
+      const e: Key = { chord: false, bound: false };
+      const { state, keys } = setup({
+        keyActive: () => true,
+        keydown: () => e,
+      });
+      state.update({ selection: { anchor: 3 }, userEvent: 'select' });
+      expect(keys).toEqual([]);
+    });
+
+    it('does not refuse a transaction an exempt mark covers', () => {
+      const { state } = setup();
+      const tr = state.update({
+        changes: { from: 0, to: 5 },
+        annotations: exemptMark.of(true),
+      });
+      expect(tr.docChanged).toBe(true);
+      const sel = state.update({
+        selection: { anchor: 2, head: 9 },
+        userEvent: 'select',
+        annotations: exemptMark.of(true),
+      });
+      expect(sel.newSelection.main.head).toBe(9);
+    });
+
+    it('lets a pointer selection through', () => {
+      const { state } = setup({ keyActive: () => true });
+      const tr = state.update({
+        selection: { anchor: 3 },
+        userEvent: 'select.pointer',
+      });
+      expect(tr.newSelection.main.head).toBe(3);
+    });
+
+    it('refuses a user edit during a hold', () => {
+      const { state } = setup({ holds: () => 1, outside: () => false });
+      expect(typed(state, 'input.type').docChanged).toBe(false);
+    });
+  });
+
+  describe('under a selection one window holds', () => {
+    it('queues nothing and lets a key command inside the window through', () => {
+      const e: Key = { chord: true, bound: true };
+      const { state, keys } = setup({
+        globalSel: () => SMALL,
+        outside: () => false,
+        keyActive: () => true,
+        keydown: () => e,
+      });
+      const tr = state.update({
+        selection: { anchor: 3 },
+        userEvent: 'select',
+      });
+      expect(tr.newSelection.main.head).toBe(3);
+      expect(keys).toEqual([]);
+    });
+
+    it('does not queue the key of a bound key that is no chord', () => {
+      const e: Key = { chord: false, bound: true };
+      const { state, keys } = setup({
+        globalSel: () => SMALL,
+        outside: () => true,
+        keyActive: () => true,
+        keydown: () => e,
+      });
+      state.update({ selection: { anchor: 3 }, userEvent: 'select' });
+      expect(keys).toEqual([]);
+    });
+
+    it('queues the key of a chord that is refused outside the window', () => {
+      const e: Key = { chord: true, bound: true };
+      const { state, keys } = setup({
+        globalSel: () => SMALL,
+        outside: () => true,
+        keyActive: () => true,
+        keydown: () => e,
+      });
+      state.update({ selection: { anchor: 3 }, userEvent: 'select' });
+      expect(keys).toEqual([e]);
+    });
+  });
+
+  it('takes a user edit during a swap to keep the composition apart', () => {
+    const swapping = setup({ swapping: () => true, outside: () => false });
+    expect(typed(swapping.state, 'input.type').docChanged).toBe(false);
+    const composing = setup({
+      swapping: () => true,
+      outside: () => false,
+      capturing: () => true,
+    });
+    expect(typed(composing.state, 'input.type.compose').docChanged).toBe(true);
   });
 });

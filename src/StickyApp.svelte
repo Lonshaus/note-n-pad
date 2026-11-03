@@ -43,6 +43,11 @@
   } from './lib/util/editorClipboard';
   import type { EditorView } from '@codemirror/view';
   import { undo, redo, selectAll } from '@codemirror/commands';
+  import { installPasteWindow } from './lib/util/pasteEnv';
+  import ConvertDialogs from './lib/ConvertDialogs.svelte';
+  import { convertController } from './lib/state/convertController.svelte';
+  import { STICKY_KEY } from './lib/util/pasteFlow';
+  import { pasteLocks } from './lib/util/pasteLock';
 
   interface RunningApp {
     name: string;
@@ -78,7 +83,6 @@
 
   const pinMode = $derived(stickyNote.note?.pin_mode ?? 'none');
   const pinApp = $derived(stickyNote.note?.pin_app ?? null);
-
   // Fixed paper palette; order is the swatch-row order. graphite is the only
   // dark surface (drives the oneDark editor theme).
   const PAPERS = ['classic', 'white', 'pink', 'blue', 'green', 'graphite'];
@@ -88,7 +92,6 @@
     // The last picked paper becomes the default for new stickies.
     stickyNote.setPaper(name);
   }
-
   // Popover dismissal: a press outside `node` (its trigger included) or Escape.
   function dismissOn(
     node: HTMLElement,
@@ -115,7 +118,6 @@
       },
     };
   }
-
   // Reflect the resolved theme onto the document root. The sticky card itself
   // is unaffected (its paper colors are independent `--sticky-*` variables),
   // but shared chrome like the danger-red close hover reads the app theme.
@@ -123,7 +125,6 @@
     applyTheme(settingsState.themeId);
     applyChrome(settingsState.interfaceMode, settingsState.prefersDark);
   });
-
   // Apply a pin mode: persist it and set the window's float state. "app" starts
   // un-floated; the backend app-watch poller raises it when its app is frontmost.
   async function applyPin(
@@ -140,7 +141,6 @@
     stickyNote.setPinMode(mode, app);
     showPinMenu = false;
   }
-
   // The pin icon itself toggles the simple none <-> top float.
   function togglePin(): void {
     void applyPin(pinMode === 'top' ? 'none' : 'top');
@@ -158,7 +158,6 @@
     await invoke('set_window_opacity', { value });
     stickyNote.setOpacity(value);
   }
-
   // Save to a real file, convert the store entry from sticky to document (same
   // id, so the saved doc reopens on restart), then open a real document window
   // for it and drop this sticky window.
@@ -227,6 +226,7 @@
   }
 
   async function discardAndDestroy(): Promise<void> {
+    convertController.cancelAll();
     stickyNote.discard();
     const note = stickyNote.note;
     if (note !== null) {
@@ -234,7 +234,6 @@
     }
     await win.destroy();
   }
-
   // Snapshot-write-failure quit gate: this note's content could not be saved
   // to the recovery snapshot and would be silently lost if the app exits now.
   // Raised by the flush-request handler below (see its own comment), which
@@ -257,7 +256,6 @@
   function quitGateCancel(): void {
     quitGateVisible = false;
   }
-
   // Empty notes vanish silently; notes with content prompt before discarding.
   // While the app is quitting this is a no-op: the flush-request handshake
   // (see the listener below) already flushes this window's content to a
@@ -279,11 +277,9 @@
   function onEditorChange(v: string): void {
     stickyNote.updateContent(v);
   }
-
   // The sticky's CodeMirror view, supplied by EditorShell for the edit actions
   // below. Stickies have no search at all (no Find, no Find and Replace).
   let editorView: EditorView | null = null;
-
   // Menu accelerators arrive from the Rust menu as a string payload. Save routes
   // to the sticky's save-and-convert flow. New Tab, Open, Find and Find and
   // Replace never reach an enabled sticky menu item, so they are ignored here.
@@ -308,10 +304,15 @@
       const view = editorView;
       switch (action) {
         case 'undo':
-          undo(view);
+          // A paste in flight holds the note.
+          if (!pasteLocks.has(STICKY_KEY)) {
+            undo(view);
+          }
           break;
         case 'redo':
-          redo(view);
+          if (!pasteLocks.has(STICKY_KEY)) {
+            redo(view);
+          }
           break;
         case 'select-all':
           selectAll(view);
@@ -334,7 +335,6 @@
         break;
     }
   }
-
   // Linux only: a sticky there has no menu (`detach_menu_unless_document`), so
   // this is the only source of its Quit/Close/Save shortcuts. Windows
   // shortcuts go through the global listener in `main.ts`, and macOS through
@@ -371,7 +371,6 @@
     // Reveal the window only after the theme is loaded and applied, so a
     // dark-theme window never flashes its default white background.
     void revealWhenThemed();
-
     // Persist logical bounds after the user finishes moving or resizing.
     const captureBounds = debounce(() => {
       void (async (): Promise<void> => {
@@ -409,7 +408,6 @@
     });
     const unlistenMoved = win.onMoved(() => captureBounds());
     const unlistenResized = win.onResized(() => captureBounds());
-
     // When the window regains OS focus, keyboard focus can be left on BODY (the
     // WebView then silently drops keystrokes); hand it back to the editor unless
     // the close dialog or an input field is holding it.
@@ -422,15 +420,12 @@
         showPinMenu = false;
       }
     });
-
     // Cmd+W (routed from the app menu) closes this sticky, matching its own flow.
     const unlistenMenuClose = win.listen('menu-close', () => requestClose());
-
     // File/Edit menu accelerators arrive here as a single string payload.
     const unlistenMenuAction = win.listen<string>('menu-action', (event) =>
       runMenuAction(event.payload),
     );
-
     // Workspace sticky-row hover buttons route back here so save/close run the
     // sticky's own flows instead of being reimplemented in the workspace.
     const unlistenRowAction = win.listen<string>(
@@ -443,7 +438,23 @@
         }
       },
     );
-
+    // The core gave back a note it was handing to a document window: it
+    // unlocks, and the user is told.
+    const unlistenReclaimed = win.listen<{ note_id: string }>(
+      'convert-reclaimed',
+      (e) => convertController.reclaimed(e.payload.note_id),
+    );
+    convertController.attachSticky({
+      noteId: () => stickyNote.note?.id ?? null,
+      language: () => stickyNote.note?.language ?? null,
+      flush: () => stickyNote.flush(),
+      // A paste too big to edit was saved: the file opens as a document the way
+      // a file is opened, and the note goes.
+      openSaved: async (path) => {
+        await invoke('open_picked_files', { paths: [path] });
+        await discardAndDestroy();
+      },
+    });
     const onBeforeUnload = (): void => {
       void stickyNote.flush();
     };
@@ -479,6 +490,7 @@
     });
     window.addEventListener('beforeunload', onBeforeUnload);
     window.addEventListener('keydown', onStickyKeydown);
+    const uninstallPaste = installPasteWindow();
     // DEV-only automation hook; dynamic import keeps it out of production.
     if (import.meta.env.DEV) {
       void import('./lib/dev/auto').then((m) =>
@@ -493,6 +505,9 @@
     return () => {
       window.removeEventListener('beforeunload', onBeforeUnload);
       window.removeEventListener('keydown', onStickyKeydown);
+      uninstallPaste();
+      convertController.attachSticky(null);
+      void unlistenReclaimed.then((u) => u());
       unlistenTheme();
       void unlistenChanges.then((u) => u());
       void unlistenThemes.then((u) => u());
@@ -737,6 +752,8 @@
       oncancel={quitGateCancel}
     />
   {/if}
+
+  <ConvertDialogs />
 
   {#if saveFailed !== null}
     <!-- Report only, layered on top of the close-confirmation dialog: the note

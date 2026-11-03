@@ -1,0 +1,976 @@
+[
+  {
+    "name": "indent: empty lines and a ragged text are all indented",
+    "op": "indent",
+    "input": "a\n\n  b\n\t\nc",
+    "anchor": {
+      "line": 0,
+      "col": 0
+    },
+    "head": {
+      "line": 4,
+      "col": 1
+    },
+    "lines": ["  a", "  ", "    b", "  \t", "  c"],
+    "resultAnchor": {
+      "line": 0,
+      "col": 2
+    },
+    "resultHead": {
+      "line": 4,
+      "col": 3
+    }
+  },
+  {
+    "name": "indent: a selection ending at column 0 skips that line",
+    "op": "indent",
+    "input": "one\ntwo\nthree\nfour",
+    "anchor": {
+      "line": 0,
+      "col": 1
+    },
+    "head": {
+      "line": 2,
+      "col": 0
+    },
+    "lines": ["  one", "  two", "three", "four"],
+    "resultAnchor": {
+      "line": 0,
+      "col": 3
+    },
+    "resultHead": {
+      "line": 2,
+      "col": 0
+    }
+  },
+  {
+    "name": "indent: a reversed selection ending at column 0",
+    "op": "indent",
+    "input": "one\ntwo\nthree\nfour",
+    "anchor": {
+      "line": 2,
+      "col": 0
+    },
+    "head": {
+      "line": 0,
+      "col": 2
+    },
+    "lines": ["  one", "  two", "three", "four"],
+    "resultAnchor": {
+      "line": 2,
+      "col": 0
+    },
+    "resultHead": {
+      "line": 0,
+      "col": 4
+    }
+  },
+  {
+    "name": "indent: the anchor at the start of a tab-indented line",
+    "op": "indent",
+    "input": "\tx\n\ty\n\tz",
+    "anchor": {
+      "line": 0,
+      "col": 0
+    },
+    "head": {
+      "line": 2,
+      "col": 2
+    },
+    "lines": ["  \tx", "  \ty", "  \tz"],
+    "resultAnchor": {
+      "line": 0,
+      "col": 2
+    },
+    "resultHead": {
+      "line": 2,
+      "col": 4
+    }
+  },
+  {
+    "name": "indent: a selection ending inside the last line",
+    "op": "indent",
+    "input": "ab\ncd\nef",
+    "anchor": {
+      "line": 0,
+      "col": 1
+    },
+    "head": {
+      "line": 2,
+      "col": 1
+    },
+    "lines": ["  ab", "  cd", "  ef"],
+    "resultAnchor": {
+      "line": 0,
+      "col": 3
+    },
+    "resultHead": {
+      "line": 2,
+      "col": 3
+    }
+  },
+  {
+    "name": "indent: CJK, a surrogate pair and a CRLF line",
+    "op": "indent",
+    "input": "日本語\r\n😀x\r\n\r\nend",
+    "anchor": {
+      "line": 0,
+      "col": 2
+    },
+    "head": {
+      "line": 3,
+      "col": 2
+    },
+    "lines": ["  日本語", "  😀x", "  ", "  end"],
+    "resultAnchor": {
+      "line": 0,
+      "col": 4
+    },
+    "resultHead": {
+      "line": 3,
+      "col": 4
+    }
+  },
+  {
+    "name": "indent: lone CR and mixed breaks",
+    "op": "indent",
+    "input": "a\rb\r\nc\nd\re",
+    "anchor": {
+      "line": 0,
+      "col": 0
+    },
+    "head": {
+      "line": 4,
+      "col": 1
+    },
+    "lines": ["  a", "  b", "  c", "  d", "  e"],
+    "resultAnchor": {
+      "line": 0,
+      "col": 2
+    },
+    "resultHead": {
+      "line": 4,
+      "col": 3
+    }
+  },
+  {
+    "name": "outdent: two tabs become six spaces",
+    "op": "outdent",
+    "input": "\t\tx\ny",
+    "anchor": {
+      "line": 0,
+      "col": 0
+    },
+    "head": {
+      "line": 1,
+      "col": 1
+    },
+    "lines": ["      x", "y"],
+    "resultAnchor": {
+      "line": 0,
+      "col": 0
+    },
+    "resultHead": {
+      "line": 1,
+      "col": 1
+    }
+  },
+  {
+    "name": "outdent: the anchor at the start of a tab-indented line",
+    "op": "outdent",
+    "input": "\tx\n\ty\n\tz",
+    "anchor": {
+      "line": 0,
+      "col": 0
+    },
+    "head": {
+      "line": 2,
+      "col": 2
+    },
+    "lines": ["  x", "  y", "  z"],
+    "resultAnchor": {
+      "line": 0,
+      "col": 0
+    },
+    "resultHead": {
+      "line": 2,
+      "col": 3
+    }
+  },
+  {
+    "name": "outdent: the anchor inside a replaced indent",
+    "op": "outdent",
+    "input": "     x\n   y\n z\nw",
+    "anchor": {
+      "line": 0,
+      "col": 3
+    },
+    "head": {
+      "line": 3,
+      "col": 1
+    },
+    "lines": ["   x", " y", "z", "w"],
+    "resultAnchor": {
+      "line": 0,
+      "col": 3
+    },
+    "resultHead": {
+      "line": 3,
+      "col": 1
+    }
+  },
+  {
+    "name": "outdent: mixed indentation",
+    "op": "outdent",
+    "input": " \tx\n\t y\n  \t\tz\n    w\n   v",
+    "anchor": {
+      "line": 0,
+      "col": 0
+    },
+    "head": {
+      "line": 4,
+      "col": 4
+    },
+    "lines": ["  x", "   y", "      z", "  w", " v"],
+    "resultAnchor": {
+      "line": 0,
+      "col": 0
+    },
+    "resultHead": {
+      "line": 4,
+      "col": 2
+    }
+  },
+  {
+    "name": "outdent: lines without indentation do not change",
+    "op": "outdent",
+    "input": "a\nb\nc",
+    "anchor": {
+      "line": 0,
+      "col": 0
+    },
+    "head": {
+      "line": 2,
+      "col": 1
+    },
+    "lines": ["a", "b", "c"],
+    "resultAnchor": {
+      "line": 0,
+      "col": 0
+    },
+    "resultHead": {
+      "line": 2,
+      "col": 1
+    }
+  },
+  {
+    "name": "outdent: whitespace-only lines and empty lines",
+    "op": "outdent",
+    "input": "    \n\n  \n \t\nx",
+    "anchor": {
+      "line": 0,
+      "col": 0
+    },
+    "head": {
+      "line": 4,
+      "col": 1
+    },
+    "lines": ["  ", "", "", "  ", "x"],
+    "resultAnchor": {
+      "line": 0,
+      "col": 0
+    },
+    "resultHead": {
+      "line": 4,
+      "col": 1
+    }
+  },
+  {
+    "name": "outdent: U+3000, U+00A0 and U+FEFF indentation",
+    "op": "outdent",
+    "input": "　a\n  b\n﻿c\n  d\nx",
+    "anchor": {
+      "line": 0,
+      "col": 0
+    },
+    "head": {
+      "line": 4,
+      "col": 1
+    },
+    "lines": ["a", "b", "c", "d", "x"],
+    "resultAnchor": {
+      "line": 0,
+      "col": 0
+    },
+    "resultHead": {
+      "line": 4,
+      "col": 1
+    }
+  },
+  {
+    "name": "outdent: U+0085 is not whitespace",
+    "op": "outdent",
+    "input": "  a\n  b\nc",
+    "anchor": {
+      "line": 0,
+      "col": 0
+    },
+    "head": {
+      "line": 2,
+      "col": 1
+    },
+    "lines": ["  a", "b", "c"],
+    "resultAnchor": {
+      "line": 0,
+      "col": 0
+    },
+    "resultHead": {
+      "line": 2,
+      "col": 1
+    }
+  },
+  {
+    "name": "outdent: a selection ending at column 0 skips that line",
+    "op": "outdent",
+    "input": "  a\n  b\n  c",
+    "anchor": {
+      "line": 0,
+      "col": 1
+    },
+    "head": {
+      "line": 2,
+      "col": 0
+    },
+    "lines": ["a", "b", "  c"],
+    "resultAnchor": {
+      "line": 0,
+      "col": 0
+    },
+    "resultHead": {
+      "line": 2,
+      "col": 0
+    }
+  },
+  {
+    "name": "outdent: CRLF lines",
+    "op": "outdent",
+    "input": "  a\r\n    b\r\n\t\tc\r\nd",
+    "anchor": {
+      "line": 0,
+      "col": 0
+    },
+    "head": {
+      "line": 3,
+      "col": 1
+    },
+    "lines": ["a", "  b", "      c", "d"],
+    "resultAnchor": {
+      "line": 0,
+      "col": 0
+    },
+    "resultHead": {
+      "line": 3,
+      "col": 1
+    }
+  },
+  {
+    "name": "outdent: a lone CR before an emptied line keeps its line",
+    "op": "outdent",
+    "input": "a\r  \nb\r  \n  c",
+    "anchor": {
+      "line": 0,
+      "col": 0
+    },
+    "head": {
+      "line": 4,
+      "col": 1
+    },
+    "lines": ["a", "", "b", "", "c"],
+    "resultAnchor": {
+      "line": 0,
+      "col": 0
+    },
+    "resultHead": {
+      "line": 4,
+      "col": 0
+    }
+  },
+  {
+    "name": "outdent: a run of lone CR before an emptied line",
+    "op": "outdent",
+    "input": "a\r\r\r  \nb",
+    "anchor": {
+      "line": 0,
+      "col": 0
+    },
+    "head": {
+      "line": 4,
+      "col": 1
+    },
+    "lines": ["a", "", "", "", "b"],
+    "resultAnchor": {
+      "line": 0,
+      "col": 0
+    },
+    "resultHead": {
+      "line": 4,
+      "col": 1
+    }
+  },
+  {
+    "name": "outdent: lone CR lines with indentation",
+    "op": "outdent",
+    "input": "  a\r  b\r c\r\n  d\re",
+    "anchor": {
+      "line": 1,
+      "col": 1
+    },
+    "head": {
+      "line": 4,
+      "col": 0
+    },
+    "lines": ["  a", "b", "c", "d", "e"],
+    "resultAnchor": {
+      "line": 1,
+      "col": 0
+    },
+    "resultHead": {
+      "line": 4,
+      "col": 0
+    }
+  },
+  {
+    "name": "outdent: a reversed selection",
+    "op": "outdent",
+    "input": "    a\n    b\n    c",
+    "anchor": {
+      "line": 2,
+      "col": 3
+    },
+    "head": {
+      "line": 0,
+      "col": 2
+    },
+    "lines": ["  a", "  b", "  c"],
+    "resultAnchor": {
+      "line": 2,
+      "col": 2
+    },
+    "resultHead": {
+      "line": 0,
+      "col": 2
+    }
+  },
+  {
+    "name": "enter: the start inside the indent of the first line moves",
+    "op": "enter",
+    "input": "  abc\ndef\nghi",
+    "anchor": {
+      "line": 0,
+      "col": 1
+    },
+    "head": {
+      "line": 2,
+      "col": 1
+    },
+    "lines": ["", "  hi"],
+    "resultAnchor": {
+      "line": 1,
+      "col": 2
+    },
+    "resultHead": {
+      "line": 1,
+      "col": 2
+    }
+  },
+  {
+    "name": "enter: byte 0 takes no indentation",
+    "op": "enter",
+    "input": "    abc\ndef\nghi",
+    "anchor": {
+      "line": 0,
+      "col": 0
+    },
+    "head": {
+      "line": 1,
+      "col": 2
+    },
+    "lines": ["", "f", "ghi"],
+    "resultAnchor": {
+      "line": 1,
+      "col": 0
+    },
+    "resultHead": {
+      "line": 1,
+      "col": 0
+    }
+  },
+  {
+    "name": "enter: a first line start after text keeps the text",
+    "op": "enter",
+    "input": "  abc\ndef\nghi",
+    "anchor": {
+      "line": 0,
+      "col": 4
+    },
+    "head": {
+      "line": 2,
+      "col": 1
+    },
+    "lines": ["  ab", "  hi"],
+    "resultAnchor": {
+      "line": 1,
+      "col": 2
+    },
+    "resultHead": {
+      "line": 1,
+      "col": 2
+    }
+  },
+  {
+    "name": "enter: a later line starting inside its indent does not move",
+    "op": "enter",
+    "input": "x\n  abc\ndef\nghi",
+    "anchor": {
+      "line": 1,
+      "col": 1
+    },
+    "head": {
+      "line": 3,
+      "col": 1
+    },
+    "lines": ["x", " ", "  hi"],
+    "resultAnchor": {
+      "line": 2,
+      "col": 2
+    },
+    "resultHead": {
+      "line": 2,
+      "col": 2
+    }
+  },
+  {
+    "name": "enter: a later all-whitespace line moves",
+    "op": "enter",
+    "input": "x\n   \nabc\nghi",
+    "anchor": {
+      "line": 1,
+      "col": 2
+    },
+    "head": {
+      "line": 3,
+      "col": 1
+    },
+    "lines": ["x", "", "   hi"],
+    "resultAnchor": {
+      "line": 2,
+      "col": 3
+    },
+    "resultHead": {
+      "line": 2,
+      "col": 3
+    }
+  },
+  {
+    "name": "enter: the second line from column 1 with a longer indent moves",
+    "op": "enter",
+    "input": "x\n    y\nz\nw",
+    "anchor": {
+      "line": 1,
+      "col": 1
+    },
+    "head": {
+      "line": 3,
+      "col": 1
+    },
+    "lines": ["x", "", "    "],
+    "resultAnchor": {
+      "line": 2,
+      "col": 4
+    },
+    "resultHead": {
+      "line": 2,
+      "col": 4
+    }
+  },
+  {
+    "name": "enter: the lower bound, CJK before the line",
+    "op": "enter",
+    "input": "日本語日本語\n  abc\ndef\nghi",
+    "anchor": {
+      "line": 1,
+      "col": 1
+    },
+    "head": {
+      "line": 3,
+      "col": 1
+    },
+    "lines": ["日本語日本語", " ", "  hi"],
+    "resultAnchor": {
+      "line": 2,
+      "col": 2
+    },
+    "resultHead": {
+      "line": 2,
+      "col": 2
+    }
+  },
+  {
+    "name": "enter: the upper bound, a short line start and a long indent",
+    "op": "enter",
+    "input": "ab\n      abc\ndef\nghi",
+    "anchor": {
+      "line": 1,
+      "col": 2
+    },
+    "head": {
+      "line": 3,
+      "col": 1
+    },
+    "lines": ["ab", "", "      hi"],
+    "resultAnchor": {
+      "line": 2,
+      "col": 6
+    },
+    "resultHead": {
+      "line": 2,
+      "col": 6
+    }
+  },
+  {
+    "name": "enter: exact count moves, CJK before the line",
+    "op": "enter",
+    "input": "日日日\n      x\ny\nz",
+    "anchor": {
+      "line": 1,
+      "col": 1
+    },
+    "head": {
+      "line": 3,
+      "col": 1
+    },
+    "lines": ["日日日", "", "      "],
+    "resultAnchor": {
+      "line": 2,
+      "col": 6
+    },
+    "resultHead": {
+      "line": 2,
+      "col": 6
+    }
+  },
+  {
+    "name": "enter: exact count does not move, CJK and ASCII before the line",
+    "op": "enter",
+    "input": "日日a\n    x\ny\nz",
+    "anchor": {
+      "line": 1,
+      "col": 1
+    },
+    "head": {
+      "line": 3,
+      "col": 1
+    },
+    "lines": ["日日a", " ", "    "],
+    "resultAnchor": {
+      "line": 2,
+      "col": 4
+    },
+    "resultHead": {
+      "line": 2,
+      "col": 4
+    }
+  },
+  {
+    "name": "enter: exact count does not move, a surrogate pair and a CRLF",
+    "op": "enter",
+    "input": "😀\r\n   x\ny\nz",
+    "anchor": {
+      "line": 1,
+      "col": 1
+    },
+    "head": {
+      "line": 3,
+      "col": 1
+    },
+    "lines": ["😀", " ", "   "],
+    "resultAnchor": {
+      "line": 2,
+      "col": 3
+    },
+    "resultHead": {
+      "line": 2,
+      "col": 3
+    }
+  },
+  {
+    "name": "enter: exact count moves, a surrogate pair and a CRLF",
+    "op": "enter",
+    "input": "😀\r\n    x\ny\nz",
+    "anchor": {
+      "line": 1,
+      "col": 1
+    },
+    "head": {
+      "line": 3,
+      "col": 1
+    },
+    "lines": ["😀", "", "    "],
+    "resultAnchor": {
+      "line": 2,
+      "col": 4
+    },
+    "resultHead": {
+      "line": 2,
+      "col": 4
+    }
+  },
+  {
+    "name": "enter: exact count with lone CR breaks before the line",
+    "op": "enter",
+    "input": "日\r日\r     x\ny\nz",
+    "anchor": {
+      "line": 2,
+      "col": 1
+    },
+    "head": {
+      "line": 4,
+      "col": 0
+    },
+    "lines": ["日", "日", "", "     z"],
+    "resultAnchor": {
+      "line": 3,
+      "col": 5
+    },
+    "resultHead": {
+      "line": 3,
+      "col": 5
+    }
+  },
+  {
+    "name": "enter: the start at column 100 or later does not move",
+    "op": "enter",
+    "input": "                                                                                                                                                      abc\ndef\nghi",
+    "anchor": {
+      "line": 0,
+      "col": 100
+    },
+    "head": {
+      "line": 2,
+      "col": 1
+    },
+    "lines": [
+      "                                                                                                    ",
+      "                                                                                                                                                      hi"
+    ],
+    "resultAnchor": {
+      "line": 1,
+      "col": 150
+    },
+    "resultHead": {
+      "line": 1,
+      "col": 150
+    }
+  },
+  {
+    "name": "enter: the start at column 99 of a blank first line moves",
+    "op": "enter",
+    "input": "                                                                                                                                                      abc\ndef\nghi",
+    "anchor": {
+      "line": 0,
+      "col": 99
+    },
+    "head": {
+      "line": 2,
+      "col": 1
+    },
+    "lines": [
+      "",
+      "                                                                                                                                                      hi"
+    ],
+    "resultAnchor": {
+      "line": 1,
+      "col": 150
+    },
+    "resultHead": {
+      "line": 1,
+      "col": 150
+    }
+  },
+  {
+    "name": "enter: tabs count to the next multiple of 4",
+    "op": "enter",
+    "input": "a\n \t\t foo\nbar\nbaz",
+    "anchor": {
+      "line": 1,
+      "col": 5
+    },
+    "head": {
+      "line": 3,
+      "col": 1
+    },
+    "lines": ["a", " \t\t f", "         az"],
+    "resultAnchor": {
+      "line": 2,
+      "col": 9
+    },
+    "resultHead": {
+      "line": 2,
+      "col": 9
+    }
+  },
+  {
+    "name": "enter: U+3000 and U+00A0 are whitespace",
+    "op": "enter",
+    "input": "x\n　 　y\nz\nw",
+    "anchor": {
+      "line": 1,
+      "col": 1
+    },
+    "head": {
+      "line": 3,
+      "col": 0
+    },
+    "lines": ["x", "", "   w"],
+    "resultAnchor": {
+      "line": 2,
+      "col": 3
+    },
+    "resultHead": {
+      "line": 2,
+      "col": 3
+    }
+  },
+  {
+    "name": "enter: a start after non-whitespace text",
+    "op": "enter",
+    "input": "ab  cd\n  ef\ngh",
+    "anchor": {
+      "line": 0,
+      "col": 3
+    },
+    "head": {
+      "line": 2,
+      "col": 1
+    },
+    "lines": ["ab ", "h"],
+    "resultAnchor": {
+      "line": 1,
+      "col": 0
+    },
+    "resultHead": {
+      "line": 1,
+      "col": 0
+    }
+  },
+  {
+    "name": "enter: a reversed selection",
+    "op": "enter",
+    "input": "  abc\ndef\nghi",
+    "anchor": {
+      "line": 2,
+      "col": 1
+    },
+    "head": {
+      "line": 0,
+      "col": 1
+    },
+    "lines": ["", "  hi"],
+    "resultAnchor": {
+      "line": 1,
+      "col": 2
+    },
+    "resultHead": {
+      "line": 1,
+      "col": 2
+    }
+  },
+  {
+    "name": "enter: a lone CR before the line start",
+    "op": "enter",
+    "input": "a\r  b\nc\nd",
+    "anchor": {
+      "line": 1,
+      "col": 1
+    },
+    "head": {
+      "line": 3,
+      "col": 0
+    },
+    "lines": ["a", " ", "  d"],
+    "resultAnchor": {
+      "line": 2,
+      "col": 2
+    },
+    "resultHead": {
+      "line": 2,
+      "col": 2
+    }
+  },
+  {
+    "name": "enter: a run of lone CR before the line start",
+    "op": "enter",
+    "input": "a\r\r\r   b\nc\nd",
+    "anchor": {
+      "line": 3,
+      "col": 1
+    },
+    "head": {
+      "line": 5,
+      "col": 0
+    },
+    "lines": ["a", "", "", " ", "   d"],
+    "resultAnchor": {
+      "line": 4,
+      "col": 3
+    },
+    "resultHead": {
+      "line": 4,
+      "col": 3
+    }
+  },
+  {
+    "name": "enter: CRLF lines",
+    "op": "enter",
+    "input": "x\r\n  y\r\nz\r\nw",
+    "anchor": {
+      "line": 1,
+      "col": 1
+    },
+    "head": {
+      "line": 3,
+      "col": 1
+    },
+    "lines": ["x", " ", "  "],
+    "resultAnchor": {
+      "line": 2,
+      "col": 2
+    },
+    "resultHead": {
+      "line": 2,
+      "col": 2
+    }
+  },
+  {
+    "name": "enter: an empty line start in the middle of the file",
+    "op": "enter",
+    "input": "ab\n\ncd\nef",
+    "anchor": {
+      "line": 1,
+      "col": 0
+    },
+    "head": {
+      "line": 3,
+      "col": 1
+    },
+    "lines": ["ab", "", "f"],
+    "resultAnchor": {
+      "line": 2,
+      "col": 0
+    },
+    "resultHead": {
+      "line": 2,
+      "col": 0
+    }
+  }
+]

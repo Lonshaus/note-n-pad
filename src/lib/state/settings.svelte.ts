@@ -20,6 +20,8 @@ import {
 /** How an over-threshold file opens: ask (confirm offering view/edit), or open
  *  straight into the read-only view or in-place edit. */
 export type LargeOpenMode = 'ask' | 'view' | 'edit';
+/** What Select All covers in a large file: what is on screen, or the file. */
+export type LargeSelectAll = 'visible' | 'file';
 
 /** Where a non-project file opens from the Open dialog / menu. */
 export type OpenTarget = 'tab' | 'window';
@@ -46,6 +48,7 @@ interface AppSettings {
   editor_line_numbers: boolean;
   worker_highlight: boolean;
   large_open_mode: LargeOpenMode;
+  large_select_all: LargeSelectAll;
   ask_long_line_open: boolean;
   preview_local_resources: boolean;
   open_target: OpenTarget;
@@ -113,6 +116,7 @@ export class SettingsState {
   editorLineNumbers = $state(true);
   workerHighlight = $state(false);
   largeOpenMode = $state<LargeOpenMode>('ask');
+  largeSelectAll = $state<LargeSelectAll>('visible');
   askLongLineOpen = $state(true);
   previewLocalResources = $state(false);
   openTarget = $state<OpenTarget>('tab');
@@ -185,6 +189,7 @@ export class SettingsState {
     this.editorLineNumbers = s.editor_line_numbers;
     this.workerHighlight = s.worker_highlight;
     this.largeOpenMode = s.large_open_mode;
+    this.largeSelectAll = s.large_select_all;
     this.askLongLineOpen = s.ask_long_line_open;
     this.previewLocalResources = s.preview_local_resources;
     this.openTarget = s.open_target;
@@ -387,6 +392,11 @@ export class SettingsState {
   async setLargeOpenMode(mode: LargeOpenMode): Promise<void> {
     this.largeOpenMode = mode;
     await this.save({ large_open_mode: mode });
+  }
+
+  async setLargeSelectAll(mode: LargeSelectAll): Promise<void> {
+    this.largeSelectAll = mode;
+    await this.save({ large_select_all: mode });
   }
 
   async setAskLongLineOpen(on: boolean): Promise<void> {

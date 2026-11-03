@@ -7,6 +7,7 @@
     settingsState,
     snapshotDirErrorText,
     type LargeOpenMode,
+    type LargeSelectAll,
     type OpenTarget,
   } from './lib/state/settings.svelte';
   import { platform } from './lib/state/platform.svelte';
@@ -52,6 +53,8 @@
   import { localeRegistry } from './lib/i18n/localeRegistry.svelte';
   import LocaleEditor from './lib/i18n/LocaleEditor.svelte';
   import { isLite } from './lib/state/edition.svelte';
+  import { installPasteWindow, pasteEnv } from './lib/util/pasteEnv';
+  import { fieldPaste } from './lib/util/pasteRouting';
   import {
     editionUi,
     editorTabsFor,
@@ -63,11 +66,9 @@
   // The editor section has two sub-tabs: its own settings, and the theme editor
   // (a theme only colors the editor, so it belongs here, not a top-level tab).
   // Lite has no theme editor, so no sub-tabs.
-
   // Theme colors only the editor surface, so the color editor drops the
   // interface chrome group (that is the interface mode's job now).
   const COLOR_GROUPS = ['editor', 'syntax'] as const;
-
   // Labels resolve through `t()` in the template, so section/theme/language
   // rows carry a stable id plus their dictionary key (never a captured string),
   // keeping every label reactive to a live language change.
@@ -78,13 +79,11 @@
     { id: 'shortcuts', key: 'settings.section.shortcuts' },
     { id: 'language', key: 'settings.section.language' },
   ];
-
   // Sub-tabs of the editor section (reusing the General label for the first).
   const EDITOR_TAB_KEYS: Record<EditorTab, I18nKey> = {
     general: 'settings.section.general',
     theme: 'settings.editor.tabTheme',
   };
-
   // Interface (chrome) appearance options, shown in the General section.
   const INTERFACE_MODES: { id: InterfaceMode; key: I18nKey }[] = [
     { id: 'system', key: 'settings.interface.system' },
@@ -107,12 +106,10 @@
   const shortcutGroups = $derived(groupShortcutRows(shortcutsState.rows));
 
   let snapshotDirError = $state('');
-
   // Windows-only row, and only on builds where the Default apps deep link
   // understands its app parameter. The Rust check answers false everywhere
   // else, so this stays false and the row never renders.
   let defaultAppsSupported = $state(false);
-
   // A small in-app choice dialog (message + arbitrary buttons), used for the
   // two snapshot-folder-switch prompts below: `ask()`'s system dialog only
   // ever offers OK/Cancel, and these need three and four labeled choices.
@@ -152,7 +149,6 @@
     choiceModal?.resolve(id);
     choiceModal = null;
   }
-
   /** Switch the active snapshot folder to `dir` (null = default location),
    *  asking first when the current folder actually has something to lose. */
   async function switchSnapshotDir(dir: string | null): Promise<void> {
@@ -375,7 +371,6 @@
       document.removeEventListener('pointerdown', closeOnOutsidePress, true);
     };
   });
-
   // Reflect the resolved theme onto the document root.
   $effect(() => {
     applyTheme(settingsState.themeId);
@@ -400,6 +395,7 @@
         }
       },
     );
+    const uninstallPaste = installPasteWindow();
     void platform.init();
     void invoke<boolean>('default_apps_page_supported')
       .catch(() => false)
@@ -448,6 +444,7 @@
       );
     }
     return () => {
+      uninstallPaste();
       unlistenTheme();
       void unlistenChanges.then((u) => u());
       void unlistenThemes.then((u) => u());
@@ -455,7 +452,6 @@
       void unlistenMenuAction.then((u) => u());
     };
   });
-
   // The currently selected theme object, resolved through the registry so its
   // live edits (below) are visible immediately.
   const selectedTheme = $derived(themeRegistry.get(settingsState.themeId));
@@ -474,7 +470,6 @@
   // entered in a small modal opened by the button.
   let newThemeName = $state('');
   let saveAsOpen = $state(false);
-
   // Any theme action dismisses a lingering import error.
   function selectTheme(id: string): void {
     importError = '';
@@ -533,7 +528,6 @@
       importError = t('settings.theme.importError');
     }
   }
-
   // Any theme exports (defaults included) — a theme is just data.
   // `pathOverride` skips the dialog (automation/E2E), like the document saves.
   async function exportTheme(pathOverride?: string): Promise<void> {
@@ -557,7 +551,6 @@
       importError = t('settings.theme.exportError');
     }
   }
-
   // Save the current colors as a new, user-named theme (a separate entry; the
   // theme it was copied from is untouched).
   async function saveAsNewTheme(): Promise<void> {
@@ -574,7 +567,6 @@
     await themeRegistry.save(copy);
     await settingsState.setThemeId(copy.id);
   }
-
   // 復原: restore a default theme to its seeded colors and name (dropping the
   // "（自訂）" marker). Only meaningful for defaults; the id is unchanged so the
   // selection stays put.
@@ -599,7 +591,6 @@
     }
     await themeRegistry.restoreDefault(theme.id);
   }
-
   // 刪除: permanently remove the selected theme's file, freeing the space it
   // used. Any theme is deletable (defaults are seeded data files too), but the
   // picker always keeps at least one — the button is disabled at the last theme.
@@ -629,14 +620,12 @@
       await settingsState.setThemeId(next.id);
     }
   }
-
   // Live-editing mutates the registry's reactive entry in place (so applyTheme's
   // $effect recolors instantly), then debounces persistence so rapid drags don't
   // spam the core.
   const persistSelected = debounce((theme: Theme) => {
     void themeRegistry.persist(theme);
   }, 300);
-
   // Every theme edits in place. Editing a default the first time appends the
   // "（自訂）" marker to its name so the list shows it has diverged from the
   // seed; 復原 restores the seeded name and colors.
@@ -656,7 +645,6 @@
     }
     persistSelected(theme);
   }
-
   // Language: the list mirrors the theme list. The three compiled locales sit
   // above the divider — always present and never deletable, they are the floor
   // the UI falls back to — and the pure-data locales below it can be imported
@@ -666,7 +654,6 @@
   //
   // Selecting a row applies that language and opens it in the editor; per-locale
   // actions (save / update / export / restore) live in the editor's own toolbar.
-
   /** The language open in the editor: any concrete id, or '' while following
    *  the system (nothing concrete to edit). */
   const editingId = $derived(
@@ -690,10 +677,8 @@
   function localeLabel(id: string): string {
     return localeRegistry.get(id)?.label ?? BUILTIN_LABELS[id] ?? id;
   }
-
   // Unsaved-edit state, reported up by the editor so switching away can warn.
   let langDirty = $state(false);
-
   /** Switch language. Edits are buffered in the editor, so leaving with unsaved
    *  changes would silently discard them — confirm first. */
   async function selectLanguage(lang: string): Promise<void> {
@@ -974,6 +959,7 @@
               placeholder={t('settings.theme.nameLabel')}
               bind:value={newThemeName}
               onkeydown={onSaveAsKeydown}
+              onpaste={(e) => void fieldPaste(e, e.currentTarget, pasteEnv)}
               use:autofocus
             />
             <div class="modal-actions">
@@ -1216,6 +1202,7 @@
             max="32"
             value={settingsState.editorFontSize}
             onchange={(e) => commitFontSize(e.currentTarget.value)}
+            onpaste={(e) => void fieldPaste(e, e.currentTarget, pasteEnv)}
           />
           <button
             class="step"
@@ -1272,6 +1259,17 @@
           {/each}
         </div>
       </div>
+
+      <label class="toggle">
+        <input
+          type="checkbox"
+          checked={settingsState.showTrayIcon}
+          onchange={(e) =>
+            settingsState.setShowTrayIcon(e.currentTarget.checked)}
+        />
+        <span>{t('settings.general.showTrayIcon')}</span>
+      </label>
+
       <div class="field">
         <span class="field-label">{t('settings.general.snapshotLocation')}</span
         >
@@ -1297,6 +1295,67 @@
         <span class="hint">{t('settings.general.snapshotCloudHint')}</span>
       </div>
 
+      <div class="field">
+        <span class="field-label">{t('settings.general.openTarget')}</span>
+        <select
+          class="select"
+          value={settingsState.openTarget}
+          onchange={(e) =>
+            settingsState.setOpenTarget(e.currentTarget.value as OpenTarget)}
+        >
+          <option value="tab">{t('settings.general.openTargetTab')}</option>
+          <option value="window"
+            >{t('settings.general.openTargetWindow')}</option
+          >
+        </select>
+      </div>
+
+      {#if ui.openWorkspaceOnStartup}
+        <label class="toggle">
+          <input
+            type="checkbox"
+            checked={settingsState.openWorkspaceOnStartup}
+            onchange={(e) =>
+              settingsState.setOpenWorkspaceOnStartup(e.currentTarget.checked)}
+          />
+          <span>{t('settings.general.openWorkspaceOnStartup')}</span>
+        </label>
+      {/if}
+
+      <label class="toggle">
+        <input
+          type="checkbox"
+          checked={settingsState.previewLocalResources}
+          onchange={(e) =>
+            settingsState.setPreviewLocalResources(e.currentTarget.checked)}
+        />
+        <span>{t('settings.general.previewLocalResources')}</span>
+      </label>
+
+      {#if ui.largeFileSettings}
+        <label class="toggle">
+          <input
+            type="checkbox"
+            checked={settingsState.askLongLineOpen}
+            onchange={(e) =>
+              settingsState.setAskLongLineOpen(e.currentTarget.checked)}
+          />
+          <span>{t('settings.general.askLongLineOpen')}</span>
+        </label>
+      {/if}
+
+      {#if defaultAppsSupported}
+        <div class="field">
+          <span class="field-label">{t('settings.general.defaultApps')}</span>
+          <button
+            class="btn default-apps-action"
+            onclick={() => void invoke('open_default_apps_page')}
+          >
+            {t('settings.general.defaultAppsOpen')}
+          </button>
+        </div>
+      {/if}
+
       {#if ui.largeFileSettings}
         <div class="field">
           <span class="field-label">{t('settings.general.largeOpenMode')}</span>
@@ -1319,74 +1378,25 @@
           </select>
         </div>
 
-        <label class="toggle">
-          <input
-            type="checkbox"
-            checked={settingsState.askLongLineOpen}
-            onchange={(e) =>
-              settingsState.setAskLongLineOpen(e.currentTarget.checked)}
-          />
-          <span>{t('settings.general.askLongLineOpen')}</span>
-        </label>
-      {/if}
-
-      <label class="toggle">
-        <input
-          type="checkbox"
-          checked={settingsState.previewLocalResources}
-          onchange={(e) =>
-            settingsState.setPreviewLocalResources(e.currentTarget.checked)}
-        />
-        <span>{t('settings.general.previewLocalResources')}</span>
-      </label>
-
-      <div class="field">
-        <span class="field-label">{t('settings.general.openTarget')}</span>
-        <select
-          class="select"
-          value={settingsState.openTarget}
-          onchange={(e) =>
-            settingsState.setOpenTarget(e.currentTarget.value as OpenTarget)}
-        >
-          <option value="tab">{t('settings.general.openTargetTab')}</option>
-          <option value="window"
-            >{t('settings.general.openTargetWindow')}</option
-          >
-        </select>
-      </div>
-
-      {#if defaultAppsSupported}
         <div class="field">
-          <span class="field-label">{t('settings.general.defaultApps')}</span>
-          <button
-            class="btn default-apps-action"
-            onclick={() => void invoke('open_default_apps_page')}
+          <span class="field-label">{t('settings.general.largeSelectAll')}</span
           >
-            {t('settings.general.defaultAppsOpen')}
-          </button>
-        </div>
-      {/if}
-
-      <label class="toggle">
-        <input
-          type="checkbox"
-          checked={settingsState.showTrayIcon}
-          onchange={(e) =>
-            settingsState.setShowTrayIcon(e.currentTarget.checked)}
-        />
-        <span>{t('settings.general.showTrayIcon')}</span>
-      </label>
-
-      {#if ui.openWorkspaceOnStartup}
-        <label class="toggle">
-          <input
-            type="checkbox"
-            checked={settingsState.openWorkspaceOnStartup}
+          <select
+            class="select"
+            value={settingsState.largeSelectAll}
             onchange={(e) =>
-              settingsState.setOpenWorkspaceOnStartup(e.currentTarget.checked)}
-          />
-          <span>{t('settings.general.openWorkspaceOnStartup')}</span>
-        </label>
+              settingsState.setLargeSelectAll(
+                e.currentTarget.value as LargeSelectAll,
+              )}
+          >
+            <option value="visible"
+              >{t('settings.general.largeSelectAllVisible')}</option
+            >
+            <option value="file"
+              >{t('settings.general.largeSelectAllFile')}</option
+            >
+          </select>
+        </div>
       {/if}
     {:else if section === 'language'}
       <div class="lang-layout">

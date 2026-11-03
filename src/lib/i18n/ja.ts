@@ -2,7 +2,6 @@
 // SPDX-License-Identifier: GPL-3.0-only
 
 import type { I18nKey } from './index';
-
 // Japanese. Uses concise UI conventions (体言止め / short imperatives), not
 // polite です・ます prose. `satisfies` enforces the exact master key set.
 export const ja = {
@@ -16,7 +15,7 @@ export const ja = {
   'settings.theme.light': 'ライト',
   'settings.theme.dark': 'ダーク',
   'settings.theme.customSuffix': '（カスタム）',
-  'settings.interface.label': '外観',
+  'settings.interface.label': '外観モード',
   'settings.interface.system': 'システムに従う',
   'settings.theme.reset': '元に戻す',
   'settings.theme.resetConfirm': 'テーマ「{name}」を既定に戻しますか？',
@@ -127,6 +126,9 @@ export const ja = {
   'settings.general.largeOpenModeAsk': '毎回確認（既定）',
   'settings.general.largeOpenModeView': '閲覧',
   'settings.general.largeOpenModeEdit': '編集',
+  'settings.general.largeSelectAll': '大きなファイルの全選択の範囲',
+  'settings.general.largeSelectAllVisible': '画面に表示中の内容（既定）',
+  'settings.general.largeSelectAllFile': 'ファイル全体',
   'settings.general.openTarget': 'ファイルの開き方',
   'settings.general.openTargetTab': '新しいタブ（既定）',
   'settings.general.openTargetWindow': '新しいウィンドウ',
@@ -177,6 +179,23 @@ export const ja = {
     '元のファイルが変更されています。書き戻すと他の変更を上書きする可能性があります。',
   'doc.windowedConflict.message':
     '元のファイルが別のプログラムによって変更されています。書き戻すと現在の内容でファイル全体を上書きし、外部の変更は失われます。',
+  'convert.confirm':
+    'コンテンツが多すぎるため、大容量ファイルに変換します。続けますか？',
+  'convert.continue': '続ける',
+  'convert.tooBig':
+    '貼り付け後の内容が編集できる大きさを超えるため、閲覧モードでのみ開けます。先に保存して、閲覧モードで開きますか？',
+  'convert.tooBig.save': '保存して閲覧モードで開く',
+  'convert.tooBig.discard': '貼り付けない',
+  'convert.unmappable':
+    '「{name}」に {encoding} で表せない文字が含まれています。',
+  'convert.unmappable.utf8': '元のパスに UTF-8 で保存',
+  'convert.unmappable.saveAs': '別名で保存（UTF-8）',
+  'convert.failed': '貼り付けできません：{error}',
+  'paste.clipUnreadable': 'コピーした内容を読み込めなくなりました',
+  'paste.clipReadFailed': 'コピーした内容を読み込めませんでした（{detail}）',
+  'convert.interrupted': '大容量ファイルへの変換が完了する前に中断されました',
+  'convert.reclaimed':
+    'この付箋をドキュメントに変換できません。付箋は変更されていません。',
   'doc.oversized.message':
     'このタブの未保存の内容は大きすぎてスナップショットを保持できません。閉じる前に処理が必要です。',
   'doc.oversized.discard': '変更を破棄',
@@ -386,6 +405,8 @@ export const ja = {
   'doc.revealFailed':
     '「{name}」を表示できません。ファイルが移動または削除された可能性があります。',
   'doc.saveFailed': '「{name}」を保存できません：{error}',
+  'doc.discardFailed':
+    '「{name}」の変更を破棄できません：{error}。タブの内容はそのままです。',
   'doc.saveReadOnly':
     '「{name}」は読み取り専用のため、保存されませんでした。ファイルの権限を変更してから保存してください。',
   'sticky.saveFailed': 'この付箋を保存できません：{error}',

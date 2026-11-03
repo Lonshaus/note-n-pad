@@ -141,6 +141,14 @@ pub struct NoteSnapshot {
   /// `initialTopLine` on restore so editing continues from where it left off.
   #[serde(default)]
   pub windowed_top_line: Option<u64>,
+  /// The encoding a windowed tab converted from a paste is written in, when it is
+  /// not plain UTF-8: restore decodes the file with it instead of opening the
+  /// file as it is. None for every other tab.
+  #[serde(default)]
+  pub windowed_encoding: Option<String>,
+  /// Whether that file starts with a byte order mark.
+  #[serde(default)]
+  pub windowed_bom: bool,
 }
 
 fn default_encoding() -> String {
@@ -166,7 +174,6 @@ fn default_pin_mode() -> String {
 fn default_kind() -> String {
   "sticky".to_string()
 }
-
 /// Upgrade a legacy note object in place: a pre-pin_mode note with `pinned: true`
 /// becomes `pin_mode: "top"`. Notes that already carry a pin_mode are untouched.
 fn migrate_legacy_pin(value: &mut serde_json::Value) {
@@ -181,18 +188,15 @@ fn migrate_legacy_pin(value: &mut serde_json::Value) {
     obj.insert("pin_mode".into(), serde_json::Value::String("top".into()));
   }
 }
-
 /// A note id may only contain ASCII alphanumerics and hyphens (UUID shape), so it
 /// can never traverse outside the snapshots directory when used as a file name.
 fn valid_id(id: &str) -> bool {
   !id.is_empty() && id.len() <= 64 && id.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-')
 }
-
 /// Absolute path of the per-note file for `id` inside `dir`.
 fn note_file(dir: &Path, id: &str) -> PathBuf {
   dir.join(format!("{id}.json"))
 }
-
 /// Serialize one note and atomically write it to `<dir>/{id}.json`.
 fn save_note(dir: &Path, note: &NoteSnapshot) -> Result<(), String> {
   if !valid_id(&note.id) {
@@ -201,7 +205,6 @@ fn save_note(dir: &Path, note: &NoteSnapshot) -> Result<(), String> {
   let json = serde_json::to_string_pretty(note).map_err(|e| e.to_string())?;
   write_text_atomic_private(&note_file(dir, &note.id), &json)
 }
-
 /// Remove `<dir>/{id}.json`. A missing file is not an error.
 fn delete_note_file(dir: &Path, id: &str) -> Result<(), String> {
   if !valid_id(id) {
@@ -213,7 +216,6 @@ fn delete_note_file(dir: &Path, id: &str) -> Result<(), String> {
     Err(e) => Err(e.to_string()),
   }
 }
-
 /// Parse one per-note file, applying the legacy pin migration first. The error
 /// carries the reason as well as the message, so `load_dir` can tell a person
 /// which of three different problems the file has.
@@ -229,7 +231,6 @@ fn load_note_file(path: &Path) -> Result<NoteSnapshot, (SkipReason, String)> {
   }
   Ok(note)
 }
-
 /// Load every `*.json` note file in `dir`. A missing dir yields an empty Vec, and
 /// an unparsable individual file is skipped with a warning rather than crashing.
 /// A file whose name does not match the id inside it is skipped the same way:
@@ -364,7 +365,6 @@ pub fn load_dir(dir: &Path) -> Result<Loaded<NoteSnapshot>, String> {
     skipped,
   })
 }
-
 /// Replace the note with a matching id, or append it when new.
 pub fn upsert(notes: &mut Vec<NoteSnapshot>, note: NoteSnapshot) {
   match notes.iter_mut().find(|n| n.id == note.id) {
@@ -372,14 +372,12 @@ pub fn upsert(notes: &mut Vec<NoteSnapshot>, note: NoteSnapshot) {
     None => notes.push(note),
   }
 }
-
 /// Remove the note with `id`. Returns true when something was removed.
 pub fn delete(notes: &mut Vec<NoteSnapshot>, id: &str) -> bool {
   let before = notes.len();
   notes.retain(|n| n.id != id);
   notes.len() != before
 }
-
 /// One document window to open on restore: its group id plus the bounds of the
 /// group's lowest-tab_index tab that is shown (all tabs share the one window).
 #[derive(Debug, Clone, PartialEq)]
@@ -390,13 +388,11 @@ pub struct DocWindowPlan {
   pub width: Option<f64>,
   pub height: Option<f64>,
 }
-
 /// A document note's effective group id: its window_group, or its own id when
 /// None (a legacy/solo document becomes its own single-tab window).
 pub(crate) fn resolved_group(note: &NoteSnapshot) -> &str {
   note.window_group.as_deref().unwrap_or(&note.id)
 }
-
 /// Plan one document window per group from stored notes. Stickies are ignored.
 /// Groups keep first-appearance order; each window inherits the bounds of its
 /// lowest-tab_index tab.
@@ -434,7 +430,6 @@ pub fn plan_document_windows(notes: &[NoteSnapshot]) -> Vec<DocWindowPlan> {
     .map(|g| plans.remove(&g).unwrap().1)
     .collect()
 }
-
 /// Migrate every group-less document in `notes` to its own solo group (keyed by
 /// its id) so future restores keep it grouped. A store that cannot be written to
 /// (read-only dir, full disk) only loses the migration, never the launch.
@@ -470,7 +465,6 @@ pub fn drop_clean_range_records(store: &NoteStore) {
     }
   }
 }
-
 /// The snapshot files that could not be loaded at startup, held until a window
 /// takes focus and claims them. `NoteStore::load` runs inside `setup`, before a
 /// single window exists, so there is nowhere to report them at the moment they
@@ -495,7 +489,6 @@ impl StartupSkips {
 pub fn take_startup_skips(state: State<StartupSkips>) -> Option<Vec<SkippedFile>> {
   state.0.lock().unwrap().take()
 }
-
 /// The in-memory notes plus the directory their per-note files live in. Both are
 /// guarded together so a location switch stays consistent with the file layout.
 ///
@@ -516,6 +509,16 @@ struct Inner {
   /// snapshot write still tagged with a `from` project is re-tagged on arrival,
   /// following the edges until a project with none.
   rebinds: std::collections::HashMap<String, String>,
+  /// Stickies whose text lives on in a document tab, by id (this run only). Their
+  /// records stay, but they are not listed and have no window.
+  handed_off: std::collections::HashMap<String, HandedLoc>,
+}
+/// Where the tab a sticky became is.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct HandedLoc {
+  /// The label of the document window.
+  pub window: String,
+  pub tab_id: String,
 }
 /// The project a write tagged `project` ends up with once this run's rebinds
 /// are applied. The step cap only guards against a cyclic map.
@@ -532,7 +535,6 @@ fn rebound_project(
   }
   Some(current)
 }
-
 /// The single owner of note snapshots: an in-memory Vec guarded by a Mutex,
 /// loaded once at startup and persisted as one atomic file per note.
 pub struct NoteStore {
@@ -548,7 +550,6 @@ impl NoteStore {
   pub fn load(dir: PathBuf) -> Result<Self, String> {
     Ok(Self::load_reporting(dir)?.0)
   }
-
   /// `load`, plus the files in `dir` that could not be loaded. Startup uses
   /// this one: it is the only caller with somewhere to report them.
   pub fn load_reporting(dir: PathBuf) -> Result<(Self, Vec<SkippedFile>), String> {
@@ -561,12 +562,12 @@ impl NoteStore {
           seqs: std::collections::HashMap::new(),
           lock: None,
           rebinds: std::collections::HashMap::new(),
+          handed_off: std::collections::HashMap::new(),
         }),
       },
       loaded.skipped,
     ))
   }
-
   /// Build a store with no notes, still bound to `dir`. Used when `dir`
   /// exists but cannot be listed (e.g. permissions): starting empty touches
   /// nothing on disk, and every write into `dir` would fail the same way, so
@@ -579,6 +580,7 @@ impl NoteStore {
         seqs: std::collections::HashMap::new(),
         lock: None,
         rebinds: std::collections::HashMap::new(),
+        handed_off: std::collections::HashMap::new(),
       }),
     }
   }
@@ -586,9 +588,46 @@ impl NoteStore {
   pub fn hold_lock(&self, lock: Option<std::fs::File>) {
     self.inner.lock().unwrap().lock = lock;
   }
-
+  /// Every note but the ones handed off to a document tab.
   pub fn list(&self) -> Vec<NoteSnapshot> {
-    self.inner.lock().unwrap().notes.clone()
+    let inner = self.inner.lock().unwrap();
+    inner
+      .notes
+      .iter()
+      .filter(|n| !inner.handed_off.contains_key(&n.id))
+      .cloned()
+      .collect()
+  }
+  /// The sticky `id` now lives in the tab at `loc`.
+  pub fn hand_off(&self, id: &str, loc: HandedLoc) {
+    self
+      .inner
+      .lock()
+      .unwrap()
+      .handed_off
+      .insert(id.to_string(), loc);
+  }
+  /// Where the tab of a handed-off sticky is.
+  pub fn handed_off(&self, id: &str) -> Option<HandedLoc> {
+    self.inner.lock().unwrap().handed_off.get(id).cloned()
+  }
+  /// The sticky `id` is a sticky again (or gone). False if it was not handed off.
+  pub fn take_back(&self, id: &str) -> bool {
+    self.inner.lock().unwrap().handed_off.remove(id).is_some()
+  }
+  /// Takes back every sticky whose tab is in window `label`; their ids.
+  pub fn take_back_in(&self, label: &str) -> Vec<String> {
+    let mut inner = self.inner.lock().unwrap();
+    let ids: Vec<String> = inner
+      .handed_off
+      .iter()
+      .filter(|(_, loc)| loc.window == label)
+      .map(|(id, _)| id.clone())
+      .collect();
+    for id in &ids {
+      inner.handed_off.remove(id);
+    }
+    ids
   }
 
   pub fn get(&self, id: &str) -> Option<NoteSnapshot> {
@@ -609,7 +648,6 @@ impl NoteStore {
     upsert(&mut inner.notes, note);
     Ok(())
   }
-
   /// Like `upsert`, but drops the write instead of applying it when `seq` is
   /// older than the last `seq` this id was successfully written with. `seq` is
   /// assigned by the frontend at the moment the write is issued (a single
@@ -699,12 +737,10 @@ impl NoteStore {
     delete(&mut inner.notes, id);
     Ok(())
   }
-
   /// The directory currently active for per-note files.
   pub fn current_dir(&self) -> PathBuf {
     self.inner.lock().unwrap().dir.clone()
   }
-
   /// Snapshot-file counts for the switch-confirmation dialogs, computed from
   /// what is actually on disk (not the in-memory list): how many notes would
   /// be stranded by a "don't move" choice, and how many of the active
@@ -835,7 +871,6 @@ impl From<String> for SetDirError {
     SetDirError::Other(message)
   }
 }
-
 /// How to resolve a filename collision when moving snapshot files into an
 /// already-populated destination. Filenames are note ids (UUIDs), so a
 /// per-file prompt is meaningless — the whole batch is resolved one way.
@@ -849,7 +884,6 @@ pub enum CollisionPolicy {
   /// Both are kept: the incoming copy gets a new id, becoming an independent note.
   Both,
 }
-
 /// Snapshot-file counts used to word the switch-confirmation dialogs before a
 /// move is attempted.
 #[derive(Debug, Clone, Copy, Serialize)]
@@ -857,7 +891,6 @@ pub struct SnapshotMovePreview {
   pub source_count: usize,
   pub collision_count: usize,
 }
-
 /// The id (file stem) of every `*.json` file directly inside `dir`. A missing
 /// dir yields an empty Vec.
 fn json_file_names(dir: &Path) -> Vec<String> {
@@ -871,7 +904,6 @@ fn json_file_names(dir: &Path) -> Vec<String> {
     .filter_map(|p| p.file_stem().and_then(|s| s.to_str()).map(str::to_string))
     .collect()
 }
-
 /// Copy `path` into `dst` under a freshly generated id, so a "keep both"
 /// collision produces a note `load_dir` will actually admit (its filename
 /// must equal the id stored inside it, so a same-name copy cannot just be
@@ -893,7 +925,6 @@ fn write_with_new_id(path: &Path, dst: &Path) -> Result<PathBuf, String> {
   std::fs::write(&dest_path, rewritten).map_err(|e| e.to_string())?;
   Ok(dest_path)
 }
-
 /// Physically move every `*.json` file directly inside `src` into `dst`,
 /// resolving name collisions per `policy`. On any I/O failure, every file
 /// already copied into `dst` during this call is removed before returning,
@@ -943,7 +974,6 @@ fn move_snapshot_files(src: &Path, dst: &Path, policy: CollisionPolicy) -> Resul
   }
   Ok(())
 }
-
 /// Resolve the effective snapshots directory: `None` (the default) resolves to
 /// the app data dir's `snapshots` folder, exactly as before this setting
 /// existed; `Some(picked)` resolves to `picked/Note&Pad/snapshots` — the user
@@ -962,7 +992,6 @@ pub fn resolve_snapshot_dir(app: &AppHandle, picked: Option<&Path>) -> Result<Pa
   let app_data = app.path().app_data_dir().map_err(|e| e.to_string())?;
   Ok(snapshot_dir_for(&app_data, picked))
 }
-
 /// Whether snapshots can actually be written into `dir`: the directory can be
 /// created and a file inside it opened for writing. Nothing else in the startup
 /// path finds this out — `resolve_snapshot_dir` is pure path arithmetic and
@@ -971,7 +1000,6 @@ pub fn resolve_snapshot_dir(app: &AppHandle, picked: Option<&Path>) -> Result<Pa
 #[cfg(unix)]
 mod access_check {
   use std::ffi::c_int;
-
   // access(2) is a plain existence/permission check with no side effects,
   // unlike creating and deleting a probe file — the latter fires a sync
   // event on every launch for iCloud Drive / Dropbox snapshot folders.
@@ -1233,7 +1261,6 @@ pub fn startup_snapshot_dir(
   fallback.mark(choice.reason, choice.unlockable);
   Ok((choice.dir, choice.lock))
 }
-
 /// The folder the settings choose, or `None` for the default. Prefers the
 /// bookmark, which is the only form that still opens under the sandbox, and
 /// falls back to the plain path when there is no bookmark or it no longer
@@ -1246,7 +1273,6 @@ fn picked_snapshot_dir(settings: &settings::AppSettings) -> Option<PathBuf> {
   };
   mac_bookmark::to_path(bookmark).or(path)
 }
-
 /// The iCloud Drive base for our snapshots, or None when the platform has no
 /// iCloud Drive concept. Existence of iCloud Drive itself is checked separately.
 #[cfg(target_os = "macos")]
@@ -1262,7 +1288,6 @@ fn icloud_base(app: &AppHandle) -> Option<PathBuf> {
 fn icloud_base(_app: &AppHandle) -> Option<PathBuf> {
   None
 }
-
 /// Map the retired `"local"`/`"icloud"` `snapshot_location` string to the new
 /// `snapshot_dir` path setting. `"icloud"` resolves to `icloud_parent` — the
 /// parent of the old hard-coded iCloud `Note&Pad` folder — so
@@ -1279,7 +1304,6 @@ pub fn migrate_legacy_snapshot_location(
     _ => None,
   }
 }
-
 /// One-time startup migration: read the legacy `snapshot_location` string
 /// straight from the settings JSON (the field has no home on `AppSettings`
 /// anymore) and, when `snapshot_dir` is still unset, fold it into
@@ -1321,7 +1345,6 @@ pub fn migrate_legacy_snapshot_location_setting(app: &AppHandle) {
     Err(e) => log::warn!("failed to migrate snapshot_location into snapshot_dir: {e}"),
   }
 }
-
 /// Switch `store`'s active directory to `new_dir` (optionally moving the old
 /// directory's files into it first, resolving collisions per `policy`), calling
 /// `write_setting` to persist the choice once the files are moved. The setting
@@ -1344,7 +1367,6 @@ fn switch_and_persist(
     write_setting,
   )
 }
-
 /// Validate the picked folder, then switch and persist via `switch_and_persist`.
 pub fn apply_snapshot_dir(
   app: &AppHandle,
@@ -1374,7 +1396,6 @@ pub fn apply_snapshot_dir(
     settings::save_to(&path, &settings)
   })
 }
-
 /// Broadcast that the store changed so live views (e.g. the workspace window)
 /// can re-read. Payload is the affected note id, or None for a bulk change. The
 /// store itself stays emit-free; every command/helper mutating it emits here.
@@ -1396,7 +1417,6 @@ pub fn list_notes(store: State<NoteStore>) -> Vec<NoteSnapshot> {
 pub fn get_note(store: State<NoteStore>, id: String) -> Option<NoteSnapshot> {
   store.get(&id)
 }
-
 /// Off the UI thread: this runs on every debounced snapshot, so the full
 /// serialize + write + fsync + rename must not block the UI thread. `seq`
 /// guards against the reordering that moving this off the main thread makes
@@ -1429,7 +1449,6 @@ pub fn delete_note(app: AppHandle, store: State<NoteStore>, id: String) -> Resul
   emit_store_changed(&app, Some(&id));
   Ok(())
 }
-
 /// Delete every note in `ids` from `store`, tolerating ids that don't exist
 /// (an unknown id is not an error — see `delete_note_file`) and logging any
 /// individual failure without aborting the rest of the batch.
@@ -1440,7 +1459,6 @@ fn delete_notes(store: &NoteStore, ids: &[String]) {
     }
   }
 }
-
 /// Forget a closed document window's clean tabs, but only after a short
 /// deferral and only if `should_forget_tabs` says it's safe. A window that is
 /// the FIRST of a desktop-shell batch close cannot be recognized as part of
@@ -1492,7 +1510,6 @@ pub fn drop_closed_tabs(app: AppHandle, label: String, ids: Vec<String>) {
     emit_store_changed(&app, None);
   });
 }
-
 /// Note counts the settings UI uses to word its switch-confirmation dialogs
 /// before committing to a move: how many notes are in the currently active
 /// directory, and how many of them would collide with `dir`'s contents.
@@ -1523,7 +1540,6 @@ pub fn set_snapshot_dir(
   emit_store_changed(&app, None);
   Ok(fallback.state())
 }
-
 /// The currently resolved snapshots directory, for the settings UI to display.
 #[tauri::command]
 pub fn get_snapshot_dir(store: State<NoteStore>) -> Result<String, String> {
@@ -1953,6 +1969,8 @@ mod tests {
       windowed_fp_mtime: None,
       windowed_digest: None,
       windowed_top_line: None,
+      windowed_encoding: None,
+      windowed_bom: false,
     }
   }
 
@@ -2007,7 +2025,6 @@ mod tests {
   #[test]
   fn a_snapshot_and_its_directory_are_created_owner_only() {
     use std::os::unix::fs::PermissionsExt;
-
     // A sticky note has no file of its own, so this snapshot is the only copy
     // of text the user has not saved anywhere. The snapshot directory can be
     // pointed at a shared path in settings, which is the case this covers.
@@ -2124,7 +2141,6 @@ mod tests {
     );
     assert_eq!(store.list(), vec![note("c")]);
   }
-
   /// The reasons reported for `dir`, as (file name, reason) pairs sorted by
   /// name so an assertion does not depend on directory order.
   fn skips(dir: &Path) -> Vec<(String, SkipReason)> {
@@ -2716,6 +2732,78 @@ mod tests {
     assert_eq!(notes[0].windowed_fp_mtime, None);
     assert_eq!(notes[0].windowed_digest, None);
     assert_eq!(notes[0].windowed_top_line, None);
+    // And of the encoding a converted tab is written in.
+    assert_eq!(notes[0].windowed_encoding, None);
+    assert!(!notes[0].windowed_bom);
+  }
+
+  #[test]
+  fn the_encoding_of_a_converted_tab_roundtrips_through_disk() {
+    let dir = tempdir().unwrap();
+    let store = NoteStore::load(dir.path().to_path_buf()).unwrap();
+    let mut d = doc("d", Some("grp-1"), 0);
+    d.windowed_encoding = Some("Shift_JIS".to_string());
+    d.windowed_bom = true;
+    store.upsert(d.clone()).unwrap();
+    let reloaded = NoteStore::load(dir.path().to_path_buf()).unwrap().list();
+    assert_eq!(reloaded, vec![d]);
+    assert_eq!(reloaded[0].windowed_encoding.as_deref(), Some("Shift_JIS"));
+    assert!(reloaded[0].windowed_bom);
+    let json = r#"{"id":"d","content":"","file_path":null,"windowed_encoding":"UTF-16LE","windowed_bom":true}"#;
+    let note: NoteSnapshot = serde_json::from_str(json).unwrap();
+    assert_eq!(note.windowed_encoding.as_deref(), Some("UTF-16LE"));
+    assert!(note.windowed_bom);
+  }
+
+  #[test]
+  fn a_handed_off_sticky_is_not_listed_but_its_record_stays() {
+    let dir = tempdir().unwrap();
+    let store = NoteStore::load(dir.path().to_path_buf()).unwrap();
+    store.upsert(note("a")).unwrap();
+    store.upsert(note("b")).unwrap();
+    let loc = HandedLoc {
+      window: "doc-1".to_string(),
+      tab_id: "t".to_string(),
+    };
+    store.hand_off("a", loc.clone());
+    assert_eq!(store.list(), vec![note("b")]);
+    assert_eq!(store.get("a"), Some(note("a")));
+    assert_eq!(store.handed_off("a"), Some(loc));
+    // Nothing of it is on disk: the next start lists it again.
+    let restarted = NoteStore::load(dir.path().to_path_buf()).unwrap();
+    assert_eq!(restarted.list(), vec![note("a"), note("b")]);
+    assert!(store.take_back("a"));
+    assert!(!store.take_back("a"));
+    assert_eq!(store.list(), vec![note("a"), note("b")]);
+  }
+
+  #[test]
+  fn the_stickies_of_a_window_are_taken_back_together() {
+    let dir = tempdir().unwrap();
+    let store = NoteStore::load(dir.path().to_path_buf()).unwrap();
+    for (id, window) in [("a", "doc-1"), ("b", "doc-2"), ("c", "doc-1")] {
+      store.upsert(note(id)).unwrap();
+      store.hand_off(
+        id,
+        HandedLoc {
+          window: window.to_string(),
+          tab_id: id.to_string(),
+        },
+      );
+    }
+    let mut back = store.take_back_in("doc-1");
+    back.sort();
+    assert_eq!(back, vec!["a", "c"]);
+    assert_eq!(store.list(), vec![note("a"), note("c")]);
+    assert!(store.take_back_in("doc-1").is_empty());
+  }
+
+  #[test]
+  fn the_dock_and_the_jump_list_read_the_stickies_through_list() {
+    for source in [include_str!("dock.rs"), include_str!("jumplist.rs")] {
+      assert!(source.contains("state::<NoteStore>().list()"));
+      assert!(!source.contains("NoteStore>().get("));
+    }
   }
 
   #[test]
@@ -2929,7 +3017,6 @@ mod tests {
     // The large record is the lowest tab: no edition makes another one win.
     assert_eq!(plans[0].x, Some(10.0));
   }
-
   /// The bytes of every `*.json` in `dir`, by name.
   fn file_bytes(dir: &Path) -> std::collections::BTreeMap<String, Vec<u8>> {
     std::fs::read_dir(dir)

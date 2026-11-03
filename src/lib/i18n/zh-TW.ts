@@ -120,6 +120,9 @@ export const zhTW = {
   'settings.general.largeOpenModeAsk': '詢問（預設）',
   'settings.general.largeOpenModeView': '閱覽',
   'settings.general.largeOpenModeEdit': '編輯',
+  'settings.general.largeSelectAll': '大型檔案全選範圍',
+  'settings.general.largeSelectAllVisible': '畫面上的內容（預設）',
+  'settings.general.largeSelectAllFile': '整個檔案',
   'settings.general.openTarget': '開啟檔案方式',
   'settings.general.openTargetTab': '新分頁（預設）',
   'settings.general.openTargetWindow': '新視窗',
@@ -168,6 +171,20 @@ export const zhTW = {
   'doc.rangeConflict.message': '原始檔案已被修改，寫回可能覆蓋其他變更。',
   'doc.windowedConflict.message':
     '原始檔案已被其他程式修改。寫回會以目前內容整檔覆蓋，外部變更將遺失。',
+  'convert.confirm': '內容過多，將轉成大型檔案。是否繼續？',
+  'convert.continue': '繼續',
+  'convert.tooBig':
+    '貼上後的內容超過可編輯的大小，只能以閱覽模式開啟。要先存檔，再以閱覽模式開啟嗎？',
+  'convert.tooBig.save': '存檔並以閱覽模式開啟',
+  'convert.tooBig.discard': '不貼上',
+  'convert.unmappable': '「{name}」含有無法以 {encoding} 表示的字元。',
+  'convert.unmappable.utf8': '改用 UTF-8 存到原路徑',
+  'convert.unmappable.saveAs': '另存新檔（UTF-8）',
+  'convert.failed': '無法貼上：{error}',
+  'paste.clipUnreadable': '拷貝的內容已無法讀取',
+  'paste.clipReadFailed': '拷貝的內容讀取失敗（{detail}）',
+  'convert.interrupted': '轉成大型檔案的過程在完成前中斷',
+  'convert.reclaimed': '無法把這張便利貼轉成文件，便利貼維持原樣。',
   'doc.oversized.message':
     '此分頁的未儲存內容過大，無法保留快照，關閉前必須處理。',
   'doc.oversized.discard': '放棄變更',
@@ -357,6 +374,7 @@ export const zhTW = {
   'edition.row.globalShortcuts': '全域快速鍵',
   'doc.revealFailed': '無法顯示「{name}」。這個檔案可能已被移動或刪除。',
   'doc.saveFailed': '無法儲存「{name}」：{error}',
+  'doc.discardFailed': '無法放棄「{name}」的變更：{error}。分頁內容維持不變。',
   'doc.saveReadOnly':
     '「{name}」是唯讀檔案，因此未儲存任何內容。請變更該檔案的權限後再儲存。',
   'sticky.saveFailed': '無法儲存這則便利貼：{error}',

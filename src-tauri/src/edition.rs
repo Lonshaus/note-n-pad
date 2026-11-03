@@ -11,16 +11,13 @@
 // initial value. Gating itself lives at the feature entry points, not here.
 use std::sync::atomic::{AtomicBool, Ordering};
 use tauri::{AppHandle, Emitter, Manager};
-
 /// The name the app calls itself. The Windows trial is the full package and
 /// never changes its name.
 pub const fn app_name() -> &'static str {
   "Note&Pad"
 }
-
 /// Lite until `init` says otherwise.
 static LITE: AtomicBool = AtomicBool::new(true);
-
 /// What the package license read returned. `Full` is
 /// `IsActive && !IsTrial`; anything the read could not confirm is not `Full`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -31,7 +28,6 @@ pub enum LicenseRead {
   Failed,
   TimedOut,
 }
-
 /// The one decision outside the sandboxed store build: is this process lite?
 /// `packaged` is "runs from an MSIX package"; an unpackaged process (any
 /// unpackaged Windows build, macOS, Linux) is never lite on its own.
@@ -42,36 +38,29 @@ pub fn resolve(packaged: bool, license: LicenseRead) -> bool {
   }
   license != LicenseRead::Full
 }
-
 /// Whether this process is lite right now.
 pub fn is_lite() -> bool {
   LITE.load(Ordering::Relaxed)
 }
-
 /// Whether a build has editions at all, and so the "Full Version Features"
 /// window and its Help item: the sandboxed store build and an MSIX package do.
 #[cfg_attr(all(target_os = "macos", feature = "storekit"), allow(dead_code))]
 pub fn has_editions(storekit: bool, packaged: bool) -> bool {
   storekit || packaged
 }
-
 /// Set by `init`.
 static HAS_EDITIONS: AtomicBool = AtomicBool::new(false);
-
 /// Whether this process has editions.
 pub fn editions_exist() -> bool {
   HAS_EDITIONS.load(Ordering::Relaxed)
 }
-
 /// The open-workspace-on-startup setting, taken by whichever of the startup
 /// check and a late launch read sees the full edition first.
 #[cfg(all(target_os = "macos", feature = "storekit"))]
 pub(crate) static STARTUP_WORKSPACE_TOKEN: AtomicBool = AtomicBool::new(false);
-
 /// What every refusal ends with. The frontend tells a refusal the edition caused
 /// from one about the file by it (`LITE_REFUSAL` in `util/protocol.ts`).
 pub(crate) const LITE_REFUSAL: &str = "is not available in the Lite edition";
-
 /// The refusal a removed feature gives when `lite`; `Ok` otherwise. Pure so the
 /// decision is testable without flipping the process-wide flag.
 pub(crate) fn refuse_if(lite: bool, feature: &str) -> Result<(), String> {
@@ -81,7 +70,6 @@ pub(crate) fn refuse_if(lite: bool, feature: &str) -> Result<(), String> {
     Ok(())
   }
 }
-
 /// The refusal for something that exists only in a build with editions; `Ok`
 /// when `editions`.
 pub(crate) fn refuse_unless_editions(editions: bool, what: &str) -> Result<(), String> {
@@ -91,23 +79,19 @@ pub(crate) fn refuse_unless_editions(editions: bool, what: &str) -> Result<(), S
     Err(format!("{what} exists only in a build with editions"))
   }
 }
-
 /// Entry-point guard of something that only a build with editions has.
 pub(crate) fn require_editions(what: &str) -> Result<(), String> {
   refuse_unless_editions(editions_exist(), what)
 }
-
 /// Entry-point guard of a command that belongs to a removed feature.
 pub(crate) fn require_full(feature: &str) -> Result<(), String> {
   refuse_if(is_lite(), feature)
 }
-
 /// Whether the workspace window and every way into it (View menu item, tray
 /// item, Dock item, Jump List task, `--workspace`, open on startup) exist.
 pub(crate) fn workspace_enabled(lite: bool) -> bool {
   !lite
 }
-
 /// The value of `NOTENPAD_EDITION`: `lite` or `full`, anything else is no override.
 #[cfg_attr(not(debug_assertions), allow(dead_code))]
 fn parse_override(value: Option<&str>) -> Option<bool> {
@@ -117,13 +101,11 @@ fn parse_override(value: Option<&str>) -> Option<bool> {
     _ => None,
   }
 }
-
 /// The value of `NOTENPAD_EDITION_DELAY_MS`: a whole number of milliseconds.
 #[cfg_attr(not(debug_assertions), allow(dead_code))]
 fn parse_delay_ms(value: Option<&str>) -> Option<u64> {
   value.and_then(|v| v.trim().parse().ok())
 }
-
 /// Debug builds: sleep for `NOTENPAD_EDITION_DELAY_MS`, standing in for a slow
 /// license read so the startup ordering can be tested on any platform.
 #[cfg(debug_assertions)]
@@ -133,7 +115,6 @@ fn debug_delay() {
     std::thread::sleep(std::time::Duration::from_millis(ms));
   }
 }
-
 /// Settle the flag. Called once from `setup`, before the first window or
 /// edition-dependent menu exists; it may block for the license or store read
 /// (3 s at most).
@@ -187,7 +168,6 @@ pub fn init(app: &AppHandle) {
     LITE.store(resolve(packaged, license), Ordering::Relaxed);
   }
 }
-
 /// What the launch store read found, with the ticket each of its two reads took
 /// when it started.
 #[cfg(all(target_os = "macos", feature = "storekit"))]
@@ -197,7 +177,6 @@ struct InitRead {
   original_ticket: u64,
   original: crate::store_state::OriginalRead,
 }
-
 /// The launch read outlived `setup`'s wait: the edition stays lite, and the
 /// read is applied whenever it lands.
 #[cfg(all(target_os = "macos", feature = "storekit"))]
@@ -209,7 +188,6 @@ fn on_init_timeout(app: &AppHandle, rx: std::sync::mpsc::Receiver<InitRead>) {
     }
   });
 }
-
 /// Apply a late launch read with its own tickets, then open the workspace the
 /// startup check skipped while the edition was still lite.
 #[cfg(all(target_os = "macos", feature = "storekit"))]
@@ -225,7 +203,6 @@ fn apply_late_init(app: &AppHandle, read: InitRead) {
     });
   }
 }
-
 /// Store a new value and tell everyone: the flag, every window (`edition-changed`
 /// with the new `lite` as payload), and the native menus (app menu, tray, Jump
 /// List). Returns whether the value changed; an unchanged value does nothing.
@@ -269,7 +246,6 @@ pub(crate) fn set_lite(app: &AppHandle, lite: bool) -> bool {
 pub fn edition_info() -> bool {
   is_lite()
 }
-
 /// Debug builds only: flip the edition at runtime through the same path a
 /// license change takes, so the unlock can be tested before publishing.
 #[cfg(debug_assertions)]
@@ -283,12 +259,10 @@ pub fn debug_set_edition(app: AppHandle, lite: bool) -> Result<(), String> {
 fn read_license(_app: &AppHandle) -> (bool, LicenseRead) {
   (false, LicenseRead::Failed)
 }
-
 /// How long `setup` waits for the first license or store read before calling
 /// it unreadable (and so lite).
 #[cfg(any(target_os = "windows", all(target_os = "macos", feature = "storekit")))]
 const READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
-
 /// Packaged processes read the package license on a worker thread, which keeps
 /// running to watch for changes. Unpackaged ones have no license to read.
 #[cfg(target_os = "windows")]
@@ -324,7 +298,6 @@ mod store {
   use windows::core::IInspectable;
   use windows::Foundation::TypedEventHandler;
   use windows::Services::Store::StoreContext;
-
   /// One read of the app license. Not active, or any API error, is not full.
   fn read(context: &StoreContext) -> LicenseRead {
     let license = match context.GetAppLicenseAsync().and_then(|op| op.get()) {
@@ -340,7 +313,6 @@ mod store {
       _ => LicenseRead::Failed,
     }
   }
-
   /// The worker thread: subscribe to license changes, read once and hand the
   /// result to `setup` through `first`, then re-read on every change for the
   /// life of the process (the StoreContext must stay alive for the
@@ -445,7 +417,6 @@ mod tests {
     assert!(is_lite());
   }
 }
-
 /// Each removed feature is cut at its entry points, which are Tauri commands and
 /// menu builders that need a running app to call. So these read the sources, as
 /// `heavy_io_command_threading_tests` does, and assert every listed entry point
@@ -497,7 +468,6 @@ mod gate_tests {
     assert!(!workspace_enabled(true));
     assert!(workspace_enabled(false));
   }
-
   /// Every `pub fn` of `source` whose body carries the lite refusal.
   fn guarded(source: &str) -> Vec<String> {
     source
@@ -518,7 +488,10 @@ mod gate_tests {
     // A lite session can only hold a large viewer, windowed session or range
     // tab that was opened while full, so everything that works on one stays
     // allowed. The guard list is exactly the commands that start a new one.
-    assert_eq!(guarded(include_str!("windowed.rs")), vec!["windowed_open"]);
+    assert_eq!(
+      guarded(include_str!("windowed.rs")),
+      vec!["windowed_open", "windowed_open_converted"]
+    );
     assert_eq!(guarded(include_str!("range_edit.rs")), vec!["read_range"]);
     assert!(guarded(include_str!("large_file.rs")).is_empty());
   }
@@ -535,6 +508,7 @@ mod gate_tests {
           "line_to_offset",
           "index_line_count",
           "stream_search",
+          "clip_copy_file",
         ][..],
       ),
       (
@@ -554,6 +528,39 @@ mod gate_tests {
           "windowed_find",
           "windowed_search",
           "windowed_replace_all",
+          "windowed_end_pos",
+          "windowed_replace_range",
+          "windowed_enter",
+          "windowed_indent_range",
+          "clip_copy_session",
+          "windowed_paste_clip",
+          "windowed_paste_system",
+          "clip_read_chunk",
+          "windowed_reopen_converted",
+          "windowed_set_encoding",
+        ][..],
+      ),
+      (
+        include_str!("convert.rs"),
+        &[
+          "convert_begin",
+          "convert_append",
+          "convert_append_clip",
+          "convert_finish",
+          "convert_abort",
+          "convert_save",
+          "convert_from_file",
+        ][..],
+      ),
+      (
+        include_str!("convert_handoff.rs"),
+        &[
+          "convert_handoff_start",
+          "convert_claim",
+          "convert_done",
+          "convert_failed",
+          "convert_release",
+          "convert_sticky_saved",
         ][..],
       ),
     ] {
@@ -570,7 +577,7 @@ mod gate_tests {
   fn the_openers_carry_the_refusal() {
     assert_guarded(
       include_str!("windowed.rs"),
-      &["windowed_open"],
+      &["windowed_open", "windowed_open_converted"],
       "crate::edition::require_full(",
     );
     assert_guarded(
@@ -703,7 +710,6 @@ mod gate_tests {
     "store_restore",
     "store_refresh_original",
   ];
-
   /// The part of `body` compiled into the sandboxed store build.
   fn store_branch(body: &str) -> &str {
     let at = body
@@ -714,7 +720,6 @@ mod gate_tests {
       .find("#[cfg(not(all(target_os = \"macos\", feature = \"storekit\")))]")
       .expect("a branch without the store")]
   }
-
   /// The store commands whose StoreKit call can wait on the user indefinitely.
   const INTERACTIVE_STORE_COMMANDS: &[&str] =
     &["store_purchase", "store_restore", "store_refresh_original"];

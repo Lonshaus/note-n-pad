@@ -128,31 +128,6 @@ with open('$WORK/nested.json', 'w', newline='') as f:
 PYEOF
 FIXSIZE=$(file_size "$WORK/nested.json")
 echo "nested.json bytes: $FIXSIZE (needs > 10,000,000 chars)"
-
-launch
-BOOT=$(auto '{"id":1,"cmd":"list_windows"}' | jq -r '.data[]|select(.label|startswith("note-") or startswith("doc-"))|.label' | head -1)
-evl "$BOOT" "window.__TAURI_INTERNALS__.invoke('open_document_window',{path:'$WORK/nested.json'})" >/dev/null
-sleep 5
-DL=$(doc_label)
-tries=0
-until [ -n "$DL" ] && [ "$(evl "$DL" "typeof __auto!=='undefined' && typeof __auto.getWorkerHighlight==='function'")" = "true" ]; do
-  sleep 1
-  tries=$((tries + 1))
-  if [ "$tries" -gt 30 ]; then
-    echo "FATAL: doc window/hooks never appeared"
-    quit_app
-    exit 1
-  fi
-  DL=$(doc_label)
-done
-
-echo "=== baseline (flag off) ==="
-ORIG_FLAG=$(e2e_read "$DL" "String(__auto.getWorkerHighlight())")
-echo "original flag: $ORIG_FLAG"
-# Pin the UI language so text assertions never depend on the host system
-# language; restored alongside the flag below.
-ORIG_LANG=$(e2e_read "$DL" "String(__auto.getLanguage())")
-echo "original language: $ORIG_LANG"
 # The flag writes the user's real settings.json; make sure an interrupt between
 # enable and teardown still restores it and the language (and kills the app)
 # instead of leaving worker_highlight silently flipped on.
@@ -177,7 +152,32 @@ restore_flag() {
   fi
   e2e_kill_owned_ports
 }
-trap restore_flag EXIT INT TERM
+trap restore_flag EXIT
+trap 'exit 1' INT TERM
+
+launch
+BOOT=$(auto '{"id":1,"cmd":"list_windows"}' | jq -r '.data[]|select(.label|startswith("note-") or startswith("doc-"))|.label' | head -1)
+evl "$BOOT" "window.__TAURI_INTERNALS__.invoke('open_document_window',{path:'$WORK/nested.json'})" >/dev/null
+sleep 5
+DL=$(doc_label)
+tries=0
+until [ -n "$DL" ] && [ "$(evl "$DL" "typeof __auto!=='undefined' && typeof __auto.getWorkerHighlight==='function'")" = "true" ]; do
+  sleep 1
+  tries=$((tries + 1))
+  if [ "$tries" -gt 30 ]; then
+    echo "FATAL: doc window/hooks never appeared"
+    exit 1
+  fi
+  DL=$(doc_label)
+done
+
+echo "=== baseline (flag off) ==="
+ORIG_FLAG=$(e2e_read "$DL" "String(__auto.getWorkerHighlight())")
+echo "original flag: $ORIG_FLAG"
+# Pin the UI language so text assertions never depend on the host system
+# language; restored alongside the flag below.
+ORIG_LANG=$(e2e_read "$DL" "String(__auto.getLanguage())")
+echo "original language: $ORIG_LANG"
 evl "$DL" "__auto.setLanguage('zh-TW')" >/dev/null
 sleep 1
 evl "$DL" "__auto.setWorkerHighlight(false)" >/dev/null

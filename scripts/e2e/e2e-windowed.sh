@@ -1,12 +1,6 @@
 #!/bin/bash
 # Copyright © 2026 Lonshaus
 # SPDX-License-Identifier: GPL-3.0-only
-# PENDING LIVE RUN: updated for the unified large_open_mode ('ask'|'view'|'edit')
-# that replaced the ask_before_large_open toggle; the edit-mode section no longer
-# expects a confirm (edit opens straight through). Also updated for the
-# lazy-reopen change: the restart-restore section now expects the tab to reopen
-# into windowed editing again (no more permanent read-only fallback) and
-# checks the restored top line. Not yet re-run against the app.
 # E2E: windowed editing.
 # Open a ~240 MB file read-only, unlock it for editing in place via the tab-bar
 # lock icon, edit at the head and 4.8M lines deep, save byte-precisely, exercise
@@ -41,7 +35,7 @@ check() {
   if [ "$2" = "$3" ]; then
     ok "$1"
   else
-    bad "$1 (got: [$2], want: [$3])"
+    bad "$1 (got: [$(e2e_show "$2")], want: [$(e2e_show "$3")])"
   fi
 }
 count_kind() {
@@ -240,25 +234,9 @@ with open('$WORK/bad.log', 'r+b') as f:
 PYEOF
 BAD_SIZE=$(file_size "$WORK/bad.log")
 echo "bad.log bytes: $BAD_SIZE (>104857600 required)"
-
-launch
-
-echo "=== non-UTF-8: lock disabled ==="
-open_large "$WORK/bad.log"
-tries=0
-until [ "$(evl "$DL" "String(__auto.isLargeTab())")" = "true" ]; do
-  sleep 1
-  tries=$((tries + 1))
-  if [ "$tries" -gt 30 ]; then
-    break
-  fi
-done
-# Pin the UI language before any text-dependent assertion so results never
-# depend on the host system language. A single combined trap restores both the
-# language and the large-open mode (captured just below); it must be the only
-# trap, since a later trap would silently replace this one.
-ORIG_LANG=$(e2e_read "$DL" "String(__auto.getLanguage())")
-echo "original language: $ORIG_LANG"
+# A single combined trap restores both the language and the large-open mode
+# (captured below); it must be the only trap, since a later trap would silently
+# replace this one.
 restore_state() {
   trap '' INT TERM
   if [ -n "${DL:-}" ] && [ -n "${ORIG_LANG:-}" ]; then
@@ -280,7 +258,25 @@ restore_state() {
   fi
   e2e_kill_owned_ports
 }
-trap restore_state EXIT INT TERM
+trap restore_state EXIT
+trap 'exit 1' INT TERM
+
+launch
+
+echo "=== non-UTF-8: lock disabled ==="
+open_large "$WORK/bad.log"
+tries=0
+until [ "$(evl "$DL" "String(__auto.isLargeTab())")" = "true" ]; do
+  sleep 1
+  tries=$((tries + 1))
+  if [ "$tries" -gt 30 ]; then
+    break
+  fi
+done
+# Pin the UI language before any text-dependent assertion so results never
+# depend on the host system language.
+ORIG_LANG=$(e2e_read "$DL" "String(__auto.getLanguage())")
+echo "original language: $ORIG_LANG"
 evl "$DL" "__auto.setLanguage('zh-TW')" >/dev/null
 sleep 1
 check "bad.log opened read-only" "$(e2e_read "$DL" "String(__auto.isLargeTab())")" "true"
@@ -334,14 +330,7 @@ evl "$DL" "__auto.largeGoto(3000000)" >/dev/null
 sleep 2
 check "lock available for editable file" "$(e2e_read "$DL" "String(__auto.largeUnlockAvailable())")" "true"
 evl "$DL" "__auto.largeUnlockEdit().then((r)=>{window.__u=r;})" >/dev/null
-tries=0
-until [ "$(evl "$DL" "String(__auto.isWindowedTab())")" = "true" ]; do
-  sleep 1
-  tries=$((tries + 1))
-  if [ "$tries" -gt 30 ]; then
-    break
-  fi
-done
+e2e_wait_eval "$DL" "String(__auto.isWindowedTab())" "true"
 check "unlocked into windowed edit in place" "$(e2e_read "$DL" "String(__auto.isWindowedTab())")" "true"
 check "window opened at the viewed position (line 3,000,000)" "$(e2e_read "$DL" "String(__auto.windowedInfo().windowStartLine > 2900000 && __auto.windowedInfo().windowStartLine < 3000000)")" "true"
 

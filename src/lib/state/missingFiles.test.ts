@@ -810,6 +810,8 @@ describe('after the window restored its tabs', () => {
       windowed_fp_mtime: null,
       windowed_digest: null,
       windowed_top_line: null,
+      windowed_encoding: null,
+      windowed_bom: false,
       ...over,
     };
   }

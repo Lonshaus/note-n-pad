@@ -5,7 +5,6 @@ use crate::fs_ops::{read_error, write_bytes_atomic};
 use encoding_rs::Encoding;
 use serde::Serialize;
 use std::path::Path;
-
 /// Result of decoding a byte buffer into text. `content` is BOM-free; line
 /// endings are preserved (the frontend normalizes to LF).
 #[derive(Debug, Clone, Serialize, PartialEq)]
@@ -17,7 +16,6 @@ pub struct Decoded {
   /// did not fully fit the chosen encoding.
   pub lossy: bool,
 }
-
 /// The fixed set of encodings exposed to the frontend, paired with their
 /// encoding_rs backing. The label (not encoding_rs's `.name()`) is what we
 /// persist and show, so casing stays stable ("GB18030", "Windows-1252").
@@ -47,22 +45,19 @@ fn supported() -> [(&'static str, &'static Encoding); 22] {
     ("MacRoman", encoding_rs::MACINTOSH),
   ]
 }
-
 /// Whether `label` is one of the supported encoding labels (case-insensitive).
 /// Exposed so settings validation reuses this single source of truth instead of
 /// duplicating the encoding list.
 pub fn is_supported_label(label: &str) -> bool {
   label_to_encoding(label).is_some()
 }
-
 /// Resolve a label (case-insensitive) to its encoding_rs encoding.
-fn label_to_encoding(label: &str) -> Option<&'static Encoding> {
+pub(crate) fn label_to_encoding(label: &str) -> Option<&'static Encoding> {
   supported()
     .into_iter()
     .find(|(name, _)| name.eq_ignore_ascii_case(label))
     .map(|(_, enc)| enc)
 }
-
 /// Map an encoding_rs encoding back to our fixed label.
 fn label_for(enc: &'static Encoding) -> String {
   supported()
@@ -72,7 +67,6 @@ fn label_for(enc: &'static Encoding) -> String {
     // Unreachable in practice: every path passes a supported encoding.
     .unwrap_or_else(|| "Windows-1252".to_string())
 }
-
 /// Constrain a detector guess to the supported list; unknown guesses fall back
 /// to Windows-1252 (a superset-ish single-byte reading that never fails).
 fn constrain(enc: &'static Encoding) -> &'static Encoding {
@@ -82,14 +76,12 @@ fn constrain(enc: &'static Encoding) -> &'static Encoding {
     encoding_rs::WINDOWS_1252
   }
 }
-
 /// Decode `bytes` with `enc`, without any BOM handling (callers strip BOMs
 /// explicitly). Returns the text and whether replacement characters appeared.
 fn decode_bytes(enc: &'static Encoding, bytes: &[u8]) -> (String, bool) {
   let (cow, lossy) = enc.decode_without_bom_handling(bytes);
   (cow.into_owned(), lossy)
 }
-
 /// Auto-detect the encoding of `bytes` and decode it.
 pub fn decode_auto(bytes: &[u8]) -> Decoded {
   // 1. BOM sniff wins outright.
@@ -155,7 +147,6 @@ pub fn decode_auto(bytes: &[u8]) -> Decoded {
     lossy,
   }
 }
-
 /// Strip a BOM only when it matches `enc`, reporting whether one was removed.
 fn strip_matching_bom<'a>(enc: &'static Encoding, bytes: &'a [u8]) -> (&'a [u8], bool) {
   let bom: &[u8] = if std::ptr::eq(enc, encoding_rs::UTF_8) {
@@ -172,7 +163,6 @@ fn strip_matching_bom<'a>(enc: &'static Encoding, bytes: &'a [u8]) -> (&'a [u8],
     None => (bytes, false),
   }
 }
-
 /// Forced decode with a specific label.
 pub fn decode_as(bytes: &[u8], label: &str) -> Result<Decoded, String> {
   let enc = label_to_encoding(label).ok_or_else(|| format!("unsupported encoding: {label}"))?;
@@ -185,7 +175,6 @@ pub fn decode_as(bytes: &[u8], label: &str) -> Result<Decoded, String> {
     lossy,
   })
 }
-
 /// Encode text to `label`. UTF-8 optionally prepends a BOM; UTF-16 variants
 /// always write their BOM; `with_bom` is ignored for non-Unicode encodings.
 /// Characters that cannot be represented are a hard error (never silently dropped).
@@ -236,7 +225,6 @@ pub fn read_file_as(path: String, encoding: String) -> Result<Decoded, String> {
   let bytes = std::fs::read(&path).map_err(|e| read_error(&e))?;
   decode_as(&bytes, &encoding)
 }
-
 /// Off the UI thread: the encode + atomic write can run long on a large file.
 /// Every call site awaits this one call before its next action, so there is no
 /// overlapping write to reorder.
@@ -255,6 +243,21 @@ pub fn write_file_encoded(
 mod tests {
   use super::*;
   use tempfile::tempdir;
+
+  #[test]
+  fn supported_list_matches_the_frontend_list() {
+    let ts = include_str!("../../src/lib/util/text.ts");
+    let start = ts.find("export const ENCODINGS = [").unwrap();
+    let list = &ts[start..];
+    let list = &list[..list.find("] as const;").unwrap()];
+    let frontend: Vec<&str> = list
+      .lines()
+      .skip(1)
+      .map(|line| line.trim().trim_end_matches(',').trim_matches('\''))
+      .collect();
+    let backend: Vec<&str> = supported().iter().map(|(label, _)| *label).collect();
+    assert_eq!(frontend, backend);
+  }
 
   #[test]
   fn read_commands_report_missing_file_as_protocol_value() {

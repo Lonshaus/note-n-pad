@@ -24,6 +24,8 @@
     resolveByteRange,
   } from '../util/rangeEdit';
   import { formatFileSize } from '../util/format';
+  import { withReservation } from '../util/liveTokens';
+  import type { Reservation } from '../util/replayQueue';
   import {
     canReuseIndex,
     type IndexScanState,
@@ -35,8 +37,20 @@
   import { isLite } from '../state/edition.svelte';
   import { editionUi } from '../util/editionUi';
   import { shortcutsState } from '../state/shortcuts.svelte';
+  import { settingsState } from '../state/settings.svelte';
   import { matchWindowShortcut } from '../util/windowShortcut';
-
+  import {
+    clipCopyRoute,
+    clipFileRange,
+    viewerFocus,
+    type ClipRoute,
+  } from '../util/clipRouting';
+  import {
+    movesSelection,
+    wholeFileAfter,
+    type SelectAllEntry,
+    type WholeFileEvent,
+  } from '../util/windowSelection';
   /** Byte span + line labels of a range selection, handed to the app to edit. */
   export interface RangeExtract {
     startByte: number;
@@ -44,7 +58,6 @@
     startLine: number;
     endLine: number;
   }
-
   /** Byte span of a range selection, handed to the app's save-range path. */
   export interface RangeSaveAs {
     startByte: number;
@@ -113,7 +126,6 @@
     onindexchange,
     ontopline,
   }: Props = $props();
-
   /** Boundary-aligned text slice returned by the Rust `read_chunk` command. */
   interface Chunk {
     text: string;
@@ -138,7 +150,6 @@
     done: boolean;
     error: boolean;
   }
-
   /** A streaming-search match emitted by the Rust `stream_search` command. `line`
    *  is 0-based, matching the line index; the UI shows it 1-based. */
   interface SearchHitPayload {
@@ -154,10 +165,8 @@
     truncated: boolean;
     error: boolean;
   }
-
   /** One result row: `line` is 1-based (as displayed and returned to DEV hooks). */
   type SearchResult = FindResult;
-
   // Bytes read per backend request; also the LRU key grid is line-page based.
   const READ_LEN = 1024 * 1024;
   // Lines grouped into a page; a page is the unit that is loaded and cached.
@@ -170,7 +179,6 @@
   const SEARCH_MAX = 5000;
   // How long a jumped-to line stays tinted, in milliseconds.
   const HIGHLIGHT_MS = 1200;
-
   // Equal row height derived from the editor font; line math depends on it being
   // exact, so rows are pinned to this pixel height.
   const lineHeight = $derived(Math.round(fontSize * 1.5));
@@ -202,7 +210,6 @@
     startLine: 0,
     lines: [],
   });
-
   // Goto/search overlays are mutually exclusive: only one is ever open.
   let panel = $state<'none' | 'goto' | 'search'>('none');
   let gotoValue = $state('');
@@ -233,6 +240,13 @@
   let anchor = $state<number | null>(null);
   // Hint shown in the range toolbar when extraction is refused (range too big).
   let rangeError = $state('');
+  // Select All was made under the "file" setting and nothing has changed the
+  // selection since: it stands for the whole file, though the rows drawn are
+  // the ones on screen.
+  let wholeFile = false;
+  function updateWholeFile(event: WholeFileEvent): void {
+    wholeFile = wholeFileAfter({ mode: settingsState.largeSelectAll }, event);
+  }
 
   const selCount = $derived(sel === null ? 0 : sel.end - sel.start + 1);
   // Rough pre-extraction size estimate from the seeded average line length; the
@@ -252,7 +266,6 @@
             (truncated ? t('large.search.truncatedSuffix') : '')
           : '',
   );
-
   // Precise count once the index finishes, otherwise the running estimate.
   const effectiveTotal = $derived(totalLines ?? estTotalLines);
   // Scroll-axis height, capped so it never exceeds the browser's per-element
@@ -344,7 +357,6 @@
     }
     return lines;
   }
-
   /** Ensure the page containing the first visible line (and its neighbours) is
    *  loaded. Reloads only when the visible page changes, so scrolling within a
    *  page is a synchronous reslice. */
@@ -384,7 +396,6 @@
     ontopline?.(visible.firstVisible);
     void syncLoad();
   }
-
   /** Scroll a line into view at the top of the viewport (used by Cmd+L / DEV). */
   export async function scrollToLine(line: number): Promise<void> {
     if (container === null) {
@@ -401,14 +412,12 @@
     publishStatus();
     await syncLoad();
   }
-
   /** The text currently rendered in the viewport, for E2E content assertions. */
   export function visibleText(): string {
     const from = visible.firstVisible - loaded.startLine;
     const to = from + visible.visibleCount;
     return loaded.lines.slice(Math.max(0, from), Math.max(0, to)).join('\n');
   }
-
   /** Tint a line briefly after a jump so the eye can find it. */
   function highlight(line: number): void {
     highlightLine = line;
@@ -426,11 +435,11 @@
     anchor = null;
     rangeError = '';
   }
-
   /** Gutter click: plain click sets a single-line selection (re-clicking the same
    *  start cancels); Shift+click extends the range from the anchor. */
   function onGutterClick(line: number, e: MouseEvent): void {
     rangeError = '';
+    updateWholeFile({ type: 'select' });
     if (e.shiftKey && anchor !== null) {
       sel = { start: Math.min(anchor, line), end: Math.max(anchor, line) };
     } else if (anchor === line) {
@@ -440,7 +449,6 @@
       sel = { start: line, end: line };
     }
   }
-
   /** Resolve the current selection to an exact `[startByte, endByte)` span. The
    *  end uses the offset of the line after the last selected line, falling back to
    *  EOF when that line is past the file's end. Returns null when the start offset
@@ -504,7 +512,6 @@
     }
     clearSelection();
   }
-
   /** Save the selection straight to a new file, which then opens as a new tab.
    *  Same size ceiling as extraction (the slice is read whole into memory). */
   async function triggerRangeSaveAs(pathOverride?: string): Promise<boolean> {
@@ -547,7 +554,6 @@
     }
     return ok;
   }
-
   /** Cancel any in-flight search and clear its results. */
   function resetSearch(): void {
     if (currentSearchId !== null) {
@@ -562,7 +568,6 @@
     searchFailed = false;
     truncated = false;
   }
-
   /** Start a fresh streaming search for the current query. Each run gets a unique
    *  id (the Rust cancel flags collide on reused ids), cancelling the previous. */
   function runSearch(): void {
@@ -589,7 +594,6 @@
       }
     });
   }
-
   /** Jump to the result at `index`, scrolling it into view and tinting the row. */
   function jumpToResult(index: number): void {
     const r = results[index];
@@ -607,7 +611,6 @@
       jumpToResult(next);
     }
   }
-
   // Enter re-searches on a changed query, otherwise advances to the next hit.
   let lastSearched = '';
   function searchOrNext(): void {
@@ -641,6 +644,7 @@
       anchor = target.range.start;
       sel = { start: target.range.start, end: target.range.end };
       rangeError = '';
+      updateWholeFile({ type: 'select' });
       void scrollToLine(target.range.start);
     }
     closeGoto();
@@ -701,7 +705,7 @@
     return r.toString().length;
   }
   // The rendered rows fully on screen become the selection.
-  function selectVisibleRows(): void {
+  function selectVisibleRows(entry: SelectAllEntry): void {
     const sel = document.getSelection();
     if (wrap === null || container === null || sel === null) {
       return;
@@ -731,6 +735,7 @@
     next.setEnd(b, b.childNodes.length);
     sel.removeAllRanges();
     sel.addRange(next);
+    updateWholeFile({ type: 'selectAll', entry });
   }
   // A native select-all (keyboard) starts before the viewer and ends at or
   // after the last rendered row; narrow it to the rows fully on screen.
@@ -762,16 +767,59 @@
     ) {
       return;
     }
-    selectVisibleRows();
+    selectVisibleRows('native');
+  }
+  // The way a copy goes now: the whole file or a line range past the loaded
+  // rows goes through a clip file, anything else through the browser.
+  function copyRoute(): ClipRoute {
+    const dom = document.getSelection();
+    return clipCopyRoute({
+      mode: 'view',
+      focus: viewerFocus(document.activeElement, {
+        content: container,
+        wrap,
+        body: document.body,
+      }),
+      globalSel: null,
+      wholeFile,
+      domSelection: dom !== null && dom.rangeCount > 0 && !dom.isCollapsed,
+      sel,
+      loadedRows: { startLine: loaded.startLine, count: loaded.lines.length },
+    });
+  }
+  // A line range lives in the gutter, with nothing selected in the page, and
+  // WebKit disables Copy then unless this event is prevented.
+  function onBeforeCopy(e: Event): void {
+    if (copyRoute() === 'file') {
+      e.preventDefault();
+    }
   }
   // Copies the selected rows' text only: a multi-row selection otherwise
   // carries the gutter numbers in WebKit.
   function onCopy(e: ClipboardEvent): void {
-    const sel = document.getSelection();
-    if (sel === null || sel.rangeCount === 0 || sel.isCollapsed) {
+    if (copyRoute() === 'file') {
+      e.preventDefault();
+      const range = clipFileRange({ wholeFile, sel });
+      if (range !== null) {
+        // The outcome shows no message. A paste elsewhere waits for the copy,
+        // so it is reserved first, renewed while it runs and released by the core.
+        withReservation(
+          () => invoke<Reservation>('clip_copy_reserve'),
+          (reservation) =>
+            invoke('clip_copy_file', { path, range, reservation }),
+        ).catch(() => {});
+      }
       return;
     }
-    const range = sel.getRangeAt(0);
+    const selection = document.getSelection();
+    if (
+      selection === null ||
+      selection.rangeCount === 0 ||
+      selection.isCollapsed
+    ) {
+      return;
+    }
+    const range = selection.getRangeAt(0);
     const rows: SelectedRow[] = [];
     for (const el of rowTexts()) {
       if (!range.intersectsNode(el)) {
@@ -797,17 +845,25 @@
     e.preventDefault();
     e.clipboardData.setData('text/plain', joinSelectedRows(rows));
   }
+  // A click in the viewer starts a new selection.
+  function onMouseDown(e: MouseEvent): void {
+    if (e.target instanceof Node && wrap?.contains(e.target) === true) {
+      updateWholeFile({ type: 'click' });
+    }
+  }
   // The shortcut registry's `goto-line` key opens goto. Cmd/Ctrl+F is a native
   // menu accelerator (it never reaches this listener), so DocumentApp routes it
   // to `openSearch` instead.
   function onWindowKeydown(e: KeyboardEvent): void {
+    if (movesSelection(e.key)) {
+      updateWholeFile({ type: 'key' });
+    }
     const accel = shortcutsState.accel('goto-line');
     if (accel !== null && matchWindowShortcut(e, accel, platform.os)) {
       e.preventDefault();
       openGoto();
     }
   }
-
   // DEV/automation surface, driven by DocumentApp's hooks.
   export function largeGotoOpen(): void {
     openGoto();
@@ -821,7 +877,11 @@
   // Edit > Select All (the macOS item is custom): the rows fully on screen, the
   // same rows the narrowing above picks.
   export function selectAllVisible(): void {
-    selectVisibleRows();
+    selectVisibleRows('menu');
+  }
+  // DEV/automation: whether the selection stands for the whole file.
+  export function largeWholeFile(): boolean {
+    return wholeFile;
   }
   export function largeSearchOpen(): void {
     openSearch();
@@ -853,6 +913,7 @@
     anchor = s;
     sel = { start: Math.min(s, e), end: Math.max(s, e) };
     rangeError = '';
+    updateWholeFile({ type: 'select' });
   }
   export function largeGetRange(): {
     startLine: number;
@@ -977,8 +1038,10 @@
     // Only mounted while a large tab is active, so this shortcut never fires in
     // the normal editor (which has no LargeFileView).
     window.addEventListener('keydown', onWindowKeydown);
+    document.addEventListener('mousedown', onMouseDown);
     document.addEventListener('selectionchange', onSelectionChange);
     document.addEventListener('copy', onCopy);
+    document.addEventListener('beforecopy', onBeforeCopy);
     if (container !== null) {
       // Keep the visible-line math and status in step with the pane height.
       observer = new ResizeObserver(() => {
@@ -1077,8 +1140,10 @@
       destroyed = true;
       observer?.disconnect();
       window.removeEventListener('keydown', onWindowKeydown);
+      document.removeEventListener('mousedown', onMouseDown);
       document.removeEventListener('selectionchange', onSelectionChange);
       document.removeEventListener('copy', onCopy);
+      document.removeEventListener('beforecopy', onBeforeCopy);
     };
   });
 

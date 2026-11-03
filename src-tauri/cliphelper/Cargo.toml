@@ -1,0 +1,32 @@
+[package]
+name = "cliphelper"
+version = "1.1.4"
+description = "Holds a large clipboard text outside the main app, so the app's memory does not grow with it"
+authors = ["Lonshaus"]
+license = "GPL-3.0-only"
+edition = "2021"
+publish = false
+# Not a member of the app's package: it is built on its own by
+# scripts/build-cliphelper.mjs and shipped next to the app.
+
+[dependencies]
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.60", features = [
+  "Win32_Foundation",
+  "Win32_Graphics_Gdi",
+  "Win32_Security",
+  "Win32_System_DataExchange",
+  "Win32_System_Diagnostics_ToolHelp",
+  "Win32_System_LibraryLoader",
+  "Win32_System_Memory",
+  "Win32_System_Threading",
+  "Win32_UI_WindowsAndMessaging",
+] }
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true

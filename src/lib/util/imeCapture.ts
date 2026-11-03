@@ -100,6 +100,21 @@ export function outsideInputAction(s: {
   }
   return 'reject';
 }
+/** Whether a transaction is the input of a composition a capture covers. */
+export function capturedInput(
+  capturing: boolean,
+  userEvent: string | undefined,
+): boolean {
+  return (
+    capturing &&
+    outsideInputAction({
+      capturing: true,
+      pending: false,
+      late: false,
+      userEvent,
+    }) === 'capture'
+  );
+}
 /** What an editor update means for the window's bookkeeping. While a capture
  *  runs, its changes only accumulate: they are no edit for the core and they
  *  must not move the global selection, which still holds the real caret. */
@@ -134,8 +149,11 @@ export function captureStartAllowed(s: {
   wanted: boolean;
   /** The selection lies outside the window and fits one. */
   outside: boolean;
+  /** A Select All waits to run, which takes no new input. */
+  selectAllPending: boolean;
 }): boolean {
   return (
+    !s.selectAllPending &&
     !s.capturing &&
     !s.locked &&
     !s.draining &&
