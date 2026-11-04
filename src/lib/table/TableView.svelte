@@ -31,6 +31,8 @@
   } from '../util/tableRows';
   import { t } from '../i18n';
   import { platform } from '../state/platform.svelte';
+  import { pasteEnv } from '../util/pasteEnv';
+  import { fieldPaste } from '../util/pasteRouting';
   import { overlayKeyAction } from '../util/overlayKeys';
 
   interface Props {
@@ -56,17 +58,14 @@
   const colIndexes = $derived(
     Array.from({ length: colCount }, (_unused, i) => i),
   );
-
   // Header-row styling is display-only, per-tab runtime state (not persisted).
   let headerRow = $state(false);
-
   // Root element, used to locate a cell when the menu is opened by automation.
   let rootEl: HTMLDivElement;
   // The table itself. Observed alongside the pane: the pane's own box does not
   // move when a row changes height, but the table's does, and that is the only
   // signal a row-height change gives.
   let gridEl: HTMLTableElement | undefined = $state();
-
   // Row virtualization: rendering every row cost ~12s of frozen
   // window at 100k rows. Only the viewport's rows are built; two spacer rows
   // stand in for the rest so the scrollbar still measures the whole document.
@@ -93,7 +92,6 @@
     value: string;
     document: DsvIndex;
   } | null = null;
-
   // At least one row: an empty document still shows one editable cell.
   const rowCount = $derived(Math.max(index.rowStarts.length, 1));
   // Asked of the engine once on mount, so no per-platform constant has to be
@@ -114,7 +112,6 @@
       OVERSCAN,
     ),
   );
-
   // The promoted header row renders even when scrolled past: sticky only pins
   // an element that is there.
   const layout = $derived(
@@ -150,7 +147,6 @@
     scrollTop = scrollEl.scrollTop;
     commitPendingIfLeaving();
   }
-
   // A removed input fires no blur, so a pending edit on a row leaving the
   // window would vanish with no commit and no dirty flag. Commit it here.
   // Call from every path that narrows the window, not just scrolling: a shorter
@@ -170,7 +166,6 @@
     }
     commitCell(p.r, p.c, p.value);
   }
-
   // Measured, not read off the stylesheet. Forces layout, so mount/resize only.
   // Writes only on a real change: this runs inside a ResizeObserver, and a
   // no-op write there re-renders, which resizes, which calls it again.
@@ -204,7 +199,6 @@
     measureRowHeight();
     return () => observer.disconnect();
   });
-
   // The in-table context menu: the target cell (r, c) plus its viewport anchor.
   // Null when closed. `variant` picks which operation group(s) to show: a gutter
   // column head opens 'col', a row head opens 'row', a data cell opens 'cell'
@@ -216,7 +210,6 @@
     x: number;
     y: number;
   } | null>(null);
-
   // Row/column/whole-table selection for copy/clear shortcuts. Null when nothing
   // is selected. Indices go stale on any structural change, so every mutation and
   // edit path deselects first.
@@ -226,7 +219,6 @@
   export function deselect(): void {
     selection = null;
   }
-
   // Crosshair hover: the hovered data cell lights up its whole row and whole
   // column, with a fainter tint than an actual selection. The promoted header
   // row acts like the column-head gutter: hovering it triggers nothing, but it
@@ -242,14 +234,12 @@
     }
     return hover.r === r || hover.c === c;
   }
-
   // Focusing a cell deselects (the shared convention) and reports the 1-based
   // cell position so the status bar tracks the table cursor.
   function onCellFocus(r: number, c: number): void {
     deselect();
     oncursor(r + 1, c + 1);
   }
-
   // A selected data cell is any cell in the selected row (or column). Drives the
   // tinted highlight and lets the gutter/header cell wear a stronger tint.
   function cellSelected(r: number, c: number): boolean {
@@ -263,7 +253,6 @@
       ? selection.index === r
       : selection.index === c;
   }
-
   // Clicking a row/column gutter cell toggles its selection; clicking a
   // different one moves it. Focus the root so the scoped key handler receives
   // shortcuts even when no cell input is focused.
@@ -279,7 +268,6 @@
     }
     rootEl?.focus();
   }
-
   // Clicking the corner toggles a whole-table selection.
   function toggleSelectAll(): void {
     selection =
@@ -293,7 +281,6 @@
       toggleSelectAll();
     }
   }
-
   // Build the clipboard text for the current selection: a whole-table selection
   // becomes the full grid in the tab's delimiter; a row becomes one RFC-quoted
   // record line; a column becomes one RFC-quoted value per line.
@@ -365,7 +352,6 @@
     }
     commitCell(r, c, (e.currentTarget as HTMLInputElement).value);
   }
-
   // Open the menu at a viewport point, clamped so it stays fully on screen.
   // The gutter menus carry one cross-axis item so the table can grow at its
   // edges: the top strip's 'col' menu adds "Insert Row Below" (the strip passes
@@ -395,12 +381,10 @@
       y: Math.min(y, window.innerHeight - h),
     };
   }
-
   // A header cell is the promoted first data row while the header toggle is on.
   function isHeaderCell(r: number): boolean {
     return headerRow && r === 0;
   }
-
   // First click on an unselected header column selects the whole column instead
   // of focusing the input; a second click (column already selected, or caret
   // already in the field) falls through so the title text becomes editable.
@@ -473,7 +457,6 @@
       closeMenu();
     }
   }
-
   // Selection shortcuts, scoped to the table view (this handler lives on the
   // root element, which is focused when a selection is made). Only fires while a
   // selection exists, so ordinary editing keys pass through untouched.
@@ -513,7 +496,6 @@
       clearSelection();
     }
   }
-
   // Automation surface for selection. selectRow/selectCol set (not toggle) so
   // E2E is deterministic; the UI click path toggles via toggleSelect.
   export function selectRow(r: number): void {
@@ -544,7 +526,6 @@
   export function getSelection(): Selection | null {
     return selection;
   }
-
   // Copy the selection to the clipboard and return the exact text written, so
   // E2E can assert without clipboard-read access.
   export function copySelection(): string {
@@ -552,7 +533,6 @@
     void navigator.clipboard.writeText(text);
     return text;
   }
-
   // Clear the selected row's/column's cell CONTENTS (never removes the line);
   // the selection stays valid since indices do not shift.
   export function clearSelection(): void {
@@ -569,7 +549,6 @@
       emitAll(clearColChange(content, index, selection.index, delimiter));
     }
   }
-
   // Automation surface: open the menu targeting a cell, and report whether it is
   // open. Position is looked up from the live cell (falls back to the origin).
   export async function openMenu(r: number, c: number): Promise<void> {
@@ -600,7 +579,6 @@
   export function menuOpen(): boolean {
     return menu !== null;
   }
-
   // Automation/host surface for the header-row toggle (component-local $state).
   export function setHeaderRow(on: boolean): void {
     headerRow = on;
@@ -819,6 +797,7 @@
             };
           }}
           onkeydown={(e) => onCellKeydown(e, r, c)}
+          onpaste={(e) => void fieldPaste(e, e.currentTarget, pasteEnv)}
           onblur={(e) => onCellBlur(e, r, c)}
           oncontextmenu={(e) => onCellContextMenu(e, r, c)}
         />

@@ -45,6 +45,12 @@ if [ -z "$REPO_ROOT" ] || [ ! -d "$REPO_ROOT/src-tauri" ]; then
   exit 1
 fi
 echo "repo: $REPO_ROOT"
+# The index is a build output and tauri-build refuses to compile without it;
+# the image has no Node to generate it.
+if [ ! -f "$REPO_ROOT/src-tauri/resources/licenses.json" ]; then
+  echo "run \`npm run licenses\` in $REPO_ROOT first" >&2
+  exit 1
+fi
 
 # Docker defaults to root, and root reads a file whose mode is 000 — which made
 # the settings test for an unreadable file fail here and pass on CI, where the

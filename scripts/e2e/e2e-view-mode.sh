@@ -69,6 +69,10 @@ entry_count() {
 tab_count() {
   e2e_read "$DL" "String(__auto.getTabs().length)"
 }
+# Waits until the tab of $1 is open and active; a fixed sleep reads the old tab list on a slow runner.
+wait_tab_active() {
+  e2e_wait_eval "$DL" "String(__auto.getTabs().some((t)=>t.path==='$1' && t.active))" "true"
+}
 # The view-mode switcher is the only select in the status bar's right-hand
 # group, so its options can be counted without a test-only marker. 0 means the
 # switcher is not rendered at all.
@@ -1098,15 +1102,16 @@ if [ "$BIG_SIZE" -le 104857600 ]; then
   exit 1
 fi
 
+trap 'quit_app' EXIT
+trap 'exit 1' INT TERM
 launch
-trap 'quit_app' EXIT INT TERM
 open_doc
 
 echo "=== A. three tabs, each with a remembered mode ==="
 evl "$DL" "__auto.openTab('$WORK/b.csv')" >/dev/null
-sleep 2
+wait_tab_active "$WORK/b.csv"
 evl "$DL" "__auto.openTab('$WORK/c.csv')" >/dev/null
-sleep 2
+wait_tab_active "$WORK/c.csv"
 check "three tabs open" "$(tab_count)" "3"
 # The map only gains an entry when a mode is actually chosen, so choose one on
 # every tab; 'source' is the non-default for a .csv, which also proves the
@@ -1133,7 +1138,7 @@ check "one remembered mode left" "$(entry_count)" "1"
 
 echo "=== C. the dirty-close 'don't save' route clears its entry too ==="
 evl "$DL" "__auto.openTab('$WORK/b.csv')" >/dev/null
-sleep 2
+wait_tab_active "$WORK/b.csv"
 evl "$DL" "__auto.setViewMode('source')" >/dev/null
 sleep 1
 check "two remembered modes" "$(entry_count)" "2"
@@ -1156,7 +1161,7 @@ check "discarded tab forgotten" "$(entry_count)" "1"
 
 echo "=== D. the JSON preview switches on and off ==="
 evl "$DL" "__auto.openTab('$WORK/good.json')" >/dev/null
-sleep 2
+wait_tab_active "$WORK/good.json"
 check "json tab starts in source" "$(e2e_read "$DL" "String(__auto.getViewMode())")" "source"
 check "switcher offers two modes" "$(mode_option_count)" "2"
 evl "$DL" "__auto.setViewMode('json')" >/dev/null
@@ -1171,7 +1176,7 @@ check "preview unmounted" "$(e2e_read "$DL" "String(document.querySelectorAll('.
 
 echo "=== E. a syntax error shows a message rather than an empty pane ==="
 evl "$DL" "__auto.openTab('$WORK/bad.json')" >/dev/null
-sleep 2
+wait_tab_active "$WORK/bad.json"
 evl "$DL" "__auto.setViewMode('json')" >/dev/null
 sleep 2
 check "error shown" "$(e2e_read "$DL" "String((document.querySelector('.json-view .error')||{}).textContent||'').length > 0")" "true"
@@ -1190,7 +1195,7 @@ check "disabled option explains itself" "$(e2e_read "$DL" "String(Array.from(doc
 
 echo "=== G. the markdown preview switches on and off ==="
 evl "$DL" "__auto.openTab('$WORK/doc.md')" >/dev/null
-sleep 2
+wait_tab_active "$WORK/doc.md"
 check "markdown tab starts in source" "$(e2e_read "$DL" "String(__auto.getViewMode())")" "source"
 check "switcher offers two modes" "$(mode_option_count)" "2"
 evl "$DL" "__auto.setViewMode('markdown')" >/dev/null
@@ -1210,7 +1215,7 @@ check "preview unmounted" "$(e2e_read "$DL" "String(document.querySelectorAll('.
 
 echo "=== H. find from a preview returns to the editor first ==="
 evl "$DL" "__auto.openTab('$WORK/good.json')" >/dev/null
-sleep 2
+wait_tab_active "$WORK/good.json"
 evl "$DL" "__auto.setViewMode('json')" >/dev/null
 sleep 2
 evl "$DL" "__auto.openFind()" >/dev/null
@@ -1224,7 +1229,7 @@ echo "=== I. anchor links jump to their heading ==="
 # Anchors are deliberately not behind the preview-local-resources setting: the
 # jump stays inside the document. So this runs with the setting at its default.
 evl "$DL" "__auto.openTab('$WORK/anchors.md')" >/dev/null
-sleep 2
+wait_tab_active "$WORK/anchors.md"
 evl "$DL" "__auto.setViewMode('markdown')" >/dev/null
 sleep 2
 check "an anchor with a matching heading is a link" \
@@ -1305,7 +1310,8 @@ restore_mode() {
       && mv "$APPDIR/settings.json.tmp" "$APPDIR/settings.json"
   fi
 }
-trap 'quit_app; restore_mode' EXIT INT TERM
+trap 'quit_app; restore_mode' EXIT
+trap 'exit 1' INT TERM
 evl "$DL" "__auto.setLargeOpenMode('view')" >/dev/null
 e2e_wait_setting large_open_mode "view"
 evl "$DL" "__auto.openTab('$WORK/big.json')" >/dev/null

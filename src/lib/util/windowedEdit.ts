@@ -1,5 +1,22 @@
 // Copyright © 2026 Lonshaus
 // SPDX-License-Identifier: GPL-3.0-only
+import {
+  EditorState,
+  Transaction,
+  type Extension,
+  type Text,
+} from '@codemirror/state';
+import { devTrace } from '../dev/devTrace';
+import { offscreenMove } from '../editor/offscreenArrow';
+import { capturedInput, outsideInputAction } from './imeCapture';
+import {
+  blockedWhileGlobal,
+  globalOpPath,
+  isNativeSelectAll,
+  selectAllTarget,
+  type LineSelection,
+  type SelectAllMode,
+} from './windowSelection';
 /** Pure helpers for the sliding-window editor: mapping a CodeMirror transaction's
  *  changes to the Rust core's global byte edits, and computing which line range a
  *  window should cover. Kept free of CodeMirror/Tauri so they unit-test in
@@ -17,6 +34,9 @@ export const MARGIN_LINES = 500;
  *  window's top/bottom, the next window is loaded. Comfortably larger than a
  *  viewport so the swap completes before the user scrolls past the loaded text. */
 export const SWAP_THRESHOLD_LINES = 300;
+/** A swap leaves the viewport this many lines clear of the threshold behind it,
+ *  so the next scroll event cannot swap straight back. */
+export const SWAP_SLACK_LINES = 50;
 
 /** Edits made within this many milliseconds of the previous one coalesce into the
  *  same undo group (when the edit kind is unchanged), matching the typical
@@ -40,7 +60,14 @@ const BREAK_RE = /\r\n|\n|\r/g;
 export function scanBreaks(raw: string): LineBreak[] {
   return (raw.match(BREAK_RE) ?? []) as LineBreak[];
 }
-
+/** A scan slower than this many milliseconds is logged (DEV only). */
+const SLOW_SCAN_MS = 50;
+function traceSlow(name: string, since: number, length: number): void {
+  const ms = performance.now() - since;
+  if (ms > SLOW_SCAN_MS) {
+    devTrace(`${name} took ${Math.round(ms)} ms, doc.length=${length}`);
+  }
+}
 function countLf(doc: string, from: number, to: number): number {
   let n = 0;
   let i = doc.indexOf('\n', from);
@@ -57,6 +84,7 @@ export function charToByte(
   breaks: readonly string[],
   pos: number,
 ): number {
+  const started = performance.now();
   const lines = countLf(doc, 0, pos);
   let extra = 0;
   for (let k = 0; k < lines; k += 1) {
@@ -64,7 +92,9 @@ export function charToByte(
       extra += 1;
     }
   }
-  return byteLength(doc.slice(0, pos)) + extra;
+  const bytes = byteLength(doc.slice(0, pos)) + extra;
+  traceSlow('charToByte', started, doc.length);
+  return bytes;
 }
 /** Number of UTF-16 code units (a CodeMirror position) before byte offset
  *  `byteOffset` of the raw window whose normalized text is `doc` and whose line
@@ -75,6 +105,16 @@ export function charToByte(
  *  ponytail: re-encodes each code point (O(window)) but runs only per undo/redo,
  *  not per keystroke; add a per-line byte index if it ever shows on the profile. */
 export function byteToChar(
+  doc: string,
+  breaks: readonly string[],
+  byteOffset: number,
+): number | null {
+  const started = performance.now();
+  const chars = scanByteToChar(doc, breaks, byteOffset);
+  traceSlow('byteToChar', started, doc.length);
+  return chars;
+}
+function scanByteToChar(
   doc: string,
   breaks: readonly string[],
   byteOffset: number,
@@ -145,6 +185,223 @@ export function replaceBreaks(
     ...inserted,
     ...breaks.slice(before + removed),
   ];
+}
+/** `docBefore` with `changes` (ascending, non-overlapping) applied. */
+function applyChangesToDoc(
+  docBefore: string,
+  changes: readonly RawChange[],
+): string {
+  let out = '';
+  let prev = 0;
+  for (const c of changes) {
+    out += docBefore.slice(prev, c.fromA) + c.inserted;
+    prev = c.toA;
+  }
+  return out + docBefore.slice(prev);
+}
+/** Document indexes of every `\n` in `doc`: where the window's breaks sit. */
+function lfPositions(doc: string): number[] {
+  const out: number[] = [];
+  for (let i = doc.indexOf('\n'); i !== -1; i = doc.indexOf('\n', i + 1)) {
+    out.push(i);
+  }
+  return out;
+}
+/** For each break after `changes`, the index it had before them, or -1 for a
+ *  break the changes inserted. */
+function breakOrigins(
+  docBefore: string,
+  countBefore: number,
+  changes: readonly RawChange[],
+): number[] {
+  const out: number[] = [];
+  let next = 0;
+  let prevTo = 0;
+  for (const c of changes) {
+    const keep = countLf(docBefore, prevTo, c.fromA);
+    for (let k = 0; k < keep; k += 1) {
+      out.push(next + k);
+    }
+    next += keep + countLf(docBefore, c.fromA, c.toA);
+    for (let n = countLf(c.inserted, 0, c.inserted.length); n > 0; n -= 1) {
+      out.push(-1);
+    }
+    prevTo = c.toA;
+  }
+  for (let k = next; k < countBefore; k += 1) {
+    out.push(k);
+  }
+  return out;
+}
+/** One lone `\r` an edit would join to a `\n`, to be rewritten to the insert
+ *  separator in the same batch. `at` is its byte offset in the window before the
+ *  change; `whereBefore` is `'before'` (and `at` is -1) for the byte that sits
+ *  just ahead of the window. */
+export interface JunctionRewrite {
+  at: number;
+  whereBefore: 'inside' | 'before';
+}
+/** What `junctionRewrites` found: the rewrites, the window's breaks after the
+ *  change and the rewrites, how far the rewrite of the byte before the window
+ *  moves the window start, and whether that byte is still a lone `\r`. */
+export interface JunctionResult {
+  rewrites: JunctionRewrite[];
+  breaksAfter: string[];
+  startShift: number;
+  prevLoneCr: boolean;
+}
+/** The rewrites a change set needs so that no lone `\r` break becomes the first
+ *  half of a `\r\n`. After the change, a lone-`\r` break that is directly
+ *  followed by a break written as a bare `\n` (inside the window; or the byte
+ *  just before the window, `prevLoneCr`, with the window now opening on such a
+ *  break; or the window's last break with `nextIsLf` for the byte after it)
+ *  would be read back as one CRLF, one line short. Inserted text never holds a
+ *  lone `\r`, so every such `\r` is one the window already had. For an LF
+ *  separator the rewrite also takes the run of `\r` bytes before it (each would
+ *  meet the `\n` in turn): the run inside the window is set in `breaksAfter`, and
+ *  one that reaches the window start clears `prevLoneCr`, since the core
+ *  rewrites the bytes before the window too. */
+export function junctionRewrites(
+  docBefore: string,
+  breaksBefore: readonly string[],
+  changes: readonly RawChange[],
+  insertSep: string,
+  prevLoneCr: boolean,
+  nextIsLf: boolean,
+): JunctionResult {
+  const breaksAfter = applyBreaks(docBefore, breaksBefore, changes, insertSep);
+  if (!prevLoneCr && !breaksBefore.includes('\r')) {
+    return { rewrites: [], breaksAfter, startShift: 0, prevLoneCr };
+  }
+  const docAfter = applyChangesToDoc(docBefore, changes);
+  const lf = lfPositions(docAfter);
+  const rewrites: JunctionRewrite[] = [];
+  const found: number[] = [];
+  let startShift = 0;
+  let stillPrevCr = prevLoneCr;
+  if (prevLoneCr) {
+    const opensOnLf =
+      docAfter.length === 0
+        ? nextIsLf
+        : docAfter.charCodeAt(0) === 10 && breaksAfter[0] === '\n';
+    if (opensOnLf) {
+      rewrites.push({ at: -1, whereBefore: 'before' });
+      stillPrevCr = false;
+      startShift = insertSep.length - 1;
+    }
+  }
+  for (let i = 0; i < breaksAfter.length; i += 1) {
+    if (breaksAfter[i] !== '\r') {
+      continue;
+    }
+    const at = lf[i] as number;
+    const joins =
+      i + 1 < breaksAfter.length
+        ? lf[i + 1] === at + 1 && breaksAfter[i + 1] === '\n'
+        : at === docAfter.length - 1 && nextIsLf;
+    if (joins) {
+      found.push(i);
+    }
+  }
+  const out = [...breaksAfter];
+  if (found.length > 0) {
+    const origins = breakOrigins(docBefore, breaksBefore.length, changes);
+    const lfBefore = lfPositions(docBefore);
+    for (const i of found) {
+      const k = origins[i] as number;
+      rewrites.push({
+        at: charToByte(docBefore, breaksBefore, lfBefore[k] as number),
+        whereBefore: 'inside',
+      });
+      if (insertSep !== '\n') {
+        out[i] = insertSep;
+        continue;
+      }
+      let j = i;
+      out[j] = '\n';
+      while (
+        j > 0 &&
+        breaksAfter[j - 1] === '\r' &&
+        (lf[j - 1] as number) === (lf[j] as number) - 1
+      ) {
+        j -= 1;
+        out[j] = '\n';
+      }
+      if (j === 0 && lf[0] === 0 && stillPrevCr) {
+        stillPrevCr = false;
+      }
+    }
+  }
+  return { rewrites, breaksAfter: out, startShift, prevLoneCr: stillPrevCr };
+}
+/** A window's breaks after the core rewrote the bytes `[from, to)` (offsets in
+ *  the window's raw text) to the break byte `byte`: the break list changes,
+ *  the document text does not. */
+export function fillBreaks(
+  doc: string,
+  breaks: readonly string[],
+  from: number,
+  to: number,
+  byte: string,
+): string[] {
+  const out = [...breaks];
+  let bytes = 0;
+  let k = 0;
+  for (const ch of doc) {
+    if (bytes >= to) {
+      break;
+    }
+    if (ch === '\n') {
+      if (bytes >= from) {
+        out[k] = byte;
+      }
+      bytes += (breaks[k] ?? '\n').length;
+      k += 1;
+    } else {
+      bytes += byteLength(ch);
+    }
+  }
+  return out;
+}
+/** An edit of the core's undo or redo result, as `ByteEdit` without the flags
+ *  only a forward apply sends. */
+export type UndoEdit = Pick<ByteEdit, 'start' | 'end' | 'text'> &
+  Pick<ByteEdit, 'keep_start' | 'fill' | 'len'>;
+/** How one undo/redo edit lands in a window holding `doc` with `breaks` that
+ *  starts at byte `windowStart`: the document change to dispatch (none for a
+ *  `fill` edit, which only turns break bytes into other break bytes) and the
+ *  break list after it. Null when a boundary falls inside a `\r\n`, which has
+ *  no document position. */
+export function mirrorStep(
+  doc: string,
+  breaks: readonly string[],
+  windowStart: number,
+  edit: UndoEdit,
+): {
+  change: { from: number; to: number; insert: string } | null;
+  breaks: string[];
+} | null {
+  if ((edit.fill ?? null) !== null) {
+    return {
+      change: null,
+      breaks: fillBreaks(
+        doc,
+        breaks,
+        edit.start - windowStart,
+        edit.end - windowStart,
+        edit.fill as string,
+      ),
+    };
+  }
+  const from = byteToChar(doc, breaks, edit.start - windowStart);
+  const to = byteToChar(doc, breaks, edit.end - windowStart);
+  if (from === null || to === null) {
+    return null;
+  }
+  return {
+    change: { from, to, insert: edit.text },
+    breaks: replaceBreaks(doc, breaks, from, to, scanBreaks(edit.text)),
+  };
 }
 /** The line-ending style of a raw text sample: `lineEnding` for display and
  *  `insert` (the separator typed line breaks get) both follow the majority of
@@ -225,11 +482,20 @@ export interface RawChange {
 }
 
 /** A global-byte edit as the Rust `windowed_apply` expects: replace the source
- *  bytes `[start, end)` with `text` (UTF-8). */
+ *  bytes `[start, end)` with `text` (UTF-8). `keep_start` marks the rewrite of a
+ *  lone `\r` an edit would join to a `\n` (an offset at `start` stays there) and
+ *  `cascade` asks the core to rewrite the run of `\r` before it too. `fill`
+ *  (undo and redo results only) says the range's bytes became that break byte,
+ *  with `text` empty. `len` (undo and redo results only) is the byte length of
+ *  text put back from a spill file, with `text` empty. */
 export interface ByteEdit {
   start: number;
   end: number;
   text: string;
+  keep_start?: boolean;
+  cascade?: boolean;
+  fill?: string | null;
+  len?: number;
 }
 
 /** Convert one transaction's changes into global byte edits. `docBefore` is the
@@ -256,7 +522,43 @@ export function mapChangesToEdits(
       insertSep === '\n' ? c.inserted : c.inserted.replaceAll('\n', insertSep),
   }));
 }
-
+/** A global byte offset after one edit: unchanged before the edit's start, moved
+ *  by the length change at or after its end, and put after the inserted text when
+ *  it lay inside the replaced range. A `fill` edit and a same-length `keep_start`
+ *  edit only change break bytes, so every offset stays; any `keep_start` edit
+ *  keeps an offset at its start there. */
+export function mapOffset(offset: number, edit: ByteEdit): number {
+  if (offset < edit.start || (edit.fill ?? null) !== null) {
+    return offset;
+  }
+  const inserted = edit.len ?? byteLength(edit.text);
+  if (
+    edit.keep_start === true &&
+    (offset === edit.start || inserted === edit.end - edit.start)
+  ) {
+    return offset;
+  }
+  if (offset >= edit.end) {
+    return offset + inserted - (edit.end - edit.start);
+  }
+  return edit.start + inserted;
+}
+/** A global byte offset after edits applied one after another, each in the
+ *  frame the one before it left (the order the core applies them in). */
+export function mapThrough(offset: number, edits: readonly ByteEdit[]): number {
+  let mapped = offset;
+  for (const edit of edits) {
+    mapped = mapOffset(mapped, edit);
+  }
+  return mapped;
+}
+/** The edits of one forward apply in the order the core applies them: from the
+ *  highest `(start, end)` down, so every edit still sits where its coordinates
+ *  say. Of an insertion and a rewrite starting at the same byte, the rewrite
+ *  goes first and the inserted text lands before it. */
+export function inApplyOrder(edits: readonly ByteEdit[]): ByteEdit[] {
+  return [...edits].sort((a, b) => b.start - a.start || b.end - a.end);
+}
 /** The line range `[startLine, endLine)` (0-based, end exclusive) a window should
  *  cover to hold `targetLine`. The window is `windowLines` tall when the file
  *  allows, anchored `marginLines` above the target, and clamped so it never runs
@@ -271,6 +573,36 @@ export function nextWindow(
   const startLine = Math.min(Math.max(0, targetLine - marginLines), maxStart);
   const endLine = Math.min(totalLines, startLine + windowLines);
   return { startLine, endLine };
+}
+/** The target line to swap the window to (for `nextWindow`) when the viewport,
+ *  global lines `top` to `bottom`, nears the loaded window's start (checked
+ *  first) or end; null when it does not. Either way the new window holds the
+ *  viewport `SWAP_SLACK_LINES` clear of the threshold behind it, leaving the
+ *  same room ahead in both directions. A viewport too tall for that never
+ *  swaps. */
+export function swapTarget(
+  top: number,
+  bottom: number,
+  windowStartLine: number,
+  windowEndLine: number,
+  totalLines: number,
+): number | null {
+  const clear = SWAP_THRESHOLD_LINES + SWAP_SLACK_LINES;
+  if (bottom - top >= WINDOW_LINES - SWAP_THRESHOLD_LINES - clear) {
+    return null;
+  }
+  if (windowStartLine > 0 && top - windowStartLine < SWAP_THRESHOLD_LINES) {
+    // The window ends `clear` lines below the viewport.
+    return bottom + clear - WINDOW_LINES + MARGIN_LINES;
+  }
+  if (
+    windowEndLine < totalLines &&
+    windowEndLine - bottom < SWAP_THRESHOLD_LINES
+  ) {
+    // The window starts `clear` lines above the viewport.
+    return top - clear + MARGIN_LINES;
+  }
+  return null;
 }
 /** The document span from the first to the last line block lying fully inside
  *  the viewport (1 px tolerance). With no fully visible block, the first block
@@ -299,4 +631,230 @@ export function rejectDuringSwap(
   userEvent: string | undefined,
 ): boolean {
   return swapping && docChanged && userEvent !== undefined;
+}
+/** Whether a DOM-derived selection sync must be dropped during a window swap.
+ *  A composition captured in the swap back to the caret keeps its syncs:
+ *  dropping one makes CodeMirror write its own selection back into the DOM,
+ *  and WebKit ends the composition. */
+export function dropSwapSelect(
+  swapping: boolean,
+  docChanged: boolean,
+  userEvent: string | undefined,
+  composingKept: boolean,
+): boolean {
+  return swapping && !docChanged && userEvent === 'select' && !composingKept;
+}
+/** What the filters for selections synced from the DOM read from the editor. */
+export interface SelectionFilterDeps {
+  swapping: () => boolean;
+  /** A composition captured in the swap back to the caret keeps its syncs. */
+  keep: () => boolean;
+  mode: () => SelectAllMode;
+  /** A key command is being handled: its selections are no native select-all. */
+  keyActive: () => boolean;
+  /** A key command is being replayed from the queue. */
+  replayingKey: () => boolean;
+  /** The rendered range, or null without a view. */
+  viewport: () => { from: number; to: number } | null;
+  /** Ask for a Select All over the file. */
+  request: () => void;
+}
+/** The transaction filters for DOM-derived selections, in registration order.
+ *  CodeMirror runs the last registered first, so the one that notes a native
+ *  select-all sees the transaction before the swap's filter throws it away
+ *  (during a swap the DOM is no selection source, and the select-all would be
+ *  lost). It only asks for the Select All; the transaction passes unchanged. */
+export function selectionFilters(deps: SelectionFilterDeps): Extension[] {
+  return [
+    EditorState.transactionFilter.of((tr) =>
+      dropSwapSelect(
+        deps.swapping(),
+        tr.docChanged,
+        tr.annotation(Transaction.userEvent),
+        deps.keep(),
+      )
+        ? []
+        : tr,
+    ),
+    EditorState.transactionFilter.of((tr) => {
+      const viewport = deps.viewport();
+      const selection = tr.selection;
+      if (
+        viewport !== null &&
+        selection !== undefined &&
+        selectAllTarget(deps.mode(), 'native') === 'file' &&
+        !selection.eq(tr.startState.selection) &&
+        isNativeSelectAll({
+          docChanged: tr.docChanged,
+          isSelect: tr.isUserEvent('select'),
+          isPointer: tr.isUserEvent('select.pointer'),
+          keyActive:
+            deps.keyActive() ||
+            deps.replayingKey() ||
+            tr.annotation(offscreenMove) === true,
+          from: selection.main.from,
+          to: selection.main.to,
+          viewportFrom: viewport.from,
+          viewportTo: viewport.to,
+        })
+      ) {
+        deps.request();
+      }
+      return tr;
+    }),
+  ];
+}
+/** What the filters that route input around the loaded window read from the
+ *  editor. `E` is the keydown the component keeps. */
+export interface GlobalFilterDeps<E> {
+  swapping: () => boolean;
+  locked: () => boolean;
+  holds: () => number;
+  /** A composition is being captured. */
+  capturing: () => boolean;
+  /** An input method key came and no composition has started. */
+  pendingIme: () => boolean;
+  /** A capture ended a moment ago. */
+  late: () => boolean;
+  replayPending: () => boolean;
+  draining: () => boolean;
+  /** A key command is being handled: its selections are no pointer's. */
+  keyActive: () => boolean;
+  /** The keydown being handled, if any. */
+  keydown: () => E | undefined;
+  globalSel: () => LineSelection;
+  /** Whether the input acts outside the loaded window `doc` (see
+   *  `inputOutside`). */
+  outside: (doc: Text) => boolean;
+  /** Select All and the transactions that undo a capture are never refused. */
+  exempt: (tr: Transaction) => boolean;
+  captureMark: (tr: Transaction) => boolean;
+  /** The keydown is a Ctrl or Meta shortcut. */
+  chord: (e: E) => boolean;
+  /** The keydown matches a key binding of the editor. */
+  bound: (e: E) => boolean;
+  /** Queue text no keydown announced; never swaps the window in the filter. */
+  queueText: (text: string) => void;
+  /** Runs `run` after the filter, never inside it. */
+  defer: (run: () => void) => void;
+  queueKey: (e: E) => void;
+}
+
+function insertedText(tr: Transaction): string {
+  let text = '';
+  tr.changes.iterChanges((_fromA, _toA, _fromB, _toB, inserted) => {
+    text += inserted.toString();
+  });
+  return text;
+}
+/** The transaction filters that keep an edit or a key command off the window
+ *  edge while the selection is outside the window or too large for one, in
+ *  registration order. CodeMirror runs the last registered first, so they run
+ *  as: the outside-window rejection (which queues or refuses what it takes),
+ *  the late composition text, the refusal of a user edit under a selection too
+ *  large for one window, and the swap's refusal of user edits. The refusal
+ *  under a large selection only sees what the first two let pass, and lets a
+ *  captured composition through. */
+export function globalFilters<E>(deps: GlobalFilterDeps<E>): Extension[] {
+  const captured = (tr: Transaction): boolean =>
+    capturedInput(deps.capturing(), tr.annotation(Transaction.userEvent));
+  return [
+    EditorState.transactionFilter.of((tr) =>
+      rejectDuringSwap(
+        (deps.swapping() && !captured(tr)) || deps.holds() > 0,
+        tr.docChanged,
+        tr.annotation(Transaction.userEvent),
+      )
+        ? []
+        : tr,
+    ),
+    EditorState.transactionFilter.of((tr) =>
+      blockedWhileGlobal(
+        {
+          docChanged: tr.docChanged,
+          userEvent: tr.annotation(Transaction.userEvent),
+        },
+        deps.globalSel(),
+      ) && !captured(tr)
+        ? []
+        : tr,
+    ),
+    // The last text of a composition that just ended may arrive after its
+    // capture is gone: it is queued, wherever the swap has got to.
+    EditorState.transactionFilter.of((tr) => {
+      if (
+        deps.capturing() ||
+        !deps.replayPending() ||
+        deps.draining() ||
+        !tr.docChanged ||
+        deps.captureMark(tr) ||
+        !deps.late()
+      ) {
+        return tr;
+      }
+      const action = outsideInputAction({
+        capturing: false,
+        pending: false,
+        late: true,
+        userEvent: tr.annotation(Transaction.userEvent),
+      });
+      if (action !== 'queue') {
+        return tr;
+      }
+      const text = insertedText(tr);
+      if (text !== '') {
+        deps.defer(() => deps.queueText(text));
+      }
+      return [];
+    }),
+    EditorState.transactionFilter.of((tr) => {
+      if (
+        deps.swapping() ||
+        deps.locked() ||
+        deps.exempt(tr) ||
+        !deps.outside(tr.startState.doc)
+      ) {
+        return tr;
+      }
+      const userEvent = tr.annotation(Transaction.userEvent);
+      const edit = tr.docChanged && userEvent !== undefined;
+      const keySelect =
+        deps.keyActive() &&
+        !tr.docChanged &&
+        tr.selection !== undefined &&
+        !tr.isUserEvent('select.pointer');
+      if (!edit && !keySelect) {
+        return tr;
+      }
+      const action = edit
+        ? outsideInputAction({
+            capturing: deps.capturing(),
+            pending: deps.pendingIme(),
+            late: deps.late(),
+            userEvent,
+          })
+        : 'reject';
+      if (action === 'capture') {
+        return tr;
+      }
+      if (action === 'queue') {
+        // Text no keydown announced, such as an AltGr character or the text
+        // of an input method that did not compose.
+        const text = insertedText(tr);
+        if (text !== '') {
+          deps.defer(() => deps.queueText(text));
+        }
+        return [];
+      }
+      const e = deps.keydown();
+      if (
+        e !== undefined &&
+        ((!deps.replayPending() && deps.chord(e)) ||
+          (globalOpPath(deps.globalSel()) && deps.bound(e)))
+      ) {
+        deps.queueKey(e);
+      }
+      return [];
+    }),
+  ];
 }

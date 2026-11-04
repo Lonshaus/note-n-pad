@@ -25,7 +25,6 @@ const HOOK_FILE = path.join(
 );
 
 const conf = JSON.parse(fs.readFileSync(CONFIG_FILE, 'utf8'));
-
 /** The lines between `!macro <name>` and its `!macroend`. */
 function hookBody(source, hook) {
   const start = source.indexOf(`!macro ${hook}\n`);
@@ -48,7 +47,6 @@ describe('uninstall-cleanup.nsh', () => {
     ].map((m) => m[1]);
     expect(covered).toEqual(extensionPairs(conf).map(([ext]) => ext));
   });
-
   // Without these the app is absent from Windows' Default apps list, and the
   // in-app shortcut to its page has nothing to open.
   it('registers the app capabilities, covering every declared extension', () => {
@@ -89,6 +87,17 @@ describe('uninstall-cleanup.nsh', () => {
       `DeleteRegKey /ifempty HKCU "Software\\${conf.productName}"`,
     );
   });
+  // A running helper keeps its own file locked, so an update or an uninstall
+  // has to make it let go first.
+  it.each(['NSIS_HOOK_PREINSTALL', 'NSIS_HOOK_PREUNINSTALL'])(
+    'releases the clipboard helper in %s when it is installed',
+    (hook) => {
+      const body = hookBody(fs.readFileSync(HOOK_FILE, 'utf8'), hook);
+      expect(body).toContain('${If} ${FileExists} "$INSTDIR\\cliphelper.exe"');
+      expect(body).toContain(`ExecWait '"$INSTDIR\\cliphelper.exe" release'`);
+      expect(buildHook(conf)).toContain(`!macro ${hook}\n`);
+    },
+  );
 
   it('is wired into the bundler', () => {
     expect(conf.bundle.windows?.nsis?.installerHooks).toBe(

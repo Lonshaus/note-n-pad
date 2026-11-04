@@ -14,12 +14,14 @@ export function isCleanOldRange(note: NoteSnapshot): boolean {
 /** Whether restoring `note` opens an ordinary tab that the stored record does
  *  not describe, so the record is written again right away: an old range
  *  record anywhere, and in the trial a record of the large-file viewer or of
- *  windowed editing, which the trial has none of. */
+ *  windowed editing (plain or in another encoding), which the trial has none of. */
 export function needsRewrite(note: NoteSnapshot, trial: boolean): boolean {
   return (
     isOldRangeRecord(note) ||
     (trial &&
       note.kind === 'document' &&
-      (note.large !== null || note.windowed_index !== null))
+      (note.large !== null ||
+        note.windowed_index !== null ||
+        note.windowed_encoding !== null))
   );
 }

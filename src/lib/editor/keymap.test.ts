@@ -13,6 +13,7 @@ import {
   cursorLineStart,
   defaultKeymap,
   historyKeymap,
+  selectAll,
   selectLine,
   selectParentSyntax,
   undoSelection,
@@ -288,6 +289,18 @@ describe('buildKeymap', () => {
     expect(find(gotoLine).preventDefault).toBeUndefined();
   });
 
+  it('leaves CodeMirror Select All to the document and sticky editors only', () => {
+    expect(
+      everyBinding('windowed', 'windows').some((b) => b.run === selectAll),
+    ).toBe(false);
+    for (const profile of ['document', 'sticky'] as const) {
+      expect(
+        everyBinding(profile, 'windows').some((b) => b.run === selectAll),
+        profile,
+      ).toBe(true);
+    }
+  });
+
   it('leaves every other stock binding exactly as it was', () => {
     const rebindable = new Set(REBINDABLE.map((c) => c.run));
     for (const profile of PROFILES) {
@@ -306,6 +319,10 @@ describe('buildKeymap', () => {
           // The one deliberate change: see the Emacs test below.
           const dropsShift =
             stock.run === cursorLineStart && stock.mac === 'Ctrl-a';
+          // The windowed editor binds its own Select All instead.
+          if (profile === 'windowed' && stock.run === selectAll) {
+            continue;
+          }
           expect(
             built.some(
               (b) =>

@@ -153,9 +153,9 @@ mod tests {
     assert!(parse(json).is_err());
   }
 
-  /// The real committed resource must parse and validate without any test-only massaging.
+  /// The real generated resource must parse and validate without any test-only massaging.
   #[test]
-  fn real_committed_licenses_json_parses_and_validates() {
+  fn real_licenses_json_parses_and_validates() {
     let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("resources/licenses.json");
     let index = load_from(&path).unwrap();
     assert!(!index.packages.is_empty());

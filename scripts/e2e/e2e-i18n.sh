@@ -157,16 +157,9 @@ echo "=== fixtures ==="
 rm -rf "$WORK"
 mkdir -p "$WORK"
 printf 'hello\nworld\n' >"$WORK/note.txt"
-
-launch
-open_doc
-
-# Pin/restore the UI language: capture the user's real preference so an
-# interrupt or normal exit restores it (and kills the app) instead of leaving
-# settings.json flipped. The trap looks the doc label up live so it works after
-# the restart below reassigns DL.
-ORIG_LANG=$(e2e_read "$DL" "String(__auto.getLanguage())")
-echo "original language: $ORIG_LANG"
+# Restore the user's UI language and kill the app on interrupt or normal exit
+# instead of leaving settings.json flipped. The trap looks the doc label up live
+# so it works after the restart below reassigns DL.
 restore_lang() {
   trap '' INT TERM
   local dl
@@ -183,7 +176,15 @@ restore_lang() {
   fi
   e2e_kill_owned_ports
 }
-trap restore_lang EXIT INT TERM
+trap restore_lang EXIT
+trap 'exit 1' INT TERM
+
+launch
+open_doc
+
+# Pin the UI language: capture the user's real preference for the trap to restore.
+ORIG_LANG=$(e2e_read "$DL" "String(__auto.getLanguage())")
+echo "original language: $ORIG_LANG"
 
 echo "=== live switch in the document window ==="
 evl "$DL" "__auto.setLanguage('zh-TW')" >/dev/null

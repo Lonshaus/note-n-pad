@@ -8,17 +8,29 @@ import { toggleTabFocusMode } from '@codemirror/commands';
 import { buildKeymap } from '../editor/keymap';
 import {
   altGrText,
+  blockedWhilePending,
   chordReplaysAtEdge,
   commandChain,
   copiedRange,
   coreKeyBindings,
   decideKey,
   EDGE_COMMANDS,
+  inputWhileSelectAll,
+  isSelectAllKey,
   linewiseAfterCopy,
+  drainStep,
   matchesBinding,
+  needsCaret,
+  parkedUndoKey,
   pasteSpec,
+  pushSelect,
+  replayStartAction,
+  resumeAction,
   replayWanted,
+  settledState,
+  swapEndAction,
   type AltGrTable,
+  type ReplayItemKind,
   type KeyLayers,
   type ReplayState,
 } from './replayKeys';
@@ -59,6 +71,7 @@ const state = (over: Partial<ReplayState> = {}): ReplayState => ({
   swapping: false,
   replayPending: false,
   outside: false,
+  globalPath: false,
   ...over,
 });
 
@@ -480,6 +493,20 @@ describe('decideKey', () => {
     });
   });
 
+  it('queues Option plus a character as text on macOS only', () => {
+    const e = ev('l', { code: 'KeyL', altKey: true });
+    const outside = { outside: true };
+    expect(decide(e, outside, { os: 'macos', layers: mac })).toEqual({
+      type: 'text',
+      text: 'l',
+    });
+    for (const os of ['windows', 'linux']) {
+      expect(decide(e, outside, { os, layers: win }), os).toEqual({
+        type: 'none',
+      });
+    }
+  });
+
   it('drops a key typed during a replace all pass', () => {
     expect(decide(ev('a'), { dropHold: true, outside: true })).toEqual({
       type: 'none',
@@ -557,6 +584,62 @@ describe('decideKey', () => {
           pending,
           { ...draining, draining: false },
         ),
+      ).toEqual({ type: 'none' });
+    });
+  });
+
+  describe('a selection too large for one window', () => {
+    const global = { outside: true, globalPath: true };
+    const mod = { os: 'macos', layers: mac };
+
+    it('queues typed characters as text and Enter, Backspace and Tab as keys', () => {
+      expect(decide(ev('x'), global, mod)).toEqual({ type: 'text', text: 'x' });
+      for (const key of ['Enter', 'Backspace', 'Tab']) {
+        expect(decide(ev(key), global, mod), key).toEqual({ type: 'key' });
+      }
+    });
+
+    it('leaves the key to another element holding focus', () => {
+      expect(
+        decide(ev('Enter'), { ...global, focusElsewhere: true }, mod),
+      ).toEqual({ type: 'none' });
+    });
+
+    it('leaves the key to a locked editor', () => {
+      expect(decide(ev('x'), { ...global, locked: true }, mod)).toEqual({
+        type: 'none',
+      });
+    });
+
+    it('drops the key during a replace all pass', () => {
+      expect(decide(ev('x'), { ...global, dropHold: true }, mod)).toEqual({
+        type: 'none',
+      });
+    });
+
+    it('queues a bound chord pressed while the replay is pending, not draining', () => {
+      const indent = ev(']', { keyCode: 221, metaKey: true });
+      expect(decide(indent, { ...global, replayPending: true }, mod)).toEqual({
+        type: 'key',
+      });
+    });
+
+    it('leaves a chord alone when the replay is not pending', () => {
+      const indent = ev(']', { keyCode: 221, metaKey: true });
+      expect(decide(indent, global, mod)).toEqual({ type: 'none' });
+    });
+
+    it('leaves a menu accelerator alone while the replay is pending', () => {
+      const save = ev('s', { keyCode: 83, metaKey: true });
+      expect(decide(save, { ...global, replayPending: true }, mod)).toEqual({
+        type: 'none',
+      });
+    });
+
+    it('keeps the old rule for a selection one window holds', () => {
+      const indent = ev(']', { keyCode: 221, metaKey: true });
+      expect(
+        decide(indent, { outside: true, replayPending: true }, mod),
       ).toEqual({ type: 'none' });
     });
   });
@@ -660,5 +743,379 @@ describe('pasteSpec', () => {
       selection: EditorSelection.single(0, 3),
     });
     expect(apply(s, pasteSpec(s, 'two', 'two'))).toBe('two\ntwo');
+  });
+  // The three cases of CodeMirror's doPaste (view index.js:4930-4961).
+  const carets = (doc: string, ...at: number[]): EditorState =>
+    EditorState.create({
+      doc,
+      extensions: EditorState.allowMultipleSelections.of(true),
+      selection: EditorSelection.create(
+        at.map((p) => EditorSelection.cursor(p)),
+      ),
+    });
+
+  it('gives each caret one line of text that has as many lines as carets', () => {
+    const s = carets('a\nb\nc', 0, 2);
+    const next = s.update(pasteSpec(s, 'X\nY', null)).state;
+    expect(next.doc.toString()).toBe('Xa\nYb\nc');
+    expect(next.selection.ranges.map((r) => r.head)).toEqual([1, 4]);
+  });
+
+  it('gives each selection one line, replacing what it held', () => {
+    const s = EditorState.create({
+      doc: 'aaa\nbbb',
+      extensions: EditorState.allowMultipleSelections.of(true),
+      selection: EditorSelection.create([
+        EditorSelection.range(0, 3),
+        EditorSelection.range(4, 7),
+      ]),
+    });
+    expect(apply(s, pasteSpec(s, '1\n2', null))).toBe('1\n2');
+  });
+
+  it('puts one line above each caret line when the remembered text has as many lines as carets', () => {
+    const s = carets('a\nb\nc', 0, 2);
+    const next = s.update(pasteSpec(s, 'X\nY', 'X\nY')).state;
+    expect(next.doc.toString()).toBe('X\na\nY\nb\nc');
+  });
+
+  it('repeats the whole text above each caret line when the line count differs', () => {
+    const s = carets('a\nb\nc', 0, 2, 4);
+    const next = s.update(pasteSpec(s, 'X\nY', 'X\nY')).state;
+    expect(next.doc.toString()).toBe('X\nY\na\nX\nY\nb\nX\nY\nc');
+  });
+
+  it('replaces every selection with the whole text when the line count differs', () => {
+    const s = carets('a\nb\nc', 0, 2, 4);
+    expect(apply(s, pasteSpec(s, 'X\nY', null))).toBe('X\nYa\nX\nYb\nX\nYc');
+  });
+});
+
+describe('replayStartAction', () => {
+  const idle = {
+    gone: false,
+    locked: false,
+    swapping: false,
+    capturing: false,
+    composing: false,
+    holds: 0,
+  };
+  it('swaps back to the selection when nothing holds the view', () => {
+    expect(replayStartAction(idle)).toBe('swap');
+  });
+  it('waits for a window swap that is already running, keeping the queue', () => {
+    expect(replayStartAction({ ...idle, swapping: true })).toBe('wait');
+  });
+  it('swaps while a capture runs: the queue drains in a shadow meanwhile', () => {
+    expect(replayStartAction({ ...idle, capturing: true })).toBe('swap');
+    expect(
+      replayStartAction({ ...idle, capturing: true, composing: true }),
+    ).toBe('swap');
+  });
+  it('waits for a composition that no capture covers', () => {
+    expect(replayStartAction({ ...idle, composing: true })).toBe('wait');
+  });
+  it('waits for an undo or redo even with a capture running', () => {
+    expect(replayStartAction({ ...idle, capturing: true, holds: 1 })).toBe(
+      'wait',
+    );
+    expect(
+      replayStartAction({ ...idle, capturing: true, swapping: true }),
+    ).toBe('wait');
+  });
+  it('waits for an undo or redo', () => {
+    expect(replayStartAction({ ...idle, holds: 1 })).toBe('wait');
+  });
+  it('drops the queue when the editor is locked or gone', () => {
+    expect(replayStartAction({ ...idle, locked: true })).toBe('drop');
+    expect(replayStartAction({ ...idle, gone: true })).toBe('drop');
+    expect(replayStartAction({ ...idle, locked: true, swapping: true })).toBe(
+      'drop',
+    );
+  });
+});
+
+describe('swapEndAction', () => {
+  it('does nothing when nothing is queued', () => {
+    expect(
+      swapEndAction({
+        replayPending: false,
+        replaySwap: false,
+        capturing: false,
+      }),
+    ).toBe('none');
+  });
+  it('waits for a captured composition, whose end carries on', () => {
+    expect(
+      swapEndAction({ replayPending: true, replaySwap: true, capturing: true }),
+    ).toBe('none');
+    expect(
+      swapEndAction({
+        replayPending: true,
+        replaySwap: false,
+        capturing: true,
+      }),
+    ).toBe('none');
+  });
+  it('drains after the swap that brought the window back to the selection', () => {
+    expect(
+      swapEndAction({
+        replayPending: true,
+        replaySwap: true,
+        capturing: false,
+      }),
+    ).toBe('drain');
+  });
+  it('resumes after another swap, which may have left the selection outside', () => {
+    expect(
+      swapEndAction({
+        replayPending: true,
+        replaySwap: false,
+        capturing: false,
+      }),
+    ).toBe('resume');
+  });
+});
+
+describe('needsCaret', () => {
+  it('is true for the items that act at the caret', () => {
+    for (const kind of ['text', 'key', 'copy', 'cut'] as const) {
+      expect(needsCaret(kind)).toBe(true);
+    }
+  });
+  it('is false for a pointer selection, an undo, a redo and a slot', () => {
+    for (const kind of ['select', 'undo', 'redo', 'slot'] as const) {
+      expect(needsCaret(kind)).toBe(false);
+    }
+  });
+});
+
+describe('drainStep', () => {
+  const at = (
+    head: ReplayItemKind | null,
+    over: Partial<Parameters<typeof drainStep>[0]> = {},
+  ) =>
+    drainStep({
+      swapping: false,
+      holds: 0,
+      head,
+      headMapping: false,
+      ready: true,
+      ...over,
+    });
+  it('runs a caret item when the window holds the selection', () => {
+    for (const kind of ['text', 'key', 'copy', 'cut'] as const) {
+      expect(at(kind)).toBe('run');
+    }
+  });
+  it('stops for a swap when a caret item finds the selection outside', () => {
+    expect(at('text', { ready: false })).toBe('swap');
+    expect(at('cut', { ready: false })).toBe('swap');
+  });
+  it('runs a pointer selection, an undo and a redo wherever the window is', () => {
+    expect(at('select', { ready: false })).toBe('select');
+    expect(at('undo', { ready: false })).toBe('undo');
+    expect(at('redo', { ready: false })).toBe('undo');
+  });
+  it('waits for a pointer selection whose mapping is under way', () => {
+    expect(at('select', { headMapping: true })).toBe('map');
+  });
+  it('waits at a slot, for a swap and for an undo or redo in flight', () => {
+    expect(at('slot')).toBe('wait');
+    expect(at('text', { swapping: true })).toBe('wait');
+    expect(at('select', { holds: 1 })).toBe('wait');
+    expect(at(null, { swapping: true, ready: false })).toBe('wait');
+  });
+  it('ends with the queue empty, or swaps to reveal an outside selection', () => {
+    expect(at(null)).toBe('done');
+    expect(at(null, { ready: false })).toBe('swap');
+  });
+});
+
+describe('resumeAction', () => {
+  it('swaps when an item that needs the caret finds the selection outside', () => {
+    expect(resumeAction('text', false)).toBe('swap');
+    expect(resumeAction('key', false)).toBe('swap');
+    expect(resumeAction('text', true)).toBe('drain');
+  });
+  it('drains at once for an undo, a redo, a pointer selection and a slot', () => {
+    for (const kind of ['undo', 'redo', 'select', 'slot'] as const) {
+      expect(resumeAction(kind, false)).toBe('drain');
+    }
+  });
+  it('swaps for an empty queue only to bring an outside selection into view', () => {
+    expect(resumeAction(null, false)).toBe('swap');
+    expect(resumeAction(null, true)).toBe('drain');
+  });
+});
+
+describe('pushSelect', () => {
+  const sel = (n: number) => ({ kind: 'select', n });
+  it('replaces a pointer selection directly behind another (a drag)', () => {
+    const q: { kind: string; n?: number }[] = [{ kind: 'text' }, sel(1)];
+    pushSelect(q, sel(2));
+    expect(q).toEqual([{ kind: 'text' }, sel(2)]);
+  });
+  it('does not replace across a slot or another item', () => {
+    const q: { kind: string; n?: number }[] = [sel(1), { kind: 'slot' }];
+    pushSelect(q, sel(2));
+    expect(q).toEqual([sel(1), { kind: 'slot' }, sel(2)]);
+    pushSelect(q, sel(3));
+    expect(q).toEqual([sel(1), { kind: 'slot' }, sel(3)]);
+    q.push({ kind: 'undo' });
+    pushSelect(q, sel(4));
+    expect(q.map((i) => i.kind)).toEqual([
+      'select',
+      'slot',
+      'select',
+      'undo',
+      'select',
+    ]);
+  });
+  it('queues the first pointer selection', () => {
+    const q: { kind: string }[] = [];
+    pushSelect(q, sel(1));
+    expect(q).toHaveLength(1);
+  });
+});
+
+describe('parkedUndoKey', () => {
+  const undo: Command = () => true;
+  const redo: Command = () => true;
+  const bindings = coreKeyBindings({
+    closeBox: () => true,
+    selectVisible: () => true,
+    undo,
+    redo,
+  });
+  const key = (e: Ev, os: string) => parkedUndoKey(bindings, e, os, undo, redo);
+  it('turns Ctrl+Z and Ctrl+Shift+Z on Windows into an undo and a redo', () => {
+    expect(key(ev('z', { keyCode: 90, ctrlKey: true }), 'windows')).toBe(
+      'undo',
+    );
+    expect(
+      key(ev('Z', { keyCode: 90, ctrlKey: true, shiftKey: true }), 'windows'),
+    ).toBe('redo');
+  });
+  it('does the same for the command keys on macOS', () => {
+    expect(key(ev('z', { keyCode: 90, metaKey: true }), 'macos')).toBe('undo');
+    expect(
+      key(ev('Z', { keyCode: 90, metaKey: true, shiftKey: true }), 'macos'),
+    ).toBe('redo');
+  });
+  it('leaves Ctrl+Y and every other chord to the decision it had', () => {
+    expect(key(ev('y', { keyCode: 89, ctrlKey: true }), 'windows')).toBeNull();
+    expect(key(ev('s', { keyCode: 83, ctrlKey: true }), 'windows')).toBeNull();
+    expect(key(ev('z', { keyCode: 90 }), 'windows')).toBeNull();
+    expect(key(ev('a', { keyCode: 65, ctrlKey: true }), 'windows')).toBeNull();
+  });
+});
+
+describe('inputWhileSelectAll', () => {
+  it('drops a keydown, paste, copy and cut while a Select All waits', () => {
+    for (const kind of ['keydown', 'paste', 'copy', 'cut'] as const) {
+      expect(inputWhileSelectAll(true, kind)).toBe('drop');
+    }
+  });
+  it('lets a modifier pressed on its own pass', () => {
+    expect(inputWhileSelectAll(true, 'modifier')).toBe('pass');
+  });
+  it('lets everything pass while none waits', () => {
+    for (const kind of [
+      'keydown',
+      'modifier',
+      'paste',
+      'copy',
+      'cut',
+    ] as const) {
+      expect(inputWhileSelectAll(false, kind)).toBe('pass');
+    }
+  });
+});
+
+describe('settledState', () => {
+  const idle = {
+    queueEmpty: true,
+    replayPending: false,
+    swapping: false,
+    shadow: null,
+    holds: 0,
+    pendingApplies: 0,
+  };
+  it('is settled with nothing in flight', () => {
+    expect(settledState(idle)).toBe(true);
+  });
+  const busy: [string, Partial<Parameters<typeof settledState>[0]>][] = [
+    ['input is queued', { queueEmpty: false }],
+    ['a replay is pending', { replayPending: true }],
+    ['a swap runs', { swapping: true }],
+    ['the shadow runs', { shadow: {} }],
+    ['whole-file work holds the editor', { holds: 1 }],
+    ['an edit is on its way to the core', { pendingApplies: 1 }],
+  ];
+  for (const [name, over] of busy) {
+    it(`is not settled while ${name}`, () => {
+      expect(settledState({ ...idle, ...over })).toBe(false);
+    });
+  }
+});
+
+describe('blockedWhilePending', () => {
+  const edit = {
+    pending: true,
+    docChanged: true,
+    userEvent: 'input.type.compose',
+    replayDispatch: false,
+    replayingKey: false,
+  };
+  it('refuses a user edit while a Select All waits', () => {
+    expect(blockedWhilePending(edit)).toBe(true);
+    expect(blockedWhilePending({ ...edit, userEvent: 'input.drop' })).toBe(
+      true,
+    );
+    expect(blockedWhilePending({ ...edit, userEvent: 'input.type' })).toBe(
+      true,
+    );
+  });
+  it('lets what the replay dispatches pass', () => {
+    expect(blockedWhilePending({ ...edit, replayDispatch: true })).toBe(false);
+    expect(blockedWhilePending({ ...edit, replayingKey: true })).toBe(false);
+  });
+  it('lets a change of the selection alone pass', () => {
+    expect(blockedWhilePending({ ...edit, docChanged: false })).toBe(false);
+  });
+  it('lets a change no user action made pass', () => {
+    expect(blockedWhilePending({ ...edit, userEvent: undefined })).toBe(false);
+  });
+  it('refuses nothing while no Select All waits', () => {
+    expect(blockedWhilePending({ ...edit, pending: false })).toBe(false);
+  });
+});
+
+describe('isSelectAllKey', () => {
+  const key = ev;
+  it('is Cmd+A on macOS and Ctrl+A elsewhere', () => {
+    expect(isSelectAllKey(key('a', { metaKey: true }), 'macos')).toBe(true);
+    expect(isSelectAllKey(key('a', { ctrlKey: true }), 'windows')).toBe(true);
+    expect(isSelectAllKey(key('a', { ctrlKey: true }), 'linux')).toBe(true);
+  });
+  it('is not the other platform modifier, a plain a or another key', () => {
+    expect(isSelectAllKey(key('a', { ctrlKey: true }), 'macos')).toBe(false);
+    expect(isSelectAllKey(key('a', { metaKey: true }), 'windows')).toBe(false);
+    expect(isSelectAllKey(key('a'), 'macos')).toBe(false);
+    expect(isSelectAllKey(key('b', { metaKey: true }), 'macos')).toBe(false);
+  });
+  it('is not Cmd+Shift+A or AltGr+A', () => {
+    expect(
+      isSelectAllKey(key('a', { metaKey: true, shiftKey: true }), 'macos'),
+    ).toBe(false);
+    expect(
+      isSelectAllKey(key('a', { ctrlKey: true, altKey: true }), 'windows'),
+    ).toBe(false);
+  });
+  it('reads the key code on a layout that types no Latin a', () => {
+    expect(
+      isSelectAllKey(key('ф', { keyCode: 65, ctrlKey: true }), 'windows'),
+    ).toBe(true);
   });
 });

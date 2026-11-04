@@ -27,13 +27,13 @@ import {
   setSearchQuery,
 } from '@codemirror/search';
 import { TEXT_FIELD_ATTRS } from './textFieldAttrs';
-
+import { pasteEnv } from '../util/pasteEnv';
+import { fieldPaste } from '../util/pasteRouting';
 // Custom search/replace panel: a faithful rebuild of @codemirror/search's
 // built-in SearchPanel that adds an "in selection" checkbox. It reuses the CM
 // class names (cm-search, cm-textfield, cm-button, [name='close']) so the
 // existing app.css rules style it unchanged, and delegates every action to the
 // stock search commands so behaviour matches upstream exactly.
-
 // Captured "in selection" scope: whether the option is on, plus the range it
 // was captured over. A null range (empty capture selection) means the whole
 // document, so ticking the box with no selection never restricts anything.
@@ -41,7 +41,6 @@ export interface ScopeState {
   on: boolean;
   scope: { from: number; to: number } | null;
 }
-
 // Pure filter predicate for a match [from, to): off or a null scope never
 // restricts; otherwise the match must sit fully inside the captured range.
 export function inScope(state: ScopeState, from: number, to: number): boolean {
@@ -52,10 +51,8 @@ export function inScope(state: ScopeState, from: number, to: number): boolean {
 }
 
 const setScope = StateEffect.define<ScopeState>();
-
 // Highlights the captured scope so the user sees where search is confined.
 const scopeMark = Decoration.mark({ class: 'cm-searchScope' });
-
 // Holds the current scope and maps its range through document edits, so
 // inserts and deletions move the range with the text. Provides the scope
 // highlight decoration.
@@ -85,7 +82,6 @@ const scopeField = StateField.define<ScopeState>({
         : Decoration.none,
     ),
 });
-
 // Match filter handed to SearchQuery. Reading the scope from the live state (not
 // a capture-time closure) means every command sees the current, mapped range.
 function scopeTest(
@@ -97,7 +93,6 @@ function scopeTest(
   const s = state.field(scopeField, false);
   return s ? inScope(s, from, to) : true;
 }
-
 // Rebuild a SearchQuery from a spec, always re-attaching scopeTest. Passing the
 // same function reference keeps SearchQuery.eq() stable across rebuilds.
 function withScopeTest(spec: SearchQuery): SearchQuery {
@@ -111,7 +106,6 @@ function withScopeTest(spec: SearchQuery): SearchQuery {
     test: scopeTest,
   });
 }
-
 // Capture the scope for a given on/off state from the current main selection.
 function captureScope(view: EditorView, on: boolean): ScopeState {
   if (!on) {
@@ -120,7 +114,6 @@ function captureScope(view: EditorView, on: boolean): ScopeState {
   const sel = view.state.selection.main;
   return { on: true, scope: sel.empty ? null : { from: sel.from, to: sel.to } };
 }
-
 // Toggle "in selection": capture (or clear) the scope and refresh the query so
 // the highlight and every command pick up the new restriction immediately.
 // Shared by the panel checkbox and the DEV automation hook.
@@ -170,6 +163,8 @@ class InSelectionSearchPanel implements Panel {
     this.searchField.setAttribute('aria-label', phrase('Find'));
     this.searchField.onchange = this.commit;
     this.searchField.onkeyup = this.commit;
+    this.searchField.onpaste = (e) =>
+      void fieldPaste(e, this.searchField, pasteEnv);
     this.replaceField = input({
       value: query.replace,
       class: 'cm-textfield',
@@ -181,6 +176,8 @@ class InSelectionSearchPanel implements Panel {
     this.replaceField.setAttribute('aria-label', phrase('Replace'));
     this.replaceField.onchange = this.commit;
     this.replaceField.onkeyup = this.commit;
+    this.replaceField.onpaste = (e) =>
+      void fieldPaste(e, this.replaceField, pasteEnv);
     this.caseField = input({ type: 'checkbox', name: 'case', form: '' });
     this.caseField.checked = query.caseSensitive;
     this.caseField.onchange = this.commit;
@@ -353,7 +350,6 @@ class InSelectionSearchPanel implements Panel {
     return 80;
   }
 }
-
 // Editor extension: the scope field plus the search extension configured to use
 // the custom panel. Drop into an editor's setup in place of a bare search().
 export const searchWithInSelection: Extension = [

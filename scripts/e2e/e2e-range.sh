@@ -178,15 +178,8 @@ with open('$WORK/big.log', 'w', newline='') as f:
 PYEOF
 ORIG_SIZE=$(file_size "$WORK/big.log")
 echo "big.log bytes: $ORIG_SIZE"
-
-launch
-open_large "$WORK/big.log"
-
-# Pin the UI language so the text assertions below never depend on the host
-# system language; restore the user's real preference on exit or interrupt. The
-# trap looks the doc label up live because the restart section reassigns DL.
-ORIG_LANG=$(e2e_read "$DL" "String(__auto.getLanguage())")
-echo "original language: $ORIG_LANG"
+# Restore the user's UI language and kill the app on interrupt or normal exit.
+# The trap looks the doc label up live because the restart section reassigns DL.
 restore_lang() {
   trap '' INT TERM
   local dl
@@ -203,7 +196,16 @@ restore_lang() {
   fi
   e2e_kill_owned_ports
 }
-trap restore_lang EXIT INT TERM
+trap restore_lang EXIT
+trap 'exit 1' INT TERM
+
+launch
+open_large "$WORK/big.log"
+
+# Pin the UI language so the text assertions below never depend on the host
+# system language; the trap restores the user's real preference.
+ORIG_LANG=$(e2e_read "$DL" "String(__auto.getLanguage())")
+echo "original language: $ORIG_LANG"
 evl "$DL" "__auto.setLanguage('zh-TW')" >/dev/null
 sleep 1
 

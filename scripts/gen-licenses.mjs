@@ -7,8 +7,10 @@
 //
 //   node scripts/gen-licenses.mjs
 //
+// The output is not kept in version control: run `npm run licenses` once before
+// the first local build and again after dependency changes.
 // Requires `cargo-bundle-licenses` (cargo install cargo-bundle-licenses) and a
-// populated ~/.cargo/registry/src cache (the same one cargo build already used).
+// populated registry source cache under $CARGO_HOME (default ~/.cargo).
 import { execFileSync } from 'node:child_process';
 import crypto from 'node:crypto';
 import fs from 'node:fs';
@@ -55,9 +57,45 @@ const VENDORED_LICENSE_OVERRIDES = {
   brotli: ['LICENSE.BSD-3-Clause'],
   encoding_rs: ['LICENSE-WHATWG'],
 };
+/**
+ * How to start npm without a shell; on Windows `npm` is `npm.cmd`, which execFile cannot start.
+ * With `npm_execpath` set (under `npm run`), node runs that script.
+ * On Windows otherwise, node runs the npm-cli.js installed beside node.exe.
+ * Elsewhere `npm` is started directly.
+ */
+export function npmInvocation(env, platform, execPath) {
+  if (env.npm_execpath) {
+    return { cmd: execPath, prefixArgs: [env.npm_execpath] };
+  }
+  if (platform === 'win32') {
+    const cli = path.join(
+      path.dirname(execPath),
+      'node_modules',
+      'npm',
+      'bin',
+      'npm-cli.js',
+    );
+    if (!fs.existsSync(cli)) {
+      throw new Error(
+        `npm-cli.js not found beside ${execPath}; run \`npm run licenses\` instead`,
+      );
+    }
+    return { cmd: execPath, prefixArgs: [cli] };
+  }
+  return { cmd: 'npm', prefixArgs: [] };
+}
 
 /** Run a command and return its stdout as a string; stderr is inherited so warnings are visible. */
 function run(cmd, args, cwd) {
+  if (cmd === 'npm') {
+    const invocation = npmInvocation(
+      process.env,
+      process.platform,
+      process.execPath,
+    );
+    cmd = invocation.cmd;
+    args = [...invocation.prefixArgs, ...args];
+  }
   return execFileSync(cmd, args, {
     cwd,
     maxBuffer: 64 * 1024 * 1024,
@@ -72,8 +110,9 @@ function canonicalText(spdxId) {
 }
 
 /** Find `<name>-<version>`'s extracted source directory under the local cargo registry cache. */
-function findRegistrySrcDir(name, version) {
-  const base = path.join(os.homedir(), '.cargo', 'registry', 'src');
+export function findRegistrySrcDir(name, version) {
+  const cargoHome = process.env.CARGO_HOME || path.join(os.homedir(), '.cargo');
+  const base = path.join(cargoHome, 'registry', 'src');
   if (!fs.existsSync(base)) {
     return null;
   }
@@ -86,15 +125,18 @@ function findRegistrySrcDir(name, version) {
   return null;
 }
 
-/** Real licence text for a package in VENDORED_LICENSE_OVERRIDES, or null. */
-function vendoredOverrideText(name, version) {
+/** Real licence text for a package in VENDORED_LICENSE_OVERRIDES, or null if it has no override. Throws when the override cannot be read. */
+export function vendoredOverrideText(name, version) {
   const filenames = VENDORED_LICENSE_OVERRIDES[name];
   if (!filenames) {
     return null;
   }
   const dir = findRegistrySrcDir(name, version);
   if (!dir) {
-    return null;
+    throw new Error(
+      `source folder of ${name}@${version} not found in the cargo registry cache; ` +
+        'run `cargo fetch` in src-tauri first',
+    );
   }
   for (const filename of filenames) {
     const file = path.join(dir, filename);
@@ -102,7 +144,9 @@ function vendoredOverrideText(name, version) {
       return fs.readFileSync(file, 'utf8');
     }
   }
-  return null;
+  throw new Error(
+    `none of ${filenames.join(', ')} found in ${dir} for ${name}@${version}`,
+  );
 }
 
 /** The union of `name@version` pairs reachable via normal (non-dev, non-build) deps for every desktop target. */
@@ -393,11 +437,8 @@ function buildTextsAndIndices(sortedPackages) {
 }
 
 /**
- * SHA-256 of the two dependency lockfiles, stamped into the output so a stale
- * licenses.json can be detected without regenerating it (which needs
- * cargo-bundle-licenses and a populated registry cache). Every dependency
- * change moves at least one of these two files, so a mismatch means the
- * generator has not been re-run since. See scripts/gen-licenses.test.mjs.
+ * SHA-256 of the two dependency lockfiles, stamped into the output as `inputs`
+ * to record which dependency tree the index was generated from.
  */
 export function lockfileDigests() {
   const digest = (file) =>
@@ -432,8 +473,8 @@ function main() {
   );
 }
 
-// Only generate when run as a script. The freshness test imports this module
-// for `lockfileDigests`, and importing it must not rewrite the output file.
+// Only generate when run as a script. The tests import this module, and
+// importing it must not rewrite the output file.
 if (import.meta.url === pathToFileURL(process.argv[1]).href) {
   main();
 }

@@ -58,6 +58,7 @@
         openIds={OPEN_IDS}
         reloadSeq={0}
         reloadTarget=""
+        convertible={false}
         {onchange}
         onselection={() => {}}
         {onview}

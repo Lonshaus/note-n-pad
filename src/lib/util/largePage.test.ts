@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: GPL-3.0-only
 
 import { describe, expect, it } from 'vitest';
-import { readPageLines, type PageSource } from './largePage';
+import { readPageLines, splitLines, type PageSource } from './largePage';
 
 const LOAD_PAGE = 400;
 /** A file of `total` short lines, "L<n>\n" each, read through the same two
@@ -55,6 +55,44 @@ describe('readPageLines', () => {
     expect(await readPageLines(0, LOAD_PAGE, source)).toBeNull();
   });
 
+  describe('line breaks', () => {
+    const readOf = (
+      text: string,
+      eof: boolean,
+      pageLines = LOAD_PAGE,
+    ): Promise<string[] | null> =>
+      readPageLines(0, pageLines, {
+        lineToOffset: async () => 0,
+        readText: async () => ({ text, eof }),
+      });
+
+    it('splits at LF, CRLF and a lone CR', async () => {
+      expect(await readOf('a\nb\r\nc\rd', true)).toEqual(['a', 'b', 'c', 'd']);
+    });
+
+    it('treats a bare string as a read that reached the end', async () => {
+      const got = await readPageLines(0, LOAD_PAGE, {
+        lineToOffset: async () => 0,
+        readText: async () => 'a\r',
+      });
+      expect(got).toEqual(['a', '']);
+    });
+
+    it('ends a file on a final lone CR with an empty last line', async () => {
+      expect(await readOf('a\rb\r', true)).toEqual(['a', 'b', '']);
+    });
+
+    it('does not break at a CR that ends a read short of the end', async () => {
+      // The next read may begin with the LF of a CRLF.
+      expect(await readOf('a\rb\r', false)).toEqual(['a', 'b']);
+      expect(await readOf('a\r\r', false)).toEqual(['a', '']);
+    });
+
+    it('keeps only the lines of the page', async () => {
+      expect(await readOf('a\rb\rc\rd\r', false, 2)).toEqual(['a', 'b']);
+    });
+  });
+
   it('fails when the chunk read rejects', async () => {
     const source = fileOf(1000, {
       readText: async () => {
@@ -62,5 +100,13 @@ describe('readPageLines', () => {
       },
     });
     expect(await readPageLines(1, LOAD_PAGE, source)).toBeNull();
+  });
+});
+
+describe('splitLines', () => {
+  it('drops a CR that ends a read short of the end with its incomplete line', () => {
+    expect(splitLines('a\rb\r', false)).toEqual(['a', 'b']);
+    expect(splitLines('a\rb\r', true)).toEqual(['a', 'b', '']);
+    expect(splitLines('a\r\nb', false)).toEqual(['a', 'b']);
   });
 });

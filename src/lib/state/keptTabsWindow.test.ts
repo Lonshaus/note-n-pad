@@ -66,6 +66,8 @@ function note(over: Partial<NoteSnapshot>): NoteSnapshot {
     windowed_fp_mtime: null,
     windowed_digest: null,
     windowed_top_line: null,
+    windowed_encoding: null,
+    windowed_bom: false,
     ...over,
   };
 }
@@ -100,7 +102,6 @@ const stored = [
     range_trailing_break: null,
   }),
 ];
-
 /** Commands that touch a stored record. */
 const WRITES = ['upsert_note', 'delete_note', 'drop_closed_tabs'];
 
@@ -124,6 +125,7 @@ function backend(over: Record<string, unknown> = {}): void {
             editor_line_numbers: true,
             worker_highlight: false,
             large_open_mode: 'ask',
+            large_select_all: 'visible',
             ask_long_line_open: false,
             preview_local_resources: false,
             open_target: 'tab',
@@ -209,7 +211,6 @@ describe('opensInLargeViewer', () => {
     expect(opensInLargeViewer(10 * 1024 ** 3, true)).toBe(false);
   });
 });
-
 /** The record each `upsert_note` wrote for `id`, in order. */
 function upsertsOf(id: string): NoteSnapshot[] {
   return mockInvoke.mock.calls
@@ -306,7 +307,6 @@ describe('restoring large-file records in the trial', () => {
     expect(attempted()).not.toContain('stat_file');
   });
 });
-
 // A range is an edit box over its viewer tab now. A range tab an earlier
 // version stored restores as an untitled tab holding the edited slice, or is
 // dropped when it held nothing.
@@ -467,7 +467,6 @@ describe('opening a file over 100 MB', () => {
     );
   });
 });
-
 // A lite session can hold a large viewer or windowed session only if it was
 // opened while full. The window state does not react to `edition-changed` for
 // them: nothing closes, and every operation on them keeps going to the core.

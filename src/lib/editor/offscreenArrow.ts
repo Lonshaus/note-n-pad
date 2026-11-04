@@ -8,8 +8,13 @@
 // vertical move, so it goes by visual row (a wrapped line included). Another
 // caret that is still off-screen goes by text line instead.
 
-import { EditorSelection, type SelectionRange } from '@codemirror/state';
+import {
+  Annotation,
+  EditorSelection,
+  type SelectionRange,
+} from '@codemirror/state';
 import { EditorView, type Command, type KeyBinding } from '@codemirror/view';
+import { devTrace } from '../dev/devTrace';
 /** A text line's document offsets. */
 export interface TextLine {
   from: number;
@@ -23,6 +28,55 @@ export interface OffscreenTarget {
 /** How many measure passes the move waits for the scroll to render the main
  *  caret's line before it moves that caret by text line like the others. */
 const MAX_MEASURE_WAITS = 3;
+/** Marks the transaction of a move that ran after a measure. It runs once the
+ *  key handling is over, so nothing else says a key made it. */
+export const offscreenMove = Annotation.define<boolean>();
+interface DeferredMove {
+  count: number;
+  promise: Promise<void>;
+  settle: () => void;
+}
+const deferred = new WeakMap<EditorView, DeferredMove>();
+// The frame loops of afterMeasure still running, and the frames they have asked
+// for since the page began.
+let liveRearms = 0;
+let rearmFrames = 0;
+/** DEV/E2E: the frame loops running now and the frames asked for in all. */
+export function rearmStats(): { live: number; frames: number } {
+  return { live: liveRearms, frames: rearmFrames };
+}
+/** Resolves once every move deferred on `view` has run, or undefined when none
+ *  is waiting. */
+export function deferredMove(view: EditorView): Promise<void> | undefined {
+  return deferred.get(view)?.promise;
+}
+/** Resolve the waiting moves of a view that is going away. */
+export function settleDeferredMove(view: EditorView): void {
+  const entry = deferred.get(view);
+  deferred.delete(view);
+  entry?.settle();
+}
+/** Register a deferred move; the returned function reports it done. */
+function trackMove(view: EditorView): () => void {
+  let entry = deferred.get(view);
+  if (entry === undefined) {
+    let settle!: () => void;
+    const promise = new Promise<void>((resolve) => {
+      settle = resolve;
+    });
+    entry = { count: 0, promise, settle };
+    deferred.set(view, entry);
+  }
+  const tracked = entry;
+  tracked.count += 1;
+  return () => {
+    tracked.count -= 1;
+    if (tracked.count === 0 && deferred.get(view) === tracked) {
+      deferred.delete(view);
+      tracked.settle();
+    }
+  };
+}
 /** Where the head goes when it moves one text line. `adjacent` is the line
  *  above or below `current`, or null at the document edge, where the head goes
  *  to the edge of its own line. The column is counted in characters. The goal
@@ -143,7 +197,12 @@ function isRendered(
   return range.head >= viewport.from && range.head <= viewport.to;
 }
 
-function moveAll(view: EditorView, forward: boolean, extend: boolean): void {
+function moveAll(
+  view: EditorView,
+  forward: boolean,
+  extend: boolean,
+  late = false,
+): void {
   const { state } = view;
   const { selection } = state;
   const moved = EditorSelection.create(
@@ -156,6 +215,7 @@ function moveAll(view: EditorView, forward: boolean, extend: boolean): void {
         selection: moved,
         scrollIntoView: true,
         userEvent: 'select',
+        annotations: late ? offscreenMove.of(true) : [],
       }),
     );
   }
@@ -163,9 +223,12 @@ function moveAll(view: EditorView, forward: boolean, extend: boolean): void {
 /** Run `run` once the scroll requested so far has been measured and, with it,
  *  the main caret's line rendered. */
 function afterMeasure(view: EditorView, run: () => void, waits = 0): void {
+  let written = false;
   view.requestMeasure({
     read: () => null,
     write: () => {
+      written = true;
+      devTrace(`afterMeasure write waits=${waits}`);
       if (
         waits < MAX_MEASURE_WAITS &&
         !isRendered(view.viewport, view.state.selection.main)
@@ -177,6 +240,22 @@ function afterMeasure(view: EditorView, run: () => void, waits = 0): void {
       }
     },
   });
+  // A measure loop that restarts too often drops out with the request still
+  // queued and no frame scheduled, so ask again each frame until it has run.
+  const rearm = (): void => {
+    if (written || !view.dom.isConnected) {
+      liveRearms -= 1;
+      return;
+    }
+    rearmFrames += 1;
+    if (rearmFrames % 60 === 0) {
+      devTrace(`rearm frames=${rearmFrames} live=${liveRearms}`);
+    }
+    view.requestMeasure();
+    requestAnimationFrame(rearm);
+  };
+  liveRearms += 1;
+  requestAnimationFrame(rearm);
 }
 
 function offscreenLine(forward: boolean, extend: boolean): Command {
@@ -192,7 +271,14 @@ function offscreenLine(forward: boolean, extend: boolean): Command {
       view.dispatch({
         effects: EditorView.scrollIntoView(selection.main.head),
       });
-      afterMeasure(view, () => moveAll(view, forward, extend));
+      const done = trackMove(view);
+      afterMeasure(view, () => {
+        try {
+          moveAll(view, forward, extend, true);
+        } finally {
+          done();
+        }
+      });
     }
     return true;
   };

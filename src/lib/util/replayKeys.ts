@@ -49,8 +49,11 @@ export interface ReplayState {
   swapping: boolean;
   /** Something is queued, or the swap that replays it is running. */
   replayPending: boolean;
-  /** The selection lies outside the loaded window (and fits one). */
+  /** The selection lies outside the loaded window (and fits one), or is too
+   *  large for one and so is edited as an operation on the file. */
   outside: boolean;
+  /** The selection is too large for one window. */
+  globalPath: boolean;
 }
 /** Whether input should be handled by the replay: the selection is outside the
  *  window, a replay is running, or an undo/redo is under way. A plain window
@@ -65,6 +68,139 @@ export function replayWanted(s: ReplayState): boolean {
     return false;
   }
   return s.replayPending || s.queueHold || s.outside;
+}
+/** What `startReplaySwap` does: 'drop' the queue when nothing can ever replay it
+ *  (the editor is gone or locked), 'wait' while something else holds the view (a
+ *  window swap, an undo or redo, a composition no capture covers) because its
+ *  end carries on with the queue, or 'swap' back to the selection now. A
+ *  captured composition does not hold the swap back: the swap keeps the editor
+ *  open to it and the queue drains in a shadow meanwhile. */
+export function replayStartAction(s: {
+  gone: boolean;
+  locked: boolean;
+  swapping: boolean;
+  capturing: boolean;
+  /** A composition is open, captured or not. */
+  composing: boolean;
+  holds: number;
+}): 'drop' | 'wait' | 'swap' {
+  if (s.gone || s.locked) {
+    return 'drop';
+  }
+  if (s.swapping || s.holds > 0) {
+    return 'wait';
+  }
+  if (s.composing && !s.capturing) {
+    return 'wait';
+  }
+  return 'swap';
+}
+/** What an item of the replay queue is. */
+export type ReplayItemKind =
+  | 'text'
+  | 'key'
+  | 'copy'
+  | 'cut'
+  | 'clipPaste'
+  | 'select'
+  | 'undo'
+  | 'redo'
+  | 'slot';
+/** Whether the item acts at the caret, so the window must hold the selection
+ *  and the view must show it. */
+export function needsCaret(kind: ReplayItemKind): boolean {
+  return (
+    kind !== 'select' && kind !== 'undo' && kind !== 'redo' && kind !== 'slot'
+  );
+}
+/** What the drain does next. 'run' an item at the caret, 'select' runs a
+ *  pointer selection whose mapping is done, 'map' waits for that mapping,
+ *  'undo' runs an undo or redo (the hold it takes resumes the drain), 'swap'
+ *  stops so the window is brought to the selection, 'wait' stops until
+ *  something that holds the queue ends (a swap, an undo, an open composition's
+ *  slot), 'done' ends the drain with the queue empty. */
+export function drainStep(s: {
+  swapping: boolean;
+  holds: number;
+  head: ReplayItemKind | null;
+  /** The head is a `select` item with a mapping under way. */
+  headMapping: boolean;
+  /** The window holds the selection the caret items act on. */
+  ready: boolean;
+}): 'run' | 'select' | 'map' | 'undo' | 'swap' | 'wait' | 'done' {
+  if (s.swapping || s.holds > 0) {
+    return 'wait';
+  }
+  if (s.head === null) {
+    return s.ready ? 'done' : 'swap';
+  }
+  if (s.head === 'slot') {
+    return 'wait';
+  }
+  if (s.head === 'select') {
+    return s.headMapping ? 'map' : 'select';
+  }
+  if (s.head === 'undo' || s.head === 'redo') {
+    return 'undo';
+  }
+  return s.ready ? 'run' : 'swap';
+}
+/** How `resumeReplay` carries on: 'swap' back to the selection when the head
+ *  needs the caret (or nothing is left and the selection is outside the
+ *  window), 'drain' otherwise: an undo, a redo, a pointer selection or a slot
+ *  at the head runs without the window on the caret. */
+export function resumeAction(
+  head: ReplayItemKind | null,
+  ready: boolean,
+): 'swap' | 'drain' {
+  if (head !== null && !needsCaret(head)) {
+    return 'drain';
+  }
+  return ready ? 'drain' : 'swap';
+}
+/** Pushes a pointer selection onto the queue; one directly behind another
+ *  pointer selection replaces it (a drag), a slot or any other item keeps them
+ *  apart. */
+export function pushSelect<T extends { kind: string }>(
+  queue: T[],
+  item: T,
+): void {
+  const last = queue[queue.length - 1];
+  if (last !== undefined && last.kind === 'select') {
+    queue[queue.length - 1] = item;
+  } else {
+    queue.push(item);
+  }
+}
+/** Which of the large-file profile's undo and redo bindings a keydown is, for
+ *  the swap back to the caret during which the editor's bindings are taken out. */
+export function parkedUndoKey(
+  bindings: readonly KeyBinding[],
+  e: KeyLike,
+  os: string,
+  undo: Command,
+  redo: Command,
+): 'undo' | 'redo' | null {
+  const chain = commandChain([bindings], e, os);
+  if (chain.includes(undo)) {
+    return 'undo';
+  }
+  return chain.includes(redo) ? 'redo' : null;
+}
+/** What the end of a window swap does for the queue: 'drain' it when the swap
+ *  was the one that brought the window back to the selection, 'resume' it when
+ *  another swap (a scroll's) ended first and the selection may still be outside
+ *  the window, 'none' when nothing is queued or a captured composition is still
+ *  open (its end carries on with the queue). */
+export function swapEndAction(s: {
+  replayPending: boolean;
+  replaySwap: boolean;
+  capturing: boolean;
+}): 'none' | 'drain' | 'resume' {
+  if (!s.replayPending || s.capturing) {
+    return 'none';
+  }
+  return s.replaySwap ? 'drain' : 'resume';
 }
 /** The keys' AltGr characters, by `KeyboardEvent.code`, as the Rust
  *  `altgr_table` command reports them. A code without an entry types nothing
@@ -358,6 +494,58 @@ export function coreKeyBindings(commands: {
     { key: 'Mod-Shift-z', preventDefault: true, run: commands.redo },
   ];
 }
+/** Whether the keydown is Select All (Cmd+A on macOS, Ctrl+A elsewhere), read
+ *  the way key bindings are, so it holds on layouts that type no Latin `a`. */
+export function isSelectAllKey(e: KeyLike, os: string): boolean {
+  return eventKeyNames(e, os).includes(os === 'macos' ? 'Meta-a' : 'Ctrl-a');
+}
+/** What happens to input that arrives while a Select All waits to run: it is
+ *  dropped, except a modifier pressed on its own. */
+export function inputWhileSelectAll(
+  pending: boolean,
+  kind: 'keydown' | 'modifier' | 'paste' | 'copy' | 'cut',
+): 'drop' | 'pass' {
+  return pending && kind !== 'modifier' ? 'drop' : 'pass';
+}
+/** Whether everything a waiting Select All must follow is over: nothing is
+ *  queued, no swap or shadow runs, no whole-file work holds the editor, and no
+ *  edit is on its way to the core. */
+export function settledState(s: {
+  queueEmpty: boolean;
+  replayPending: boolean;
+  swapping: boolean;
+  shadow: object | null;
+  holds: number;
+  pendingApplies: number;
+}): boolean {
+  return (
+    s.queueEmpty &&
+    !s.replayPending &&
+    !s.swapping &&
+    s.shadow === null &&
+    s.holds === 0 &&
+    s.pendingApplies === 0
+  );
+}
+/** Whether a transaction is refused while a Select All waits to run: a user
+ *  action that changes the document (a composition, a dead key, a drop). What
+ *  the replay of earlier input dispatches goes through, so input accepted
+ *  before the Select All is applied first. */
+export function blockedWhilePending(s: {
+  pending: boolean;
+  docChanged: boolean;
+  userEvent: string | undefined;
+  replayDispatch: boolean;
+  replayingKey: boolean;
+}): boolean {
+  return (
+    s.pending &&
+    s.docChanged &&
+    s.userEvent !== undefined &&
+    !s.replayDispatch &&
+    !s.replayingKey
+  );
+}
 /** What a keydown does while the replay may be wanted. */
 export type KeyAction =
   | { type: 'none' }
@@ -385,7 +573,7 @@ export function decideKey(i: KeyDecisionInput): KeyAction {
     return { type: 'none' };
   }
   const isWindows = i.os === 'windows';
-  const kind = replayKind(e, isWindows);
+  const kind = replayKind(e, i.os);
   if (kind === 'text') {
     return { type: 'text', text: e.key };
   }
@@ -399,9 +587,13 @@ export function decideKey(i: KeyDecisionInput): KeyAction {
     }
     // The queue must run in order: an editor shortcut pressed while it drains
     // or while an undo/redo is under way (another undo included) waits behind
-    // what is already queued, a menu accelerator does not.
+    // what is already queued, a menu accelerator does not. A selection too
+    // large for a window refuses the shortcut's own edit, so it waits for as
+    // long as anything is pending.
     if (
-      (i.draining || i.state.queueHold) &&
+      (i.draining ||
+        i.state.queueHold ||
+        (i.state.globalPath && i.state.replayPending)) &&
       matchesBinding(i.layers(), e, i.os)
     ) {
       return { type: 'key' };
@@ -465,32 +657,43 @@ export function pasteIsLinewise(
     remembered === state.toText(text).toString()
   );
 }
-/** CodeMirror's paste of `text`: a line-wise paste inserts each line above its
- *  caret line, anything else replaces the selection. */
+/** CodeMirror's paste of `text` (its `doPaste`, view `index.js:4930-4961`): a
+ *  line-wise paste inserts each line above its caret line, text with as many
+ *  lines as there are selections gives each selection one line, anything else
+ *  replaces the selection. */
 export function pasteSpec(
   state: EditorState,
   text: string,
   remembered: string | null,
 ): TransactionSpec {
-  if (!pasteIsLinewise(state, text, remembered)) {
-    return state.replaceSelection(text);
-  }
   const pasted = state.toText(text);
   const byLine = pasted.lines === state.selection.ranges.length;
   let next = 1;
-  let lastLine = -1;
-  return state.changeByRange((range) => {
-    const line = state.doc.lineAt(range.from);
-    if (line.from === lastLine) {
-      return { range };
-    }
-    lastLine = line.from;
-    const insert = state.toText(
-      (byLine ? pasted.line(next++).text : text) + state.lineBreak,
-    );
-    return {
-      changes: { from: line.from, insert },
-      range: EditorSelection.cursor(range.from + insert.length, -1),
-    };
-  });
+  if (pasteIsLinewise(state, text, remembered)) {
+    let lastLine = -1;
+    return state.changeByRange((range) => {
+      const line = state.doc.lineAt(range.from);
+      if (line.from === lastLine) {
+        return { range };
+      }
+      lastLine = line.from;
+      const insert = state.toText(
+        (byLine ? pasted.line(next++).text : text) + state.lineBreak,
+      );
+      return {
+        changes: { from: line.from, insert },
+        range: EditorSelection.cursor(range.from + insert.length, -1),
+      };
+    });
+  }
+  if (byLine) {
+    return state.changeByRange((range) => {
+      const line = pasted.line(next++);
+      return {
+        changes: { from: range.from, to: range.to, insert: line.text },
+        range: EditorSelection.cursor(range.from + line.length, -1),
+      };
+    });
+  }
+  return state.replaceSelection(pasted);
 }

@@ -1,0 +1,3 @@
+# Build inside the app's target folder, which Prettier and git already skip.
+[build]
+target-dir = "../target/cliphelper"

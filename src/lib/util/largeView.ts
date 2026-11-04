@@ -122,9 +122,8 @@ export interface SelectedRow {
   from?: number;
   to?: number;
 }
-/** The selected text of `rows`, one line per row. Rows are split on `\n` only,
- *  so a CRLF file's rows end in `\r`; one is dropped per row to match what an
- *  ordinary tab copies. */
+/** The selected text of `rows`, one line per row. A row that still ends in
+ *  `\r` has it dropped, to match what an ordinary tab copies. */
 export function joinSelectedRows(rows: readonly SelectedRow[]): string {
   return rows
     .map((r) => r.text.slice(r.from ?? 0, r.to).replace(/\r$/, ''))

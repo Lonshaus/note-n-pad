@@ -2,7 +2,6 @@
 // SPDX-License-Identifier: GPL-3.0-only
 
 import type { I18nKey } from './index';
-
 // English. `satisfies` enforces the exact key set from the master dictionary:
 // a missing key or a stray extra key fails `npm run check`.
 export const en = {
@@ -16,7 +15,7 @@ export const en = {
   'settings.theme.light': 'Light',
   'settings.theme.dark': 'Dark',
   'settings.theme.customSuffix': ' (Custom)',
-  'settings.interface.label': 'Interface',
+  'settings.interface.label': 'Appearance',
   'settings.interface.system': 'Follow system',
   'settings.theme.reset': 'Reset',
   'settings.theme.resetConfirm': 'Restore the theme “{name}” to its default?',
@@ -128,6 +127,9 @@ export const en = {
   'settings.general.largeOpenModeAsk': 'Ask every time (default)',
   'settings.general.largeOpenModeView': 'View',
   'settings.general.largeOpenModeEdit': 'Edit',
+  'settings.general.largeSelectAll': 'Large file Select All range',
+  'settings.general.largeSelectAllVisible': 'What is on screen (default)',
+  'settings.general.largeSelectAllFile': 'The whole file',
   'settings.general.openTarget': 'Open files in',
   'settings.general.openTargetTab': 'New tab (default)',
   'settings.general.openTargetWindow': 'New window',
@@ -179,6 +181,24 @@ export const en = {
     'The source file has changed; writing back may overwrite other edits.',
   'doc.windowedConflict.message':
     'The source file was changed by another program. Writing back overwrites the whole file with the current content, and external changes will be lost.',
+  'convert.confirm':
+    'There is too much content. It will be converted to a large file. Continue?',
+  'convert.continue': 'Continue',
+  'convert.tooBig':
+    'The content after pasting is too large to edit and can only be opened in view mode. Save it first and open it in view mode?',
+  'convert.tooBig.save': 'Save and Open in View Mode',
+  'convert.tooBig.discard': 'Don’t Paste',
+  'convert.unmappable':
+    '“{name}” contains characters that can’t be represented in {encoding}.',
+  'convert.unmappable.utf8': 'Save to the Original Path as UTF-8',
+  'convert.unmappable.saveAs': 'Save As New (UTF-8)',
+  'convert.failed': 'Couldn’t paste: {error}',
+  'paste.clipUnreadable': 'The copied content can no longer be read',
+  'paste.clipReadFailed': 'the copied content could not be read ({detail})',
+  'convert.interrupted':
+    'the conversion to a large file stopped before it finished',
+  'convert.reclaimed':
+    'Couldn’t turn this note into a document. The note is unchanged.',
   'doc.oversized.message':
     'This tab’s unsaved content is too large to snapshot and must be handled before closing.',
   'doc.oversized.discard': 'Discard Changes',
@@ -386,6 +406,8 @@ export const en = {
   'doc.revealFailed':
     'Couldn’t show “{name}”. The file may have been moved or deleted.',
   'doc.saveFailed': 'Couldn’t save “{name}”: {error}',
+  'doc.discardFailed':
+    'Couldn’t discard the changes to “{name}”: {error}. The tab is unchanged.',
   'doc.saveReadOnly':
     '“{name}” is read-only, so nothing was saved. Change the file’s permissions to save to it.',
   'sticky.saveFailed': 'Couldn’t save this note: {error}',

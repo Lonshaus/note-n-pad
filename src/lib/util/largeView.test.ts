@@ -10,6 +10,7 @@ import {
   SAFE_SCROLL_HEIGHT,
   scrollAxisHeight,
 } from './largeView';
+import { splitLines } from './largePage';
 
 describe('scrollAxisHeight', () => {
   it('uses the exact pixel height while it fits under the cap', () => {
@@ -179,6 +180,14 @@ describe('joinSelectedRows', () => {
         { text: 'three\r', to: 3 },
       ]),
     ).toBe('ne\ntwo\nthr');
+  });
+
+  it('joins the rows of a lone-CR file as the ordinary tab would copy them', () => {
+    const rows = splitLines('one\rtwo\r\nthree', true).map((text) => ({
+      text,
+    }));
+    expect(rows).toEqual([{ text: 'one' }, { text: 'two' }, { text: 'three' }]);
+    expect(joinSelectedRows(rows)).toBe('one\ntwo\nthree');
   });
 
   it('keeps the whole row text when the selection reaches past its CR', () => {

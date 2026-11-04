@@ -39,6 +39,7 @@ function settingsPayload(fontSize: number): Record<string, unknown> {
     editor_line_numbers: true,
     worker_highlight: false,
     large_open_mode: 'ask',
+    large_select_all: 'visible',
     ask_long_line_open: true,
     preview_local_resources: false,
     open_target: 'tab',
@@ -161,6 +162,26 @@ describe('settings readiness (real SettingsState)', () => {
     };
     expect(s[state]).toBe(true);
     expect(Object.values(flags).filter(Boolean)).toHaveLength(1);
+  });
+
+  it('maps large_select_all to largeSelectAll and saves a change as a patch', async () => {
+    mockInvoke.mockReset();
+    mockInvoke.mockResolvedValue({
+      ...payload(13),
+      settings: { ...settingsPayload(13), large_select_all: 'file' },
+    });
+    const s = new SettingsState();
+    expect(s.largeSelectAll).toBe('visible');
+    void s.init();
+    await s.ready;
+    expect(s.largeSelectAll).toBe('file');
+    mockInvoke.mockReset();
+    mockInvoke.mockResolvedValue(undefined);
+    await s.setLargeSelectAll('visible');
+    expect(s.largeSelectAll).toBe('visible');
+    expect(mockInvoke).toHaveBeenCalledWith('save_settings', {
+      settings: { large_select_all: 'visible' },
+    });
   });
 
   it('takes the notice state returned by set_snapshot_dir', async () => {

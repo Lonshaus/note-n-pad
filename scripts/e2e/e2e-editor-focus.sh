@@ -183,7 +183,8 @@ restore_state() {
   wipe_test_docs
   e2e_kill_owned_ports
 }
-trap restore_state EXIT INT TERM
+trap restore_state EXIT
+trap 'exit 1' INT TERM
 
 echo "=== scenario C: open new file, no click, editor is focused ==="
 launch

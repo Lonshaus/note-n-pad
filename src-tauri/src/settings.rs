@@ -82,6 +82,10 @@ pub struct AppSettings {
   /// "edit" fall back to view for a non-UTF-8 or oversized file).
   #[serde(default = "default_large_open_mode")]
   pub large_open_mode: String,
+  /// What Select All covers in a large file: "visible" (default) takes what is on
+  /// screen, "file" takes the whole file.
+  #[serde(default = "default_large_select_all")]
+  pub large_select_all: String,
   /// Whether to ask how to open a file whose longest line is over the frontend
   /// long-line threshold (offering open-as-is / format / soft-wrap). On by
   /// default; when off such files always open as-is. serde default keeps old
@@ -204,6 +208,10 @@ fn default_large_open_mode() -> String {
   "ask".to_string()
 }
 
+fn default_large_select_all() -> String {
+  "visible".to_string()
+}
+
 fn default_ask_long_line_open() -> bool {
   true
 }
@@ -271,6 +279,7 @@ impl Default for AppSettings {
       editor_line_numbers: default_editor_line_numbers(),
       worker_highlight: default_worker_highlight(),
       large_open_mode: default_large_open_mode(),
+      large_select_all: default_large_select_all(),
       ask_long_line_open: default_ask_long_line_open(),
       preview_local_resources: default_preview_local_resources(),
       open_target: default_open_target(),
@@ -501,6 +510,10 @@ fn repair(settings: &mut AppSettings) -> Vec<String> {
     settings.large_open_mode = default_large_open_mode();
     repaired.push("large_open_mode".to_string());
   }
+  if !matches!(settings.large_select_all.as_str(), "visible" | "file") {
+    settings.large_select_all = default_large_select_all();
+    repaired.push("large_select_all".to_string());
+  }
   if !matches!(settings.open_target.as_str(), "tab" | "window") {
     settings.open_target = default_open_target();
     repaired.push("open_target".to_string());
@@ -548,6 +561,10 @@ fn validate(settings: &AppSettings) -> Result<(), String> {
   match settings.large_open_mode.as_str() {
     "ask" | "view" | "edit" => {}
     other => return Err(format!("unknown large open mode: {other}")),
+  }
+  match settings.large_select_all.as_str() {
+    "visible" | "file" => {}
+    other => return Err(format!("unknown large select all: {other}")),
   }
   match settings.open_target.as_str() {
     "tab" | "window" => {}
@@ -729,6 +746,12 @@ fn tolerant_settings(
       obj,
       "large_open_mode",
       default_large_open_mode,
+      &mut dropped,
+    ),
+    large_select_all: field_or_default(
+      obj,
+      "large_select_all",
+      default_large_select_all,
       &mut dropped,
     ),
     ask_long_line_open: field_or_default(
@@ -1372,6 +1395,7 @@ mod tests {
       editor_line_numbers: false,
       worker_highlight: true,
       large_open_mode: "edit".into(),
+      large_select_all: "file".into(),
       ask_long_line_open: false,
       preview_local_resources: true,
       open_target: "window".into(),
@@ -1826,6 +1850,50 @@ mod tests {
       load_json(r#"{"ask_before_large_open":true}"#).large_open_mode,
       "ask"
     );
+  }
+
+  #[test]
+  fn merge_patches_large_select_all() {
+    let current = AppSettings::default();
+    assert_eq!(current.large_select_all, "visible");
+    let merged =
+      merge_settings(&current, &serde_json::json!({ "large_select_all": "file" })).unwrap();
+    assert_eq!(merged.large_select_all, "file");
+    // Unpatched fields survive.
+    assert_eq!(merged.theme, "ink");
+    assert_eq!(merged.large_open_mode, "ask");
+  }
+
+  #[test]
+  fn an_invalid_large_select_all_is_repaired_and_reported_on_load() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("settings.json");
+    for stored in [r#""everything""#, "3"] {
+      std::fs::write(&path, format!(r#"{{"large_select_all": {stored}}}"#)).unwrap();
+      let (settings, repaired) = load_from_with_report(&path).unwrap();
+      assert_eq!(settings.large_select_all, "visible");
+      assert!(repaired.contains(&"large_select_all".to_string()));
+    }
+    std::fs::write(&path, r#"{"large_select_all": "file"}"#).unwrap();
+    let (settings, repaired) = load_from_with_report(&path).unwrap();
+    assert_eq!(settings.large_select_all, "file");
+    assert!(repaired.is_empty());
+    std::fs::write(&path, "{}").unwrap();
+    assert_eq!(
+      load_from_with_report(&path).unwrap().0.large_select_all,
+      "visible"
+    );
+  }
+
+  #[test]
+  fn save_rejects_unknown_large_select_all() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("settings.json");
+    let settings = AppSettings {
+      large_select_all: "everything".into(),
+      ..AppSettings::default()
+    };
+    assert!(save_to(&path, &settings).is_err());
   }
 
   #[test]

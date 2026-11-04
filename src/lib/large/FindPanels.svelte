@@ -8,6 +8,8 @@
   import { t } from '../i18n';
   import { TEXT_FIELD_ATTRS } from '../editor/textFieldAttrs';
   import { matchSegments } from '../util/matchSegments';
+  import { pasteEnv } from '../util/pasteEnv';
+  import { fieldPaste } from '../util/pasteRouting';
   /** One result row: `line` is 1-based, as displayed. */
   export interface FindResult {
     line: number;
@@ -91,6 +93,7 @@
       aria-label={t('large.goto.aria')}
       bind:value={gotoValue}
       onkeydown={ongotokeydown}
+      onpaste={(e) => void fieldPaste(e, e.currentTarget, pasteEnv)}
       {...TEXT_FIELD_ATTRS}
     />
   </div>
@@ -107,6 +110,7 @@
         aria-label={t('large.search.label')}
         bind:value={query}
         onkeydown={onsearchkeydown}
+        onpaste={(e) => void fieldPaste(e, e.currentTarget, pasteEnv)}
         {...TEXT_FIELD_ATTRS}
       />
       <button class="cm-button" onclick={onsearch}
@@ -127,6 +131,7 @@
           aria-label={t('cm.replaceField')}
           bind:value={replacement}
           onkeydown={onsearchkeydown}
+          onpaste={(e) => void fieldPaste(e, e.currentTarget, pasteEnv)}
           {...TEXT_FIELD_ATTRS}
         />
         <button class="cm-button" onclick={onreplace}>{t('cm.replace')}</button>

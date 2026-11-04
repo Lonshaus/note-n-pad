@@ -8,6 +8,8 @@
   import { localeRegistry } from './localeRegistry.svelte';
   import { isLite } from '../state/edition.svelte';
   import { editionUi } from '../util/editionUi';
+  import { pasteEnv } from '../util/pasteEnv';
+  import { fieldPaste } from '../util/pasteRouting';
   import {
     customizedLabel,
     groupKeys,
@@ -31,18 +33,15 @@
   // Lite edits and restores a language but cannot merge a file into it or
   // export it.
   const ui = $derived(editionUi(isLite()));
-
   // Editor rows, grouped by the key's namespace. The key set is fixed at build
   // time (it comes from the master dictionary), so this is computed once.
   const KEY_GROUPS = groupKeys(I18N_KEYS);
-
   // The draft. Edits stay here until the user saves, so typing never
   // retranslates the running UI mid-keystroke.
   let label = $state('');
   let strings = $state<Record<string, string>>({});
   let dirty = $state(false);
   let error = $state('');
-
   /** (Re)load the draft from what is currently stored. A built-in with no
    *  override starts from its compiled dictionary, so editing e.g. English
    *  begins with the shipped English rather than a blank form. */
@@ -63,7 +62,6 @@
       ondirty(true);
     }
   }
-
   /** The draft as a storable locale. A built-in override has no menu order of
    *  its own — the list renders the compiled three from a fixed order. */
   function draftLocale(labelOverride?: string): LocaleData {
@@ -88,7 +86,6 @@
     error = '';
     ondirty(false);
   }
-
   /** Merge someone else's corrected translations into the draft. Only the keys
    *  present in the file are replaced, so a partial correction file is enough;
    *  the result still needs an explicit save.
@@ -120,7 +117,6 @@
       error = t('settings.language.importError');
     }
   }
-
   /** Export what is on screen (draft included), so a translation can be shared
    *  without saving it into the running app first. */
   async function exportDraft(): Promise<void> {
@@ -134,7 +130,6 @@
     }
     await localeRegistry.exportFile(draftLocale(), path);
   }
-
   /** Discard customizations: a bundled locale returns to its seed, a built-in
    *  drops its override file and falls back to the compiled dictionary. */
   async function reset(): Promise<void> {
@@ -155,7 +150,6 @@
     }
     loadDraft();
   }
-
   // Restorable once something is stored to undo: a bundled seed to return to,
   // or (for a built-in) an override file currently shadowing the compiled one.
   const canReset = $derived(
@@ -209,6 +203,7 @@
               value={strings[key] ?? ''}
               placeholder={reference}
               oninput={(e) => edit(key, e.currentTarget.value)}
+              onpaste={(e) => void fieldPaste(e, e.currentTarget, pasteEnv)}
             />
           </div>
         {/each}

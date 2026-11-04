@@ -239,8 +239,14 @@ pub(crate) fn restore(app: &AppHandle) -> &'static str {
   }
 }
 
-/// Ask the store for the original version again: "known" or "unknown".
+/// Sync with the store, which signs in when no account is, then ask it for the
+/// original version again: "known" or "unknown". The refresh alone never shows
+/// a sign-in.
 pub(crate) fn refresh(app: &AppHandle) -> &'static str {
+  // SAFETY: no arguments.
+  if unsafe { np_store_sync() } == 1 {
+    reread_owned(app);
+  }
   let ticket = state().take_ticket();
   let original = refresh_original();
   apply(app, ticket, None, Some(original));

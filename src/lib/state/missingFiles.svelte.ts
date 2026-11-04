@@ -8,6 +8,7 @@ import type { DocumentWindowState } from './documentWindow.svelte';
 type MissingWindow = Pick<
   DocumentWindowState,
   | 'activeTab'
+  | 'endComposition'
   | 'isDirty'
   | 'onConflictClosed'
   | 'onRestored'
@@ -21,6 +22,7 @@ type MissingWindow = Pick<
   | 'switchTo'
   | 'tabs'
   | 'windowedConflict'
+  | 'windowedPending'
 >;
 /** What it needs from the close gate. */
 type MissingGate = Pick<
@@ -69,6 +71,8 @@ export class MissingFiles {
   /** The last tab was discarded and the window kept open for a quit or close
    *  that was held back; it must not outlive that quit or close. */
   private keptEmpty = false;
+  /** A tab close is waiting for typed input to reach the core. */
+  private closing = false;
   private readonly win: MissingWindow;
   private readonly gate: MissingGate;
   private readonly host: MissingHost;
@@ -334,6 +338,31 @@ export class MissingFiles {
     if (tab === null) {
       return;
     }
+    // Input of a windowed editor that is not in the core yet would be lost:
+    // the close waits for it, then goes on with what the tab is by then.
+    if (tab.windowed !== undefined && this.win.windowedPending?.() === true) {
+      if (!this.closing) {
+        this.closing = true;
+        void this.closeWhenSettled(tab);
+      }
+      return;
+    }
+    this.closeNow(tab);
+  }
+  private async closeWhenSettled(
+    tab: NonNullable<MissingWindow['activeTab']>,
+  ): Promise<void> {
+    try {
+      await this.win.endComposition?.();
+    } finally {
+      this.closing = false;
+    }
+    if (this.win.activeTab !== tab) {
+      return;
+    }
+    this.closeNow(tab);
+  }
+  private closeNow(tab: NonNullable<MissingWindow['activeTab']>): void {
     const box = this.boxOf(tab.id);
     if (tab.missing === true || box?.missing === true) {
       this.promote({ tabId: tab.id, box: tab.missing !== true });

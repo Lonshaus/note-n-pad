@@ -62,6 +62,7 @@ boot_label() {
 doc_label() {
   auto '{"id":3,"cmd":"list_windows"}' | jq -r '.data[]|select(.label|startswith("doc-"))|.label' | head -1
 }
+doc_label_ready() { [ -n "$(doc_label)" ]; }
 evl() {
   auto "{\"id\":$(e2e_next_id),\"cmd\":\"eval\",\"label\":\"$1\",\"js\":$(jq -Rn --arg js "$2" '$js')}" | jq -r '.data'
 }
@@ -163,6 +164,10 @@ with open(f'{w}/small.csv', 'w', newline='') as f:
     f.write('col a,col b,col c\n')
     for i in range(50):
         f.write(f'{i},value {i},another {i}\n')
+with open(f'{w}/fresh.csv', 'w', newline='') as f:
+    f.write('col a,col b,col c\n')
+    for i in range(50):
+        f.write(f'{i},value {i},another {i}\n')
 with open(f'{w}/huge.csv', 'w', newline='') as f:
     f.write('n,v\n')
     for i in range(1600000):
@@ -201,7 +206,8 @@ cleanup() {
   rm -rf "$WORK"
   e2e_kill_owned_ports
 }
-trap cleanup EXIT INT TERM
+trap cleanup EXIT
+trap 'exit 1' INT TERM
 
 launch
 BOOT=$(boot_label)
@@ -212,7 +218,7 @@ fi
 # A plain host window: every case below runs through its in-window openTab, and
 # a tab that stays open keeps the window alive between cases.
 evl "$BOOT" "window.__TAURI_INTERNALS__.invoke('open_document_window',{path:'$WORK/host.txt'})" >/dev/null
-e2e_wait_until 60 test -n "$(doc_label)"
+e2e_wait_until 60 doc_label_ready
 DL=$(doc_label)
 if [ -z "$DL" ]; then
   echo "FATAL: no document window"
@@ -583,7 +589,7 @@ e2e_wait_eval "$DL" "String(document.querySelector('.cell[data-r=\"270000\"][dat
 # Premise: the tab we are leaving really is scrolled to the bottom.
 check "the long file is scrolled to its end" \
   "$(e2e_read "$DL" "String(document.querySelector('.grid-scroll').scrollTop > 6000000)")" "true"
-evl "$DL" "__auto.openTab('$WORK/small.csv')" >/dev/null
+evl "$DL" "__auto.openTab('$WORK/fresh.csv')" >/dev/null
 e2e_wait_eval "$DL" "String(__auto.tableDims().rows)" "51"
 check "the new tab starts at the top" \
   "$(e2e_read "$DL" "String(document.querySelector('.grid-scroll').scrollTop)")" "0"
