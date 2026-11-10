@@ -70,6 +70,7 @@ import {
   isLiteRefusal,
 } from '../util/protocol';
 import { appliedTarget } from '../util/windowedApplied';
+import { readDocument, writeDocument, type Decoded } from '../util/documentIo';
 /** Rust `splice_file` rejects an out-of-band-edited source with this exact error
  *  string; the write-back keys its conflict flow off it (protocol value). */
 const FINGERPRINT_MISMATCH = 'fingerprint-mismatch';
@@ -263,14 +264,6 @@ interface RangeRead {
   text: string;
   lossy: boolean;
 }
-/** Result of a Rust decode command; content is BOM-free, line endings intact. */
-interface Decoded {
-  content: string;
-  encoding: string;
-  had_bom: boolean;
-  lossy: boolean;
-}
-
 interface FileStat {
   size: number;
 }
@@ -1081,11 +1074,8 @@ export class DocumentWindowState {
     let readError: string | null = null;
     try {
       decoded = snap?.encoding
-        ? await invoke<Decoded>('read_file_as', {
-            path,
-            encoding: snap.encoding,
-          })
-        : await invoke<Decoded>('read_file_auto', { path });
+        ? await readDocument(path, snap.encoding)
+        : await readDocument(path);
     } catch (e) {
       decoded = null;
       readError = String(e);
@@ -2157,7 +2147,7 @@ export class DocumentWindowState {
     // Flush point: materialize the rope to a string for the write.
     const out = applyLineEnding(written.toString(), writtenEnding);
     try {
-      await invoke('write_file_encoded', {
+      await writeDocument({
         path: tab.path,
         content: out,
         encoding: tab.encoding,
@@ -2220,7 +2210,7 @@ export class DocumentWindowState {
     // Flush point: materialize the rope for the save-as write.
     const out = applyLineEnding(written.toString(), writtenEnding);
     try {
-      await invoke('write_file_encoded', {
+      await writeDocument({
         path: chosen,
         content: out,
         encoding: tab.encoding,
@@ -2488,7 +2478,7 @@ export class DocumentWindowState {
     // Flush point: materialize the rope for the save-as write.
     const out = applyLineEnding(box.content.toString(), box.lineEnding);
     try {
-      await invoke('write_file_encoded', {
+      await writeDocument({
         path: chosen,
         content: out,
         encoding: settingsState.defaultEncoding,
@@ -3290,10 +3280,7 @@ export class DocumentWindowState {
     const readEnding = tab.lineEnding;
     let decoded: Decoded;
     try {
-      decoded = await invoke<Decoded>('read_file_as', {
-        path: tab.path,
-        encoding: label,
-      });
+      decoded = await readDocument(tab.path, label);
     } catch {
       this.encodingFailed = tab.path;
       return;

@@ -843,6 +843,7 @@ pub(crate) fn apply_app_theme(app: &tauri::AppHandle, mode: &str) {
 fn handle_page_load(webview: &tauri::Webview, payload: &tauri::webview::PageLoadPayload<'_>) {
   if payload.event() == tauri::webview::PageLoadEvent::Started {
     clipboard_store::window_reset(webview.label());
+    encoding::window_gone(webview.app_handle(), webview.label());
   }
 }
 /// The app's single window-event handler: keeps the menu's focus-dependent
@@ -979,6 +980,7 @@ fn handle_window_event(window: &tauri::Window, event: &tauri::WindowEvent) {
     convert_handoff::window_destroyed(window.app_handle(), window.label());
     convert::window_destroyed(window.app_handle(), window.label());
     clipboard_store::window_destroyed(window.label());
+    encoding::window_gone(window.app_handle(), window.label());
     // A destroyed window has nothing left to flush; ack it on its behalf so
     // a quit whose wait list still names it (it was already let through and
     // is mid-destroy when the quit starts) doesn't stall out the full
@@ -2539,8 +2541,9 @@ fn apply_launch_action(app: &tauri::AppHandle, action: cmdline::Action) {
 /// parser does not recognize — including the common case of a plain
 /// double-launch with no flags at all.
 #[cfg(any(target_os = "windows", target_os = "linux"))]
-fn handle_second_launch(app: &tauri::AppHandle, argv: Vec<String>) {
-  match cmdline::for_edition(cmdline::parse_args(&argv), edition::is_lite()) {
+fn handle_second_launch(app: &tauri::AppHandle, argv: Vec<String>, cwd: &str) {
+  let action = cmdline::absolute_files(cmdline::parse_args(&argv), std::path::Path::new(cwd));
+  match cmdline::for_edition(action, edition::is_lite()) {
     cmdline::Action::None => activate_existing(app),
     action => apply_launch_action(app, action),
   }
@@ -2554,10 +2557,9 @@ fn handle_second_launch(app: &tauri::AppHandle, argv: Vec<String>) {
 #[cfg(any(target_os = "windows", target_os = "linux"))]
 fn handle_first_launch(app: &tauri::AppHandle) {
   let argv: Vec<String> = std::env::args().collect();
-  apply_launch_action(
-    app,
-    cmdline::for_edition(cmdline::parse_args(&argv), edition::is_lite()),
-  );
+  let cwd = std::env::current_dir().unwrap_or_default();
+  let action = cmdline::absolute_files(cmdline::parse_args(&argv), &cwd);
+  apply_launch_action(app, cmdline::for_edition(action, edition::is_lite()));
 }
 /// Whether the launch hands the app files to open. Windows and Linux read them
 /// off the command line; macOS has already received them as `RunEvent::Opened`
@@ -2682,8 +2684,8 @@ pub fn run() {
   // executable directly starts a second process.
   #[cfg(any(target_os = "windows", target_os = "linux"))]
   {
-    builder = builder.plugin(tauri_plugin_single_instance::init(|app, argv, _cwd| {
-      handle_second_launch(app, argv);
+    builder = builder.plugin(tauri_plugin_single_instance::init(|app, argv, cwd| {
+      handle_second_launch(app, argv, &cwd);
     }));
   }
   // The opener plugin is not a dependency on Windows; see `open_externally`.
@@ -2829,6 +2831,7 @@ pub fn run() {
         app.manage(windowed::WindowedState::new(windowed_tmp));
       }
       app.manage(windows::OpenDocTabs::default());
+      app.manage(encoding::DocIoState::new());
       app.manage(pending_opens::PendingOpens::default());
       app.manage(MenuLists::default());
       app.manage(preview_img::PreviewBases::default());
@@ -2969,6 +2972,14 @@ pub fn run() {
       encoding::read_file_auto,
       encoding::read_file_as,
       encoding::write_file_encoded,
+      encoding::ipc_probe,
+      encoding::read_begin,
+      encoding::doc_read_chunk,
+      encoding::read_end,
+      encoding::write_begin,
+      encoding::write_chunk,
+      encoding::write_commit,
+      encoding::write_abort,
       note_store::list_notes,
       note_store::take_startup_skips,
       windows::show_load_problems_window,
@@ -3782,6 +3793,36 @@ mod app_focus_tests {
 }
 
 #[cfg(test)]
+mod launch_working_directory_tests {
+  fn body_of<'a>(source: &'a str, signature: &str) -> &'a str {
+    let body = &source[source.find(signature).unwrap()..];
+    &body[..body.find("\n}\n").unwrap()]
+  }
+
+  #[test]
+  fn the_first_launch_resolves_files_against_its_own_directory() {
+    let body = body_of(include_str!("lib.rs"), "fn handle_first_launch(");
+    assert!(body.contains("let cwd = std::env::current_dir().unwrap_or_default();"));
+    assert!(body.contains("cmdline::absolute_files(cmdline::parse_args(&argv), &cwd)"));
+    assert!(body.contains("cmdline::for_edition(action, edition::is_lite())"));
+  }
+
+  #[test]
+  fn a_second_launch_resolves_files_against_the_directory_it_was_started_in() {
+    let source = include_str!("lib.rs");
+    let run = &source[source.find("pub fn run()").unwrap()..];
+    let run = &run[..run.find("\n#[cfg(test)]").unwrap()];
+    assert!(run.contains("single_instance::init(|app, argv, cwd| {"));
+    assert!(run.contains("handle_second_launch(app, argv, &cwd);"));
+    let body = body_of(source, "fn handle_second_launch(");
+    assert!(body
+      .contains("cmdline::absolute_files(cmdline::parse_args(&argv), std::path::Path::new(cwd))"));
+    assert!(body.contains("cmdline::for_edition(action, edition::is_lite())"));
+    assert!(!body.contains("current_dir"));
+  }
+}
+
+#[cfg(test)]
 mod page_load_tests {
   #[test]
   fn a_page_that_starts_loading_lets_go_of_what_the_old_one_held() {
@@ -3797,6 +3838,19 @@ mod page_load_tests {
       .find("clipboard_store::window_reset(webview.label())")
       .unwrap();
     assert!(started < reset);
+  }
+
+  #[test]
+  fn a_page_load_and_a_destroyed_window_release_chunked_io_sessions() {
+    let source = include_str!("lib.rs");
+    let load = &source[source.find("fn handle_page_load(").unwrap()..];
+    let load = &load[..load.find("\n}\n").unwrap()];
+    assert!(load.contains("encoding::window_gone(webview.app_handle(), webview.label())"));
+    let event = &source[source
+      .find("if let tauri::WindowEvent::Destroyed = event {")
+      .unwrap()..];
+    let event = &event[..event.find("\n  }\n").unwrap()];
+    assert!(event.contains("encoding::window_gone(window.app_handle(), window.label())"));
   }
 }
 

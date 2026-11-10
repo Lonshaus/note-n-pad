@@ -7,6 +7,7 @@
 // single-instance handler in `lib.rs` can route a recognized launch without
 // re-parsing logic living inside Windows-only code.
 
+use std::path::{Component, Path, MAIN_SEPARATOR_STR};
 /// A parsed command line, or `None` for anything not recognized (including a
 /// plain double-launch with no flags), which falls back to the existing
 /// "activate the running instance" behavior.
@@ -80,10 +81,86 @@ pub fn for_edition(action: Action, lite: bool) -> Action {
     other => other,
   }
 }
+/// `path` made absolute, a relative one taken from `cwd`. Works on the text
+/// alone: a missing file still resolves and links are not followed. A path that
+/// cannot be placed under `cwd` comes back byte for byte.
+// Assembled as text: `PathBuf::push` reads a segment like `a:b` as a Windows
+// drive and discards everything before it.
+// Called on Windows/Linux; compiled (and tested) on every platform.
+#[allow(dead_code)]
+pub fn absolute_from(path: &str, cwd: &Path) -> String {
+  let target = Path::new(path);
+  if cwd.to_str().is_none()
+    || !cwd.is_absolute()
+    || target.is_absolute()
+    || names_server_or_device(path)
+  {
+    return path.to_string();
+  }
+  // `C:foo` hangs off that drive's own working directory; only `cwd`'s is known.
+  if let Some(Component::Prefix(drive)) = target.components().next() {
+    let same_drive = cwd
+      .components()
+      .next()
+      .is_some_and(|first| first.as_os_str().eq_ignore_ascii_case(drive.as_os_str()));
+    if !same_drive {
+      return path.to_string();
+    }
+  }
+  let mut head = String::new();
+  let mut segments = Vec::new();
+  for part in cwd.components() {
+    match part {
+      Component::Prefix(_) | Component::RootDir => {
+        head.push_str(&part.as_os_str().to_string_lossy());
+      }
+      other => apply_component(&mut segments, other),
+    }
+  }
+  // Only `\foo` gets here with a root: the top of `cwd`'s drive.
+  if target.has_root() {
+    segments.clear();
+  }
+  for part in target.components() {
+    apply_component(&mut segments, part);
+  }
+  head + &segments.join(MAIN_SEPARATOR_STR)
+}
+/// Windows forms that `is_absolute` calls relative but that never hang off a
+/// folder: `\\server`, `\\.`, `\??\C:\foo`. On Unix these are file names.
+fn names_server_or_device(path: &str) -> bool {
+  if !cfg!(windows) {
+    return false;
+  }
+  let mut start = path.chars().map(|c| c == '\\' || c == '/');
+  (start.next() == Some(true) && start.next() == Some(true)) || path.starts_with(r"\??\")
+}
+/// Add one path component to `segments`; `..` at the root stays at the root.
+fn apply_component(segments: &mut Vec<String>, part: Component) {
+  match part {
+    Component::ParentDir => {
+      segments.pop();
+    }
+    Component::Normal(name) => segments.push(name.to_string_lossy().into_owned()),
+    Component::Prefix(_) | Component::RootDir | Component::CurDir => {}
+  }
+}
+/// `action` with every file it opens made absolute; any other action as it came.
+// Called on Windows/Linux; compiled (and tested) on every platform.
+#[allow(dead_code)]
+pub fn absolute_files(action: Action, cwd: &Path) -> Action {
+  match action {
+    Action::OpenFiles(paths) => {
+      Action::OpenFiles(paths.iter().map(|path| absolute_from(path, cwd)).collect())
+    }
+    other => other,
+  }
+}
 
 #[cfg(test)]
 mod tests {
   use super::*;
+  use std::path::{PathBuf, MAIN_SEPARATOR as SEP};
 
   #[test]
   fn lite_ignores_the_workspace_flag_only() {
@@ -256,5 +333,195 @@ mod tests {
       parse_args(&args(&["note-n-pad.exe", "/tmp/a.txt", "--new-sticky"])),
       Action::OpenFiles(vec!["/tmp/a.txt".into()])
     );
+  }
+  /// An absolute working directory below the temp folder, and the same as text.
+  fn work() -> (PathBuf, String) {
+    let cwd = std::env::temp_dir().join("np-base").join("work");
+    let text = cwd.to_str().unwrap().to_string();
+    (cwd, text)
+  }
+
+  #[test]
+  fn relative_paths_resolve_against_the_working_directory() {
+    let (cwd, text) = work();
+    let parent = text.strip_suffix(&format!("{SEP}work")).unwrap();
+    for (input, expected) in [
+      ("foo.txt", format!("{text}{SEP}foo.txt")),
+      ("sub/foo.txt", format!("{text}{SEP}sub{SEP}foo.txt")),
+      ("./foo.txt", format!("{text}{SEP}foo.txt")),
+      ("../foo.txt", format!("{parent}{SEP}foo.txt")),
+      ("a/../b/./c.txt", format!("{text}{SEP}b{SEP}c.txt")),
+      ("./../foo.txt", format!("{parent}{SEP}foo.txt")),
+    ] {
+      assert_eq!(absolute_from(input, &cwd), expected, "{input}");
+    }
+  }
+
+  #[test]
+  fn going_up_past_the_root_stops_at_the_root() {
+    let (cwd, _) = work();
+    let root = cwd.ancestors().last().unwrap().to_str().unwrap();
+    let ups = "../".repeat(cwd.components().count() + 2);
+    assert_eq!(
+      absolute_from(&format!("{ups}foo.txt"), &cwd),
+      format!("{root}foo.txt")
+    );
+  }
+
+  #[test]
+  fn an_absolute_path_comes_back_unchanged() {
+    let (cwd, text) = work();
+    for input in [
+      format!("{text}{SEP}foo.txt"),
+      format!("{text}{SEP}a{SEP}..{SEP}b.txt"),
+      format!("{text}{SEP}.{SEP}b.txt"),
+    ] {
+      assert_eq!(absolute_from(&input, &cwd), input);
+    }
+  }
+
+  #[test]
+  fn a_working_directory_that_is_not_absolute_leaves_the_path_unchanged() {
+    for cwd in ["", ".", "rel/dir"] {
+      for input in ["./foo.txt", "a/../b.txt"] {
+        assert_eq!(absolute_from(input, Path::new(cwd)), input, "cwd {cwd:?}");
+      }
+    }
+  }
+
+  #[test]
+  fn spaces_and_non_ascii_survive() {
+    let (cwd, text) = work();
+    let cwd = cwd.join("空 白");
+    assert_eq!(
+      absolute_from("my notes/メモ 1.txt", &cwd),
+      format!("{text}{SEP}空 白{SEP}my notes{SEP}メモ 1.txt")
+    );
+  }
+
+  #[test]
+  fn a_missing_file_still_resolves_and_nothing_is_created() {
+    let dir = tempfile::tempdir().unwrap();
+    let text = dir.path().to_str().unwrap();
+    assert_eq!(
+      absolute_from("missing/foo.txt", dir.path()),
+      format!("{text}{SEP}missing{SEP}foo.txt")
+    );
+    assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
+  }
+
+  #[cfg(unix)]
+  #[test]
+  fn a_working_directory_that_is_not_unicode_leaves_the_path_unchanged() {
+    use std::ffi::OsStr;
+    use std::os::unix::ffi::OsStrExt;
+
+    let cwd = Path::new(OsStr::from_bytes(b"/tmp/\xFF"));
+    assert!(cwd.is_absolute());
+    assert_eq!(absolute_from("./foo.txt", cwd), "./foo.txt");
+  }
+
+  #[cfg(unix)]
+  #[test]
+  fn windows_shapes_are_ordinary_names_on_unix() {
+    let cwd = Path::new("/tmp/work");
+    for (input, expected) in [
+      ("sub/a:b.txt", "/tmp/work/sub/a:b.txt"),
+      ("C:foo.txt", "/tmp/work/C:foo.txt"),
+      (r"\\server", r"/tmp/work/\\server"),
+      (r"\??\C:\foo.txt", r"/tmp/work/\??\C:\foo.txt"),
+    ] {
+      assert_eq!(absolute_from(input, cwd), expected);
+    }
+  }
+
+  #[cfg(windows)]
+  #[test]
+  fn windows_absolute_and_server_or_device_forms_come_back_unchanged() {
+    let cwd = Path::new(r"C:\x");
+    for input in [
+      r"C:\x\foo.txt",
+      r"\\server\share\foo.txt",
+      r"\\?\C:\foo.txt",
+      r"\\server",
+      r"\\server\",
+      r"\\.",
+      r"\\?",
+      "//server",
+      r"\/server",
+      r"\??\C:\foo.txt",
+    ] {
+      assert_eq!(absolute_from(input, cwd), input);
+    }
+  }
+
+  #[cfg(windows)]
+  #[test]
+  fn windows_paths_resolve_against_the_working_directory() {
+    for (cwd, input, expected) in [
+      (r"C:\x\y", r"\foo.txt", r"C:\foo.txt"),
+      (r"C:\x\y", r"..\foo.txt", r"C:\x\foo.txt"),
+      (r"C:\x", "sub/foo.txt", r"C:\x\sub\foo.txt"),
+      (
+        r"\\srv\share\dir",
+        r"..\..\..\foo.txt",
+        r"\\srv\share\foo.txt",
+      ),
+    ] {
+      assert_eq!(absolute_from(input, Path::new(cwd)), expected, "{input}");
+    }
+  }
+
+  #[cfg(windows)]
+  #[test]
+  fn windows_drive_relative_paths_need_the_working_directorys_drive() {
+    let cwd = Path::new(r"C:\x");
+    assert_eq!(absolute_from("C:foo.txt", cwd), r"C:\x\foo.txt");
+    assert_eq!(absolute_from("c:foo.txt", cwd), r"C:\x\foo.txt");
+    assert_eq!(absolute_from("D:foo.txt", cwd), "D:foo.txt");
+  }
+
+  #[cfg(windows)]
+  #[test]
+  fn windows_segments_that_look_like_drives_stay_segments() {
+    let cwd = Path::new(r"C:\x");
+    for (input, expected) in [
+      (r"sub\a:b.txt", r"C:\x\sub\a:b.txt"),
+      (r"sub\C:\foo.txt", r"C:\x\sub\C:\foo.txt"),
+      ("C:a:b", r"C:\x\a:b"),
+    ] {
+      assert_eq!(absolute_from(input, cwd), expected);
+    }
+  }
+
+  #[test]
+  fn absolute_files_resolves_every_path_in_order() {
+    let (cwd, text) = work();
+    let absolute = format!("{text}{SEP}c.txt");
+    assert_eq!(
+      absolute_files(
+        Action::OpenFiles(vec!["b.txt".into(), "./a.txt".into(), absolute.clone()]),
+        &cwd
+      ),
+      Action::OpenFiles(vec![
+        format!("{text}{SEP}b.txt"),
+        format!("{text}{SEP}a.txt"),
+        absolute
+      ])
+    );
+  }
+
+  #[test]
+  fn absolute_files_leaves_every_other_action_alone() {
+    let (cwd, _) = work();
+    for action in [
+      Action::NewSticky,
+      Action::Workspace,
+      Action::Note("./n".into()),
+      Action::Doc("./g".into(), 1),
+      Action::None,
+    ] {
+      assert_eq!(absolute_files(action.clone(), &cwd), action);
+    }
   }
 }
