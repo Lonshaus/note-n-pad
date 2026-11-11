@@ -232,6 +232,9 @@ pub(crate) fn set_lite(app: &AppHandle, lite: bool) -> bool {
     let locale =
       crate::i18n::current_locale(&crate::settings::app_settings(&app_for_main).language);
     crate::rebuild_menus(&app_for_main, locale);
+    // App pins float in the full edition only; the poller re-applies them
+    // just when the frontmost app changes.
+    crate::app_watch::apply_app_pins(&app_for_main, crate::app_watch::frontmost_id().as_deref());
     log::info!(
       "edition-changed: {}; menus rebuilt",
       if lite { "lite" } else { "full" }
@@ -441,6 +444,36 @@ mod gate_tests {
         "{name} must carry `{guard}`"
       );
     }
+  }
+
+  /// The text of the first `pin_on_top(` call in `body`, up to its `);`.
+  fn pin_on_top_call(body: &str) -> &str {
+    let at = body.find("pin_on_top(").expect("a pin_on_top call");
+    let rest = &body[at..];
+    &rest[..rest.find(");").expect("end of the call")]
+  }
+
+  #[test]
+  fn app_pins_follow_the_edition_at_every_place_that_floats_a_sticky() {
+    let windows = include_str!("windows.rs");
+    let app_watch = include_str!("app_watch.rs");
+    // `apply_app_pins` is also the re-apply helper for edition changes.
+    for body in [
+      body_of(windows, "create_sticky_window"),
+      body_of(app_watch, "apply_app_pins"),
+    ] {
+      assert!(
+        pin_on_top_call(body).contains("is_lite()"),
+        "the app-pin decision must pass the live edition"
+      );
+    }
+    assert!(!body_of(windows, "create_sticky_window").contains("\"app\" =>"));
+    assert!(!body_of(app_watch, "apply_app_pins").contains("pin_app.as_deref() == front"));
+  }
+
+  #[test]
+  fn an_edition_change_re_applies_the_app_pins() {
+    assert_guarded(include_str!("edition.rs"), &["set_lite"], "apply_app_pins(");
   }
 
   #[test]
