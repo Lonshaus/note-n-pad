@@ -28,7 +28,13 @@ export function featureRows(os: string): FeatureRow[] {
     { label: 'edition.row.themes', lite: false },
     { label: 'edition.row.languageFiles', lite: false },
     { label: 'edition.row.workspace', lite: false },
-    { label: 'edition.row.stickies', lite: true },
+    { label: 'edition.row.stickyPinApp', lite: false },
+    {
+      label: 'edition.row.stickies',
+      lite: true,
+      note: 'edition.row.stickiesNote',
+    },
+    { label: 'edition.row.stickyPinTop', lite: true },
     { label: 'edition.row.documents', lite: true },
     { label: 'edition.row.markdown', lite: true },
     { label: 'edition.row.table', lite: true },
@@ -42,11 +48,7 @@ export function featureRows(os: string): FeatureRow[] {
   if (os === 'windows') {
     rows.push({ label: 'edition.row.jumpList', lite: true });
   }
-  rows.push(
-    { label: 'edition.row.globalShortcuts', lite: true },
-    { label: 'sticky.pin.toApp', lite: true },
-    { label: 'sticky.paperColor', lite: true },
-  );
+  rows.push({ label: 'edition.row.globalShortcuts', lite: true });
   return rows;
 }
 

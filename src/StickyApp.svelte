@@ -16,7 +16,9 @@
   } from './lib/state/stickyNote.svelte';
   import { settingsState } from './lib/state/settings.svelte';
   import { platform } from './lib/state/platform.svelte';
+  import { editionState, isLite } from './lib/state/edition.svelte';
   import { shouldFloatOnTop } from './lib/util/pinFloat';
+  import { effectivePinMode, pinMenuHasApps } from './lib/util/pinMenu';
   import { matchStickyShortcut } from './lib/util/stickyShortcut';
   import { revealWhenThemed } from './lib/util/reveal';
   import { onFileDragOver, onFileDrop } from './lib/util/fileDrop';
@@ -81,7 +83,9 @@
   let showPinMenu = $state(false);
   let runningApps = $state<RunningApp[]>([]);
 
-  const pinMode = $derived(stickyNote.note?.pin_mode ?? 'none');
+  const pinMode = $derived(
+    effectivePinMode(stickyNote.note?.pin_mode ?? 'none', isLite()),
+  );
   const pinApp = $derived(stickyNote.note?.pin_app ?? null);
   // Fixed paper palette; order is the swatch-row order. graphite is the only
   // dark surface (drives the oneDark editor theme).
@@ -146,10 +150,14 @@
     void applyPin(pinMode === 'top' ? 'none' : 'top');
   }
 
+  async function loadRunningApps(): Promise<void> {
+    runningApps = await invoke<RunningApp[]>('list_running_apps');
+  }
+
   async function openPinMenu(): Promise<void> {
     showPinMenu = !showPinMenu;
-    if (showPinMenu) {
-      runningApps = await invoke<RunningApp[]>('list_running_apps');
+    if (showPinMenu && pinMenuHasApps(isLite())) {
+      await loadRunningApps();
     }
   }
 
@@ -368,6 +376,12 @@
     const unlistenChanges = settingsState.listenChanges();
     const unlistenThemes = themeRegistry.listen();
     const unlistenLocales = localeRegistry.listen();
+    // A menu left open across a switch to full gets its app list now.
+    const unlistenEdition = editionState.onChanged((lite) => {
+      if (showPinMenu && pinMenuHasApps(lite)) {
+        void loadRunningApps();
+      }
+    });
     // Reveal the window only after the theme is loaded and applied, so a
     // dark-theme window never flashes its default white background.
     void revealWhenThemed();
@@ -512,6 +526,7 @@
       void unlistenChanges.then((u) => u());
       void unlistenThemes.then((u) => u());
       void unlistenLocales.then((u) => u());
+      unlistenEdition();
       void unlistenClose.then((u) => u());
       void unlistenMoved.then((u) => u());
       void unlistenResized.then((u) => u());
@@ -594,17 +609,19 @@
           >
             {t('sticky.pin.alwaysOnTop')}
           </button>
-          <div class="pin-sep"></div>
-          <div class="pin-heading">{t('sticky.pin.toApp')}</div>
-          {#each runningApps as app (app.id)}
-            <button
-              class="pin-item"
-              class:current={pinMode === 'app' && pinApp === app.id}
-              onclick={() => applyPin('app', app.id)}
-            >
-              {app.name}
-            </button>
-          {/each}
+          {#if pinMenuHasApps(isLite())}
+            <div class="pin-sep"></div>
+            <div class="pin-heading">{t('sticky.pin.toApp')}</div>
+            {#each runningApps as app (app.id)}
+              <button
+                class="pin-item"
+                class:current={pinMode === 'app' && pinApp === app.id}
+                onclick={() => applyPin('app', app.id)}
+              >
+                {app.name}
+              </button>
+            {/each}
+          {/if}
           <div class="pin-sep"></div>
           <button
             class="pin-item"
