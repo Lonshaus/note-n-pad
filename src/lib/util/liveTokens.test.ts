@@ -88,6 +88,7 @@ describe('startKeepalive', () => {
         onGateRevoked: () => () => {},
         pin: () => Promise.resolve(21),
         unpin: () => {},
+        readSystemText: () => Promise.resolve({ kind: 'other' as const }),
         redispatchPaste: () => Promise.resolve('send' as const),
         readText: () => Promise.resolve(''),
         focusStill: () => true,

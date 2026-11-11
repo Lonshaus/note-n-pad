@@ -254,7 +254,7 @@ pub fn write_file_encoded(
 }
 /// The most UTF-8 bytes one chunk of a document read or write carries over IPC
 /// (`src/lib/util/documentIoProtocol.ts`, which a test ties to this value).
-const IO_CHUNK_BYTES: usize = 1048576;
+pub(crate) const IO_CHUNK_BYTES: usize = 1048576;
 /// Header carrying the write session's token.
 const IO_TOKEN_HEADER: &str = "x-note-n-pad-io-token";
 /// Header carrying the UTF-8 offset where a written chunk starts.

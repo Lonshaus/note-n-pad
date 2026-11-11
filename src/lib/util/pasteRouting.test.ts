@@ -26,6 +26,7 @@ import {
   type FieldDeps,
   type PasteEventLike,
   type ResolveDeps,
+  type SystemTextRead,
   type TextBegin,
 } from './pasteRouting';
 import { LARGE_FILE_THRESHOLD } from '../state/documentWindow.svelte';
@@ -67,6 +68,7 @@ interface Harness {
   textEnd: ReturnType<typeof vi.fn>;
   pin: ReturnType<typeof vi.fn>;
   unpin: ReturnType<typeof vi.fn>;
+  readSystemText: ReturnType<typeof vi.fn>;
   redispatchPaste: ReturnType<typeof vi.fn>;
   readText: ReturnType<typeof vi.fn>;
   userInput: { fire: () => void; armed: () => boolean };
@@ -83,6 +85,10 @@ function harness(over: Partial<ResolveDeps> = {}): Harness {
   const textEnd = vi.fn((_token: number) => Promise.resolve(true));
   const pin = vi.fn((_id: string) => Promise.resolve(7));
   const unpin = vi.fn();
+  // Not plain text unless a test says so: the page is handed the paste.
+  const readSystemText = vi.fn((_token: number) =>
+    Promise.resolve<SystemTextRead>({ kind: 'other' }),
+  );
   const redispatchPaste = vi.fn(() =>
     Promise.resolve<'send' | 'not-key' | 'not-handled'>('send'),
   );
@@ -110,6 +116,7 @@ function harness(over: Partial<ResolveDeps> = {}): Harness {
     },
     pin,
     unpin,
+    readSystemText,
     redispatchPaste,
     readText,
     focusStill: () => true,
@@ -133,6 +140,7 @@ function harness(over: Partial<ResolveDeps> = {}): Harness {
     textEnd,
     pin,
     unpin,
+    readSystemText,
     redispatchPaste,
     readText,
     userInput,
@@ -272,8 +280,118 @@ describe('resolveClip', () => {
     const r = await resolveClip(h.deps, 3, 'web');
     expect(r).toEqual({ kind: 'text', text: 'typed elsewhere' });
     expect(h.readText).toHaveBeenCalledTimes(1);
+    expect(h.readSystemText).not.toHaveBeenCalled();
     expect(h.redispatchPaste).not.toHaveBeenCalled();
     expect(h.textEnd).toHaveBeenCalledWith(5);
+  });
+
+  describe('the core reading plain text on macOS', () => {
+    it('takes the text the core read and sends no paste', async () => {
+      const h = harness();
+      h.readSystemText.mockResolvedValue({ kind: 'text', text: 'plain' });
+      const r = await resolveClip(h.deps, 3, 'web');
+      expect(r).toEqual({ kind: 'text', text: 'plain' });
+      expect(h.readSystemText).toHaveBeenCalledWith(5);
+      expect(h.redispatchPaste).not.toHaveBeenCalled();
+      expect(h.readText).not.toHaveBeenCalled();
+      expect(h.textEnd).toHaveBeenCalledTimes(1);
+      expect(h.textEnd).toHaveBeenCalledWith(5);
+      expect(h.tokens.tokens()).toEqual([]);
+      const late = pasteEvent('after');
+      h.waiter.handle(late.e);
+      expect(late.getData).not.toHaveBeenCalled();
+    });
+
+    it('asks the core before it has a paste sent, and has one sent as before for anything but plain text', async () => {
+      const h = harness();
+      const ev = pasteEvent('from elsewhere');
+      h.redispatchPaste.mockImplementation(() => {
+        expect(h.readSystemText).toHaveBeenCalledTimes(1);
+        h.waiter.handle(ev.e);
+        return Promise.resolve('send');
+      });
+      const r = await resolveClip(h.deps, 3, 'web');
+      expect(r).toEqual({ kind: 'text', text: 'from elsewhere' });
+      expect(h.redispatchPaste).toHaveBeenCalledTimes(1);
+      expect(ev.preventDefault).toHaveBeenCalledTimes(1);
+      expect(ev.stopImmediatePropagation).toHaveBeenCalledTimes(1);
+      expect(h.textEnd).toHaveBeenCalledTimes(1);
+      expect(h.textEnd).toHaveBeenCalledWith(5);
+    });
+
+    it('takes a read that fails for anything but plain text', async () => {
+      const h = harness();
+      h.readSystemText.mockRejectedValue(new Error('lost'));
+      h.redispatchPaste.mockImplementation(() => {
+        h.waiter.handle(pasteEvent('sent').e);
+        return Promise.resolve('send');
+      });
+      expect(await resolveClip(h.deps, 3, 'web')).toEqual({
+        kind: 'text',
+        text: 'sent',
+      });
+    });
+
+    it.each(['not_key', 'none'] as const)(
+      'pastes nothing and has no paste sent when the core answers %s',
+      async (kind) => {
+        const h = harness();
+        h.readSystemText.mockResolvedValue({ kind });
+        // A paste sent would not be waited for either.
+        h.redispatchPaste.mockResolvedValue('not-key');
+        expect(await resolveClip(h.deps, 3, 'web')).toEqual({ kind: 'none' });
+        expect(h.redispatchPaste).not.toHaveBeenCalled();
+        expect(h.textEnd).toHaveBeenCalledTimes(1);
+        expect(h.tokens.tokens()).toEqual([]);
+      },
+    );
+
+    it('drops the text when the core no longer held the gate', async () => {
+      const h = harness();
+      h.readSystemText.mockResolvedValue({ kind: 'text', text: 'maybe ours' });
+      h.textEnd.mockResolvedValue(false);
+      expect(await resolveClip(h.deps, 3, 'web')).toEqual({ kind: 'none' });
+      expect(h.textEnd).toHaveBeenCalledTimes(1);
+    });
+
+    it('drops text that comes back after the core revoked the gate, and has no paste sent', async () => {
+      for (const late of [
+        { kind: 'text', text: 'too late' },
+        { kind: 'other' },
+      ] as const) {
+        const h = harness();
+        let answer: (found: SystemTextRead) => void = () => {};
+        h.readSystemText.mockImplementation(
+          () => new Promise<SystemTextRead>((resolve) => (answer = resolve)),
+        );
+        const pending = resolveClip(h.deps, 3, 'web');
+        await vi.advanceTimersByTimeAsync(PASTE_SLOW_MS + 1000);
+        h.revoked.fire(5);
+        expect(await pending).toEqual({ kind: 'none' });
+        answer(late);
+        await settle();
+        expect(h.redispatchPaste).not.toHaveBeenCalled();
+        expect(h.textEnd).toHaveBeenCalledTimes(1);
+      }
+    });
+
+    it('drops text that comes back after the user typed once the editor was released', async () => {
+      const h = harness();
+      let answer: (found: SystemTextRead) => void = () => {};
+      h.readSystemText.mockImplementation(
+        () => new Promise<SystemTextRead>((resolve) => (answer = resolve)),
+      );
+      const onSlow = vi.fn();
+      const pending = resolveClip(h.deps, 3, 'web', { onSlow });
+      await vi.advanceTimersByTimeAsync(PASTE_SLOW_MS);
+      expect(onSlow).toHaveBeenCalledTimes(1);
+      h.userInput.fire();
+      expect(await pending).toEqual({ kind: 'none' });
+      answer({ kind: 'text', text: 'too late' });
+      await settle();
+      expect(h.redispatchPaste).not.toHaveBeenCalled();
+      expect(h.textEnd).toHaveBeenCalledTimes(1);
+    });
   });
 
   it('pastes nothing when the clipboard has no text to read', async () => {

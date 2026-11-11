@@ -3106,6 +3106,10 @@ pub fn run() {
       clipboard_store::clip_unpin,
       #[cfg(target_os = "macos")]
       clipboard_store::clipboard_redispatch_paste,
+      #[cfg(target_os = "macos")]
+      clipboard_store::clip_text_read,
+      #[cfg(target_os = "macos")]
+      clipboard_store::clip_text_chunk,
       file_ops::create_file,
       file_ops::create_folder,
       file_ops::rename_path,
