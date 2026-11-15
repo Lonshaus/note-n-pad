@@ -118,7 +118,7 @@ windows = { version = "0.61", features = [
 # WebView2's COM interfaces. Both crates are wry's own dependencies, so the
 # versions have to stay the ones wry uses for the types to be the same.
 webview2-com = "0.39"
-windows-core = "0.62"
+windows-core = "0.100"
 # Single-instance guard for Windows and Linux. macOS uses `mac_single_instance`
 # instead: this plugin's macOS socket lives in /tmp, which a sandboxed build
 # cannot use.
