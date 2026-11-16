@@ -14,6 +14,7 @@
   import { localeRegistry } from './lib/i18n/localeRegistry.svelte';
   import { t } from './lib/i18n';
   import { debounce } from './lib/util/debounce';
+  import { marquee } from './lib/util/marquee';
   import { nativeFieldHistory, nativeSelectAll } from './lib/util/menuBar';
   import { installPasteWindow, pasteEnv } from './lib/util/pasteEnv';
   import { fieldPaste } from './lib/util/pasteRouting';
@@ -1298,7 +1299,9 @@
               <path d="M9 6l6 6-6 6" />
             </svg>
           </span>
-          {t('workspace.section.stickies')}
+          <span class="marquee" use:marquee={t('workspace.section.stickies')}
+            ><span>{t('workspace.section.stickies')}</span></span
+          >
         </button>
       </h2>
       {#if !secOpen.stickies}
@@ -1322,9 +1325,15 @@
                   aria-hidden="true"
                 ></span>
                 {#if row.preview === ''}
-                  <span class="label muted">{t('workspace.sticky.blank')}</span>
+                  <span
+                    class="label marquee muted"
+                    use:marquee={t('workspace.sticky.blank')}
+                    ><span>{t('workspace.sticky.blank')}</span></span
+                  >
                 {:else}
-                  <span class="label">{row.preview}</span>
+                  <span class="label marquee" use:marquee={row.preview}
+                    ><span>{row.preview}</span></span
+                  >
                 {/if}
               </button>
               <button
@@ -1405,7 +1414,9 @@
               <path d="M9 6l6 6-6 6" />
             </svg>
           </span>
-          {t('workspace.section.docs')}
+          <span class="marquee" use:marquee={t('workspace.section.docs')}
+            ><span>{t('workspace.section.docs')}</span></span
+          >
         </button>
       </h2>
       {#if !secOpen.docs}
@@ -1430,7 +1441,9 @@
                   class="row"
                   onclick={() => void focusDoc(row.group, row.tabIndex)}
                 >
-                  <span class="label">{row.name}</span>
+                  <span class="label marquee" use:marquee={row.name}
+                    ><span>{row.name}</span></span
+                  >
                   {#if row.dirty}
                     <span class="dirty" aria-hidden="true">•</span>
                   {/if}
@@ -1468,7 +1481,9 @@
                 <path d="M9 6l6 6-6 6" />
               </svg>
             </span>
-            {t('workspace.section.project')}
+            <span class="marquee" use:marquee={t('workspace.section.project')}
+              ><span>{t('workspace.section.project')}</span></span
+            >
           </button>
         </h2>
         <div class="proj-actions">
@@ -1654,7 +1669,9 @@
                       />
                     </svg>
                   </span>
-                  <span class="label">{row.name}</span>
+                  <span class="label marquee" use:marquee={row.name}
+                    ><span>{row.name}</span></span
+                  >
                 </button>
                 <button
                   class="icon-btn row-add"
@@ -1760,7 +1777,9 @@
                       <path d="M13 3v6h6" />
                     </svg>
                   </span>
-                  <span class="label">{row.name}</span>
+                  <span class="label marquee" use:marquee={row.name}
+                    ><span>{row.name}</span></span
+                  >
                   {#if dirty}
                     <span class="open-dot" aria-hidden="true"></span>
                   {/if}
@@ -1837,6 +1856,9 @@
     text-transform: inherit;
     letter-spacing: inherit;
     cursor: default;
+    max-width: 100%;
+    overflow: hidden;
+    flex-shrink: 0;
   }
   .sec-chevron {
     display: flex;
@@ -1888,6 +1910,9 @@
     font: inherit;
     text-align: left;
     cursor: default;
+    max-width: 100%;
+    overflow: hidden;
+    flex-shrink: 0;
   }
   .row:hover {
     background: var(--topbar-border);
@@ -1958,7 +1983,6 @@
   .label {
     flex: 1 1 auto;
     overflow: hidden;
-    text-overflow: ellipsis;
     white-space: nowrap;
   }
   .label.muted {
@@ -2015,6 +2039,9 @@
     align-items: center;
     justify-content: space-between;
     gap: 0.5rem;
+  }
+  .proj-head .heading {
+    min-width: 0;
   }
   .proj-actions {
     display: flex;

@@ -22,6 +22,7 @@
   } from './lib/util/editionFeatures';
   import { isLite } from './lib/state/edition.svelte';
   import { t, type I18nKey } from './lib/i18n';
+  import { marquee } from './lib/util/marquee';
   // Reflect the resolved theme onto the document root.
   $effect(() => {
     applyTheme(settingsState.themeId);
@@ -34,6 +35,11 @@
   let busy = $state(false);
   let message = $state<I18nKey | null>(null);
   const controls = $derived(storeControls(info, isLite()));
+  const buyText = $derived(
+    info === null || info.price === null
+      ? t('edition.store.buy')
+      : t('edition.store.buyPrice', { price: info.price }),
+  );
 
   async function loadInfo(): Promise<void> {
     try {
@@ -106,9 +112,11 @@
   {#if controls === 'retry'}
     <div class="store">
       <p class="message">{t('edition.store.unreachable')}</p>
-      <button class="action" disabled={busy} onclick={() => void retry()}>
-        {t('edition.store.retry')}
-      </button>
+      <button class="action" disabled={busy} onclick={() => void retry()}
+        ><span class="marquee" use:marquee={t('edition.store.retry')}
+          ><span>{t('edition.store.retry')}</span></span
+        ></button
+      >
     </div>
   {:else if controls === 'buy'}
     <div class="store">
@@ -117,17 +125,17 @@
         disabled={busy}
         onclick={() => void run('store_purchase')}
       >
-        {info === null || info.price === null
-          ? t('edition.store.buy')
-          : t('edition.store.buyPrice', { price: info.price })}
+        <span class="marquee" use:marquee={buyText}><span>{buyText}</span></span
+        >
       </button>
       <button
         class="action"
         disabled={busy}
         onclick={() => void run('store_restore')}
+        ><span class="marquee" use:marquee={t('edition.store.restore')}
+          ><span>{t('edition.store.restore')}</span></span
+        ></button
       >
-        {t('edition.store.restore')}
-      </button>
       {#if message !== null}
         <p class="message">{t(message)}</p>
       {/if}
@@ -233,6 +241,9 @@
     font: inherit;
     font-size: 0.8rem;
     color: inherit;
+    max-width: 100%;
+    overflow: hidden;
+    flex-shrink: 0;
   }
   .action:hover:not(:disabled) {
     background: color-mix(in srgb, CanvasText 12%, Canvas);

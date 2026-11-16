@@ -9,6 +9,7 @@
   import EditorShell from './lib/editor/EditorShell.svelte';
   import ConfirmModal, { isModalOpen } from './lib/ConfirmModal.svelte';
   import { popupClosesOnEscape } from './lib/util/popupEscape';
+  import { marquee } from './lib/util/marquee';
   import {
     stickyNote,
     type PinMode,
@@ -606,9 +607,10 @@
             class="pin-item"
             class:current={pinMode === 'top'}
             onclick={() => applyPin('top')}
+            ><span class="marquee" use:marquee={t('sticky.pin.alwaysOnTop')}
+              ><span>{t('sticky.pin.alwaysOnTop')}</span></span
+            ></button
           >
-            {t('sticky.pin.alwaysOnTop')}
-          </button>
           {#if pinMenuHasApps(isLite())}
             <div class="pin-sep"></div>
             <div class="pin-heading">{t('sticky.pin.toApp')}</div>
@@ -617,9 +619,10 @@
                 class="pin-item"
                 class:current={pinMode === 'app' && pinApp === app.id}
                 onclick={() => applyPin('app', app.id)}
+                ><span class="marquee" use:marquee={app.name}
+                  ><span>{app.name}</span></span
+                ></button
               >
-                {app.name}
-              </button>
             {/each}
           {/if}
           <div class="pin-sep"></div>
@@ -627,9 +630,10 @@
             class="pin-item"
             class:current={pinMode === 'none'}
             onclick={() => applyPin('none')}
+            ><span class="marquee" use:marquee={t('sticky.pin.unpin')}
+              ><span>{t('sticky.pin.unpin')}</span></span
+            ></button
           >
-            {t('sticky.pin.unpin')}
-          </button>
         </div>
       {/if}
     </span>
@@ -886,6 +890,7 @@
     min-width: 130px;
     /* Fits a short sticky: the list scrolls instead of being clipped. */
     max-height: min(220px, calc(100vh - 40px));
+    max-width: calc(100vw - 12px - 6px);
     overflow-y: auto;
     padding: 3px;
     border-radius: 6px;
@@ -906,6 +911,9 @@
     text-align: left;
     white-space: nowrap;
     cursor: default;
+    max-width: 100%;
+    overflow: hidden;
+    flex-shrink: 0;
   }
   .pin-item:hover {
     background: var(--sticky-scrim);

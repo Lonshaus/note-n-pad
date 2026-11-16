@@ -9,6 +9,8 @@ const DEFAULT_WIDTH: f64 = 280.0;
 const DEFAULT_HEIGHT: f64 = 230.0;
 /// Narrowest sticky that fits its toolbar with the color row open.
 pub const STICKY_MIN_WIDTH: f64 = 280.0;
+/// Shortest sticky that fits the save-before-close dialog in a 280 px width.
+pub const STICKY_MIN_HEIGHT: f64 = 160.0;
 const CASCADE_STEP: f64 = 28.0;
 /// The sticky card's corner radius, matching `border-radius` on `.card` in
 /// `StickyApp.svelte`. macOS clips the window's layer to it; a mismatch shows
@@ -519,6 +521,10 @@ fn cascade_position(app: &AppHandle) -> (f64, f64) {
 fn sticky_open_width(stored: Option<f64>) -> f64 {
   stored.unwrap_or(DEFAULT_WIDTH).max(STICKY_MIN_WIDTH)
 }
+/// A sticky saved under an older, shorter minimum opens at the current one.
+fn sticky_open_height(stored: Option<f64>) -> f64 {
+  stored.unwrap_or(DEFAULT_HEIGHT).max(STICKY_MIN_HEIGHT)
+}
 /// Whether a sticky floats always-on-top. A top pin floats in both editions;
 /// pin to app is full-only, so an app pin never floats while `lite`. Without
 /// foreground detection (e.g. Wayland) an app pin degrades to permanent
@@ -566,10 +572,10 @@ pub fn create_sticky_window(app: &AppHandle, note: &NoteSnapshot) -> Result<(), 
     .visible(false)
     .decorations(false)
     .always_on_top(on_top)
-    .min_inner_size(STICKY_MIN_WIDTH, 140.0)
+    .min_inner_size(STICKY_MIN_WIDTH, STICKY_MIN_HEIGHT)
     .inner_size(
       sticky_open_width(note.width),
-      note.height.unwrap_or(DEFAULT_HEIGHT),
+      sticky_open_height(note.height),
     );
   // Tauri's own way to clear the window layer. macOS is excluded because there
   // it is gated behind the `macos-private-api` feature, whose only private act
@@ -616,6 +622,15 @@ pub fn create_sticky_window(app: &AppHandle, note: &NoteSnapshot) -> Result<(), 
 
 const DOC_DEFAULT_WIDTH: f64 = 800.0;
 const DOC_DEFAULT_HEIGHT: f64 = 600.0;
+/// Narrowest document window that keeps the status bar on one line.
+const DOC_MIN_WIDTH: f64 = 480.0;
+/// Shortest document window that fits the tab bar, the status bar, the search
+/// panel and a few lines of text.
+const DOC_MIN_HEIGHT: f64 = 300.0;
+/// A document window saved under an older, smaller minimum opens at the current one.
+fn document_open_size(width: f64, height: f64) -> (f64, f64) {
+  (width.max(DOC_MIN_WIDTH), height.max(DOC_MIN_HEIGHT))
+}
 /// The URL a document window loads, carrying the window group (and, for a fresh
 /// open, an initial file path and project root) so the frontend can load every
 /// tab in the group and restore it.
@@ -662,6 +677,7 @@ fn build_document_window(
     width,
     height,
   } = bounds;
+  let size = document_open_size(width, height);
   let label = format!("doc-{group}");
   let query = document_window_query(group, initial_path, project, tab, blank);
   let url = WebviewUrl::App(query.into());
@@ -679,7 +695,8 @@ fn build_document_window(
     .title(title)
     .visible(false)
     .background_color(chrome_background(app))
-    .inner_size(width, height);
+    .min_inner_size(DOC_MIN_WIDTH, DOC_MIN_HEIGHT)
+    .inner_size(size.0, size.1);
   if let (Some(x), Some(y)) = (x, y) {
     builder = builder.position(x, y);
   }
@@ -688,7 +705,7 @@ fn build_document_window(
   let builder = builder.disable_drag_drop_handler();
   let window = builder.build().map_err(|e| e.to_string())?;
   crate::file_drop::attach(&window);
-  fix_inner_size(&window, (width, height));
+  fix_inner_size(&window, size);
   show_after_grace(window);
   Ok(())
 }
@@ -1432,6 +1449,50 @@ mod tests {
     assert_eq!(super::sticky_open_width(None), 280.0);
     assert_eq!(super::sticky_open_width(Some(200.0)), 280.0);
     assert_eq!(super::sticky_open_width(Some(300.0)), 300.0);
+  }
+
+  #[test]
+  fn a_sticky_opens_no_shorter_than_the_minimum() {
+    assert_eq!(super::sticky_open_height(None), 230.0);
+    assert_eq!(
+      super::sticky_open_height(Some(super::STICKY_MIN_HEIGHT - 1.0)),
+      super::STICKY_MIN_HEIGHT
+    );
+    assert_eq!(super::sticky_open_height(Some(400.0)), 400.0);
+  }
+
+  #[test]
+  fn a_document_window_opens_no_smaller_than_the_minimum() {
+    let (w, h) = (super::DOC_MIN_WIDTH, super::DOC_MIN_HEIGHT);
+    assert_eq!(super::document_open_size(w - 1.0, h - 1.0), (w, h));
+    assert_eq!(super::document_open_size(w, h), (w, h));
+    assert_eq!(
+      super::document_open_size(w + 1.0, h + 1.0),
+      (w + 1.0, h + 1.0)
+    );
+    assert_eq!(super::document_open_size(w - 1.0, h + 1.0), (w, h + 1.0));
+  }
+
+  #[test]
+  fn the_document_window_is_built_at_a_size_no_smaller_than_the_minimum() {
+    let source = include_str!("windows.rs");
+    let at = source.find("fn build_document_window(").unwrap();
+    let body = &source[at..];
+    let body = &body[..body.find("\n}\n").unwrap()];
+    assert!(body.contains(".min_inner_size(DOC_MIN_WIDTH, DOC_MIN_HEIGHT)"));
+    assert!(body.contains("let size = document_open_size(width, height);"));
+    assert!(body.contains(".inner_size(size.0, size.1)"));
+    assert!(body.contains("fix_inner_size(&window, size);"));
+  }
+
+  #[test]
+  fn the_sticky_window_is_built_at_a_size_no_smaller_than_the_minimum() {
+    let source = include_str!("windows.rs");
+    let at = source.find("pub fn create_sticky_window(").unwrap();
+    let body = &source[at..];
+    let body = &body[..body.find("\n}\n").unwrap()];
+    assert!(body.contains(".min_inner_size(STICKY_MIN_WIDTH, STICKY_MIN_HEIGHT)"));
+    assert!(body.contains("sticky_open_height(note.height)"));
   }
 
   #[test]
