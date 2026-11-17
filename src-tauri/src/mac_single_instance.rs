@@ -17,7 +17,7 @@ use objc2_app_kit::{NSRunningApplication, NSWorkspace, NSWorkspaceOpenConfigurat
 use objc2_foundation::{NSBundle, NSError, NSString, NSURL};
 use std::ffi::CStr;
 use std::fs::{DirBuilder, File};
-use std::io;
+use std::io::{self, Write};
 use std::os::fd::{AsRawFd, FromRawFd};
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::DirBuilderExt;
@@ -106,19 +106,25 @@ struct Candidate {
 /// over to the running one and exits. Returns when this process may launch.
 pub fn ensure() {
   let Some(dir) = data_dir() else {
-    eprintln!("single-instance guard is off: no data directory");
+    let _ = writeln!(
+      io::stderr(),
+      "single-instance guard is off: no data directory"
+    );
     return;
   };
   match start_in(&dir) {
     Ok((fds, Decision::Launch)) => keep(fds),
     Ok((fds, Decision::HandOver)) => hand_over(fds),
     Ok((_, Decision::LaunchUnguarded(errno))) => {
-      eprintln!(
+      let _ = writeln!(
+        io::stderr(),
         "single-instance guard is off: flock failed: {}",
         io::Error::from_raw_os_error(errno)
       );
     }
-    Err(why) => eprintln!("single-instance guard is off: {why}"),
+    Err(why) => {
+      let _ = writeln!(io::stderr(), "single-instance guard is off: {why}");
+    }
   }
 }
 /// Creates `.quitting`; called when the quit handshake starts.
@@ -189,7 +195,8 @@ fn hand_over(fds: Fds) {
         return;
       }
       (Step::LaunchUnguarded(errno), _) => {
-        eprintln!(
+        let _ = writeln!(
+          io::stderr(),
           "single-instance guard is off: flock failed: {}",
           io::Error::from_raw_os_error(errno)
         );
@@ -212,11 +219,14 @@ fn hand_over(fds: Fds) {
         std::thread::sleep(POLL);
       }
       (Step::Exit(Exit::HandedOver), _) => {
-        eprintln!("handed over to the running instance");
+        let _ = writeln!(io::stderr(), "handed over to the running instance");
         std::process::exit(0);
       }
       (Step::Exit(Exit::BudgetExhausted), _) => {
-        eprintln!("another instance holds the lock and could not be reached; exiting");
+        let _ = writeln!(
+          io::stderr(),
+          "another instance holds the lock and could not be reached; exiting"
+        );
         std::process::exit(0);
       }
     }
@@ -733,5 +743,16 @@ mod tests {
       ),
       Step::LaunchUnguarded(libc::ENOLCK)
     );
+  }
+}
+
+#[cfg(test)]
+mod stderr_write_tests {
+  const SOURCE: &str = include_str!("mac_single_instance.rs");
+
+  #[test]
+  fn non_test_code_never_uses_eprintln() {
+    let production = SOURCE.split("#[cfg(test)]").next().unwrap();
+    assert!(!production.contains(concat!("eprint", "ln!")));
   }
 }

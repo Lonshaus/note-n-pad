@@ -6,6 +6,8 @@
 
 use log::{Level, LevelFilter, Log, Metadata, Record};
 use std::collections::VecDeque;
+#[cfg(debug_assertions)]
+use std::io::Write;
 use std::path::PathBuf;
 use std::sync::{Mutex, OnceLock};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -102,7 +104,7 @@ impl Log for DiagLogger {
     self.ring.push_line(&line);
     // Debug builds still print to stderr so `npm run tauri dev` stays usable.
     #[cfg(debug_assertions)]
-    eprintln!("{line}");
+    let _ = writeln!(std::io::stderr(), "{line}");
   }
 
   fn flush(&self) {}
@@ -126,7 +128,7 @@ fn record_line(line: &str) {
   if let Some(logger) = LOGGER.get() {
     logger.ring.push_line(line);
     #[cfg(debug_assertions)]
-    eprintln!("{line}");
+    let _ = writeln!(std::io::stderr(), "{line}");
   }
 }
 
@@ -204,5 +206,33 @@ mod tests {
     std::fs::write(&path, ring.snapshot()).unwrap();
     let written = String::from_utf8(std::fs::read(&path).unwrap()).unwrap();
     assert_eq!(written, "first\nsecond\n");
+  }
+
+  #[test]
+  #[ignore = "run only as the child of stderr_closed_does_not_panic"]
+  fn stderr_closed_child() {
+    init();
+    for i in 0..100 {
+      log::info!("child line {i}");
+      record_line(&format!("child record {i}"));
+    }
+  }
+
+  #[test]
+  fn stderr_closed_does_not_panic() {
+    let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+      .args([
+        "--ignored",
+        "--exact",
+        "--nocapture",
+        "diag::tests::stderr_closed_child",
+      ])
+      .stdout(std::process::Stdio::null())
+      .stderr(std::process::Stdio::piped())
+      .spawn()
+      .unwrap();
+    drop(child.stderr.take());
+    let status = child.wait().unwrap();
+    assert_eq!(status.code(), Some(0));
   }
 }
