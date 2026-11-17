@@ -13,7 +13,6 @@
   } from '@codemirror/state';
   import {
     EditorView,
-    lineNumbers,
     highlightActiveLineGutter,
     highlightSpecialChars,
     drawSelection,
@@ -51,6 +50,7 @@
   import { keymapExtension } from './keymap';
   import { compositionCancel } from './composition';
   import { isUndoKey } from './imeShortcuts';
+  import { stickyLineNumbers } from './stickyLineNumbers';
   import { cmPhraseExtension, cmPhraseSignature } from './cmPhrases';
   import { shortcutsState } from '../state/shortcuts.svelte';
   import { platform } from '../state/platform.svelte';
@@ -170,7 +170,9 @@
   // The whole gutter column (line numbers + fold + active-line gutter) toggles
   // together, so turning line numbers off removes the gutter entirely.
   function gutterExtension(on: boolean): Extension {
-    return on ? [lineNumbers(), highlightActiveLineGutter(), foldGutter()] : [];
+    return on
+      ? [stickyLineNumbers(), highlightActiveLineGutter(), foldGutter()]
+      : [];
   }
 
   let container: HTMLDivElement;
