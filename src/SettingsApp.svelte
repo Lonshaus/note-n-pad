@@ -21,6 +21,7 @@
   import { getColor, setColor } from './lib/theme/themeColor';
   import { open, save, ask } from '@tauri-apps/plugin-dialog';
   import { debounce } from './lib/util/debounce';
+  import { marquee } from './lib/util/marquee';
   import { recordAccelerator, formatKeyDisplay } from './lib/util/accelerator';
   import {
     shortcutsState,
@@ -280,6 +281,16 @@
       };
     }
     await shortcutsState.load();
+  }
+
+  function recorderText(row: ShortcutRow): string {
+    if (recordingId === row.id) {
+      return t('settings.sticky.recording');
+    }
+    if (row.accelerator === '') {
+      return t('settings.shortcuts.notSet');
+    }
+    return formatKeyDisplay(row.accelerator, platform.isMacOS);
   }
 
   function keysText(row: ShortcutRow): string {
@@ -758,9 +769,10 @@
         role="tab"
         aria-selected={section === s.id}
         onclick={() => (section = s.id)}
+        ><span class="marquee" use:marquee={t(s.key)}
+          ><span>{t(s.key)}</span></span
+        ></button
       >
-        {t(s.key)}
-      </button>
     {/each}
   </div>
 
@@ -788,16 +800,23 @@
       {@const modal = choiceModal}
       <div class="modal-overlay" role="presentation">
         <div class="modal-card" role="presentation">
-          <span class="modal-title">{t(modal.titleKey, modal.titleParams)}</span
-          >
-          {#if modal.bodyKey !== undefined}
-            <span class="modal-body">{t(modal.bodyKey, modal.bodyParams)}</span>
-          {/if}
+          <div class="modal-scroll">
+            <span class="modal-title"
+              >{t(modal.titleKey, modal.titleParams)}</span
+            >
+            {#if modal.bodyKey !== undefined}
+              <span class="modal-body"
+                >{t(modal.bodyKey, modal.bodyParams)}</span
+              >
+            {/if}
+          </div>
           <div class="modal-actions">
             {#each modal.buttons as button (button.id)}
-              <button class="btn" onclick={() => answerChoice(button.id)}>
-                {t(button.labelKey)}
-              </button>
+              <button class="btn" onclick={() => answerChoice(button.id)}
+                ><span class="marquee" use:marquee={t(button.labelKey)}
+                  ><span>{t(button.labelKey)}</span></span
+                ></button
+              >
             {/each}
           </div>
         </div>
@@ -812,9 +831,10 @@
             role="tab"
             aria-selected={shownTab === tab}
             onclick={() => (editorTab = tab)}
+            ><span class="marquee" use:marquee={t(EDITOR_TAB_KEYS[tab])}
+              ><span>{t(EDITOR_TAB_KEYS[tab])}</span></span
+            ></button
           >
-            {t(EDITOR_TAB_KEYS[tab])}
-          </button>
         {/each}
       </div>
     {/if}
@@ -838,9 +858,10 @@
                   role="option"
                   aria-selected={settingsState.themeId === th.id}
                   onclick={() => selectTheme(th.id)}
+                  ><span class="marquee" use:marquee={th.name}
+                    ><span>{th.name}</span></span
+                  ></button
                 >
-                  {th.name}
-                </button>
               {/each}
             {/if}
             {#if themeRegistry.light().length > 0}
@@ -854,16 +875,19 @@
                   role="option"
                   aria-selected={settingsState.themeId === th.id}
                   onclick={() => selectTheme(th.id)}
+                  ><span class="marquee" use:marquee={th.name}
+                    ><span>{th.name}</span></span
+                  ></button
                 >
-                  {th.name}
-                </button>
               {/each}
             {/if}
           </div>
           <div class="theme-actions">
-            <button class="btn" onclick={() => void importTheme()}>
-              {t('settings.theme.import')}
-            </button>
+            <button class="btn" onclick={() => void importTheme()}
+              ><span class="marquee" use:marquee={t('settings.theme.import')}
+                ><span>{t('settings.theme.import')}</span></span
+              ></button
+            >
           </div>
           {#if importError !== ''}
             <span class="error">{importError}</span>
@@ -890,28 +914,42 @@
             {@const theme = selectedTheme}
             <div class="theme-editor">
               <div class="theme-editor-actions">
-                <button class="btn" onclick={() => void exportTheme()}>
-                  {t('settings.theme.export')}
-                </button>
+                <button class="btn" onclick={() => void exportTheme()}
+                  ><span
+                    class="marquee"
+                    use:marquee={t('settings.theme.export')}
+                    ><span>{t('settings.theme.export')}</span></span
+                  ></button
+                >
                 {#if selectedIsDefault}
                   <button
                     class="btn"
                     disabled={!selectedModified}
                     onclick={() => void resetSelected()}
+                    ><span
+                      class="marquee"
+                      use:marquee={t('settings.theme.reset')}
+                      ><span>{t('settings.theme.reset')}</span></span
+                    ></button
                   >
-                    {t('settings.theme.reset')}
-                  </button>
                 {/if}
                 <button
                   class="btn"
                   disabled={themeRegistry.themes.length <= 1}
                   onclick={() => void deleteSelected()}
+                  ><span
+                    class="marquee"
+                    use:marquee={t('settings.theme.delete')}
+                    ><span>{t('settings.theme.delete')}</span></span
+                  ></button
                 >
-                  {t('settings.theme.delete')}
-                </button>
-                <button class="btn" onclick={openSaveAs}>
-                  {t('settings.theme.saveAsNew')}
-                </button>
+                <button class="btn" onclick={openSaveAs}
+                  ><span
+                    class="marquee"
+                    use:marquee={t('settings.theme.saveAsNew')}
+                    ><span>{t('settings.theme.saveAsNew')}</span></span
+                  ></button
+                >
               </div>
               {#if importError !== ''}
                 <span class="error">{importError}</span>
@@ -963,16 +1001,19 @@
               use:autofocus
             />
             <div class="modal-actions">
-              <button class="btn" onclick={cancelSaveAs}>
-                {t('common.cancel')}
-              </button>
+              <button class="btn" onclick={cancelSaveAs}
+                ><span class="marquee" use:marquee={t('common.cancel')}
+                  ><span>{t('common.cancel')}</span></span
+                ></button
+              >
               <button
                 class="btn"
                 disabled={newThemeName.trim() === ''}
                 onclick={() => void confirmSaveAs()}
+                ><span class="marquee" use:marquee={t('common.save')}
+                  ><span>{t('common.save')}</span></span
+                ></button
               >
-                {t('common.save')}
-              </button>
             </div>
           </div>
         </div>
@@ -985,9 +1026,11 @@
             >{Math.round(settingsState.defaultStickyWidth)} ×
             {Math.round(settingsState.defaultStickyHeight)}</span
           >
-          <button class="btn" onclick={() => settingsState.resetStickySize()}>
-            {t('settings.sticky.resetSize')}
-          </button>
+          <button class="btn" onclick={() => settingsState.resetStickySize()}
+            ><span class="marquee" use:marquee={t('settings.sticky.resetSize')}
+              ><span>{t('settings.sticky.resetSize')}</span></span
+            ></button
+          >
         </div>
       </div>
     {:else if section === 'shortcuts'}
@@ -996,9 +1039,10 @@
         <button
           class="btn"
           onclick={() => changeShortcut('', 'reset_all_shortcuts', {})}
+          ><span class="marquee" use:marquee={t('settings.shortcuts.resetAll')}
+            ><span>{t('settings.shortcuts.resetAll')}</span></span
+          ></button
         >
-          {t('settings.shortcuts.resetAll')}
-        </button>
       </div>
       {#if notice !== null && notice.id === ''}
         <span class="error">{t(notice.message.key, notice.message.params)}</span
@@ -1026,13 +1070,9 @@
                   onclick={(e) => e.currentTarget.focus()}
                   onkeydown={(e) => onRecorderKeydown(e, row)}
                 >
-                  {#if recordingId === row.id}
-                    {t('settings.sticky.recording')}
-                  {:else if row.accelerator === ''}
-                    {t('settings.shortcuts.notSet')}
-                  {:else}
-                    {formatKeyDisplay(row.accelerator, platform.isMacOS)}
-                  {/if}
+                  <span class="marquee" use:marquee={recorderText(row)}
+                    ><span>{recorderText(row)}</span></span
+                  >
                 </button>
                 <button
                   class="btn"
@@ -1042,17 +1082,23 @@
                       id: row.id,
                       accel: null,
                     })}
+                  ><span
+                    class="marquee"
+                    use:marquee={t('settings.shortcuts.clear')}
+                    ><span>{t('settings.shortcuts.clear')}</span></span
+                  ></button
                 >
-                  {t('settings.shortcuts.clear')}
-                </button>
                 <button
                   class="btn"
                   disabled={row.accelerator === row.default}
                   onclick={() =>
                     changeShortcut(row.id, 'reset_shortcut', { id: row.id })}
+                  ><span
+                    class="marquee"
+                    use:marquee={t('settings.shortcuts.reset')}
+                    ><span>{t('settings.shortcuts.reset')}</span></span
+                  ></button
                 >
-                  {t('settings.shortcuts.reset')}
-                </button>
               {:else}
                 <span class="shortcut-keys">{keysText(row)}</span>
                 <span class="badge">{t('settings.shortcuts.system')}</span>
@@ -1077,7 +1123,9 @@
           <span class="chevron" aria-hidden="true"
             >{otherExpanded ? '▾' : '▸'}</span
           >
-          {t('settings.shortcuts.otherGroup')}
+          <span class="marquee" use:marquee={t('settings.shortcuts.otherGroup')}
+            ><span>{t('settings.shortcuts.otherGroup')}</span></span
+          >
         </button>
         {#each shownOtherGroups(shortcutGroups.otherGroups, otherExpanded) as group (group.heading)}
           <h2 class="group-title">{group.section}</h2>
@@ -1253,9 +1301,10 @@
               class="segment"
               class:active={settingsState.interfaceMode === mode.id}
               onclick={() => void settingsState.setInterfaceMode(mode.id)}
+              ><span class="marquee" use:marquee={t(mode.key)}
+                ><span>{t(mode.key)}</span></span
+              ></button
             >
-              {t(mode.key)}
-            </button>
           {/each}
         </div>
       </div>
@@ -1275,16 +1324,23 @@
         >
         <span class="hint">{settingsState.resolvedSnapshotDir}</span>
         <div class="snapshot-actions">
-          <button class="btn" onclick={() => void chooseSnapshotDir()}>
-            {t('settings.general.snapshotChoose')}
-          </button>
+          <button class="btn" onclick={() => void chooseSnapshotDir()}
+            ><span
+              class="marquee"
+              use:marquee={t('settings.general.snapshotChoose')}
+              ><span>{t('settings.general.snapshotChoose')}</span></span
+            ></button
+          >
           <button
             class="btn"
             disabled={settingsState.snapshotDir === null}
             onclick={() => void resetSnapshotDir()}
+            ><span
+              class="marquee"
+              use:marquee={t('settings.general.snapshotReset')}
+              ><span>{t('settings.general.snapshotReset')}</span></span
+            ></button
           >
-            {t('settings.general.snapshotReset')}
-          </button>
         </div>
         {#if snapshotDirError !== ''}
           <span class="error">{snapshotDirError}</span>
@@ -1350,9 +1406,12 @@
           <button
             class="btn default-apps-action"
             onclick={() => void invoke('open_default_apps_page')}
+            ><span
+              class="marquee"
+              use:marquee={t('settings.general.defaultAppsOpen')}
+              ><span>{t('settings.general.defaultAppsOpen')}</span></span
+            ></button
           >
-            {t('settings.general.defaultAppsOpen')}
-          </button>
         </div>
       {/if}
 
@@ -1415,9 +1474,10 @@
               role="option"
               aria-selected={settingsState.language === 'system'}
               onclick={() => void selectLanguage('system')}
+              ><span class="marquee" use:marquee={t('settings.language.system')}
+                ><span>{t('settings.language.system')}</span></span
+              ></button
             >
-              {t('settings.language.system')}
-            </button>
             {#each BUILTIN_IDS as id (id)}
               <button
                 class="theme-option"
@@ -1426,8 +1486,10 @@
                 aria-selected={settingsState.language === id}
                 onclick={() => void selectLanguage(id)}
               >
-                {localeLabel(id)}{#if langDirty && editingId === id}<span
-                    class="dirty-dot">•</span
+                <span class="marquee" use:marquee={localeLabel(id)}
+                  ><span>{localeLabel(id)}</span></span
+                >{#if langDirty && editingId === id}<span class="dirty-dot"
+                    >•</span
                   >{/if}
               </button>
             {/each}
@@ -1441,7 +1503,9 @@
                   aria-selected={settingsState.language === loc.id}
                   onclick={() => void selectLanguage(loc.id)}
                 >
-                  {loc.label}{#if langDirty && editingId === loc.id}<span
+                  <span class="marquee" use:marquee={loc.label}
+                    ><span>{loc.label}</span></span
+                  >{#if langDirty && editingId === loc.id}<span
                       class="dirty-dot">•</span
                     >{/if}
                 </button>
@@ -1451,18 +1515,25 @@
           {#if ui.localeImport || ui.localeDelete}
             <div class="theme-actions">
               {#if ui.localeImport}
-                <button class="btn" onclick={() => void importLocale()}>
-                  {t('settings.language.import')}
-                </button>
+                <button class="btn" onclick={() => void importLocale()}
+                  ><span
+                    class="marquee"
+                    use:marquee={t('settings.language.import')}
+                    ><span>{t('settings.language.import')}</span></span
+                  ></button
+                >
               {/if}
               {#if ui.localeDelete}
                 <button
                   class="btn"
                   disabled={!canDeleteSelected}
                   onclick={() => void deleteLocale()}
+                  ><span
+                    class="marquee"
+                    use:marquee={t('settings.language.delete')}
+                    ><span>{t('settings.language.delete')}</span></span
+                  ></button
                 >
-                  {t('settings.language.delete')}
-                </button>
               {/if}
             </div>
           {/if}
@@ -1535,6 +1606,9 @@
     text-align: left;
     cursor: default;
     opacity: 0.7;
+    max-width: 100%;
+    overflow: hidden;
+    flex-shrink: 0;
   }
   .rail-item:hover {
     background: var(--topbar-border);
@@ -1555,6 +1629,7 @@
   }
   .subtabs {
     display: flex;
+    flex-wrap: wrap;
     flex: 0 0 auto;
     gap: 0.3rem;
     padding-bottom: 0.5rem;
@@ -1569,6 +1644,9 @@
     font: inherit;
     cursor: default;
     opacity: 0.6;
+    max-width: 100%;
+    overflow: hidden;
+    flex-shrink: 0;
   }
   .subtab:hover {
     opacity: 1;
@@ -1580,7 +1658,9 @@
   }
   .segmented {
     display: inline-flex;
+    flex-wrap: wrap;
     align-self: flex-start;
+    max-width: 100%;
     border: 1px solid var(--topbar-border);
     border-radius: 7px;
     overflow: hidden;
@@ -1593,6 +1673,9 @@
     color: inherit;
     font: inherit;
     cursor: default;
+    max-width: 100%;
+    overflow: hidden;
+    flex-shrink: 0;
   }
   .segment:last-child {
     border-right: none;
@@ -1667,6 +1750,9 @@
     font: inherit;
     text-align: center;
     cursor: default;
+    max-width: 100%;
+    overflow: hidden;
+    flex-shrink: 0;
   }
   .recorder.recording {
     border-color: var(--accent);
@@ -1696,6 +1782,7 @@
   }
   .size-row {
     display: flex;
+    flex-wrap: wrap;
     align-items: center;
     gap: 0.7rem;
   }
@@ -1704,6 +1791,7 @@
   }
   .shortcut-actions {
     display: flex;
+    flex-wrap: wrap;
     gap: 0.5rem;
   }
   .shortcut-group {
@@ -1719,11 +1807,12 @@
   }
   .shortcut-row {
     display: flex;
+    flex-wrap: wrap;
     align-items: center;
     gap: 0.5rem;
   }
   .shortcut-name {
-    flex: 1 1 auto;
+    flex: 1 1 0;
     min-width: 0;
   }
   .shortcut-row .recorder {
@@ -1756,6 +1845,9 @@
     font: inherit;
     font-weight: 600;
     cursor: default;
+    max-width: 100%;
+    overflow: hidden;
+    flex-shrink: 0;
   }
   .chevron {
     display: inline-block;
@@ -1769,6 +1861,9 @@
     color: inherit;
     font: inherit;
     cursor: default;
+    max-width: 100%;
+    overflow: hidden;
+    flex-shrink: 0;
   }
   .btn:hover:not(:disabled) {
     background: var(--topbar-border);
@@ -1784,6 +1879,7 @@
   }
   .snapshot-actions {
     display: flex;
+    flex-wrap: wrap;
     gap: 0.5rem;
   }
   /* A lone button in a column field would otherwise stretch the full width. */
@@ -1820,8 +1916,8 @@
      `min-width: 0` is required, not cosmetic: a flex item's automatic minimum
      size would otherwise let the longest non-wrapping label (e.g. "Português
      (Brasil) (Brazilian Portuguese)") stretch this column past its basis and
-     push the editor out of the window. Pinned here, long labels ellipsize
-     inside the listbox instead. */
+     push the editor out of the window. Pinned here, long labels are
+     clipped inside the listbox instead. */
   .lang-side {
     display: flex;
     flex-direction: column;
@@ -1865,6 +1961,7 @@
     display: flex;
     flex-direction: column;
     flex: 0 0 190px;
+    min-width: 0;
     gap: 0.5rem;
     min-height: 0;
   }
@@ -1924,11 +2021,21 @@
     flex-direction: column;
     gap: 0.7rem;
     min-width: 16rem;
+    max-width: calc(85% - 2rem - 2px);
+    max-height: calc(85% - 2rem - 2px);
     padding: 1rem;
     border: 1px solid var(--topbar-border);
     border-radius: 10px;
     background: var(--bg);
     box-shadow: 0 8px 30px color-mix(in srgb, #000 35%, transparent);
+  }
+  .modal-scroll {
+    display: flex;
+    flex-direction: column;
+    gap: 0.7rem;
+    flex: 1 1 auto;
+    min-height: 0;
+    overflow-y: auto;
   }
   .modal-title {
     font-size: 0.82rem;
@@ -1937,12 +2044,14 @@
   .modal-body {
     font-size: 0.8rem;
     opacity: 0.8;
+    overflow-wrap: anywhere;
   }
   .modal-card .text-input {
     align-self: stretch;
     min-width: 0;
   }
   .modal-actions {
+    flex: 0 0 auto;
     display: flex;
     flex-wrap: wrap;
     justify-content: flex-end;
@@ -2008,7 +2117,9 @@
     cursor: default;
     white-space: nowrap;
     overflow: hidden;
-    text-overflow: ellipsis;
+    max-width: 100%;
+    display: flex;
+    align-items: center;
   }
   .theme-option:hover {
     background: var(--topbar-border);

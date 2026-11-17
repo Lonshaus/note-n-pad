@@ -24,6 +24,7 @@
   import { oneDark } from '@codemirror/theme-one-dark';
   import { readCspNonce } from '../util/cspNonce';
   import { keymapExtension } from './keymap';
+  import { dialogMarquee } from './dialogMarquee';
   import { compositionCancel } from './composition';
   import { isUndoKey } from './imeShortcuts';
   import { cmPhraseExtension, cmPhraseSignature } from './cmPhrases';
@@ -177,6 +178,7 @@
               )
             : [],
           phraseCompartment.of(cmPhraseExtension()),
+          dialogMarquee,
           languageCompartment.of([]),
           themeCompartment.of([]),
           editableCompartment.of(

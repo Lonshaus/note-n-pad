@@ -59,6 +59,7 @@
 </script>
 
 <script lang="ts">
+  import { marquee } from './util/marquee';
   import { onMount } from 'svelte';
   import { modalActsOnEscape } from './util/popupEscape';
 
@@ -216,37 +217,48 @@
   onmousedown={onbackdropmousedown}
 >
   <div class="modal" role="dialog" aria-modal="true" tabindex="-1" {onkeydown}>
-    <p>{message}</p>
-    {#if items !== undefined && items.length > 0}
-      <ul class="modal-items">
-        {#each items as item, i (i)}
-          <li>
-            <span class="item-label">{item.label}</span>
-            {#if item.detail}
-              <span class="item-detail">{item.detail}</span>
-            {/if}
-          </li>
-        {/each}
-      </ul>
-    {/if}
+    <div class="modal-scroll">
+      <p>{message}</p>
+      {#if items !== undefined && items.length > 0}
+        <ul class="modal-items">
+          {#each items as item, i (i)}
+            <li>
+              <span class="item-label">{item.label}</span>
+              {#if item.detail}
+                <span class="item-detail">{item.detail}</span>
+              {/if}
+            </li>
+          {/each}
+        </ul>
+      {/if}
+    </div>
     <div class="modal-actions">
       {#if primaryLabel !== undefined && onprimary !== undefined}
         <button class="btn primary" onclick={() => fire(onprimary)}
-          >{primaryLabel}</button
+          ><span class="marquee" use:marquee={primaryLabel}
+            ><span>{primaryLabel}</span></span
+          ></button
         >
       {/if}
       {#if secondaryLabel !== undefined && onsecondary !== undefined}
         <button class="btn" onclick={() => fire(onsecondary)}
-          >{secondaryLabel}</button
+          ><span class="marquee" use:marquee={secondaryLabel}
+            ><span>{secondaryLabel}</span></span
+          ></button
         >
       {/if}
       {#if tertiaryLabel !== undefined && ontertiary !== undefined}
         <button class="btn" onclick={() => fire(ontertiary)}
-          >{tertiaryLabel}</button
+          ><span class="marquee" use:marquee={tertiaryLabel}
+            ><span>{tertiaryLabel}</span></span
+          ></button
         >
       {/if}
       {#if dismissable}
-        <button class="btn" data-cancel onclick={oncancel}>{cancelLabel}</button
+        <button class="btn" data-cancel onclick={oncancel}
+          ><span class="marquee" use:marquee={cancelLabel ?? ''}
+            ><span>{cancelLabel}</span></span
+          ></button
         >
       {/if}
     </div>
@@ -271,12 +283,21 @@
     border-radius: 8px;
     box-shadow: 0 6px 24px rgba(0, 0, 0, 0.3);
     padding: 0.85rem 1rem;
-    max-width: 85%;
+    max-width: min(85%, calc(100% - 2rem));
+    max-height: calc(85% - 1.7rem);
+    display: flex;
+    flex-direction: column;
     text-align: center;
+  }
+  .modal-scroll {
+    flex: 1 1 auto;
+    min-height: 0;
+    overflow-y: auto;
   }
   .modal p {
     margin: 0 0 0.8rem;
     font-size: 13px;
+    overflow-wrap: anywhere;
   }
   .modal-items {
     max-height: 9rem;
@@ -302,6 +323,7 @@
     overflow-wrap: anywhere;
   }
   .modal-actions {
+    flex: 0 0 auto;
     display: flex;
     flex-wrap: wrap;
     gap: 0.4rem;
@@ -316,6 +338,9 @@
        (ja "保存しない", de "Nicht sichern") otherwise wrap inside the button and
        turn it into a two-line block. The row wraps instead when they don't fit. */
     white-space: nowrap;
+    max-width: 100%;
+    overflow: hidden;
+    flex-shrink: 0;
     border-radius: 5px;
     border: 1px solid var(--modal-border);
     background: transparent;

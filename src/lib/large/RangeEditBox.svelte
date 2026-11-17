@@ -6,6 +6,7 @@
   import type { EditorView } from '@codemirror/view';
   import DocumentEditor from '../editor/DocumentEditor.svelte';
   import { t } from '../i18n';
+  import { marquee } from '../util/marquee';
   import { rangeLabel } from '../util/rangeLabel';
   import type { RangeBox } from '../util/rangeEditBox';
 
@@ -66,9 +67,15 @@
     </div>
     <div class="actions">
       <button class="btn primary" onclick={() => void onsave()}
-        >{t('common.save')}</button
+        ><span class="marquee" use:marquee={t('common.save')}
+          ><span>{t('common.save')}</span></span
+        ></button
       >
-      <button class="btn" onclick={oncancel}>{t('common.cancel')}</button>
+      <button class="btn" onclick={oncancel}
+        ><span class="marquee" use:marquee={t('common.cancel')}
+          ><span>{t('common.cancel')}</span></span
+        ></button
+      >
     </div>
   </div>
 </div>
@@ -107,6 +114,7 @@
   }
   .actions {
     display: flex;
+    flex-wrap: wrap;
     flex: 0 0 auto;
     gap: 0.4rem;
     justify-content: flex-end;
@@ -119,6 +127,9 @@
     padding: 0.3rem 0.7rem;
     font-size: 13px;
     white-space: nowrap;
+    max-width: 100%;
+    overflow: hidden;
+    flex-shrink: 0;
     border-radius: 5px;
     border: 1px solid var(--modal-border);
     background: transparent;

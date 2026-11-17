@@ -33,6 +33,7 @@
   import { history } from '@codemirror/commands';
   import { highlightSelectionMatches } from '@codemirror/search';
   import { searchWithInSelection } from './searchPanel';
+  import { dialogMarquee } from './dialogMarquee';
   import { closeBrackets, autocompletion } from '@codemirror/autocomplete';
   import {
     loadLanguage,
@@ -287,6 +288,7 @@
         // Undo while composing cancels the composition, as TextEdit does.
         platform.isMacOS ? compositionCancel(isUndoKey, afterCancel) : [],
         phraseCompartment.of(cmPhraseExtension()),
+        dialogMarquee,
         gutterCompartment.of(gutterExtension(showLineNumbers)),
         wrapCompartment.of(wordWrap ? EditorView.lineWrapping : []),
         languageCompartment.of([]),

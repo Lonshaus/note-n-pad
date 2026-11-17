@@ -485,6 +485,9 @@ fn repair(settings: &mut AppSettings) -> Vec<String> {
   if !(140.0..=4000.0).contains(&settings.default_sticky_height) {
     settings.default_sticky_height = default_sticky_height();
     repaired.push("default_sticky_height".to_string());
+  } else if settings.default_sticky_height < crate::windows::STICKY_MIN_HEIGHT {
+    // Valid under the old 140 minimum: raise it, nothing to report.
+    settings.default_sticky_height = crate::windows::STICKY_MIN_HEIGHT;
   }
   if !STICKY_PAPERS.contains(&settings.default_sticky_paper.as_str()) {
     settings.default_sticky_paper = default_sticky_paper();
@@ -535,7 +538,7 @@ fn validate(settings: &AppSettings) -> Result<(), String> {
   }
   // Matches the sticky window's min size and a sane upper bound.
   if !(crate::windows::STICKY_MIN_WIDTH..=4000.0).contains(&settings.default_sticky_width)
-    || !(140.0..=4000.0).contains(&settings.default_sticky_height)
+    || !(crate::windows::STICKY_MIN_HEIGHT..=4000.0).contains(&settings.default_sticky_height)
   {
     return Err("default sticky size out of range".to_string());
   }
@@ -1342,6 +1345,40 @@ mod tests {
     let (settings, repaired) = load_from_with_report(&path).unwrap();
     assert_eq!(settings.default_sticky_paper, "classic");
     assert!(repaired.contains(&"default_sticky_paper".to_string()));
+  }
+
+  #[test]
+  fn a_stored_sticky_height_below_the_minimum_is_raised_quietly() {
+    let (settings, repaired) = load_report(r#"{"default_sticky_height": 150}"#);
+    assert_eq!(settings.default_sticky_height, 160.0);
+    assert!(repaired.is_empty());
+  }
+
+  #[test]
+  fn a_stored_sticky_height_out_of_range_is_reset_and_reported() {
+    for bad in ["100", "5000"] {
+      let (settings, repaired) = load_report(&format!(r#"{{"default_sticky_height": {bad}}}"#));
+      assert_eq!(settings.default_sticky_height, 230.0, "{bad}");
+      assert_eq!(repaired, vec!["default_sticky_height".to_string()], "{bad}");
+    }
+  }
+
+  #[test]
+  fn a_stored_sticky_height_in_range_is_left_alone() {
+    let (settings, repaired) = load_report(r#"{"default_sticky_height": 200}"#);
+    assert_eq!(settings.default_sticky_height, 200.0);
+    assert!(repaired.is_empty());
+  }
+
+  #[test]
+  fn validate_checks_the_sticky_height_against_the_minimum() {
+    assert!(validate(&AppSettings::default()).is_ok());
+    let with_height = |h: f64| AppSettings {
+      default_sticky_height: h,
+      ..AppSettings::default()
+    };
+    assert!(validate(&with_height(159.0)).is_err());
+    assert!(validate(&with_height(160.0)).is_ok());
   }
 
   #[test]

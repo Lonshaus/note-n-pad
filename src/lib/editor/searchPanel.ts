@@ -28,6 +28,7 @@ import {
 } from '@codemirror/search';
 import { TEXT_FIELD_ATTRS } from './textFieldAttrs';
 import { pasteEnv } from '../util/pasteEnv';
+import { attachMarquee, type MarqueeHandle } from '../util/marquee';
 import { fieldPaste } from '../util/pasteRouting';
 // Custom search/replace panel: a faithful rebuild of @codemirror/search's
 // built-in SearchPanel that adds an "in selection" checkbox. It reuses the CM
@@ -147,6 +148,7 @@ class InSelectionSearchPanel implements Panel {
   private wordField: HTMLInputElement;
   private inSelField: HTMLInputElement;
   private query: SearchQuery;
+  private marquees: MarqueeHandle[] = [];
   constructor(private view: EditorView) {
     const phrase = (s: string): string => view.state.phrase(s);
     const query = (this.query = getSearchQuery(view.state));
@@ -205,8 +207,14 @@ class InSelectionSearchPanel implements Panel {
       el.className = 'cm-button';
       el.setAttribute('name', name);
       el.type = 'button';
-      el.textContent = text();
+      const marquee = document.createElement('span');
+      marquee.className = 'marquee';
+      const inner = document.createElement('span');
+      inner.textContent = text();
+      marquee.append(inner);
+      el.append(marquee);
       el.onclick = onclick;
+      this.marquees.push(attachMarquee(marquee, el));
       return el;
     };
     const label = (
@@ -345,6 +353,12 @@ class InSelectionSearchPanel implements Panel {
   }
   mount(): void {
     this.searchField.select();
+  }
+  destroy(): void {
+    for (const handle of this.marquees) {
+      handle.destroy();
+    }
+    this.marquees = [];
   }
   get pos(): number {
     return 80;

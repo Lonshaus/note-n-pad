@@ -8,6 +8,7 @@
   import { localeRegistry } from './localeRegistry.svelte';
   import { isLite } from '../state/edition.svelte';
   import { editionUi } from '../util/editionUi';
+  import { marquee } from '../util/marquee';
   import { pasteEnv } from '../util/pasteEnv';
   import { fieldPaste } from '../util/pasteRouting';
   import {
@@ -159,22 +160,32 @@
 
 <div class="editor">
   <div class="toolbar">
-    <button class="btn" disabled={!dirty} onclick={() => void save()}>
-      {t('settings.language.save')}
-    </button>
+    <button class="btn" disabled={!dirty} onclick={() => void save()}
+      ><span class="marquee" use:marquee={t('settings.language.save')}
+        ><span>{t('settings.language.save')}</span></span
+      ></button
+    >
     {#if ui.localeUpdateFromJson}
-      <button class="btn" onclick={() => void updateFromJson()}>
-        {t('settings.language.updateFromJson')}
-      </button>
+      <button class="btn" onclick={() => void updateFromJson()}
+        ><span
+          class="marquee"
+          use:marquee={t('settings.language.updateFromJson')}
+          ><span>{t('settings.language.updateFromJson')}</span></span
+        ></button
+      >
     {/if}
     {#if ui.localeExport}
-      <button class="btn" onclick={() => void exportDraft()}>
-        {t('settings.language.export')}
-      </button>
+      <button class="btn" onclick={() => void exportDraft()}
+        ><span class="marquee" use:marquee={t('settings.language.export')}
+          ><span>{t('settings.language.export')}</span></span
+        ></button
+      >
     {/if}
-    <button class="btn" disabled={!canReset} onclick={() => void reset()}>
-      {t('settings.language.reset')}
-    </button>
+    <button class="btn" disabled={!canReset} onclick={() => void reset()}
+      ><span class="marquee" use:marquee={t('settings.language.reset')}
+        ><span>{t('settings.language.reset')}</span></span
+      ></button
+    >
     {#if dirty}
       <span class="unsaved">{t('settings.language.unsaved')}</span>
     {/if}
@@ -239,6 +250,9 @@
     font: inherit;
     font-size: 0.8rem;
     cursor: default;
+    max-width: 100%;
+    overflow: hidden;
+    flex-shrink: 0;
   }
   .btn:hover:not(:disabled) {
     background: var(--topbar-border);

@@ -7,6 +7,7 @@
   import { listen, type UnlistenFn } from '@tauri-apps/api/event';
   import { cssFontFamily } from '../util/font';
   import { Lru } from '../util/lru';
+  import { marquee } from '../util/marquee';
   import {
     computeVisibleWindow,
     fullyVisibleSpan,
@@ -1210,14 +1211,20 @@
       >
       {#if editionUi(isLite()).rangeEdit}
         <button class="cm-button" onclick={() => void triggerRangeEdit()}
-          >{t('large.range.edit')}</button
+          ><span class="marquee" use:marquee={t('large.range.edit')}
+            ><span>{t('large.range.edit')}</span></span
+          ></button
         >
       {/if}
       <button class="cm-button" onclick={() => void triggerRangeSaveAs()}
-        >{t('large.range.saveAs')}</button
+        ><span class="marquee" use:marquee={t('large.range.saveAs')}
+          ><span>{t('large.range.saveAs')}</span></span
+        ></button
       >
       <button class="cm-button" onclick={clearSelection}
-        >{t('common.cancel')}</button
+        ><span class="marquee" use:marquee={t('common.cancel')}
+          ><span>{t('common.cancel')}</span></span
+        ></button
       >
       {#if rangeError !== ''}
         <span class="range-error">{rangeError}</span>
@@ -1326,6 +1333,11 @@
     border: 1px solid var(--topbar-border);
     border-radius: 6px;
     box-shadow: 0 4px 16px rgba(0, 0, 0, 0.25);
+  }
+  .range-bar .cm-button {
+    max-width: 100%;
+    overflow: hidden;
+    flex-shrink: 0;
   }
   .range-info {
     font-size: 0.8rem;

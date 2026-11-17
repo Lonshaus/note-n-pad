@@ -8,6 +8,7 @@
   import { t } from '../i18n';
   import { TEXT_FIELD_ATTRS } from '../editor/textFieldAttrs';
   import { matchSegments } from '../util/matchSegments';
+  import { marquee } from '../util/marquee';
   import { pasteEnv } from '../util/pasteEnv';
   import { fieldPaste } from '../util/pasteRouting';
   /** One result row: `line` is 1-based, as displayed. */
@@ -114,7 +115,9 @@
         {...TEXT_FIELD_ATTRS}
       />
       <button class="cm-button" onclick={onsearch}
-        >{t('large.search.label')}</button
+        ><span class="marquee" use:marquee={t('large.search.label')}
+          ><span>{t('large.search.label')}</span></span
+        ></button
       >
       <label>
         <input type="checkbox" bind:checked={caseSensitive} />
@@ -134,9 +137,15 @@
           onpaste={(e) => void fieldPaste(e, e.currentTarget, pasteEnv)}
           {...TEXT_FIELD_ATTRS}
         />
-        <button class="cm-button" onclick={onreplace}>{t('cm.replace')}</button>
+        <button class="cm-button" onclick={onreplace}
+          ><span class="marquee" use:marquee={t('cm.replace')}
+            ><span>{t('cm.replace')}</span></span
+          ></button
+        >
         <button class="cm-button" onclick={onreplaceall}
-          >{t('cm.replaceAll')}</button
+          ><span class="marquee" use:marquee={t('cm.replaceAll')}
+            ><span>{t('cm.replaceAll')}</span></span
+          ></button
         >
       </div>
     {/if}
@@ -154,10 +163,14 @@
             onkeydown={onsearchkeydown}
           >
             <span class="rline">{r.line}</span>
-            <span class="rprev"
-              >{#each matchSegments(r.preview, resultQuery, resultCase) as seg, j (j)}{#if seg.hit}<mark
-                    class="rhit">{seg.text}</mark
-                  >{:else}{seg.text}{/if}{/each}</span
+            <span
+              class="rprev marquee"
+              use:marquee={r.preview + resultQuery + resultCase}
+              ><span
+                >{#each matchSegments(r.preview, resultQuery, resultCase) as seg, j (j)}{#if seg.hit}<mark
+                      class="rhit">{seg.text}</mark
+                    >{:else}{seg.text}{/if}{/each}</span
+              ></span
             >
           </button>
         {/each}
@@ -243,6 +256,7 @@
     text-align: left;
     white-space: pre;
     overflow: hidden;
+    max-width: 100%;
     cursor: default;
   }
   .search-result:hover {
@@ -265,6 +279,6 @@
   .rprev {
     flex: 1 1 auto;
     overflow: hidden;
-    text-overflow: ellipsis;
+    white-space: pre;
   }
 </style>

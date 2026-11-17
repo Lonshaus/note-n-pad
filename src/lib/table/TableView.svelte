@@ -31,6 +31,7 @@
   } from '../util/tableRows';
   import { t } from '../i18n';
   import { platform } from '../state/platform.svelte';
+  import { marquee } from '../util/marquee';
   import { pasteEnv } from '../util/pasteEnv';
   import { fieldPaste } from '../util/pasteRouting';
   import { overlayKeyAction } from '../util/overlayKeys';
@@ -411,6 +412,13 @@
 
   function closeMenu(): void {
     menu = null;
+  }
+  // Pull a menu with long labels back inside the window; reads its width once.
+  function fitMenu(node: HTMLElement): void {
+    const { width, right } = node.getBoundingClientRect();
+    if (menu !== null && right > window.innerWidth) {
+      menu = { ...menu, x: Math.max(0, window.innerWidth - width) };
+    }
   }
 
   function runMenu(action: string): void {
@@ -821,6 +829,7 @@
     role="menu"
     tabindex="-1"
     style="left: {menu.x}px; top: {menu.y}px;"
+    use:fitMenu
   >
     {#if menu.variant !== 'col'}
       <button
@@ -829,7 +838,9 @@
         onclick={() => runMenu('row-above')}
       >
         {@render menuIcon('ins', 'none')}
-        {t('table.menu.rowAbove')}
+        <span class="marquee" use:marquee={t('table.menu.rowAbove')}
+          ><span>{t('table.menu.rowAbove')}</span></span
+        >
       </button>
       <button
         class="ctx-item"
@@ -837,7 +848,9 @@
         onclick={() => runMenu('row-below')}
       >
         {@render menuIcon('ins', 'scaleY(-1)')}
-        {t('table.menu.rowBelow')}
+        <span class="marquee" use:marquee={t('table.menu.rowBelow')}
+          ><span>{t('table.menu.rowBelow')}</span></span
+        >
       </button>
       <button
         class="ctx-item danger"
@@ -845,7 +858,9 @@
         onclick={() => runMenu('row-delete')}
       >
         {@render menuIcon('del', 'none')}
-        {t('table.menu.rowDelete')}
+        <span class="marquee" use:marquee={t('table.menu.rowDelete')}
+          ><span>{t('table.menu.rowDelete')}</span></span
+        >
       </button>
     {/if}
     {#if menu.variant === 'cell'}
@@ -858,7 +873,9 @@
         onclick={() => runMenu('col-left')}
       >
         {@render menuIcon('ins', 'rotate(-90deg)')}
-        {t('table.menu.colLeft')}
+        <span class="marquee" use:marquee={t('table.menu.colLeft')}
+          ><span>{t('table.menu.colLeft')}</span></span
+        >
       </button>
       <button
         class="ctx-item"
@@ -866,7 +883,9 @@
         onclick={() => runMenu('col-right')}
       >
         {@render menuIcon('ins', 'rotate(90deg)')}
-        {t('table.menu.colRight')}
+        <span class="marquee" use:marquee={t('table.menu.colRight')}
+          ><span>{t('table.menu.colRight')}</span></span
+        >
       </button>
       <button
         class="ctx-item danger"
@@ -874,7 +893,9 @@
         onclick={() => runMenu('col-delete')}
       >
         {@render menuIcon('del', 'rotate(90deg)')}
-        {t('table.menu.colDelete')}
+        <span class="marquee" use:marquee={t('table.menu.colDelete')}
+          ><span>{t('table.menu.colDelete')}</span></span
+        >
       </button>
     {/if}
     {#if menu.variant === 'col'}
@@ -885,7 +906,9 @@
         onclick={() => runMenu('row-below')}
       >
         {@render menuIcon('ins', 'scaleY(-1)')}
-        {t('table.menu.rowBelow')}
+        <span class="marquee" use:marquee={t('table.menu.rowBelow')}
+          ><span>{t('table.menu.rowBelow')}</span></span
+        >
       </button>
     {/if}
     {#if menu.variant === 'row'}
@@ -896,7 +919,9 @@
         onclick={() => runMenu('col-right')}
       >
         {@render menuIcon('ins', 'rotate(90deg)')}
-        {t('table.menu.colRight')}
+        <span class="marquee" use:marquee={t('table.menu.colRight')}
+          ><span>{t('table.menu.colRight')}</span></span
+        >
       </button>
     {/if}
   </div>
@@ -1123,6 +1148,7 @@
     color: var(--fg);
     box-shadow: 0 6px 20px rgba(0, 0, 0, 0.22);
     font-size: 0.8rem;
+    max-width: calc(100vw - 8px - 10px);
   }
   .ctx-item {
     display: flex;
@@ -1138,6 +1164,12 @@
     text-align: left;
     white-space: nowrap;
     cursor: default;
+    max-width: 100%;
+    overflow: hidden;
+    flex-shrink: 0;
+  }
+  .ctx-item .marquee {
+    flex: 1 1 auto;
   }
   /* The glyph inherits the item's text color (currentColor) so it tracks the
      theme and the danger hover state. */

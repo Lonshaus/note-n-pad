@@ -733,7 +733,10 @@
     for (const modal of document.querySelectorAll('.modal')) {
       if (modal.querySelector('p')?.textContent === message) {
         return [...modal.querySelectorAll('button')].map(
-          (button) => button.textContent?.trim() ?? '',
+          (button) =>
+            (
+              button.querySelector('.marquee > :first-child') ?? button
+            ).textContent?.trim() ?? '',
         );
       }
     }

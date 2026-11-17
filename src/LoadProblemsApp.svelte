@@ -13,6 +13,7 @@
   import { localeRegistry } from './lib/i18n/localeRegistry.svelte';
   import { platform } from './lib/state/platform.svelte';
   import { t } from './lib/i18n';
+  import { marquee } from './lib/util/marquee';
   import { nativeSelectAll } from './lib/util/menuBar';
   import { startupSkips } from './lib/state/startupSkips.svelte';
   import { revealKey, skipReasonKey } from './lib/util/skipped';
@@ -123,12 +124,16 @@
           <span class="reason">{t(skipReasonKey(file.reason))}</span>
         </div>
         <div class="row-actions">
-          <button class="link" onclick={() => void reveal(file.name)}>
-            {t(revealKey(platform))}
-          </button>
-          <button class="link danger" onclick={() => void remove(file.name)}>
-            {t('skipped.delete')}
-          </button>
+          <button class="link" onclick={() => void reveal(file.name)}
+            ><span class="marquee" use:marquee={t(revealKey(platform))}
+              ><span>{t(revealKey(platform))}</span></span
+            ></button
+          >
+          <button class="link danger" onclick={() => void remove(file.name)}
+            ><span class="marquee" use:marquee={t('skipped.delete')}
+              ><span>{t('skipped.delete')}</span></span
+            ></button
+          >
         </div>
       </li>
     {/each}
@@ -137,9 +142,11 @@
     {#if failure !== ''}
       <p class="failure">{failure}</p>
     {/if}
-    <button class="close" onclick={() => void win.close()}>
-      {t('common.close')}
-    </button>
+    <button class="close" onclick={() => void win.close()}
+      ><span class="marquee" use:marquee={t('common.close')}
+        ><span>{t('common.close')}</span></span
+      ></button
+    >
   </footer>
 </main>
 
@@ -197,6 +204,9 @@
     font: inherit;
     font-size: 0.8rem;
     color: inherit;
+    max-width: 100%;
+    overflow: hidden;
+    flex-shrink: 0;
   }
   .close:hover {
     background: color-mix(in srgb, CanvasText 12%, Canvas);
@@ -241,7 +251,9 @@
   }
   .row-actions {
     display: flex;
+    flex-wrap: wrap;
     flex-shrink: 0;
+    max-width: 100%;
     gap: 0.5rem;
   }
   .link {
@@ -253,6 +265,9 @@
     font: inherit;
     font-size: 0.75rem;
     white-space: nowrap;
+    max-width: 100%;
+    overflow: hidden;
+    flex-shrink: 0;
     color: var(--accent);
     transition:
       background-color 120ms ease,
