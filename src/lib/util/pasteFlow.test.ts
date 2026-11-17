@@ -25,6 +25,7 @@ import {
   PASTE_SLOW_MS,
   RedispatchWaiter,
   type FieldDeps,
+  type SystemTextRead,
   type TextBegin,
 } from './pasteRouting';
 import { SNAPSHOT_CONTENT_MAX } from './snapshotPolicy';
@@ -107,6 +108,9 @@ function setup(
   const textEnd = vi.fn((_token: number) => Promise.resolve(true));
   const pin = vi.fn((_id: string) => Promise.resolve(5));
   const unpin = vi.fn();
+  const readSystemText = vi.fn((_token: number) =>
+    Promise.resolve<SystemTextRead>({ kind: 'other' }),
+  );
   const redispatchPaste = vi.fn(() =>
     Promise.resolve<'send' | 'not-key' | 'not-handled'>('send'),
   );
@@ -125,6 +129,7 @@ function setup(
     onGateRevoked: () => () => {},
     pin,
     unpin,
+    readSystemText,
     redispatchPaste,
     readText,
     waiter,
@@ -163,6 +168,7 @@ function setup(
     textEnd,
     pin,
     unpin,
+    readSystemText,
     redispatchPaste,
     readText,
     readChunk,
@@ -324,6 +330,23 @@ describe('PasteFlow where clips exist', () => {
     expect(s.tab.locks.any()).toBe(false);
     expect(s.tab.shown.at(-1)).toBeUndefined();
     expect(s.tab.state.readOnly).toBe(false);
+  });
+
+  it('pastes the text the core read on macOS without having it sent to the page', async () => {
+    const s = setup('abc');
+    s.readSystemText.mockResolvedValue({
+      kind: 'text',
+      text: 'read by the core',
+    });
+    const pressed = s.event('web side');
+    s.flow.onPaste('t', s.view(), pressed.e);
+    await settle();
+    expect(s.readSystemText).toHaveBeenCalledWith(3);
+    expect(s.redispatchPaste).not.toHaveBeenCalled();
+    expect(pressed.getData).not.toHaveBeenCalled();
+    expect(s.tab.state.doc.toString()).toBe('abcread by the core');
+    expect(s.textEnd).toHaveBeenCalledWith(3);
+    expect(s.tab.locks.any()).toBe(false);
   });
 
   it('pastes at the place the paste was pressed, not where the selection went meanwhile', async () => {
