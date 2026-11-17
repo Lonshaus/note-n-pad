@@ -19,7 +19,6 @@
   } from '@codemirror/state';
   import {
     EditorView,
-    lineNumbers,
     highlightActiveLineGutter,
     highlightActiveLine,
     highlightSpecialChars,
@@ -51,6 +50,7 @@
   import { shortcutsState } from '../state/shortcuts.svelte';
   import { settingsState } from '../state/settings.svelte';
   import { platform } from '../state/platform.svelte';
+  import { stickyLineNumbers } from '../editor/stickyLineNumbers';
   import { cssFontFamily } from '../util/font';
   import {
     byteLength,
@@ -566,7 +566,7 @@
   ): Extension {
     return on
       ? [
-          lineNumbers({ formatNumber: (n) => String(n + startLine()) }),
+          stickyLineNumbers((n) => String(n + startLine())),
           highlightActiveLineGutter(),
         ]
       : [];
