@@ -249,6 +249,7 @@ export const ja = {
     '「{name}」のインデックス作成を完了できませんでした。このファイルでは行数の表示と指定行への移動は使用できません。',
   'large.read.failed':
     'このファイルの一部を読み込めません。ファイルが移動されたか、読み取れなくなった可能性があります。',
+  'large.notLoaded': '未読み込み {size}',
   // Status bar
   'status.view': '閲覧',
   'status.indexing': 'インデックス作成中… {count} 行',

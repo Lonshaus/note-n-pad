@@ -179,6 +179,7 @@
     "large.search.failed": "검색에 실패했습니다. 파일이 이동되었거나 더 이상 읽을 수 없는 상태일 수 있습니다.",
     "large.index.failed": "「{name}」의 색인 작업을 완료하지 못했습니다. 이 파일에서는 줄 수 표시와 지정한 줄로 이동하는 기능을 사용할 수 없습니다.",
     "large.read.failed": "이 파일의 일부를 읽을 수 없습니다. 파일이 이동되었거나 더 이상 읽을 수 없을 수 있습니다.",
+    "large.notLoaded": "{size} 로드되지 않음",
     "status.view": "보기",
     "status.indexing": "색인 중… {count}줄",
     "status.lines": "{count}줄",

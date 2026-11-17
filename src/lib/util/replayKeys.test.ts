@@ -4,8 +4,15 @@
 import { describe, expect, it } from 'vitest';
 import { EditorSelection, EditorState } from '@codemirror/state';
 import type { Command, KeyBinding } from '@codemirror/view';
-import { toggleTabFocusMode } from '@codemirror/commands';
+import {
+  cursorLineEnd,
+  cursorLineStart,
+  selectLineEnd,
+  selectLineStart,
+  toggleTabFocusMode,
+} from '@codemirror/commands';
 import { buildKeymap } from '../editor/keymap';
+import { replayReady } from './windowSelection';
 import {
   altGrText,
   blockedWhilePending,
@@ -15,8 +22,10 @@ import {
   coreKeyBindings,
   decideKey,
   EDGE_COMMANDS,
+  HIDDEN_EDGE_COMMANDS,
   inputWhileSelectAll,
   isSelectAllKey,
+  keyGuardPasses,
   linewiseAfterCopy,
   drainStep,
   matchesBinding,
@@ -116,6 +125,31 @@ describe('replayWanted', () => {
     );
     expect(replayWanted(state({ focusElsewhere: true, queueHold: true }))).toBe(
       false,
+    );
+  });
+});
+
+describe('keyGuardPasses', () => {
+  it('passes for an editor that takes input', () => {
+    expect(keyGuardPasses(state())).toBe(true);
+    expect(keyGuardPasses(state({ outside: true, replayPending: true }))).toBe(
+      true,
+    );
+  });
+
+  it('refuses a locked editor, focus elsewhere and a replace all pass', () => {
+    expect(keyGuardPasses(state({ locked: true }))).toBe(false);
+    expect(keyGuardPasses(state({ focusElsewhere: true }))).toBe(false);
+    expect(keyGuardPasses(state({ dropHold: true }))).toBe(false);
+  });
+
+  it('refuses a plain window swap, not one a replay or an undo is behind', () => {
+    expect(keyGuardPasses(state({ swapping: true }))).toBe(false);
+    expect(keyGuardPasses(state({ swapping: true, replayPending: true }))).toBe(
+      true,
+    );
+    expect(keyGuardPasses(state({ swapping: true, queueHold: true }))).toBe(
+      true,
     );
   });
 });
@@ -294,6 +328,45 @@ describe('chordReplaysAtEdge', () => {
     expect(replays(rebound, ev('[', { keyCode: 219, metaKey: true }))).toBe(
       false,
     );
+  });
+
+  describe('with an end of the selection in a part not loaded', () => {
+    const ctrlA = ev('a', { keyCode: 65, ctrlKey: true });
+    const ctrlE = ev('e', { keyCode: 69, ctrlKey: true });
+    const shiftCtrlE = ev('E', { keyCode: 69, ctrlKey: true, shiftKey: true });
+    const hiddenReplays = (e: Ev): boolean =>
+      chordReplaysAtEdge(mac, e, 'macos', NEVER, true);
+
+    it('replays Ctrl-A and Ctrl-E, whose edge is drawn where the real one is not', () => {
+      expect(hiddenReplays(ctrlA)).toBe(true);
+      expect(hiddenReplays(ctrlE)).toBe(true);
+      expect(hiddenReplays(shiftCtrlE)).toBe(true);
+    });
+
+    it('does not replay them for a caret outside the window, as today', () => {
+      expect(replays(mac, ctrlA)).toBe(false);
+      expect(replays(mac, ctrlE)).toBe(false);
+      expect(chordReplaysAtEdge(mac, ctrlA, 'macos', NEVER, false)).toBe(false);
+    });
+
+    it('names the four line-edge commands in a set of its own', () => {
+      expect([...HIDDEN_EDGE_COMMANDS]).toEqual([
+        cursorLineStart,
+        cursorLineEnd,
+        selectLineStart,
+        selectLineEnd,
+      ]);
+      for (const command of HIDDEN_EDGE_COMMANDS) {
+        expect(EDGE_COMMANDS.has(command)).toBe(false);
+      }
+    });
+
+    it('still replays what it replayed, and never undo', () => {
+      expect(hiddenReplays(ev('n', { keyCode: 78, ctrlKey: true }))).toBe(true);
+      expect(hiddenReplays(ev('z', { keyCode: 90, metaKey: true }))).toBe(
+        false,
+      );
+    });
   });
 
   it('never replays the tab-focus toggle, on whichever key it is bound', () => {
@@ -929,6 +1002,23 @@ describe('drainStep', () => {
   it('ends with the queue empty, or swaps to reveal an outside selection', () => {
     expect(at(null)).toBe('done');
     expect(at(null, { ready: false })).toBe('swap');
+  });
+});
+
+describe("resumeAction with the head key's decision", () => {
+  // `ready` as `replayReady` gives it: false for a head that must read the
+  // window around the caret first.
+  const sel = { anchor: { line: 5, col: 1 }, head: { line: 5, col: 1 } };
+  it('swaps for a head that reaches a part not loaded and the window was not read for the caret', () => {
+    const ready = replayReady(sel, 0, 100, undefined, 'reload');
+    expect(ready).toBe(false);
+    expect(resumeAction('key', ready)).toBe('swap');
+  });
+  it('drains once the window was read for the caret, to run the key or drop it', () => {
+    for (const decision of ['run', 'refuse'] as const) {
+      const ready = replayReady(sel, 0, 100, undefined, decision);
+      expect(resumeAction('key', ready)).toBe('drain');
+    }
   });
 });
 

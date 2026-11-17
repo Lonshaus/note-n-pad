@@ -120,32 +120,44 @@ import {
   type ReplayItemKind,
 } from './replayKeys';
 import {
+  coreOp,
   fitsWindow,
   globalOpPath,
+  hiddenEnd,
   insideWindow,
   queuedClipboardAction,
   type LinePos,
   type LineSelection,
+  type ReachDecision,
+  type WindowHoles,
 } from './windowSelection';
 import { LINE_END_COL, clipCopyRoute } from './clipRouting';
 
 export { globalOpPath };
-/** The loaded window as far as the routing looks at it. */
+/** The loaded window as far as the routing looks at it. `holes` says what the
+ *  window's parts not loaded mean for a selection; without it the window holds
+ *  every line whole. */
 export interface WindowLines {
   startLine: number;
   lineCount: number;
+  holes?: WindowHoles | undefined;
 }
-/** Whether the selection fits one window but lies outside the loaded one. */
+/** Whether the selection fits one window, no operation on it runs in the core,
+ *  and it is not in the loaded window: a hidden end is outside. */
 export function selectionOutside(
   sel: LineSelection,
   win: WindowLines,
 ): boolean {
-  return !insideWindow(sel, win.startLine, win.lineCount) && fitsWindow(sel);
+  return (
+    !insideWindow(sel, win.startLine, win.lineCount, win.holes) &&
+    fitsWindow(sel) &&
+    !coreOp(sel, win.holes)
+  );
 }
 /** Whether input acts through the replay: the selection is outside the loaded
- *  window, or too large for any window and so edited as a global operation. */
+ *  window, or an operation on it runs in the core (see `coreOp`). */
 export function inputOutside(sel: LineSelection, win: WindowLines): boolean {
-  return selectionOutside(sel, win) || globalOpPath(sel);
+  return selectionOutside(sel, win) || coreOp(sel, win.holes);
 }
 /** Whether a move to the start or end of the file, `spec` being one of the
  *  four doc-edge selection commands, ends outside the loaded window. */
@@ -201,10 +213,28 @@ export function opText(op: GlobalOp, text: string, sep: string): string {
   }
   return normalizeBreaks(op === 'split' ? '\n' : text, sep);
 }
-/** The two ends of a selection as the core's `track` argument, when the
- *  selection is too large for a window (and so no window mirrors it). */
-export function trackOf(sel: LineSelection): [LinePos, LinePos] | undefined {
-  return globalOpPath(sel) ? [sel.anchor, sel.head] : undefined;
+/** Why a selection is sent to the core to be tracked: an operation on it runs
+ *  in the core (`core-op`), or an end of it lies in a part of a line the window
+ *  does not hold (`hidden`), where no window position follows a change. */
+export type TrackReason = 'core-op' | 'hidden';
+/** Why the selection is tracked, null when it is not. Without `holes` only a
+ *  selection too large for a window is. */
+export function trackReason(
+  sel: LineSelection,
+  holes?: WindowHoles,
+): TrackReason | null {
+  if (coreOp(sel, holes)) {
+    return 'core-op';
+  }
+  return holes !== undefined && hiddenEnd(sel, holes) ? 'hidden' : null;
+}
+/** The two ends of a selection as the core's `track` argument, when it is
+ *  tracked (see `trackReason`). */
+export function trackOf(
+  sel: LineSelection,
+  holes?: WindowHoles,
+): [LinePos, LinePos] | undefined {
+  return trackReason(sel, holes) !== null ? [sel.anchor, sel.head] : undefined;
 }
 /** Whether the edit joins the undo group of the one before it: the typed text
  *  that follows a global delete does, with the delete a single step. */
@@ -248,6 +278,19 @@ export function undoSelection(s: {
     return { sel, mode: 'reload' };
   }
   return { sel, mode: sel === null ? 'goto' : 'reveal' };
+}
+/** The selection an undo whose change lies outside the window reveals: the
+ *  tracked one when it was tracked for an operation in the core, none when it
+ *  was tracked only for a hidden end, which no window shows (the window then
+ *  jumps to the change). */
+export function undoJump(
+  tracked: readonly [LinePos, LinePos] | undefined,
+  reason: TrackReason | null,
+): ReturnType<typeof undoSelection> {
+  return undoSelection({
+    tracked: reason === 'hidden' ? undefined : tracked,
+    branch: 'goto',
+  });
 }
 /** How a selection command moves the selection of a window-less selection. */
 export type SelectSpec =
@@ -619,6 +662,8 @@ export function globalItemAction(i: {
       mode: 'edit',
       focus: 'editor',
       globalSel: i.sel,
+      coreOp: coreOp(i.sel, i.win.holes),
+      hiddenText: i.win.holes?.hiddenText(i.sel) ?? false,
       wholeFile: false,
       domSelection: false,
       sel: null,
@@ -635,7 +680,7 @@ export function globalItemAction(i: {
   if (i.item.handled === true) {
     return NORMAL;
   }
-  if (!globalOpPath(i.sel)) {
+  if (!coreOp(i.sel, i.win.holes)) {
     // A move to the start or end of the file acts on the whole file even from
     // a caret in the window, when its target lies outside the window.
     const edge = i.item.kind === 'key' ? docEdgeSelect(i) : undefined;
@@ -702,6 +747,9 @@ export interface DequeueInput {
   holds: number;
   headMapping: boolean;
   ready: boolean;
+  /** What the head key does at a caret next to a part not loaded, when it was
+   *  asked (see `reachDecision`); absent: it runs. */
+  decision?: ReachDecision | undefined;
   totalLines: number;
   win: WindowLines;
 }
@@ -748,17 +796,21 @@ export function dequeueStep(i: DequeueInput): {
         }),
         action,
       };
-    case 'normal':
+    case 'normal': {
+      const step = drainStep({
+        swapping: i.swapping,
+        holds: i.holds,
+        head: i.item?.kind ?? null,
+        headMapping: i.headMapping,
+        ready: i.ready,
+      });
+      // A key that would act on a part not loaded is dropped; one that must
+      // read the window again first is not ready, so it swaps.
       return {
-        step: drainStep({
-          swapping: i.swapping,
-          holds: i.holds,
-          head: i.item?.kind ?? null,
-          headMapping: i.headMapping,
-          ready: i.ready,
-        }),
+        step: step === 'run' && i.decision === 'refuse' ? 'drop' : step,
         action,
       };
+    }
   }
 }
 /** The same for the queue's head in the shadow, which has no swap and no hold

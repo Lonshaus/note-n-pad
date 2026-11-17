@@ -3046,6 +3046,8 @@ pub fn run() {
       windowed::windowed_reopen,
       windowed::windowed_index,
       windowed::windowed_read,
+      windowed::windowed_offset_pos,
+      windowed::windowed_pos_offset,
       windowed::windowed_apply,
       windowed::windowed_undo,
       windowed::windowed_redo,

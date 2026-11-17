@@ -179,6 +179,7 @@
     "large.search.failed": "Tìm kiếm không thành công. Tệp có thể đã bị di chuyển hoặc không còn đọc được.",
     "large.index.failed": "Không thể hoàn tất việc lập chỉ mục cho “{name}”. Số dòng và tính năng nhảy đến dòng không khả dụng cho tệp này.",
     "large.read.failed": "Không đọc được một phần của tệp này. Tệp có thể đã bị di chuyển hoặc không còn đọc được.",
+    "large.notLoaded": "Chưa tải {size}",
     "status.view": "Xem",
     "status.indexing": "Đang lập chỉ mục… {count} dòng",
     "status.lines": "{count} dòng",

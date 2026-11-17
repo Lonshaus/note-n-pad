@@ -29,6 +29,18 @@ export interface WindowShape {
 function samePos(a: LinePos, b: LinePos): boolean {
   return a.line === b.line && a.col === b.col;
 }
+/** Whether two selections have the same ends; `undirectional` is ignored. */
+export function sameSelection(
+  a: LineSelection | null,
+  b: LineSelection | null,
+): boolean {
+  return (
+    a !== null &&
+    b !== null &&
+    samePos(a.anchor, b.anchor) &&
+    samePos(a.head, b.head)
+  );
+}
 
 function toLivePos(pos: LinePos, win: WindowShape): LinePos {
   const local = pos.line - win.startLine;
@@ -85,13 +97,16 @@ export function gotoSelection(line: number): LineSelection {
  *  each end the user moved; an end left where it was keeps its remembered global
  *  position, which may lie outside the window. A range collapsing to a caret
  *  drops the remembered ends, since an arrow key collapsing onto a clamped edge
- *  leaves that end unmoved. */
+ *  leaves that end unmoved. `moved` names the ends that count as moved whatever
+ *  their live position says (see `pointerMoves`): a selection made where a
+ *  hidden end is drawn moves it. */
 export function selectionAfterChange(
   global: LineSelection,
   prevLive: LineSelection,
   nextLive: LineSelection,
   startLine: number,
   docChanged: boolean,
+  moved?: { anchor: boolean; head: boolean },
 ): LineSelection {
   const next = toGlobalSelection(nextLive, startLine);
   const collapsed =
@@ -101,24 +116,31 @@ export function selectionAfterChange(
     return next;
   }
   return {
-    anchor: samePos(prevLive.anchor, nextLive.anchor)
-      ? global.anchor
-      : next.anchor,
-    head: samePos(prevLive.head, nextLive.head) ? global.head : next.head,
+    anchor:
+      moved?.anchor !== true && samePos(prevLive.anchor, nextLive.anchor)
+        ? global.anchor
+        : next.anchor,
+    head:
+      moved?.head !== true && samePos(prevLive.head, nextLive.head)
+        ? global.head
+        : next.head,
   };
 }
-/** Whether both ends of the selection lie on lines of the loaded window. */
+/** Whether both ends of the selection lie on lines of the loaded window, and
+ *  neither is in a part of a line it does not hold (`holes`, when given). */
 export function insideWindow(
   global: LineSelection,
   startLine: number,
   lineCount: number,
+  holes?: WindowHoles,
 ): boolean {
   const end = startLine + lineCount;
   return (
     global.anchor.line >= startLine &&
     global.anchor.line < end &&
     global.head.line >= startLine &&
-    global.head.line < end
+    global.head.line < end &&
+    (holes === undefined || !hiddenEnd(global, holes))
   );
 }
 /** Whether one window can hold the selection with a margin on both sides. */
@@ -133,19 +155,87 @@ export function fitsWindow(global: LineSelection): boolean {
 export function globalOpPath(global: LineSelection): boolean {
   return !fitsWindow(global);
 }
-/** Whether the loaded window can take the input replayed at the selection: a
- *  selection that fits one window has both ends inside; one that does not is
- *  replayed in the window holding its head, with the other end clamped. */
+/** What the loaded window's holes say about a global selection. Positions are
+ *  global lines and columns. */
+export interface WindowHoles {
+  /** Whether the position lies strictly inside a part of a line the window
+   *  does not hold. */
+  hidden: (pos: LinePos) => boolean;
+  /** Whether the selection's live range holds a placeholder, an end of it is
+   *  hidden, or it is a caret on a line with a hole: its text in the window is
+   *  not the text in the file. */
+  hiddenText: (sel: LineSelection) => boolean;
+  /** The selection the window was read focused on, null for an unfocused read
+   *  or after a document change. */
+  readFor: LineSelection | null;
+}
+/** Whether an end of the selection lies in a part of a line not loaded. */
+export function hiddenEnd(sel: LineSelection, holes: WindowHoles): boolean {
+  return holes.hidden(sel.anchor) || holes.hidden(sel.head);
+}
+/** Whether an operation on the selection runs in the core and not in the
+ *  window: it is too large for one window, or it is not empty, has a hidden end
+ *  and the window was read focused on it (a selection with a hidden end is first
+ *  brought in by a read focused on it, so one that still has a hidden end
+ *  spans more than a segment holds). A hidden caret is never core-op. Without
+ *  `holes` only the size counts. */
+export function coreOp(sel: LineSelection, holes?: WindowHoles): boolean {
+  return (
+    globalOpPath(sel) ||
+    (holes !== undefined &&
+      !samePos(sel.anchor, sel.head) &&
+      hiddenEnd(sel, holes) &&
+      sameSelection(holes.readFor, sel))
+  );
+}
+/** What a key does to a caret next to a part of a line not loaded: 'run' acts
+ *  in the window as it is, 'reload' first reads the window again around the
+ *  caret, 'refuse' does nothing (see `reachDecision`). */
+export type ReachDecision = 'run' | 'reload' | 'refuse';
+/** Whether the loaded window can take the input replayed at the selection. A
+ *  core-op selection is replayed in the window holding its head, with the other
+ *  end clamped: the head must be on a loaded line and not hidden. Any other
+ *  selection has both ends inside. Never when the queue's head is a key whose
+ *  decision is to read the window again first (`decision`). */
 export function replayReady(
   global: LineSelection,
   startLine: number,
   lineCount: number,
+  holes?: WindowHoles,
+  decision?: ReachDecision,
 ): boolean {
-  if (fitsWindow(global)) {
-    return insideWindow(global, startLine, lineCount);
+  if (decision === 'reload') {
+    return false;
   }
-  const line = global.head.line;
-  return line >= startLine && line < startLine + lineCount;
+  if (coreOp(global, holes)) {
+    const line = global.head.line;
+    return (
+      line >= startLine &&
+      line < startLine + lineCount &&
+      (holes === undefined || !holes.hidden(global.head))
+    );
+  }
+  return insideWindow(global, startLine, lineCount, holes);
+}
+/** What Replace does with the selection: 'here' replaces in the window, 'reveal'
+ *  first reads a window focused on it, 'find' acts as Find Next. A selection too
+ *  large for a window, or one a focused read did not bring in, is found. */
+export function replaceRoute(
+  sel: LineSelection,
+  win: {
+    startLine: number;
+    lineCount: number;
+    holes?: WindowHoles | undefined;
+  },
+  revealed: boolean,
+): 'here' | 'reveal' | 'find' {
+  if (insideWindow(sel, win.startLine, win.lineCount, win.holes)) {
+    return 'here';
+  }
+  if (globalOpPath(sel) || revealed || coreOp(sel, win.holes)) {
+    return 'find';
+  }
+  return 'reveal';
 }
 /** Which ends a pointer selection moved: an end left where it was (the anchor
  *  of a shift-click) keeps the queued caret's position. */
@@ -159,14 +249,15 @@ export function movedEnds(
   };
 }
 /** The ends a pointer selection queues: the converted position of each end it
- *  moved, the queued caret's end for the others. */
+ *  moved (`moved`, by default the ends whose position differs), the queued
+ *  caret's end for the others. */
 export function queuedSelectEnds<T>(
   prev: { anchor: number; head: number },
   next: { anchor: number; head: number },
   convert: (pos: number) => T,
   caret: { anchor: T; head: T },
+  moved: { anchor: boolean; head: boolean } = movedEnds(prev, next),
 ): { anchor: T; head: T } {
-  const moved = movedEnds(prev, next);
   return {
     anchor: moved.anchor ? convert(next.anchor) : caret.anchor,
     head: moved.head ? convert(next.head) : caret.head,
@@ -317,14 +408,16 @@ export function wholeFileSelection(
   const live = toLiveSelection(globalSel, win);
   return { globalSel, live, lastLive: live };
 }
-/** Whether a transaction is refused while the selection is too large for one
- *  window: one a user action made that changes the document, whatever the
- *  action. Only the part inside the window would change. */
+/** Whether a transaction is refused while an operation on the selection runs in
+ *  the core (`core`, by default only a selection too large for one window): one
+ *  a user action made that changes the document, whatever the action. Only the
+ *  part inside the window would change. */
 export function blockedWhileGlobal(
   tr: { docChanged: boolean; userEvent: string | undefined },
   global: LineSelection,
+  core: boolean = globalOpPath(global),
 ): boolean {
-  return tr.docChanged && tr.userEvent !== undefined && globalOpPath(global);
+  return tr.docChanged && tr.userEvent !== undefined && core;
 }
 /** Whether a copy or cut is refused: none is. A selection too large for one
  *  window is copied or cut through a clip (see `clipCopyRoute`), and a paste

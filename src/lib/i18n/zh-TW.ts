@@ -232,6 +232,7 @@ export const zhTW = {
     '無法完成「{name}」的索引建立。這個檔案目前無法顯示行數，也無法前往指定行。',
   'large.read.failed':
     '無法讀取這個檔案的一部分。檔案可能已被移動，或變得無法讀取。',
+  'large.notLoaded': '尚有 {size} 未載入',
   // Status bar
   'status.view': '閱覽',
   'status.indexing': '索引中… {count} 行',

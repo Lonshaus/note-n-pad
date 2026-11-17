@@ -179,6 +179,7 @@
     "large.search.failed": "Ricerca non riuscita. Il file potrebbe essere stato spostato o non è più leggibile.",
     "large.index.failed": "Impossibile completare l’indicizzazione di «{name}». Il conteggio delle righe e il salto a una riga non sono disponibili per questo file.",
     "large.read.failed": "Impossibile leggere una parte di questo file. Potrebbe essere stato spostato o non è più leggibile.",
+    "large.notLoaded": "{size} non caricati",
     "status.view": "Visualizza",
     "status.indexing": "Indicizzazione… righe: {count}",
     "status.lines": "Righe: {count}",

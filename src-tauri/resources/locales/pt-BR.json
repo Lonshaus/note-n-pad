@@ -179,6 +179,7 @@
     "large.search.failed": "A busca falhou. O arquivo pode ter sido movido ou ficou ilegível.",
     "large.index.failed": "Não foi possível concluir a indexação de “{name}”. A contagem de linhas e o ir para linha não estão disponíveis para este arquivo.",
     "large.read.failed": "Não foi possível ler parte deste arquivo. Ele pode ter sido movido ou ficado ilegível.",
+    "large.notLoaded": "{size} não carregados",
     "status.view": "Visualizar",
     "status.indexing": "Indexando… linhas: {count}",
     "status.lines": "Linhas: {count}",

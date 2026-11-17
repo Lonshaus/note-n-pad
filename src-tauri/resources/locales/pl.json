@@ -179,6 +179,7 @@
     "large.search.failed": "Wyszukiwanie nie powiodło się. Plik mógł zostać przeniesiony lub stał się nieczytelny.",
     "large.index.failed": "Nie udało się ukończyć indeksowania pliku „{name}”. Liczba wierszy i przechodzenie do wiersza są niedostępne dla tego pliku.",
     "large.read.failed": "Nie można odczytać części tego pliku. Mógł zostać przeniesiony lub stał się nieczytelny.",
+    "large.notLoaded": "Nie wczytano {size}",
     "status.view": "Podgląd",
     "status.indexing": "Indeksowanie… wierszy: {count}",
     "status.lines": "Wiersze: {count}",

@@ -59,6 +59,12 @@ export function clipCopyRoute(s: {
   focus: ClipFocus;
   /** The editor's global selection (editing only). */
   globalSel: LineSelection | null;
+  /** An operation on the selection runs in the core (editing only); absent,
+   *  only a selection too large for one window is. */
+  coreOp?: boolean | undefined;
+  /** The selection's text in the window is not the text in the file: a copy
+   *  of it, or of its caret's line, must come from the session. */
+  hiddenText?: boolean | undefined;
   /** The viewer's Select All stands for the whole file. */
   wholeFile: boolean;
   /** The browser's selection in the viewer is not empty. */
@@ -71,9 +77,9 @@ export function clipCopyRoute(s: {
     return 'text';
   }
   if (s.mode === 'edit') {
-    return s.globalSel !== null && globalOpPath(s.globalSel)
-      ? 'session'
-      : 'text';
+    const core =
+      s.coreOp ?? (s.globalSel !== null && globalOpPath(s.globalSel));
+    return core || s.hiddenText === true ? 'session' : 'text';
   }
   if (s.wholeFile) {
     return 'file';

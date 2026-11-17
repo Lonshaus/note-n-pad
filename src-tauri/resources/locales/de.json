@@ -179,6 +179,7 @@
     "large.search.failed": "Suche fehlgeschlagen. Die Datei wurde möglicherweise verschoben oder ist nicht mehr lesbar.",
     "large.index.failed": "Die Indizierung von „{name}“ konnte nicht abgeschlossen werden. Zeilenanzahl und Sprung zu einer Zeile sind für diese Datei nicht verfügbar.",
     "large.read.failed": "Ein Teil dieser Datei konnte nicht gelesen werden. Sie wurde möglicherweise verschoben oder ist nicht mehr lesbar.",
+    "large.notLoaded": "{size} nicht geladen",
     "status.view": "Ansicht",
     "status.indexing": "Indizierung… Zeilen: {count}",
     "status.lines": "Zeilen: {count}",
