@@ -179,6 +179,7 @@
     "large.search.failed": "La búsqueda falló. Es posible que el archivo se haya movido o ya no se pueda leer.",
     "large.index.failed": "No se pudo completar la indexación de «{name}». El recuento de líneas y el salto a una línea no están disponibles para este archivo.",
     "large.read.failed": "No se pudo leer parte de este archivo. Es posible que se haya movido o dejado de ser legible.",
+    "large.notLoaded": "{size} sin cargar",
     "status.view": "Ver",
     "status.indexing": "Indexando… líneas: {count}",
     "status.lines": "Líneas: {count}",

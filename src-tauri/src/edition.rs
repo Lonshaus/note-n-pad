@@ -562,6 +562,8 @@ mod gate_tests {
           "windowed_search",
           "windowed_replace_all",
           "windowed_end_pos",
+          "windowed_offset_pos",
+          "windowed_pos_offset",
           "windowed_replace_range",
           "windowed_enter",
           "windowed_indent_range",

@@ -252,6 +252,7 @@ export const en = {
     'Couldn’t finish indexing “{name}”. Line count and jump-to-line are unavailable for this file.',
   'large.read.failed':
     'Couldn’t read part of this file. It may have been moved or become unreadable.',
+  'large.notLoaded': '{size} not loaded',
   // Status bar
   'status.view': 'View',
   'status.indexing': 'Indexing… {count} line(s)',

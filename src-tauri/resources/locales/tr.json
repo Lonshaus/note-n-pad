@@ -179,6 +179,7 @@
     "large.search.failed": "Arama başarısız oldu. Dosya taşınmış veya artık okunamıyor olabilir.",
     "large.index.failed": "“{name}” için dizinleme tamamlanamadı. Bu dosya için satır sayısı ve satıra atlama kullanılamıyor.",
     "large.read.failed": "Bu dosyanın bir bölümü okunamadı. Dosya taşınmış ya da artık okunamıyor olabilir.",
+    "large.notLoaded": "{size} yüklenmedi",
     "status.view": "Görüntüle",
     "status.indexing": "Dizinleniyor… {count} satır",
     "status.lines": "{count} satır",

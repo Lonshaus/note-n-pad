@@ -179,6 +179,7 @@
     "large.search.failed": "搜索失败。文件可能已被移动或无法读取。",
     "large.index.failed": "未能完成对「{name}」的索引。此文件暂时无法显示行数，也无法跳转到指定行。",
     "large.read.failed": "无法读取这个文件的一部分。文件可能已被移动，或变得无法读取。",
+    "large.notLoaded": "还有 {size} 未加载",
     "status.view": "查看",
     "status.indexing": "索引中… {count} 行",
     "status.lines": "{count} 行",

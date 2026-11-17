@@ -11,9 +11,10 @@
     Compartment,
     EditorState,
     Prec,
+    Text,
     Transaction,
     type Extension,
-    type Text,
+    type RangeSet,
     type TransactionSpec,
   } from '@codemirror/state';
   import {
@@ -31,8 +32,13 @@
   } from '@codemirror/view';
   import { selectAll, toggleTabFocusMode } from '@codemirror/commands';
   import { varEditorTheme } from '../editor/editorTheme';
-  import { buildKeymap, keymapExtension } from '../editor/keymap';
   import {
+    buildKeymap,
+    keymapExtension,
+    resolveCodeNamedKey,
+  } from '../editor/keymap';
+  import {
+    COMPOSITION_END_TIMEOUT_MS,
     settleThenDrain,
     settleViewComposition,
   } from '../editor/composition';
@@ -57,6 +63,7 @@
     junctionRewrites,
     mapChangesToEdits,
     mapThrough,
+    mirrorRefused,
     mirrorStep,
     nextWindow,
     scanBreaks,
@@ -69,8 +76,9 @@
   } from '../util/windowedEdit';
   import {
     clipboardBlocked,
-    fitsWindow,
+    coreOp,
     gotoSelection,
+    hiddenEnd as hasHiddenEnd,
     insideWindow,
     isImeKey,
     isModifierKey,
@@ -78,6 +86,7 @@
     queuedSelectEnds,
     replayKind,
     replayReady,
+    replaceRoute,
     selectAllTarget,
     selectionAfterChange,
     selectionAfterSwap,
@@ -87,7 +96,9 @@
     wholeFileSelection,
     type LinePos,
     type LineSelection,
+    type ReachDecision,
     type SelectAllEntry,
+    type WindowHoles,
   } from '../util/windowSelection';
   import {
     blockedWhilePending,
@@ -98,6 +109,7 @@
     decideKey,
     inputWhileSelectAll,
     isSelectAllKey,
+    keyGuardPasses,
     matchesBinding,
     parkedUndoKey,
     pasteIsLinewise,
@@ -127,7 +139,6 @@
     dequeueStep,
     docEdgeSelect,
     globalItemAction,
-    globalOpPath,
     globalSelectAction,
     globalStartAction,
     groupDecision,
@@ -138,6 +149,8 @@
     opText,
     shadowStep,
     trackOf,
+    trackReason,
+    undoJump,
     undoSelection,
     type ClipCopy,
     type ClipCut,
@@ -145,6 +158,8 @@
     type GlobalOp,
     type OwnCommands,
     type SelectSpec,
+    type TrackReason,
+    type WindowLines,
   } from '../util/globalRouting';
   import {
     clipCopyRoute,
@@ -152,6 +167,49 @@
     type ClipInfo,
     type ClipOutcome,
   } from '../util/clipRouting';
+  import {
+    budgetCheck,
+    budgetPhase,
+    cutLines,
+    docPos,
+    forcedMoves,
+    hiddenAt,
+    hiddenEnds,
+    holeExtensions,
+    holeSetOf,
+    holeSpans,
+    holesOf,
+    keptMarkerPos,
+    keptRequest,
+    keptSchedule,
+    lineLength,
+    livePos,
+    markerRead,
+    markerStart,
+    newPartEnd,
+    placeOffset,
+    placedHoles,
+    pointerMoves,
+    reachDecision,
+    reachGate,
+    readForOf,
+    readRequest,
+    recordedCommand,
+    replaceTarget,
+    runKeptList,
+    runsRecordedCommand,
+    setHoles,
+    windowHoles,
+    type BudgetPhase,
+    type GotoTarget,
+    type HoleDeps,
+    type HoleValue,
+    type KeepEntry,
+    type KeptRequest,
+    type ReadHole,
+    type ReadMode,
+  } from './holes';
+  import { formatFileSize } from '../util/format';
   import { createSelectAllGate } from '../util/selectAllGate';
   import { lastLinewiseCopy, rememberCopy } from '../util/linewiseCopy';
   import { liveTokens } from '../util/liveTokens';
@@ -186,7 +244,6 @@
     gotoRangeSelection,
     hitSelection,
     orderedPositions,
-    textMatchesQuery,
     type FindHit,
   } from '../util/windowedFind';
   import type { OpGate } from '../util/windowedGate';
@@ -205,6 +262,8 @@
     // The byte before the window is a lone `\r`; the byte after it is a `\n`.
     prev_lone_cr: boolean;
     next_is_lf: boolean;
+    // The parts of lines the window does not hold, one placeholder character each.
+    holes: ReadHole[];
   }
   /** Result of a Rust `windowed_apply`: the live file totals after the edit,
    *  whether the content equals the last save, and the content generation. */
@@ -567,6 +626,10 @@
         syncReadOnly();
         if (holds === 0) {
           restoreFocusAfterHold();
+          triggerBudget();
+          if (keptList.length > 0) {
+            scheduleKept(0, false);
+          }
         }
         resumeReplay();
       }
@@ -670,6 +733,7 @@
     return {
       selection: { anchor: span.from, head: span.to },
       userEvent: 'select',
+      annotations: selectVisibleMark.of(true),
     };
   }
 
@@ -712,15 +776,36 @@
       redo: redoCommand,
     }),
   );
-
-  function buildState(doc: string, cursorPos?: number): EditorState {
+  // The document of a window's text: the lines CodeMirror would split it into.
+  function docOf(text: string): Text {
+    return Text.of(text.split(/\r\n?|\n/));
+  }
+  // The text of the marker over a part of a line the window does not hold.
+  function markerLabel(bytes: number): string {
+    return t('large.notLoaded', { size: formatFileSize(bytes) });
+  }
+  // What the hole extensions ask of the editor: the command of the key being
+  // handled, and for the main view whether an end of the selection is hidden.
+  const holeDeps: HoleDeps = {
+    onMarker: (v, pos) => onMarkerClick(v, pos),
+    recordedCommand: () => keyCommand(),
+    hiddenEnd: () => {
+      const holes = mainHoles();
+      return holes !== undefined && hasHiddenEnd(globalSel, holes);
+    },
+  };
+  function buildState(
+    doc: Text,
+    holes: RangeSet<HoleValue>,
+    readFor: LineSelection | null,
+  ): EditorState {
     return EditorState.create({
       doc,
-      ...(cursorPos !== undefined ? { selection: { anchor: cursorPos } } : {}),
       extensions: [
         // Required in every view, see the note in Editor.svelte.
         EditorView.cspNonce.of(readCspNonce()),
         coreSetup,
+        holeExtensions(holes, readFor, holeDeps),
         // A drop during the swap back to the caret is refused, as read-only
         // refuses it during any other swap.
         Prec.highest(
@@ -762,7 +847,8 @@
           keyActive: () => keyActive,
           keydown: () => currentKeydown,
           globalSel: () => globalSel,
-          outside: (doc) => inputOutside(doc),
+          outside: (state) => inputOutside(state),
+          coreOp: (state) => coreOp(globalSel, windowFor(state).holes),
           exempt: (tr) =>
             tr.annotation(selectVisibleMark) === true ||
             tr.annotation(captureMark) === true,
@@ -849,15 +935,21 @@
           }
           if (act.track && !settingSelection) {
             if (heldCaret === null) {
-              trackSelection(update.state, update.docChanged, 'listener');
+              trackSelection(
+                update.state,
+                update.docChanged,
+                'listener',
+                undefined,
+                forcedMovesOf(update, globalSel, windowStartLine),
+              );
             } else if (update.docChanged) {
               heldCaret = {
                 anchor: update.changes.mapPos(heldCaret.anchor),
                 head: update.changes.mapPos(heldCaret.head),
               };
               trackSelection(update.state, true, 'listenerHeld', {
-                anchor: livePos(update.state.doc, heldCaret.anchor),
-                head: livePos(update.state.doc, heldCaret.head),
+                anchor: livePos(update.state, heldCaret.anchor),
+                head: livePos(update.state, heldCaret.head),
               });
             }
           }
@@ -869,22 +961,35 @@
     });
   }
 
-  function livePos(doc: Text, pos: number): LinePos {
-    const line = doc.lineAt(pos);
-    return { line: line.number - 1, col: pos - line.from };
-  }
-
-  function docPos(doc: Text, pos: LinePos): number {
-    const line = doc.line(pos.line + 1);
-    return line.from + Math.min(pos.col, line.length);
-  }
-
   function liveSelection(state: EditorState): LineSelection {
     const main = state.selection.main;
     return {
-      anchor: livePos(state.doc, main.anchor),
-      head: livePos(state.doc, main.head),
+      anchor: livePos(state, main.anchor),
+      head: livePos(state, main.head),
     };
+  }
+  // The ends a pointer selection or a Select All moves whatever their live
+  // position says, because a kept global end is hidden where it is drawn.
+  function forcedMovesOf(
+    update: ViewUpdate,
+    sel: LineSelection,
+    startLine: number,
+  ): { anchor: boolean; head: boolean } | undefined {
+    if (!update.selectionSet || update.docChanged) {
+      return undefined;
+    }
+    return forcedMoves({
+      pointer: update.transactions.some((tr) =>
+        tr.isUserEvent('select.pointer'),
+      ),
+      selectAll: update.transactions.some(
+        (tr) => tr.annotation(selectVisibleMark) === true,
+      ),
+      startState: update.startState,
+      next: update.state.selection.main,
+      sel,
+      startLine,
+    });
   }
   // The one writer of globalSel; DEV builds trace every write.
   function setGlobalSel(next: LineSelection, tag: string): void {
@@ -898,12 +1003,14 @@
     }
   }
   // Fold the state's live selection into the global one: a document change
-  // replaces it, a selection change replaces the ends the user moved.
+  // replaces it, a selection change replaces the ends the user moved (and the
+  // ends `moved` names, which moved without their position changing).
   function trackSelection(
     state: EditorState,
     docChanged: boolean,
     tag: string,
     liveOverride?: LineSelection,
+    moved?: { anchor: boolean; head: boolean },
   ): void {
     const live = liveOverride ?? liveSelection(state);
     setGlobalSel(
@@ -913,6 +1020,7 @@
         live,
         windowStartLine,
         docChanged,
+        moved,
       ),
       tag,
     );
@@ -1005,12 +1113,14 @@
     update.changes.iterChanges((fromA, toA, _fromB, _toB, inserted) => {
       changes.push({ fromA, toA, inserted: inserted.toString() });
     });
+    const holesBefore = holeSpans(update.startState);
     const edits = mapChangesToEdits(
       g.startOffset,
       docBefore,
       g.breaks,
       insertSep,
       changes,
+      holesBefore,
     );
     const junction = junctionRewrites(
       docBefore,
@@ -1019,6 +1129,7 @@
       insertSep,
       g.prevLoneCr,
       g.nextIsLf,
+      holesBefore,
     );
     for (const rewrite of junction.rewrites) {
       const at = g.startOffset + rewrite.at;
@@ -1035,7 +1146,8 @@
     g.prevLoneCr = junction.prevLoneCr;
     const docAfter = update.state.doc.toString();
     g.endOffset =
-      g.startOffset + charToByte(docAfter, g.breaks, docAfter.length);
+      g.startOffset +
+      charToByte(docAfter, g.breaks, docAfter.length, holeSpans(update.state));
     g.endLine = g.startLine + update.state.doc.lines;
     return edits;
   }
@@ -1154,7 +1266,7 @@
         );
         if (res.total_lines - linesBefore !== lineDelta) {
           junctionMismatch(res.total_lines - linesBefore, lineDelta);
-          void reloadWindow();
+          void reloadWindow({ noKeep: true });
         }
         reportSelection();
       } finally {
@@ -1217,7 +1329,9 @@
         if (locked || view === undefined) {
           return;
         }
-        const res = await coreUndo(owner, dir, trackOf(globalSel));
+        const holes = mainHoles();
+        const reason = trackReason(globalSel, holes);
+        const res = await coreUndo(owner, dir, trackOf(globalSel, holes));
         if (res === null) {
           return;
         }
@@ -1231,7 +1345,7 @@
             res.generation,
           );
         }
-        applyUndoResult(res);
+        applyUndoResult(res, reason);
       } finally {
         release();
       }
@@ -1294,6 +1408,7 @@
         g.breaks,
         g.startOffset,
         e,
+        holeSpans(v.state),
       );
       if (step === null) {
         break;
@@ -1306,14 +1421,16 @@
     }
     const docAfter = v.state.doc.toString();
     g.endOffset =
-      g.startOffset + charToByte(docAfter, g.breaks, docAfter.length);
+      g.startOffset +
+      charToByte(docAfter, g.breaks, docAfter.length, holeSpans(v.state));
     g.endLine = g.startLine + v.state.doc.lines;
     return landed;
   }
   // The change an undo made lies outside the window: show it. A tracked
-  // selection is revealed at its head, not replaced by a caret at the change.
-  function jumpAfterUndo(res: UndoResult): void {
-    const jump = undoSelection({ tracked: res.tracked, branch: 'goto' });
+  // selection is revealed at its head, not replaced by a caret at the change;
+  // one tracked only for a hidden end is not, as no window shows that end.
+  function jumpAfterUndo(res: UndoResult, reason: TrackReason | null): void {
+    const jump = undoJump(res.tracked, reason);
     if (jump.sel !== null) {
       setGlobalSel(jump.sel, 'undoJump');
       void loadWindow(jump.sel.head.line, 'reveal');
@@ -1321,12 +1438,23 @@
       void loadWindow(res.first_line, 'goto');
     }
   }
+  // The window shows what an undo changed by reading the core again where it
+  // is, or at the change when it lies outside the window.
+  function reloadOrJump(res: UndoResult, reason: TrackReason | null): void {
+    logChange({ edits: res.edits }, false);
+    if (editsInWindow(mainGeometry(), res.edits)) {
+      void reloadWindow();
+    } else {
+      jumpAfterUndo(res, reason);
+    }
+  }
   // Mirror an undo/redo result into the view. If every applied edit lands inside
   // the current window's byte range, dispatch them as local CM changes (byte→char
   // mapped, suppressing the re-send to Rust); otherwise the change is off-window,
   // so reload the window at the change (standard editor jump-to-undo behaviour).
   // Whatever the view does not show yet is kept for the clicks made on it.
-  function applyUndoResult(res: UndoResult): void {
+  // `reason` is why the selection was tracked, null when it was not.
+  function applyUndoResult(res: UndoResult, reason: TrackReason | null): void {
     if (view === undefined) {
       releaseToken(res.token);
       return;
@@ -1353,21 +1481,29 @@
       }
       // A step that moved a spill file: the text is not sent, so the window is
       // read again, at the change when it lies outside.
-      logChange({ edits: res.edits }, false);
-      if (editsInWindow(mainGeometry(), res.edits)) {
-        void reloadWindow();
-      } else {
-        jumpAfterUndo(res);
-      }
+      reloadOrJump(res, reason);
       return;
     }
     const linesBefore = totalLines;
     totalLines = res.total_lines;
     totalBytes = res.total_bytes;
     const g = mainGeometry();
+    if (mirrorRefused(res.edits)) {
+      // A line longer than a window holds is put back: the window reads the
+      // core again instead of mirroring it.
+      const reloaded = undoSelection({
+        tracked: res.tracked,
+        branch: 'reload_only',
+      });
+      if (reloaded.sel !== null) {
+        setGlobalSel(reloaded.sel, 'undoReload');
+      }
+      reloadOrJump(res, reason);
+      return;
+    }
     if (!editsInWindow(g, res.edits)) {
       logChange({ edits: res.edits }, false);
-      jumpAfterUndo(res);
+      jumpAfterUndo(res, reason);
       return;
     }
     const windowLines = g.endLine - g.startLine;
@@ -1379,7 +1515,9 @@
       applyingRemote = false;
     }
     takeMainGeometry(g);
-    if (swapping && landed > 0) {
+    // A selection tracked for a hidden end is not the one the swap's fold
+    // would have to replace with the mirrored edits' selection.
+    if (swapping && landed > 0 && reason !== 'hidden') {
       docChangedDuringSwap = true;
     }
     if (landed < res.edits.length) {
@@ -1389,7 +1527,7 @@
         logChange({ edits: res.edits.slice(0, landed) }, true);
       }
       logChange({ edits: res.edits.slice(landed) }, false);
-      jumpAfterUndo(res);
+      jumpAfterUndo(res, reason);
       return;
     }
     logChange({ edits: res.edits }, true);
@@ -1408,7 +1546,7 @@
         res.total_lines - linesBefore,
         g.endLine - g.startLine - windowLines,
       );
-      void reloadWindow();
+      void reloadWindow({ noKeep: true });
     }
     reportSelection();
   }
@@ -1491,6 +1629,7 @@
       resumeReplay();
     }
     notifySettled();
+    releaseBudgetHold();
   }
   // Input typed while the selection lies outside the window (and fits one) is
   // queued, the window is swapped back to the selection, and the queue is then
@@ -1519,6 +1658,8 @@
         handled?: true;
         // The selection to put back when that replay does nothing.
         restore?: LineSelection;
+        // Queued by the reaching-delete path to be run after a window read.
+        reaching?: true;
       }
     | {
         kind: 'copy' | 'cut';
@@ -1572,13 +1713,35 @@
   function isWindows(): boolean {
     return platform.os === 'windows';
   }
-  // Whether input acts outside the loaded window `doc`: the selection lies
-  // outside it, or is too large for any window.
-  function inputOutside(doc: Text): boolean {
-    return inputOutsideOf(globalSel, {
+  // The state the window's positions belong to: while a composition is
+  // captured the view holds text the core does not, so that is the state the
+  // composition began from.
+  function captureBase(state: EditorState): EditorState {
+    return capture !== null && captureStart !== null ? captureStart : state;
+  }
+  // The loaded window as the routing looks at it, for the main view's `state`.
+  function windowFor(state: EditorState): WindowLines {
+    const base = captureBase(state);
+    return {
       startLine: windowStartLine,
-      lineCount: doc.lines,
-    });
+      lineCount: base.doc.lines,
+      holes: windowHoles(base, windowStartLine),
+    };
+  }
+  // What the main view's holes say about a global selection.
+  function mainHoles(): WindowHoles | undefined {
+    return view === undefined ? undefined : windowFor(view.state).holes;
+  }
+  // Whether input acts outside the loaded window of `state`: the selection lies
+  // outside it or in a part of a line not loaded, or an operation on it runs
+  // in the core.
+  function inputOutside(state: EditorState): boolean {
+    return inputOutsideOf(globalSel, windowFor(state));
+  }
+  // Whether an operation on the global selection runs in the core: it is too
+  // large for one window, or has a hidden end the window was read for.
+  function selectionIsCoreOp(state: EditorState): boolean {
+    return coreOp(globalSel, windowFor(state).holes);
   }
   // --- Pointer selections in the queue ---------------------------------------
   // Every change made to the core's content, in order: the edits of either
@@ -1726,64 +1889,50 @@
     if (v === undefined) {
       return windowStartOffset;
     }
-    let doc = v.state.doc;
+    let state = v.state;
     let at = pos;
     if (capture !== null && captureStart !== null) {
       at = toCaptureStart(capture.changes, captureStart.doc, pos);
-      doc = captureStart.doc;
+      state = captureStart;
     }
-    return windowStartOffset + charToByte(doc.toString(), breaks, at);
-  }
-  // The window around global line `line`, as the swap to that line shows it,
-  // read from the core.
-  function readAround(line: number): Promise<WindowRead> {
-    const w = nextWindow(line, totalLines, WINDOW_LINES, MARGIN_LINES);
-    return invoke<WindowRead>('windowed_read', {
-      sessionId,
-      startLine: w.startLine,
-      endLine: w.endLine,
-    });
+    return (
+      windowStartOffset +
+      charToByte(state.doc.toString(), breaks, at, holeSpans(state))
+    );
   }
   // A global line and column as an end in the core's frame: from the view when
-  // its window holds the line, else read from the core behind the edits typed
-  // so far.
+  // its window holds the position, else asked of the core behind the edits
+  // typed so far (a position in a part of a line not loaded is not held).
   async function coreEndOf(pos: LinePos): Promise<SelectEnd> {
     const v = view;
     if (v !== undefined) {
-      const doc =
-        capture !== null && captureStart !== null
-          ? captureStart.doc
-          : v.state.doc;
+      const state =
+        capture !== null && captureStart !== null ? captureStart : v.state;
       const local = pos.line - windowStartLine;
-      if (local >= 0 && local < doc.lines) {
-        const line = doc.line(local + 1);
-        const at = line.from + Math.min(pos.col, line.length);
+      if (
+        local >= 0 &&
+        local < state.doc.lines &&
+        !hiddenAt(state, { line: local, col: pos.col })
+      ) {
+        const at = docPos(state, { line: local, col: pos.col });
         return {
-          off: windowStartOffset + charToByte(doc.toString(), breaks, at),
+          off:
+            windowStartOffset +
+            charToByte(state.doc.toString(), breaks, at, holeSpans(state)),
           at: unshownFrom ?? logHead(),
         };
       }
     }
     // The read runs behind everything dispatched so far; the changes the core
     // has made by then are the ones already in what it reads.
-    const { read, at } = await behindApplies(async () => {
+    return behindApplies(async () => {
       const here = logHead();
-      return { read: await readAround(pos.line), at: here };
+      const off = await invoke<number>('windowed_pos_offset', {
+        sessionId,
+        pos,
+      });
+      return { off, at: here };
     });
-    // The position is found in the text as the view would hold it.
-    const lines = read.text.replace(/\r\n|\r/g, '\n').split('\n');
-    const local = clamp(pos.line - read.start_line, 0, lines.length - 1);
-    let from = 0;
-    for (let i = 0; i < local; i += 1) {
-      from += (lines[i]?.length ?? 0) + 1;
-    }
-    const doc = lines.join('\n');
-    const col = Math.min(pos.col, lines[local]?.length ?? 0);
-    return {
-      off:
-        read.start_offset + charToByte(doc, scanBreaks(read.text), from + col),
-      at,
-    };
   }
   // Queue a pointer selection of the main view.
   function queueSelect(update: ViewUpdate): void {
@@ -1791,6 +1940,21 @@
     const next = update.state.selection.main;
     const at = unshownFrom ?? logHead();
     const last = lastSelect();
+    // Where a kept global end is hidden the click is made where it is drawn,
+    // so its position does not tell whether the end moved.
+    const moved = pointerMoves(
+      prev,
+      next,
+      last === null
+        ? hiddenEnds(
+            capture !== null && captureStart !== null
+              ? captureStart
+              : update.startState,
+            globalSel,
+            windowStartLine,
+          )
+        : { anchor: false, head: false },
+    );
     const ends = queuedSelectEnds<SelectEnd>(
       prev,
       next,
@@ -1798,6 +1962,7 @@
       last !== null
         ? { anchor: { ...last.anchor }, head: { ...last.head } }
         : { anchor: { off: 0, at }, head: { off: 0, at } },
+      moved,
     );
     const item: SelectItem = {
       kind: 'select',
@@ -1808,10 +1973,10 @@
     // Without a queued selection the end a click left alone is the global one.
     const unmoved: ('anchor' | 'head')[] = [];
     if (last === null) {
-      if (prev.anchor === next.anchor) {
+      if (!moved.anchor) {
         unmoved.push('anchor');
       }
-      if (prev.head === next.head) {
+      if (!moved.head) {
         unmoved.push('head');
       }
     }
@@ -1837,27 +2002,17 @@
     }
     trimLog();
   }
-  // The global line and column of a byte offset, asked of the core: the window
-  // the swap to that line would show is loaded and the position is taken from
-  // its text.
-  async function globalPosOf(off: number): Promise<LinePos> {
-    const target = await invoke<number>('windowed_offset_line', {
+  // The global line and column of a byte offset, asked of the core.
+  function globalPosOf(off: number): Promise<LinePos> {
+    return invoke<LinePos>('windowed_offset_pos', {
       sessionId,
       offset: off,
     });
-    const read = await readAround(target);
-    const doc = read.text.replace(/\r\n|\r/g, '\n');
-    const breaks = scanBreaks(read.text);
-    const rel = off - read.start_offset;
-    const at =
-      byteToChar(doc, breaks, rel) ?? byteToChar(doc, breaks, rel - 1) ?? 0;
-    const before = doc.slice(0, at);
-    const line = read.start_line + before.split('\n').length - 1;
-    return { line, col: at - (before.lastIndexOf('\n') + 1) };
   }
   // Where a pointer selection that is up to date lies for the view `v` with the
   // window `g`: document positions when both ends are inside it, and always
-  // the global selection.
+  // the global selection. `onLoadedLines` is set when both ends are on lines
+  // the window holds, so that a missing document position means a hidden end.
   async function placeSelect(
     v: EditorView,
     g: Geometry,
@@ -1865,24 +2020,18 @@
   ): Promise<{
     doc: { anchor: number; head: number } | null;
     global: LineSelection;
+    onLoadedLines: boolean;
   }> {
+    const text = v.state.doc.toString();
+    const spans = holeSpans(v.state);
     const place = async (
       off: number,
     ): Promise<{ pos: number | null; global: LinePos }> => {
-      const inside =
-        off >= g.startOffset &&
-        (off < g.endOffset || (off === g.endOffset && g.endLine >= totalLines));
-      if (!inside) {
+      const pos = placeOffset(off, g, totalLines, text, g.breaks, spans);
+      if (pos === null) {
         return { pos: null, global: await globalPosOf(off) };
       }
-      const text = v.state.doc.toString();
-      const rel = off - g.startOffset;
-      // An offset inside a CRLF moves to the break's start.
-      const pos =
-        byteToChar(text, g.breaks, rel) ??
-        byteToChar(text, g.breaks, rel - 1) ??
-        0;
-      const local = livePos(v.state.doc, pos);
+      const local = livePos(v.state, pos);
       return {
         pos,
         global: { line: local.line + g.startLine, col: local.col },
@@ -1890,12 +2039,15 @@
     };
     const anchor = await place(item.anchor.off);
     const head = await place(item.head.off);
+    const onLine = (pos: LinePos): boolean =>
+      pos.line >= g.startLine && pos.line < g.startLine + v.state.doc.lines;
     return {
       doc:
         anchor.pos !== null && head.pos !== null
           ? { anchor: anchor.pos, head: head.pos }
           : null,
       global: { anchor: anchor.global, head: head.global },
+      onLoadedLines: onLine(anchor.global) && onLine(head.global),
     };
   }
 
@@ -1913,8 +2065,8 @@
       queueHold: queuingHolds > 0,
       swapping,
       replayPending,
-      outside: v !== undefined && inputOutside(v.state.doc),
-      globalPath: globalOpPath(globalSel),
+      outside: v !== undefined && inputOutside(v.state),
+      globalPath: coreOp(globalSel, mainHoles()),
     };
   }
   // Whether input should be handled by the replay: focus is in the editor (or
@@ -1937,6 +2089,7 @@
     replayQueue.dropAll();
     releaseResolved();
     heldCaret = null;
+    reloadAsked = null;
     replayPending = false;
     replaySwapActive = false;
     clearTimeout(replayTimer);
@@ -1973,18 +2126,91 @@
     }
     // The layout may have changed since the table was last read.
     refreshAltGr();
-    // A selection no window holds is shown at its head.
-    const target = fitsWindow(globalSel)
+    // A selection no window holds, or one with an end the window cannot show,
+    // is shown at its head.
+    const target = !coreOp(globalSel, mainHoles())
       ? windowStartFor(globalSel, totalLines) + MARGIN_LINES
       : globalSel.head.line;
+    // A key that must read the window around the caret first is judged again
+    // once the read is in: it is not asked to read twice.
+    const asked = replayQueue.head;
+    if (
+      asked !== undefined &&
+      view !== undefined &&
+      mainHeadDecision(view) === 'reload'
+    ) {
+      reloadAsked = asked;
+    }
     replaySwapActive = true;
     void loadWindow(target, 'reveal');
     // The keys that got here may have come with focus on <body>.
     hadFocusAtSwap = true;
   }
-  // Whether the window holds the selection the queued input acts at.
-  function replayWindowReady(v: EditorView): boolean {
-    return replayReady(globalSel, windowStartLine, v.state.doc.lines);
+  // The queue's head key, once the window was read around the caret for it.
+  let reloadAsked: ReplayItem | null = null;
+  // What the queue's head does at the selection `sel`, from a dry run on the
+  // window `state` of the view `v` it runs in (see `reachDecision`). Asked only
+  // when the step would otherwise be 'run': nothing busy (`busy`) and the
+  // window holds the selection, and only of a key.
+  function headDecision(
+    v: EditorView,
+    state: EditorState,
+    head: ReplayItem | undefined,
+    sel: LineSelection,
+    win: WindowLines,
+    busy: boolean,
+  ): ReachDecision {
+    if (
+      head === undefined ||
+      head.kind !== 'key' ||
+      head.handled === true ||
+      busy ||
+      !insideWindow(sel, win.startLine, win.lineCount, win.holes)
+    ) {
+      return 'run';
+    }
+    const command = commandOfKey(head.event);
+    return command === null
+      ? 'run'
+      : reachDecision(
+          state,
+          command,
+          sel,
+          readForOf(state),
+          (range, forward) => v.moveToLineBoundary(range, forward),
+          win.startLine,
+        );
+  }
+  // The same for the main view: a head that must read the window around the
+  // caret first and still must after one such read is refused.
+  function mainHeadDecision(v: EditorView): ReachDecision {
+    const head = replayQueue.head;
+    const decision = headDecision(
+      v,
+      captureBase(v.state),
+      head,
+      globalSel,
+      windowFor(v.state),
+      swapping || holds > 0,
+    );
+    return decision === 'reload' && head !== undefined && head === reloadAsked
+      ? 'refuse'
+      : decision;
+  }
+  // Whether the window holds the selection the queued input acts at, and the
+  // queue's head may run there.
+  function replayWindowReady(
+    v: EditorView,
+    decision: ReachDecision = mainHeadDecision(v),
+  ): boolean {
+    const win = windowFor(v.state);
+    return replayReady(
+      globalSel,
+      win.startLine,
+      win.lineCount,
+      win.holes,
+      decision,
+    );
   }
   // Carry on with the queued input once nothing holds it back: swap back to
   // the selection when the queue's head needs the caret and the window does not
@@ -2064,11 +2290,23 @@
       );
     } else if (item.kind === 'key') {
       replayingKey = true;
+      recordedKey = { event: item.event };
       let handled = false;
       try {
         handled = runScopeHandlers(v, item.event, 'editor');
+        // A key no binding names runs the command its layout resolves.
+        if (
+          runsRecordedCommand(
+            handled,
+            item.reaching === true,
+            commandChain(keyLayers(), item.event, platform.os).length,
+          )
+        ) {
+          handled = keyCommand()?.(v) === true;
+        }
       } finally {
         replayingKey = false;
+        recordedKey = null;
       }
       // A move that waits for a layout measure is part of this key.
       await deferredMove(v);
@@ -2114,14 +2352,17 @@
       settingSelection = false;
     }
   }
+  // Show the global selection in the view. An end in a part of a line not
+  // loaded is drawn at the nearest edge of its marker, and the live selection
+  // is read back from the view: the global one keeps the hidden end.
   function alignViewToGlobal(v: EditorView): void {
-    const doc = v.state.doc;
+    const state = v.state;
     const live = toLiveSelection(globalSel, {
       startLine: windowStartLine,
-      lineCount: doc.lines,
-      lineLength: (local) => doc.line(local + 1).length,
+      lineCount: state.doc.lines,
+      lineLength: (local) => lineLength(state, local),
     });
-    setViewSelection(v, docPos(doc, live.anchor), docPos(doc, live.head));
+    setViewSelection(v, docPos(state, live.anchor), docPos(state, live.head));
     lastLive = liveSelection(v.state);
     heldCaret = null;
   }
@@ -2145,6 +2386,10 @@
       setGlobalSel(toGlobalSelection(lastLive, windowStartLine), 'runSelectA');
     } else {
       setGlobalSel(place.global, 'runSelectB');
+      if (place.onLoadedLines) {
+        // An end is hidden: the view draws it at the edge of its marker.
+        alignViewToGlobal(v);
+      }
     }
   }
   // --- Global operations -----------------------------------------------------
@@ -2164,11 +2409,10 @@
       ? commandChain(keyLayers(), item.event, platform.os)
       : [];
   }
-  function mainWindow(): { startLine: number; lineCount: number } {
-    return {
-      startLine: windowStartLine,
-      lineCount: view?.state.doc.lines ?? 0,
-    };
+  function mainWindow(): WindowLines {
+    return view === undefined
+      ? { startLine: windowStartLine, lineCount: 0 }
+      : windowFor(view.state);
   }
   function routeOf(item: ReplayItem, sel: LineSelection): GlobalAction {
     return globalItemAction({
@@ -2381,7 +2625,7 @@
     }
     const v = view;
     const via = windowedTextVia({
-      fits: fitsWindow(globalSel),
+      fits: !coreOp(globalSel, mainHoles()),
       editable:
         v !== undefined &&
         !locked &&
@@ -2686,6 +2930,7 @@
         if (head !== undefined && head.kind === 'select') {
           advanceItem(head);
         }
+        const decision = mainHeadDecision(v);
         const { step, action } = dequeueStep({
           item: head,
           sel: globalSel,
@@ -2695,7 +2940,8 @@
           swapping,
           holds,
           headMapping: head?.kind === 'select' && head.mapping !== null,
-          ready: replayWindowReady(v),
+          ready: replayWindowReady(v, decision),
+          decision,
           totalLines,
           win: mainWindow(),
         });
@@ -2713,15 +2959,18 @@
           if (swapStreak > 2) {
             // The swap cannot bring the selection inside: use what is there.
             swapStreak = 0;
+            const clamped = toLiveSelection(globalSel, {
+              startLine: windowStartLine,
+              lineCount: v.state.doc.lines,
+              lineLength: (local) => lineLength(v.state, local),
+            });
+            // Through the view's positions, which a hidden column has none of.
+            const shown = {
+              anchor: livePos(v.state, docPos(v.state, clamped.anchor)),
+              head: livePos(v.state, docPos(v.state, clamped.head)),
+            };
             setGlobalSel(
-              toGlobalSelection(
-                toLiveSelection(globalSel, {
-                  startLine: windowStartLine,
-                  lineCount: v.state.doc.lines,
-                  lineLength: (local) => v.state.doc.line(local + 1).length,
-                }),
-                windowStartLine,
-              ),
+              toGlobalSelection(shown, windowStartLine),
               'drainClamp',
             );
             continue;
@@ -2888,16 +3137,25 @@
         live,
         sh.g.startLine,
         update.docChanged,
+        forcedMovesOf(update, sh.sel, sh.g.startLine),
       );
       sh.live = live;
     }
   }
-  function buildShadowState(doc: string): EditorState {
+  function buildShadowState(
+    doc: Text,
+    holes: RangeSet<HoleValue>,
+    readFor: LineSelection | null,
+  ): EditorState {
     return EditorState.create({
       doc,
       extensions: [
         EditorView.cspNonce.of(readCspNonce()),
         coreSetup,
+        holeExtensions(holes, readFor, {
+          onMarker: () => {},
+          recordedCommand: () => keyCommand(),
+        }),
         currentKeymap(),
         keymap.of(
           coreKeyBindings({
@@ -2929,7 +3187,13 @@
   }
   // Put a freshly read window into the shadow, with the selection it holds
   // intersected with it, or at the start of `gotoLine` after an undo's jump.
-  function placeShadow(sh: Shadow, res: WindowRead, gotoLine?: number): void {
+  // `readFor` is the selection the read was focused on.
+  function placeShadow(
+    sh: Shadow,
+    res: WindowRead,
+    readFor: LineSelection | null,
+    gotoLine?: number,
+  ): void {
     sh.g = {
       startLine: res.start_line,
       startOffset: res.start_offset,
@@ -2941,7 +3205,12 @@
     };
     totalLines = res.total_lines;
     totalBytes = res.total_bytes;
-    const fresh = buildShadowState(res.text);
+    const doc = docOf(res.text);
+    const fresh = buildShadowState(
+      doc,
+      holeSetOf(doc, res.holes, markerLabel),
+      readFor,
+    );
     if (gotoLine !== undefined) {
       sh.sel = gotoSelection(
         res.start_line +
@@ -2951,26 +3220,30 @@
     const swapped = selectionAfterSwap(sh.sel, {
       startLine: res.start_line,
       lineCount: fresh.doc.lines,
-      lineLength: (local) => fresh.doc.line(local + 1).length,
+      lineLength: (local) => lineLength(fresh, local),
     });
     sh.sel = swapped.global;
-    sh.live = swapped.live;
     sh.silent = true;
     try {
       sh.view.setState(
         fresh.update({
           selection: {
-            anchor: docPos(fresh.doc, swapped.live.anchor),
-            head: docPos(fresh.doc, swapped.live.head),
+            anchor: docPos(fresh, swapped.live.anchor),
+            head: docPos(fresh, swapped.live.head),
           },
         }).state,
       );
     } finally {
       sh.silent = false;
     }
+    // Read back from the view: a hidden column has no position in it.
+    sh.live = liveSelection(sh.view.state);
     sh.g.endLine = sh.g.startLine + sh.view.state.doc.lines;
   }
-  function createShadow(res: WindowRead): Shadow {
+  function createShadow(
+    res: WindowRead,
+    readFor: LineSelection | null,
+  ): Shadow {
     devTrace(`createShadow start=${res.start_line} chars=${res.text.length}`);
     const host = document.createElement('div');
     const size = view?.dom.getBoundingClientRect();
@@ -2979,9 +3252,14 @@
       `width: ${size?.width ?? 800}px; height: ${size?.height ?? 600}px;`;
     host.inert = true;
     container.appendChild(host);
+    const doc = docOf(res.text);
     const v = new EditorView({
       parent: host,
-      state: buildShadowState(res.text),
+      state: buildShadowState(
+        doc,
+        holeSetOf(doc, res.holes, markerLabel),
+        readFor,
+      ),
     });
     const sh: Shadow = {
       view: v,
@@ -3004,7 +3282,7 @@
       busy: false,
     };
     shadow = sh;
-    placeShadow(sh, res);
+    placeShadow(sh, res, readFor);
     return sh;
   }
   function destroyShadow(sh: Shadow): void {
@@ -3016,46 +3294,69 @@
     sh.view.destroy();
     sh.host.remove();
     notifyFlushWaiters();
+    triggerBudget();
   }
-  // Read the shadow's window again around `target`.
+  // Read the shadow's window again around `target`, focused on the shadow's
+  // selection, on a caret at `gotoLine`, or on nothing with `unfocused`. The
+  // shadow has no screen and its windows are never installed in the main view,
+  // so the read sends neither `view` nor `keep`.
   async function readShadowWindow(
     sh: Shadow,
     target: number,
     gotoLine?: number,
+    unfocused = false,
   ): Promise<void> {
     await applyChain;
     if (locked || shadow !== sh) {
       return;
     }
     const w = nextWindow(target, totalLines, WINDOW_LINES, MARGIN_LINES);
+    const req = readRequest({
+      mode: gotoLine !== undefined ? 'goto' : unfocused ? 'reload' : 'reveal',
+      range: w,
+      screen: null,
+      keepAllowed: false,
+      cuts: [],
+      shadow: true,
+      ...(gotoLine !== undefined ? { target: gotoLine } : {}),
+      sel: sh.sel,
+    });
     let res: WindowRead;
     try {
       res = await invoke<WindowRead>('windowed_read', {
         sessionId,
         startLine: w.startLine,
         endLine: w.endLine,
+        ...req.args,
       });
     } catch (e) {
       lock(t('editor.locked.read', { detail: String(e) }));
       return;
     }
     if (shadow === sh) {
-      placeShadow(sh, res, gotoLine);
+      placeShadow(sh, res, req.readFor, gotoLine);
     }
   }
   // An undo or redo run by the shadow: straight at the core behind the edits
   // before it, with no hold, and the result mirrored into the shadow.
   async function shadowUndo(sh: Shadow, dir: 'undo' | 'redo'): Promise<void> {
     const owner = sessionId;
-    const out: { res: UndoResult | null; linesBefore: number } = {
+    const out: {
+      res: UndoResult | null;
+      linesBefore: number;
+      reason: TrackReason | null;
+    } = {
       res: null,
       linesBefore: 0,
+      reason: null,
     };
     const step = applyChain.then(async () => {
       if (locked || shadow !== sh) {
         return;
       }
-      const res = await coreUndo(owner, dir, trackOf(sh.sel));
+      const holes = windowHoles(sh.view.state, sh.g.startLine);
+      out.reason = trackReason(sh.sel, holes);
+      const res = await coreUndo(owner, dir, trackOf(sh.sel, holes));
       if (res === null) {
         return;
       }
@@ -3096,7 +3397,44 @@
       if (reloaded.sel !== null) {
         sh.sel = reloaded.sel;
       }
-      await readShadowWindow(sh, sh.g.startLine + MARGIN_LINES);
+      await readShadowWindow(
+        sh,
+        sh.g.startLine + MARGIN_LINES,
+        undefined,
+        true,
+      );
+      return;
+    }
+    // A jump to the change: the tracked selection is revealed at its head,
+    // except one tracked only for a hidden end.
+    const jump = async (): Promise<void> => {
+      const target = undoJump(res.tracked, out.reason);
+      if (target.sel !== null) {
+        sh.sel = target.sel;
+        await readShadowWindow(sh, target.sel.head.line);
+      } else {
+        await readShadowWindow(sh, res.first_line, res.first_line);
+      }
+    };
+    if (mirrorRefused(res.edits)) {
+      // A line longer than a window holds is put back: read the core again.
+      const reloaded = undoSelection({
+        tracked: res.tracked,
+        branch: 'reload_only',
+      });
+      if (reloaded.sel !== null) {
+        sh.sel = reloaded.sel;
+      }
+      if (editsInWindow(sh.g, res.edits)) {
+        await readShadowWindow(
+          sh,
+          sh.g.startLine + MARGIN_LINES,
+          undefined,
+          true,
+        );
+      } else {
+        await jump();
+      }
       return;
     }
     let landed = 0;
@@ -3116,13 +3454,7 @@
       junctionMismatch(coreDelta, windowDelta);
     }
     if (landed < res.edits.length || mismatch) {
-      const jump = undoSelection({ tracked: res.tracked, branch: 'goto' });
-      if (jump.sel !== null) {
-        sh.sel = jump.sel;
-        await readShadowWindow(sh, jump.sel.head.line);
-      } else {
-        await readShadowWindow(sh, res.first_line, res.first_line);
-      }
+      await jump();
       return;
     }
     const mirrored = undoSelection({ tracked: res.tracked, branch: 'mirror' });
@@ -3132,18 +3464,18 @@
     }
   }
   function alignShadow(sh: Shadow): void {
-    const doc = sh.view.state.doc;
+    const state = sh.view.state;
     const live = toLiveSelection(sh.sel, {
       startLine: sh.g.startLine,
-      lineCount: doc.lines,
-      lineLength: (local) => doc.line(local + 1).length,
+      lineCount: state.doc.lines,
+      lineLength: (local) => lineLength(state, local),
     });
     sh.silent = true;
     try {
       setViewSelection(
         sh.view,
-        docPos(doc, live.anchor),
-        docPos(doc, live.head),
+        docPos(state, live.anchor),
+        docPos(state, live.head),
       );
     } finally {
       sh.silent = false;
@@ -3171,6 +3503,10 @@
       sh.sel = toGlobalSelection(sh.live, sh.g.startLine);
     } else {
       sh.sel = place.global;
+      if (place.onLoadedLines) {
+        // An end is hidden: the shadow draws it at the edge of its marker.
+        alignShadow(sh);
+      }
     }
   }
   // A queued item that works on a selection too large for a window, which the
@@ -3196,6 +3532,8 @@
   async function shadowDrain(sh: Shadow): Promise<GlobalStop | null> {
     sh.busy = true;
     let streak = 0;
+    // The head key the shadow was read around the caret for.
+    let asked: ReplayItem | undefined;
     try {
       for (;;) {
         if (locked || gone || shadow !== sh) {
@@ -3204,6 +3542,23 @@
         const head = replayQueue.head;
         if (head !== undefined && head.kind === 'select') {
           advanceItem(head);
+        }
+        const win: WindowLines = {
+          startLine: sh.g.startLine,
+          lineCount: sh.view.state.doc.lines,
+          holes: windowHoles(sh.view.state, sh.g.startLine),
+        };
+        // The shadow has no swap or hold of its own to wait for.
+        let decision = headDecision(
+          sh.view,
+          sh.view.state,
+          head,
+          sh.sel,
+          win,
+          false,
+        );
+        if (decision === 'reload' && head !== undefined && head === asked) {
+          decision = 'refuse';
         }
         const { step, action } = shadowStep({
           item: head,
@@ -3214,12 +3569,16 @@
           headMapping: head?.kind === 'select' && head.mapping !== null,
           ready:
             head === undefined ||
-            replayReady(sh.sel, sh.g.startLine, sh.view.state.doc.lines),
+            replayReady(
+              sh.sel,
+              win.startLine,
+              win.lineCount,
+              win.holes,
+              decision,
+            ),
+          decision,
           totalLines,
-          win: {
-            startLine: sh.g.startLine,
-            lineCount: sh.view.state.doc.lines,
-          },
+          win,
         });
         joinNextApply = joinAfterStep(joinNextApply, step);
         if (step === 'wait' || step === 'done') {
@@ -3230,9 +3589,12 @@
           if (streak > 2) {
             return null;
           }
+          if (decision === 'reload') {
+            asked = head;
+          }
           await readShadowWindow(
             sh,
-            fitsWindow(sh.sel)
+            !coreOp(sh.sel, win.holes)
               ? windowStartFor(sh.sel, totalLines) + MARGIN_LINES
               : sh.sel.head.line,
           );
@@ -3308,8 +3670,11 @@
   // Run the shadow over a window read while a composition is open, until the
   // composition is over and everything queued has been replayed, or a
   // whole-file operation stops it.
-  async function runShadow(res: WindowRead): Promise<GlobalStop | null> {
-    const sh = createShadow(res);
+  async function runShadow(
+    res: WindowRead,
+    readFor: LineSelection | null,
+  ): Promise<GlobalStop | null> {
+    const sh = createShadow(res, readFor);
     try {
       for (;;) {
         const stop = await shadowDrain(sh);
@@ -3389,7 +3754,45 @@
   // Keydowns CodeMirror had already prevented when they bubbled out of the
   // editor, before any window-level accelerator handler.
   const claimedByEditor = new WeakSet<KeyboardEvent>();
+  // The key being handled, from its keydown (a document capture listener, ahead
+  // of CodeMirror's) until CodeMirror has run its command, and for a replayed
+  // key until its replay ends. What may remove a placeholder depends on the
+  // command it runs; most keys are never asked, so the command is resolved on
+  // the first ask.
+  let recordedKey: {
+    event: KeyboardEvent;
+    command?: Command | null;
+  } | null = null;
+  function commandOfKey(e: KeyboardEvent): Command | null {
+    const { normal, completion } = buildKeymap('windowed', platform.os, (id) =>
+      shortcutsState.accel(id),
+    );
+    return recordedCommand(
+      commandChain(keyLayers(), e, platform.os),
+      resolveCodeNamedKey([...completion, ...normal], e, platform.os),
+    );
+  }
+  function keyCommand(): Command | null {
+    const key = recordedKey;
+    if (key === null) {
+      return null;
+    }
+    key.command ??= commandOfKey(key.event);
+    return key.command;
+  }
+  // Record a keydown. Not cleared in a microtask: for a trusted event one runs
+  // between the document listener and CodeMirror's.
+  function recordKey(e: KeyboardEvent): void {
+    const key = { event: e };
+    recordedKey = key;
+    setTimeout(() => {
+      if (recordedKey === key) {
+        recordedKey = null;
+      }
+    }, 0);
+  }
   function onViewKeydown(e: KeyboardEvent): void {
+    recordedKey = null;
     if (e.defaultPrevented) {
       claimedByEditor.add(e);
     }
@@ -3437,13 +3840,7 @@
   // Whether the key is a doc-edge move whose target the window does not hold,
   // typed where the replay takes the editor's input.
   function docEdgeKeyOutside(e: KeyboardEvent): boolean {
-    const st = replayState();
-    if (
-      st.locked ||
-      st.focusElsewhere ||
-      st.dropHold ||
-      (st.swapping && !st.replayPending && !st.queueHold)
-    ) {
+    if (!keyGuardPasses(replayState())) {
       return false;
     }
     return (
@@ -3456,11 +3853,68 @@
       }) !== undefined
     );
   }
+  // Judge a delete key at a caret next to a part of a line not loaded, before
+  // it runs: one that would reach the hidden part first reads the window around
+  // the caret (the key is replayed after the read), or does nothing. True when
+  // the key was taken.
+  function reachKeydown(e: KeyboardEvent): boolean {
+    const v = view;
+    const kind = replayKind(e, platform.os);
+    if (
+      v === undefined ||
+      (kind !== 'key' && kind !== 'chord') ||
+      holesOf(v.state).size === 0
+    ) {
+      return false;
+    }
+    const st = replayState();
+    const win = windowFor(v.state);
+    if (
+      !reachGate({
+        // A key behind queued input is judged when it is replayed.
+        guard: keyGuardPasses(st) && !st.replayPending,
+        focusInEditor: clipboardFocus() === 'editor',
+        inside: insideWindow(
+          globalSel,
+          win.startLine,
+          win.lineCount,
+          win.holes,
+        ),
+        imeKey: isImeKey(e),
+        composing: v.compositionStarted,
+        capturing: capture !== null,
+      })
+    ) {
+      return false;
+    }
+    const command = keyCommand();
+    if (command === null) {
+      return false;
+    }
+    const decision = reachDecision(
+      v.state,
+      command,
+      globalSel,
+      readForOf(v.state),
+      (range, forward) => v.moveToLineBoundary(range, forward),
+      windowStartLine,
+    );
+    if (decision === 'run') {
+      return false;
+    }
+    e.preventDefault();
+    e.stopPropagation();
+    if (decision === 'reload') {
+      queueReplay({ kind: 'key', event: e, reaching: true });
+    }
+    return true;
+  }
 
   function onDocKeydown(e: KeyboardEvent): void {
     if (selectAllKeydown(e)) {
       return;
     }
+    recordKey(e);
     tabFocusBefore =
       keysParked && view !== undefined
         ? { event: e, mode: tabFocusState(view).tabFocusMode }
@@ -3523,6 +3977,9 @@
       queueReplay({ kind: 'key', event: e });
       return;
     }
+    if (reachKeydown(e)) {
+      return;
+    }
     if (
       !replayPending &&
       e.isTrusted &&
@@ -3531,15 +3988,23 @@
     ) {
       // A chord that is a no-op at the window edge leaves no transaction:
       // replay it unless a menu accelerator took it after CodeMirror passed
-      // on it.
+      // on it. With an end of the selection in a part not loaded the line-edge
+      // moves count too: their edge is drawn where the real one is not.
       setTimeout(() => {
         const v = view;
+        const holes = mainHoles();
         if (
           (claimedByEditor.has(e) || !e.defaultPrevented) &&
           !replayPending &&
           v !== undefined &&
-          inputOutside(v.state.doc) &&
-          chordReplaysAtEdge(keyLayers(), e, platform.os, neverReplayed)
+          inputOutside(v.state) &&
+          chordReplaysAtEdge(
+            keyLayers(),
+            e,
+            platform.os,
+            neverReplayed,
+            holes !== undefined && hasHiddenEnd(globalSel, holes),
+          )
         ) {
           queueReplay({ kind: 'key', event: e });
         }
@@ -3549,6 +4014,7 @@
   }
 
   function onDocCompositionStart(): void {
+    compositionGen += 1;
     const v = view;
     if (
       v === undefined ||
@@ -3560,7 +4026,7 @@
         draining,
         holds,
         wanted: replayWanted(),
-        outside: inputOutside(v.state.doc),
+        outside: inputOutside(v.state),
         selectAllPending: selectAllGate.pending(),
       })
     ) {
@@ -3576,6 +4042,8 @@
   // CodeMirror has read the composition's last text by the time this bubbles up
   // to the document; the capture ends in the next microtask.
   function onDocCompositionEnd(): void {
+    // The requests kept for the composition's end run a moment after it.
+    scheduleKept(LATE_MS, false);
     if (capture !== null) {
       queueMicrotask(endCapture);
     } else if (replayPending) {
@@ -3610,9 +4078,12 @@
       const done = finishCapture(start.doc, cap.changes);
       committed = done.committed;
       if (!cap.changes.empty) {
+        // A composition over a placeholder dropped its hole: the revert puts the
+        // character back, and the holes of the start go with it.
         v.dispatch({
           changes: done.revert,
           selection: start.selection,
+          effects: setHoles(holesOf(start)),
           annotations: captureMark.of(true),
         });
         if (!v.state.doc.eq(start.doc)) {
@@ -3623,6 +4094,10 @@
     capture = null;
     captureStart = null;
     lateUntil = Date.now() + LATE_MS;
+    // A capture that ends with no compositionend (the view still composes)
+    // releases the kept requests; the compositionend of one that had it
+    // schedules them itself.
+    scheduleKept(LATE_MS, v?.compositionStarted === true);
     // The commit takes the slot's place, ahead of what was queued during the
     // composition.
     const slot = replayQueue.findIndex((item) => item.kind === 'slot');
@@ -3660,11 +4135,7 @@
     if (swapping || shadow !== null) {
       return;
     }
-    if (
-      replayQueue.length > 0 &&
-      v !== undefined &&
-      inputOutside(v.state.doc)
-    ) {
+    if (replayQueue.length > 0 && v !== undefined && inputOutside(v.state)) {
       armReplaySwap(CHAIN_MS);
     } else {
       resumeReplay();
@@ -3681,6 +4152,16 @@
           endCapture();
         }
       }, 300);
+    } else if (view?.compositionStarted === true) {
+      // A composition that never ends releases the kept requests, as the wait
+      // of `settleComposition` is given up.
+      const gen = compositionGen;
+      setTimeout(() => {
+        // A composition begun since runs the list at its own end.
+        if (compositionGen === gen) {
+          scheduleKept(0, true);
+        }
+      }, COMPOSITION_END_TIMEOUT_MS);
     }
   }
   // Where focus is, as far as the clipboard rules care.
@@ -3766,10 +4247,13 @@
     }
     // A selection too large for one window goes through a clip file, made
     // when the item is taken out of the queue; the web clipboard is not used.
+    const holes = mainHoles();
     const route = clipCopyRoute({
       mode: 'edit',
       focus: clipboardFocus(),
       globalSel,
+      coreOp: coreOp(globalSel, holes),
+      hiddenText: holes?.hiddenText(globalSel) ?? false,
       wholeFile: false,
       domSelection: false,
       sel: null,
@@ -3810,6 +4294,56 @@
       rememberCopy(v.state);
     }
   }
+  // What a window load asks for besides its mode.
+  interface LoadOpts {
+    // The read follows a junction mismatch: byte offsets inside lines are stale.
+    noKeep?: true;
+    // The read is a budget re-read; `focused` repeats the focus on the selection.
+    budget?: { focused: boolean };
+    // The read is a click on a marker: the line, what to show of it, and
+    // whether that is the part before the hole.
+    click?: { line: number; entry: KeepEntry; fromEnd: boolean };
+  }
+  // The lines on screen, `[first, end)` as global lines; null without a view.
+  function screenLines(): [number, number] | null {
+    if (view === undefined) {
+      return null;
+    }
+    const rect = view.scrollDOM.getBoundingClientRect();
+    const top = lineAtViewportY(rect.top + 2);
+    const bottom = lineAtViewportY(rect.bottom - 2);
+    return [top, Math.max(top, bottom) + 1];
+  }
+  // The request of the read a load makes now, from the view as it is (from the
+  // state a composition began from while one is captured: the view then holds
+  // text the core does not).
+  function windowRequest(
+    mode: 'preserve' | 'goto' | 'reveal' | 'reload',
+    target: number,
+    w: { startLine: number; endLine: number },
+    opts: LoadOpts | undefined,
+  ): ReturnType<typeof readRequest> {
+    const state =
+      capture !== null && captureStart !== null ? captureStart : view?.state;
+    let readMode: ReadMode = mode;
+    if (mode === 'reload' && opts?.click !== undefined) {
+      readMode = 'click';
+    } else if (mode === 'reload' && opts?.budget !== undefined) {
+      readMode = 'budget';
+    }
+    return readRequest({
+      mode: readMode,
+      range: w,
+      screen: screenLines(),
+      // The core's line content moved under the view if it does not show it.
+      keepAllowed: unshownFrom === null && opts?.noKeep !== true,
+      cuts: state === undefined ? [] : cutLines(state, windowStartLine),
+      target,
+      sel: globalSel,
+      focused: opts?.budget?.focused,
+      click: opts?.click,
+    });
+  }
   // `op`, a global operation, runs behind the edits typed so far before the
   // window is read, and the window is then the one around the head of the
   // selection it leaves.
@@ -3817,6 +4351,7 @@
     target: number,
     mode: 'preserve' | 'goto' | 'reveal' | 'reload',
     op?: () => Promise<GlobalResult>,
+    opts?: LoadOpts,
   ): Promise<void> {
     // The swap back to the caret starts with a composition open: the editor
     // stays open to it and the queue drains in a shadow meanwhile.
@@ -3865,6 +4400,7 @@
     let globalRan = false;
     try {
       let res: WindowRead;
+      let readFor: LineSelection | null = null;
       for (;;) {
         // Every in-flight apply must land before the read, or the read returns
         // stale bytes/lines that would desync the swapped-in window.
@@ -3891,10 +4427,13 @@
         const seq = editSeq;
         try {
           traceSwap({ at: 'read' });
+          const req = windowRequest(mode, target, w, opts);
+          readFor = req.readFor;
           res = await invoke<WindowRead>('windowed_read', {
             sessionId,
             startLine: w.startLine,
             endLine: w.endLine,
+            ...req.args,
           });
           if (import.meta.env.DEV) {
             const parked = parkWindowedRead();
@@ -3917,7 +4456,7 @@
         // anything changed the core since the read, read again. A whole-file
         // operation the shadow stopped at runs here, and the window is read
         // again around the selection it leaves.
-        const stop = await runShadow(res);
+        const stop = await runShadow(res, readFor);
         await applyChain;
         if (locked || view === undefined) {
           endSwap();
@@ -3981,7 +4520,12 @@
       // and stays that way until endSwap runs in the anchor rAF below. The caret
       // goes in before the view ever sees the state, so no gap exists between
       // the new document and its selection.
-      const fresh = buildState(res.text);
+      const doc = docOf(res.text);
+      const fresh = buildState(
+        doc,
+        holeSetOf(doc, res.holes, markerLabel),
+        readFor,
+      );
       // A goto puts the caret at the target line. Otherwise the remembered
       // global selection is intersected with the new window; the global one is
       // kept so a later swap can bring a clamped end back.
@@ -3997,24 +4541,26 @@
       const swapped = selectionAfterSwap(globalSel, {
         startLine: windowStartLine,
         lineCount: fresh.doc.lines,
-        lineLength: (local) => fresh.doc.line(local + 1).length,
+        lineLength: (local) => lineLength(fresh, local),
       });
       setGlobalSel(swapped.global, 'selectionAfterSwap');
-      lastLive = swapped.live;
       devTrace(
         `loadWindow setState before lines=${fresh.doc.lines} chars=${fresh.doc.length}`,
       );
       view.setState(
         fresh.update({
           selection: {
-            anchor: docPos(fresh.doc, swapped.live.anchor),
-            head: docPos(fresh.doc, swapped.live.head),
+            anchor: docPos(fresh, swapped.live.anchor),
+            head: docPos(fresh, swapped.live.head),
           },
         }).state,
       );
       devTrace('loadWindow setState after');
+      // Read back from the view: a hidden column has no position in it.
+      lastLive = liveSelection(view.state);
       windowEndLine = windowStartLine + view.state.doc.lines;
       windowInstalls += 1;
+      const budgetEpochNow = budgetInstalled();
       traceSwap({
         at: 'placed',
         mode,
@@ -4038,10 +4584,14 @@
             } else if (anchor !== null) {
               restoreAnchor(anchor);
             }
+            if (opts?.click !== undefined) {
+              scrollToNewPart(opts.click);
+            }
           }
         } finally {
           endSwap();
           reportSelection();
+          budgetFrame(budgetEpochNow);
         }
       });
     } catch (e) {
@@ -4055,6 +4605,244 @@
         `loadWindow end mode=${mode} start=${windowStartLine} chars=${view?.state.doc.length ?? -1}`,
       );
     }
+  }
+  // After a marker click: the first character the read newly shows (the part
+  // starts at the hole's start) or the last (it ends at the hole's end).
+  function scrollToNewPart(click: { line: number; fromEnd: boolean }): void {
+    if (view === undefined) {
+      return;
+    }
+    const local = clamp(
+      click.line - windowStartLine + 1,
+      1,
+      view.state.doc.lines,
+    );
+    const line = view.state.doc.line(local);
+    const pos = click.fromEnd
+      ? newPartEnd(view.state, line)
+      : Math.min(line.to, line.from + 1);
+    view.dispatch({ effects: EditorView.scrollIntoView(pos) });
+  }
+  // --- Marker clicks and the budget re-read -----------------------------------
+  // Whether the editor is busy with something that a swap must not break into.
+  function swapBlocked(): boolean {
+    return (
+      view === undefined ||
+      swapInFlight ||
+      swapping ||
+      replayPending ||
+      holds > 0 ||
+      locked ||
+      view.composing
+    );
+  }
+  // A click on the marker of the hole at `pos` shows the next part of its line.
+  // During a composition it is kept, as the hole's line and byte, for the end
+  // of the composition (see the list of kept requests).
+  function onMarkerClick(v: EditorView, pos: number): void {
+    if (v !== view) {
+      return;
+    }
+    if (composingNow()) {
+      // While one is captured the view holds text the core does not.
+      const at =
+        capture !== null && captureStart !== null
+          ? toCaptureStart(capture.changes, captureStart.doc, pos)
+          : pos;
+      const hole = markerStart(captureBase(v.state), at, windowStartLine);
+      if (hole !== null) {
+        keepRequest({
+          kind: 'marker',
+          line: hole.line,
+          start: hole.start,
+          installs: windowInstalls,
+        });
+      }
+      return;
+    }
+    void openMarker(v, pos);
+  }
+  // Show the next part of the line of the hole at `pos`: not while the window
+  // is busy, nor while the view shows something the core has not made yet (the
+  // byte offsets inside the lines are stale then).
+  async function openMarker(v: EditorView, pos: number): Promise<void> {
+    if (swapBlocked() || unshownFrom !== null) {
+      return;
+    }
+    const read = markerRead(v.state, pos, windowStartLine);
+    if (read !== null) {
+      await reloadWindow({
+        click: { line: read.line, entry: read.entry, fromEnd: read.fromEnd },
+      });
+    }
+  }
+  // --- Requests kept for the end of a composition ------------------------------
+  // Go To, a find hit, Replace and a marker click change the window and the
+  // selection, which a composition must not see: while one is open or captured
+  // they wait here, in the form they were made, and run in order once it is
+  // over. They change nothing in the core before they run.
+  let keptList: readonly KeptRequest[] = [];
+  let keptRunning: Promise<void> | null = null;
+  // Counts compositions begun, and the count when the list was last released, so
+  // a released list tells a new composition from the stale composing flag.
+  let compositionGen = 0;
+  let releaseGen = 0;
+  // Whether the editor is in a composition, captured or not.
+  function composingNow(): boolean {
+    return capture !== null || view?.compositionStarted === true;
+  }
+  // True when `request` was kept for the end of a composition, false when none
+  // is open and it runs now. A request run from the list is never kept again.
+  function keepRequest(request: KeptRequest, fromList = false): boolean {
+    const next = keptRequest(keptList, request, composingNow(), fromList);
+    keptList = next.list;
+    return next.kept;
+  }
+  // Run the list a moment after a composition's end, so its last text has
+  // arrived; at once when a hold ends. `released` is set for a composition that
+  // ended without a `compositionend`.
+  const keptTimer = keptSchedule((released) => void runKept(released));
+  function scheduleKept(delay: number, released: boolean): void {
+    if (released) {
+      releaseGen = compositionGen;
+    }
+    keptTimer.schedule(delay, released);
+  }
+  function runKept(released: boolean): Promise<void> {
+    keptRunning ??= runKeptList(
+      {
+        get: () => keptList,
+        set: (list) => {
+          keptList = list;
+        },
+        settled,
+        gone: () => gone,
+        locked: () => locked || view === undefined,
+        held: () => holds > 0,
+        composing: () => view?.compositionStarted === true,
+        capturing: () => capture !== null,
+        renewed: () => compositionGen !== releaseGen,
+        run: runKeptRequest,
+      },
+      released,
+    ).finally(() => {
+      keptRunning = null;
+      triggerBudget();
+    });
+    return keptRunning;
+  }
+  async function runKeptRequest(request: KeptRequest): Promise<void> {
+    switch (request.kind) {
+      case 'goto':
+        await loadWindow(request.line, 'goto');
+        break;
+      case 'panel':
+        await startGoto(request.target, true);
+        break;
+      case 'find':
+        await findStep(request.backward, true);
+        break;
+      case 'result':
+        await jumpToResult(request.index, true);
+        break;
+      case 'replace':
+        await replaceOne(true);
+        break;
+      case 'marker': {
+        const v = view;
+        const pos =
+          v === undefined
+            ? null
+            : keptMarkerPos(request, v.state, windowStartLine, windowInstalls);
+        if (v !== undefined && pos !== null) {
+          await openMarker(v, pos);
+        }
+        break;
+      }
+    }
+  }
+  // The budget check: pending after an install, due once the frames after it
+  // have run, and then run again by every event that can free the editor.
+  let budgetState: BudgetPhase = 'idle';
+  // Counts installs, so a timer queued after an older one makes nothing due.
+  let budgetEpoch = 0;
+  let budgetTimer: ReturnType<typeof setTimeout> | undefined;
+  // The hold a budget re-read keeps until its swap has ended.
+  let budgetRelease: (() => void) | null = null;
+  function budgetInstalled(): number {
+    budgetEpoch += 1;
+    budgetState = budgetPhase(budgetState, 'install');
+    return budgetEpoch;
+  }
+  // The install's frame has been drawn: after the next frame's measure cycle
+  // (in which CodeMirror applies a reveal install's scroll) the check is due.
+  // It never runs inside CodeMirror's measure or update phase, where a dispatch
+  // throws.
+  function budgetFrame(epoch: number): void {
+    requestAnimationFrame(() => {
+      setTimeout(() => {
+        if (gone || epoch !== budgetEpoch) {
+          return;
+        }
+        budgetState = budgetPhase(budgetState, 'timer');
+        runBudget();
+      }, 0);
+    });
+  }
+  // Run a due check in a task of its own.
+  function triggerBudget(): void {
+    if (budgetState !== 'due' || budgetTimer !== undefined || gone) {
+      return;
+    }
+    budgetTimer = setTimeout(() => {
+      budgetTimer = undefined;
+      runBudget();
+    }, 0);
+  }
+  function runBudget(): void {
+    const v = view;
+    if (
+      budgetState !== 'due' ||
+      gone ||
+      v === undefined ||
+      swapBlocked() ||
+      v.compositionStarted ||
+      capture !== null ||
+      pendingIme ||
+      selectAllGate.pending()
+    ) {
+      return;
+    }
+    const verdict = budgetCheck(
+      screenLines(),
+      placedHoles(v.state).map((h) => ({
+        line: windowStartLine + h.line,
+        budget: h.value.budget,
+        inView: h.value.inView,
+      })),
+      readForOf(v.state),
+      globalSel,
+    );
+    if (verdict.reread) {
+      void budgetReread(verdict.focused);
+    }
+  }
+  // Read the window again with the lines on screen first. Input typed
+  // meanwhile is queued and replayed when the swap ends, as during an undo.
+  async function budgetReread(focused: boolean): Promise<void> {
+    budgetRelease = hold(true);
+    try {
+      await reloadWindow({ budget: { focused } });
+    } finally {
+      if (!swapping) {
+        releaseBudgetHold();
+      }
+    }
+  }
+  function releaseBudgetHold(): void {
+    const release = budgetRelease;
+    budgetRelease = null;
+    release?.();
   }
   /** Global 0-based line at the top of the viewport, and how many pixels its top is
    *  scrolled above the viewport edge, so a swap can restore the same view. */
@@ -4122,15 +4910,7 @@
   // mid-composition would tear the composing text out from under the input.
   async function maybeSwap(): Promise<void> {
     devTrace('maybeSwap');
-    if (
-      view === undefined ||
-      swapInFlight ||
-      swapping ||
-      replayPending ||
-      holds > 0 ||
-      locked ||
-      view.composing
-    ) {
+    if (view === undefined || swapBlocked()) {
       return;
     }
     const rect = view.scrollDOM.getBoundingClientRect();
@@ -4157,6 +4937,7 @@
   function onScroll(): void {
     if (!swapping) {
       void maybeSwap();
+      triggerBudget();
       reportTopLine();
     }
   }
@@ -4239,6 +5020,7 @@
   }
   function notifySettled(): void {
     notifyFlushWaiters();
+    triggerBudget();
     if (!isSettled()) {
       return;
     }
@@ -4309,19 +5091,20 @@
       if (v === undefined || locked || gone) {
         return;
       }
-      const doc = v.state.doc;
+      const state = v.state;
       const whole = wholeFileSelection(end, {
         startLine: windowStartLine,
-        lineCount: doc.lines,
-        lineLength: (local) => doc.line(local + 1).length,
+        lineCount: state.doc.lines,
+        lineLength: (local) => lineLength(state, local),
       });
       setViewSelection(
         v,
-        docPos(doc, whole.live.anchor),
-        docPos(doc, whole.live.head),
+        docPos(state, whole.live.anchor),
+        docPos(state, whole.live.head),
       );
       setGlobalSel(whole.globalSel, 'runSelectAll');
-      lastLive = whole.lastLive;
+      // Read back from the view: a hidden column has no position in it.
+      lastLive = liveSelection(v.state);
       heldCaret = null;
       reportSelection();
     } finally {
@@ -4339,9 +5122,14 @@
     return result;
   }
   // Read the window again where it is: the content under it changed.
-  function reloadWindow(): Promise<void> {
+  function reloadWindow(opts?: LoadOpts): Promise<void> {
     devTrace('reloadWindow');
-    return loadWindow(windowStartLine + MARGIN_LINES, 'reload');
+    return loadWindow(
+      windowStartLine + MARGIN_LINES,
+      'reload',
+      undefined,
+      opts,
+    );
   }
 
   function cancelSearch(): void {
@@ -4440,18 +5228,29 @@
     unlistenHit = hit;
     unlistenDone = done;
   }
-  // Select a hit: the global selection, then the window that shows it.
-  async function showHit(hit: FindHit): Promise<void> {
+  // Select a hit: the global selection, then the window that shows it. During a
+  // composition `again`, the call that found the hit, is kept instead.
+  async function showHit(
+    hit: FindHit,
+    again: KeptRequest,
+    fromList: boolean,
+  ): Promise<void> {
+    if (keepRequest(again, fromList)) {
+      return;
+    }
     setGlobalSel(hitSelection(hit), 'findHit');
     await loadWindow(hit.start.line, 'reveal');
   }
   // Find the next (or previous) hit from the caret, over the content as the core
   // has it: queued behind the edits already typed. Looks again once if more was
   // typed meanwhile.
-  async function findStep(backward: boolean): Promise<void> {
+  async function findStep(backward: boolean, fromList = false): Promise<void> {
     const query = findQuery;
     if (query === '') {
       openFind();
+      return;
+    }
+    if (keepRequest({ kind: 'find', backward }, fromList)) {
       return;
     }
     for (let attempt = 0; attempt < 2; attempt += 1) {
@@ -4488,7 +5287,7 @@
         return;
       }
       statusNote = '';
-      await showHit(hit);
+      await showHit(hit, { kind: 'find', backward }, fromList);
       return;
     }
   }
@@ -4496,24 +5295,26 @@
   // the global selection: when that is outside the window the window is brought
   // to it first, and what is selected must still match the query. If it does
   // not, Replace acts as Find Next.
-  async function replaceOne(): Promise<void> {
+  async function replaceOne(fromList = false): Promise<void> {
     const query = findQuery;
     if (query === '') {
       openFind();
       return;
     }
-    if (!(await settled())) {
+    if (keepRequest({ kind: 'replace' }, fromList)) {
+      return;
+    }
+    if (!(await settled()) || keepRequest({ kind: 'replace' }, fromList)) {
       return;
     }
     let v = view;
     if (v === undefined) {
       return;
     }
-    if (!insideWindow(globalSel, windowStartLine, v.state.doc.lines)) {
-      if (!fitsWindow(globalSel)) {
-        void findStep(false);
-        return;
-      }
+    // A selection outside the window, or one with an end in a part not loaded
+    // that no read was focused on, is first brought in by a read focused on it.
+    let route = replaceRoute(globalSel, windowFor(v.state), false);
+    if (route === 'reveal') {
       await loadWindow(
         windowStartFor(globalSel, totalLines) + MARGIN_LINES,
         'reveal',
@@ -4525,13 +5326,12 @@
       if (v === undefined) {
         return;
       }
+      route = replaceRoute(globalSel, windowFor(v.state), true);
     }
-    const main = v.state.selection.main;
-    if (
-      main.empty ||
-      !textMatchesQuery(v.state.sliceDoc(main.from, main.to), query, findCase)
-    ) {
-      void findStep(false);
+    const main =
+      route === 'here' ? replaceTarget(v.state, query, findCase) : null;
+    if (main === null) {
+      void findStep(false, fromList);
       return;
     }
     // The normal edit path: a user-annotated transaction, which the
@@ -4549,7 +5349,7 @@
     if (v.state.doc === docBefore) {
       forceNewGroup = flagBefore;
     }
-    void findStep(false);
+    void findStep(false, fromList);
   }
   // Replace every hit in the core as one undoable step. The editor is
   // read-only from here until the window has been read again, and nothing typed
@@ -4568,7 +5368,7 @@
     try {
       const res = await behindApplies(() => {
         // A selection no window mirrors follows the replace in the core.
-        const track = trackOf(globalSel);
+        const track = trackOf(globalSel, mainHoles());
         return runop(
           owner,
           () =>
@@ -4618,9 +5418,9 @@
     }
   }
 
-  async function jumpToResult(index: number): Promise<void> {
+  async function jumpToResult(index: number, fromList = false): Promise<void> {
     const r = results[index];
-    if (r === undefined) {
+    if (r === undefined || keepRequest({ kind: 'result', index }, fromList)) {
       return;
     }
     cursor = index;
@@ -4628,7 +5428,11 @@
       return;
     }
     const start = { line: r.line - 1, col: r.col };
-    await showHit({ start, end: endOfMatch(start, resultQuery) });
+    await showHit(
+      { start, end: endOfMatch(start, resultQuery) },
+      { kind: 'result', index },
+      fromList,
+    );
   }
 
   function stepResult(delta: number): void {
@@ -4695,7 +5499,23 @@
   async function submitGoto(): Promise<void> {
     const target = parseGotoRange(gotoValue, totalLines);
     closePanel();
-    if (target === null || !(await settled())) {
+    if (target !== null) {
+      await startGoto(target);
+    }
+  }
+  // Go to what the goto box asked for, once the editor is settled; kept for the
+  // end of a composition when one is open.
+  async function startGoto(
+    target: GotoTarget,
+    fromList = false,
+  ): Promise<void> {
+    if (keepRequest({ kind: 'panel', target }, fromList)) {
+      return;
+    }
+    if (
+      !(await settled()) ||
+      keepRequest({ kind: 'panel', target }, fromList)
+    ) {
       return;
     }
     if (target.kind === 'line') {
@@ -4751,6 +5571,7 @@
     void (async (): Promise<void> => {
       let target = 0;
       let res: WindowRead;
+      let mountReadFor: LineSelection | null = null;
       try {
         // A replace all (or its undo) may still be running from before this
         // editor mounted: the first read waits for it, so it never shows
@@ -4762,10 +5583,26 @@
             Math.max(0, totalLines - 1),
           );
           const w = nextWindow(target, totalLines, WINDOW_LINES, MARGIN_LINES);
+          // Focused on the restored caret when the read holds its line, else
+          // on the start of the target line.
+          const req = readRequest({
+            mode: 'mount',
+            range: w,
+            screen: null,
+            keepAllowed: false,
+            cuts: [],
+            target,
+            caret:
+              caret === undefined
+                ? undefined
+                : { line: caret.line - 1, col: Math.max(0, caret.col - 1) },
+          });
+          mountReadFor = req.readFor;
           return invoke<WindowRead>('windowed_read', {
             sessionId,
             startLine: w.startLine,
             endLine: w.endLine,
+            ...req.args,
           });
         });
       } catch (e) {
@@ -4787,9 +5624,14 @@
         insertLineEnding ?? ondetectending(detectBreakStyle(res.text));
       totalLines = res.total_lines;
       totalBytes = res.total_bytes;
+      const mountDoc = docOf(res.text);
       const v = new EditorView({
         parent: container,
-        state: buildState(res.text),
+        state: buildState(
+          mountDoc,
+          holeSetOf(mountDoc, res.holes, markerLabel),
+          mountReadFor,
+        ),
       });
       view = v;
       windowEndLine = windowStartLine + v.state.doc.lines;
@@ -4812,15 +5654,18 @@
           caret.line > windowStartLine &&
           caret.line <= windowEndLine
         ) {
-          const caretLine = v.state.doc.line(caret.line - windowStartLine);
-          anchor = Math.min(
-            caretLine.from + Math.max(0, caret.col - 1),
-            caretLine.to,
-          );
+          anchor = docPos(v.state, {
+            line: caret.line - 1 - windowStartLine,
+            col: Math.max(0, caret.col - 1),
+          });
         }
         v.dispatch({ selection: { anchor } });
         requestAnimationFrame(() => scrollLineToTop(target));
       }
+      // The budget check runs once the first frames have been drawn, whether or
+      // not a scroll was asked for above.
+      const mountEpoch = budgetInstalled();
+      requestAnimationFrame(() => budgetFrame(mountEpoch));
       v.scrollDOM.addEventListener('scroll', onScroll);
       v.dom.addEventListener('keydown', onViewKeydown);
       v.dom.addEventListener('focusout', onViewFocusOut);
@@ -4850,6 +5695,10 @@
     return () => {
       disposed = true;
       gone = true;
+      budgetState = budgetPhase(budgetState, 'gone');
+      clearTimeout(budgetTimer);
+      keptTimer.cancel();
+      keptList = [];
       forgetTokens();
       releaseSettleWaiters();
       selectAllGate.cancel();
@@ -4989,10 +5838,10 @@
   }
 
   export function goto(line: number): void {
-    void loadWindow(
-      clamp(Math.round(line) - 1, 0, Math.max(0, totalLines - 1)),
-      'goto',
-    );
+    const target = clamp(Math.round(line) - 1, 0, Math.max(0, totalLines - 1));
+    if (!keepRequest({ kind: 'goto', line: target })) {
+      void loadWindow(target, 'goto');
+    }
   }
 
   export function undo(): void {
@@ -5040,7 +5889,7 @@
     return {
       capturing: capture !== null,
       locked,
-      outside: view === undefined ? null : inputOutside(view.state.doc),
+      outside: view === undefined ? null : inputOutside(view.state),
       selectAllPending: selectAllGate.pending(),
       swapping,
       replaySwapActive,
@@ -5110,6 +5959,7 @@
       view.state.doc.toString(),
       breaks,
       offset - windowStartOffset,
+      holeSpans(view.state),
     );
     if (at === null) {
       return false;
@@ -5126,6 +5976,10 @@
       () =>
         view === undefined ? Promise.resolve() : settleViewComposition(view),
       async () => {
+        // The requests kept for the composition's end run now, so the host
+        // switches tabs only after a kept Replace has been applied.
+        releaseGen = compositionGen;
+        await runKept(true);
         await settled();
         await applyChain;
       },

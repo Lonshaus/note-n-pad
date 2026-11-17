@@ -179,6 +179,7 @@
     "large.search.failed": "Échec de la recherche. Le fichier a peut-être été déplacé ou n’est plus lisible.",
     "large.index.failed": "Impossible de terminer l’indexation de « {name} ». Le nombre de lignes et le saut à une ligne ne sont pas disponibles pour ce fichier.",
     "large.read.failed": "Impossible de lire une partie de ce fichier. Il a peut-être été déplacé ou n’est plus lisible.",
+    "large.notLoaded": "{size} non chargés",
     "status.view": "Consultation",
     "status.indexing": "Indexation… lignes : {count}",
     "status.lines": "Lignes : {count}",
