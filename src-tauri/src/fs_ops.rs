@@ -181,19 +181,91 @@ fn create_dir_all_with_mode(dir: &Path, mode: Option<u32>) -> std::io::Result<()
 }
 
 pub fn write_bytes_atomic(path: &Path, bytes: &[u8]) -> Result<(), String> {
-  write_bytes_atomic_with(path, bytes, None)
+  write_bytes_atomic_with(path, bytes, None, &|| {})
+}
+/// Further tries a write makes when its folder is gone by the time it stages.
+pub const FOLDER_VANISHED_RETRIES: u32 = 3;
+/// Whether a write's folder is gone. A bare file name's folder is the empty
+/// path, the working directory, which `is_dir` reports as missing.
+pub(crate) fn folder_vanished(dir: &Path) -> bool {
+  !dir.as_os_str().is_empty() && !dir.is_dir()
+}
+/// Create the folder `path` would be written to when it is missing, as
+/// `write_bytes_atomic` does. Also answers with the folders this call made,
+/// deepest first, including those made before a failure part way.
+pub fn ensure_parent_dir(path: &Path) -> (Vec<PathBuf>, Result<(), String>) {
+  let Some(dir) = path.parent() else {
+    return (Vec::new(), Err("path has no parent directory".to_string()));
+  };
+  if dir.is_dir() {
+    return (Vec::new(), Ok(()));
+  }
+  match missing_ancestors(dir) {
+    Some(missing) => create_missing(&missing),
+    None => (
+      Vec::new(),
+      create_dir_all_with_mode(dir, None).map_err(|e| read_error(&e)),
+    ),
+  }
+}
+/// The levels of `dir` that do not exist, deepest first. `None` when the walk
+/// meets something other than a folder, or runs out at a root that is not there.
+fn missing_ancestors(dir: &Path) -> Option<Vec<PathBuf>> {
+  missing_ancestors_with(dir, |path| fs::symlink_metadata(path))
 }
 
+fn missing_ancestors_with(
+  dir: &Path,
+  probe: impl Fn(&Path) -> std::io::Result<fs::Metadata>,
+) -> Option<Vec<PathBuf>> {
+  let mut missing = Vec::new();
+  for ancestor in dir.ancestors() {
+    // A relative path ends at the empty path, the working directory.
+    if ancestor.as_os_str().is_empty() {
+      return Some(missing);
+    }
+    match probe(ancestor) {
+      Err(e) if e.kind() == std::io::ErrorKind::NotFound => missing.push(ancestor.to_path_buf()),
+      Ok(_) if ancestor.is_dir() => return Some(missing),
+      _ => return None,
+    }
+  }
+  None
+}
+/// Create `missing` (deepest first) from the top down, recording only the levels
+/// this call made: a level that appeared meanwhile, or that a `..` names, is not
+/// ours to remove.
+fn create_missing(missing: &[PathBuf]) -> (Vec<PathBuf>, Result<(), String>) {
+  let mut made = Vec::new();
+  for dir in missing.iter().rev() {
+    match fs::create_dir(dir) {
+      Ok(()) => made.insert(0, dir.clone()),
+      Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists && dir.is_dir() => {}
+      Err(e) => return (made, Err(read_error(&e))),
+    }
+  }
+  (made, Ok(()))
+}
+/// Remove folders a failed save made, given deepest first. Only an empty folder
+/// goes, and a failure changes nothing about the error already being reported.
+pub fn remove_created_dirs(dirs: &[PathBuf]) {
+  for dir in dirs {
+    let _ = fs::remove_dir(dir);
+  }
+}
 /// `write_bytes_atomic` plus the mode to give a file and a directory this call
 /// has to create. Only applies on Unix, only to things that did not exist yet:
 /// an existing file keeps its own mode and an existing directory is left alone,
 /// per the XDG rule that a directory already there is not re-permissioned.
 /// Failing to apply a mode is never fatal — a filesystem that cannot store one
 /// (exFAT, a File Provider cloud root) still gets the write.
+///
+/// `before_stage` runs between checking the folder and creating the staged file.
 fn write_bytes_atomic_with(
   path: &Path,
   bytes: &[u8],
   private: Option<PrivateModes>,
+  before_stage: &dyn Fn(),
 ) -> Result<(), String> {
   let dir = path
     .parent()
@@ -205,10 +277,24 @@ fn write_bytes_atomic_with(
   if !dir.is_dir() {
     create_dir_all_with_mode(dir, private.map(|m| m.dir)).map_err(|e| e.to_string())?;
   }
-  replace_with(path, "", false, private.map(|m| m.file), |file| {
-    file.write_all(bytes).map_err(|e| e.to_string())?;
-    file.sync_all().map_err(|e| e.to_string())
-  })
+  let mut retries = FOLDER_VANISHED_RETRIES;
+  loop {
+    before_stage();
+    let replaced = replace_with(path, "", false, private.map(|m| m.file), |file| {
+      file.write_all(bytes).map_err(|e| e.to_string())?;
+      file.sync_all().map_err(|e| e.to_string())
+    });
+    match replaced {
+      // A failed chunked save may have just removed this folder as empty.
+      Err(e) if retries > 0 && folder_vanished(dir) => {
+        if create_dir_all_with_mode(dir, private.map(|m| m.dir)).is_err() {
+          return Err(e);
+        }
+        retries -= 1;
+      }
+      result => return result,
+    }
+  }
 }
 
 /// Build the replacement for `dest` with `fill`, then put it in `dest`'s place
@@ -239,7 +325,7 @@ where
 }
 /// The lock serializing writers of `dest`. Entries nobody holds or waits on are
 /// dropped on the next call, so the map does not grow with every path saved.
-fn destination_lock(dest: &Path) -> Arc<Mutex<()>> {
+pub(crate) fn destination_lock(dest: &Path) -> Arc<Mutex<()>> {
   static LOCKS: OnceLock<Mutex<HashMap<PathBuf, Arc<Mutex<()>>>>> = OnceLock::new();
   let mut locks = LOCKS
     .get_or_init(Default::default)
@@ -259,6 +345,38 @@ fn replace_locked<F>(
 where
   F: FnOnce(&mut fs::File) -> Result<(), String>,
 {
+  let Prepared {
+    mut file,
+    staged,
+    landing,
+  } = prepare(dest, |at| stage(at, label, exclusive, new_mode))?;
+  if let Err(e) = fill(&mut file) {
+    drop(file);
+    staged.discard();
+    return Err(e);
+  }
+  drop(file);
+  land(staged, landing, dest, copy_into_place)
+}
+/// How a staged replacement takes the destination's place.
+pub enum Landing {
+  /// Rename over this path: the destination itself, or the target of a symlink.
+  Swap(PathBuf),
+  /// Pour the content into the destination's inode.
+  Pour,
+}
+/// A replacement file ready to be filled, and how it will land.
+pub struct Prepared {
+  pub file: fs::File,
+  pub staged: Staged,
+  pub landing: Landing,
+}
+/// Choose the route for replacing `dest` and stage its file with `make`, which
+/// is asked for the path the replacement will stand in for.
+pub fn prepare(
+  dest: &Path,
+  make: impl Fn(&Path) -> Result<(fs::File, Staged), String>,
+) -> Result<Prepared, String> {
   let kind = classify(dest);
   // A symlink is only a name: the file it points at is the one being replaced,
   // so the replacement is built beside that target and renamed onto it. The
@@ -266,15 +384,13 @@ where
   // pointed -- and the swap keeps its power-loss atomicity. This is the only
   // kind with somewhere else to go if the staging is refused, hence first.
   if let Destination::Symlink(target) = &kind {
-    match stage(target, label, exclusive, new_mode) {
-      Ok((mut file, staged)) => {
-        if let Err(e) = fill(&mut file) {
-          drop(file);
-          staged.discard();
-          return Err(e);
-        }
-        drop(file);
-        return commit(staged, target);
+    match make(target) {
+      Ok((file, staged)) => {
+        return Ok(Prepared {
+          file,
+          staged,
+          landing: Landing::Swap(target.clone()),
+        });
       }
       // A refusal the user needs words for, not an errno from a second attempt.
       Err(e) if e == READ_ONLY_DESTINATION => return Err(e),
@@ -285,36 +401,50 @@ where
       Err(_) => {}
     }
   }
-  let (mut file, staged) = stage(dest, label, exclusive, new_mode)?;
-  if let Err(e) = fill(&mut file) {
-    drop(file);
-    staged.discard();
-    return Err(e);
+  let (file, staged) = make(dest)?;
+  let landing = if matches!(kind, Destination::Plain) {
+    Landing::Swap(dest.to_path_buf())
+  } else {
+    Landing::Pour
+  };
+  Ok(Prepared {
+    file,
+    staged,
+    landing,
+  })
+}
+/// Put a staged replacement in `dest`'s place. `pour` is `copy_into_place`.
+pub fn land(
+  staged: Staged,
+  landing: Landing,
+  dest: &Path,
+  pour: impl FnOnce(&Path, &Path) -> Result<(), String>,
+) -> Result<(), String> {
+  match landing {
+    Landing::Swap(target) => commit(staged, &target),
+    Landing::Pour => {
+      // Shared, or a symlink the sandbox would not let us stage beside. The staged
+      // file is written and fsynced *before* the destination is touched, on
+      // purpose: pouring truncates first, which leaves the destination briefly
+      // short, and if the process dies in that window the complete new content
+      // still exists in the staged file. Nothing recovers from that automatically
+      // and nothing is meant to -- the file being there is enough to salvage by
+      // hand. The window is not instantaneous either: measured at 0.06s for
+      // 100 MiB and 0.5s for 4 GiB on an internal SSD, longer on slower media.
+      //
+      // What it costs is the power-loss atomicity the rename gives everyone else.
+      // That is an OS-level limit rather than a shortcut: no filesystem this app
+      // ships on can replace an inode's contents atomically, so holding several
+      // names on one inode together and surviving a crash mid-write cannot both be
+      // had. `vim` makes the same call by default (`backupcopy=yes`).
+      //
+      // Kept on failure on purpose: the destination is truncated at that point and
+      // the staged file is the only complete copy of the new content left.
+      pour(staged.path(), dest)?;
+      staged.discard();
+      Ok(())
+    }
   }
-  drop(file);
-  if matches!(kind, Destination::Plain) {
-    return commit(staged, dest);
-  }
-  // Shared, or a symlink the sandbox would not let us stage beside. The staged
-  // file is written and fsynced *before* the destination is touched, on
-  // purpose: pouring truncates first, which leaves the destination briefly
-  // short, and if the process dies in that window the complete new content
-  // still exists in the staged file. Nothing recovers from that automatically
-  // and nothing is meant to -- the file being there is enough to salvage by
-  // hand. The window is not instantaneous either: measured at 0.06s for
-  // 100 MiB and 0.5s for 4 GiB on an internal SSD, longer on slower media.
-  //
-  // What it costs is the power-loss atomicity the rename gives everyone else.
-  // That is an OS-level limit rather than a shortcut: no filesystem this app
-  // ships on can replace an inode's contents atomically, so holding several
-  // names on one inode together and surviving a crash mid-write cannot both be
-  // had. `vim` makes the same call by default (`backupcopy=yes`).
-  //
-  // Kept on failure on purpose: the destination is truncated at that point and
-  // the staged file is the only complete copy of the new content left.
-  copy_into_place(staged.path(), dest)?;
-  staged.discard();
-  Ok(())
 }
 
 /// Where a replacement file is being built before it takes the destination's
@@ -375,17 +505,74 @@ pub fn stage(
   exclusive: bool,
   new_mode: Option<u32>,
 ) -> Result<(fs::File, Staged), String> {
+  stage_checked(dest, label, exclusive, new_mode, usize::MAX).map_err(|refusal| match refusal {
+    StageError::Taken(e) => e.to_string(),
+    StageError::Other(e) => e,
+  })
+}
+/// Tries before an exclusive staging that keeps finding its name taken gives up.
+const STAGE_NAME_ATTEMPTS: u32 = 8;
+/// Bytes of the destination's name a `stage_unique` name keeps, so its longer
+/// suffix still fits the 255-unit file name limit.
+pub(crate) const STAGE_NAME_STEM_BYTES: usize = 64;
+/// `stage` under the first free name `name_at(attempt)` yields, never touching
+/// a name that is already taken: such a file may be a staged copy kept on
+/// purpose after a failed write.
+pub fn stage_unique(
+  dest: &Path,
+  name_at: impl Fn(u32) -> String,
+  new_mode: Option<u32>,
+) -> Result<(fs::File, Staged), String> {
+  for attempt in 0..STAGE_NAME_ATTEMPTS {
+    match stage_checked(
+      dest,
+      &name_at(attempt),
+      true,
+      new_mode,
+      STAGE_NAME_STEM_BYTES,
+    ) {
+      Err(StageError::Taken(_)) => {}
+      Err(StageError::Other(e)) => return Err(e),
+      Ok(staged) => return Ok(staged),
+    }
+  }
+  Err("no free name for the staged file".to_string())
+}
+/// Why `stage_checked` could not stage.
+enum StageError {
+  /// An exclusive staging found its name already there.
+  Taken(std::io::Error),
+  Other(String),
+}
+/// The longest start of `name` within `max` bytes that ends between characters.
+fn name_stem(name: &str, max: usize) -> &str {
+  let mut end = name.len().min(max);
+  while !name.is_char_boundary(end) {
+    end -= 1;
+  }
+  &name[..end]
+}
+
+fn stage_checked(
+  dest: &Path,
+  label: &str,
+  exclusive: bool,
+  new_mode: Option<u32>,
+  stem_bytes: usize,
+) -> Result<(fs::File, Staged), StageError> {
+  let other = StageError::Other;
   if !writable(dest) {
-    return Err(READ_ONLY_DESTINATION.to_string());
+    return Err(other(READ_ONLY_DESTINATION.to_string()));
   }
   let dir = dest
     .parent()
-    .ok_or_else(|| "path has no parent directory".to_string())?;
+    .ok_or_else(|| other("path has no parent directory".to_string()))?;
   let file_name = dest
     .file_name()
     .and_then(|n| n.to_str())
-    .ok_or_else(|| "path has no file name".to_string())?;
-  let sibling = dir.join(format!(".{file_name}{label}.tmp"));
+    .ok_or_else(|| other("path has no file name".to_string()))?;
+  let stem = name_stem(file_name, stem_bytes);
+  let sibling = dir.join(format!(".{stem}{label}.tmp"));
   let refused = match create_temp_file(&sibling, dest, new_mode, exclusive) {
     Ok(file) => {
       return Ok((
@@ -397,7 +584,10 @@ pub fn stage(
       ));
     }
     Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => e,
-    Err(e) => return Err(e.to_string()),
+    Err(e) if exclusive && e.kind() == std::io::ErrorKind::AlreadyExists => {
+      return Err(StageError::Taken(e));
+    }
+    Err(e) => return Err(other(e.to_string())),
   };
   #[cfg(target_os = "macos")]
   {
@@ -406,11 +596,11 @@ pub fn stage(
     // which makes it exist immediately before the swap so that a write that
     // fails part way leaves nothing at all under the name the user chose.
     if !dest.exists() || dest.is_file() {
-      let replacement = macos::item_replacement_dir(dest)?;
+      let replacement = macos::item_replacement_dir(dest).map_err(other)?;
       let path = replacement.join(file_name);
       let file = create_temp_file(&path, dest, new_mode, exclusive).map_err(|e| {
         let _ = fs::remove_dir_all(&replacement);
-        e.to_string()
+        other(e.to_string())
       })?;
       return Ok((
         file,
@@ -420,13 +610,13 @@ pub fn stage(
         },
       ));
     }
-    Err(format!(
+    Err(other(format!(
       "{} is not a file that can be replaced",
       dest.display()
-    ))
+    )))
   }
   #[cfg(not(target_os = "macos"))]
-  Err(refused.to_string())
+  Err(other(refused.to_string()))
 }
 
 /// Put the staged file in `dest`'s place, carrying over what the swap would
@@ -1489,7 +1679,7 @@ pub fn write_text_atomic(path: &Path, content: &str) -> Result<(), String> {
 /// to create is created owner-only. See `PrivateModes` for what that does and
 /// does not buy.
 pub fn write_text_atomic_private(path: &Path, content: &str) -> Result<(), String> {
-  write_bytes_atomic_with(path, content.as_bytes(), Some(PRIVATE))
+  write_bytes_atomic_with(path, content.as_bytes(), Some(PRIVATE), &|| {})
 }
 
 /// Whether a save aimed at this path would be allowed to land, asked at open
@@ -2362,5 +2552,219 @@ mod tests {
     let mode = fs::metadata(&path).unwrap().permissions().mode() & 0o777;
     assert_eq!(mode, expected);
     assert_ne!(mode, 0o600, "an ordinary save must not become owner-only");
+  }
+
+  fn not_found(_: &Path) -> std::io::Result<fs::Metadata> {
+    Err(std::io::ErrorKind::NotFound.into())
+  }
+
+  #[test]
+  fn missing_ancestors_stop_at_a_real_folder() {
+    let dir = tempdir().unwrap();
+    let outer = dir.path().join("outer");
+    let inner = outer.join("inner");
+    assert_eq!(missing_ancestors(&inner), Some(vec![inner.clone(), outer]));
+    assert_eq!(missing_ancestors(dir.path()), Some(Vec::new()));
+  }
+
+  #[test]
+  fn missing_ancestors_refuse_anything_but_a_folder() {
+    let dir = tempdir().unwrap();
+    let file = dir.path().join("file");
+    fs::write(&file, b"x").unwrap();
+    assert_eq!(missing_ancestors(&file), None);
+    assert_eq!(missing_ancestors(&file.join("sub")), None);
+    let link = dir.path().join("link");
+    if linktest::symlink(&dir.path().join("gone"), &link) {
+      assert_eq!(missing_ancestors(&link), None);
+      assert_eq!(missing_ancestors(&link.join("sub")), None);
+    }
+  }
+  // Windows makes a file link through `linktest`, and this needs a folder one.
+  #[cfg(unix)]
+  #[test]
+  fn missing_ancestors_accept_a_link_to_a_folder() {
+    let dir = tempdir().unwrap();
+    let real = dir.path().join("real");
+    fs::create_dir(&real).unwrap();
+    let link = dir.path().join("link");
+    assert!(linktest::symlink(&real, &link));
+    let sub = link.join("sub");
+    assert_eq!(missing_ancestors(&sub), Some(vec![sub.clone()]));
+  }
+
+  #[test]
+  fn missing_ancestors_end_by_the_kind_of_path() {
+    let absolute = std::env::temp_dir().join("a");
+    assert_eq!(missing_ancestors_with(&absolute, not_found), None);
+    let relative = Path::new("a").join("b");
+    assert_eq!(
+      missing_ancestors_with(&relative, not_found),
+      Some(vec![relative.clone(), PathBuf::from("a")])
+    );
+    assert_eq!(
+      missing_ancestors_with(Path::new(""), not_found),
+      Some(Vec::new())
+    );
+  }
+
+  #[test]
+  fn ensure_parent_dir_reports_what_it_made_deepest_first() {
+    let dir = tempdir().unwrap();
+    let outer = dir.path().join("outer");
+    let inner = outer.join("inner");
+    let (made, result) = ensure_parent_dir(&inner.join("f.txt"));
+    result.unwrap();
+    assert_eq!(made, vec![inner.clone(), outer]);
+    assert!(inner.is_dir());
+    let (made, result) = ensure_parent_dir(&inner.join("f.txt"));
+    result.unwrap();
+    assert!(made.is_empty());
+  }
+
+  #[test]
+  fn ensure_parent_dir_answers_as_create_dir_all_when_something_is_in_the_way() {
+    let dir = tempdir().unwrap();
+    let file = dir.path().join("file");
+    fs::write(&file, b"x").unwrap();
+    let link = dir.path().join("link");
+    let mut parents = vec![file.clone(), file.join("sub")];
+    if linktest::symlink(&dir.path().join("gone"), &link) {
+      parents.push(link.clone());
+      parents.push(link.join("sub"));
+    }
+    for parent in &parents {
+      let expected = fs::create_dir_all(parent)
+        .map_err(|e| read_error(&e))
+        .unwrap_err();
+      let (made, result) = ensure_parent_dir(&parent.join("f.txt"));
+      assert!(made.is_empty(), "{parent:?}");
+      assert_eq!(result.unwrap_err(), expected, "{parent:?}");
+    }
+    assert_eq!(fs::read(&file).unwrap(), b"x");
+    assert!(!dir.path().join("gone").exists());
+    if parents.len() > 2 {
+      assert!(fs::symlink_metadata(&link)
+        .unwrap()
+        .file_type()
+        .is_symlink());
+    }
+    assert_eq!(fs::read_dir(dir.path()).unwrap().count(), parents.len() / 2);
+  }
+
+  #[test]
+  fn a_level_that_appears_after_the_walk_is_not_recorded() {
+    let dir = tempdir().unwrap();
+    let outer = dir.path().join("outer");
+    let inner = outer.join("inner");
+    let missing = missing_ancestors(&inner).unwrap();
+    fs::create_dir(&outer).unwrap();
+    let (made, result) = create_missing(&missing);
+    result.unwrap();
+    assert_eq!(made, vec![inner.clone()]);
+    remove_created_dirs(&made);
+    assert!(outer.is_dir());
+    assert!(!inner.exists());
+  }
+
+  #[test]
+  fn removing_created_dirs_goes_deepest_first_and_spares_a_folder_in_use() {
+    let dir = tempdir().unwrap();
+    let outer = dir.path().join("outer");
+    let inner = outer.join("inner");
+    fs::create_dir_all(&inner).unwrap();
+    let mine = outer.join("mine.txt");
+    fs::write(&mine, b"mine").unwrap();
+    remove_created_dirs(&[inner.clone(), outer.clone()]);
+    assert!(!inner.exists());
+    assert_eq!(fs::read(&mine).unwrap(), b"mine");
+  }
+
+  #[test]
+  fn a_write_recreates_a_folder_that_vanishes_before_staging() {
+    let dir = tempdir().unwrap();
+    let folder = dir.path().join("new");
+    let path = folder.join("out.txt");
+    let calls = Cell::new(0);
+    let before_stage = || {
+      calls.set(calls.get() + 1);
+      if calls.get() == 1 {
+        fs::remove_dir(&folder).unwrap();
+      }
+    };
+    write_bytes_atomic_with(&path, b"text", None, &before_stage).unwrap();
+    assert_eq!(calls.get(), 2);
+    assert_eq!(fs::read(&path).unwrap(), b"text");
+  }
+
+  #[test]
+  fn a_write_gives_up_after_the_retries_with_the_last_error() {
+    let dir = tempdir().unwrap();
+    let folder = dir.path().join("new");
+    let path = folder.join("out.txt");
+    let calls = Cell::new(0);
+    let before_stage = || {
+      calls.set(calls.get() + 1);
+      fs::remove_dir(&folder).unwrap();
+    };
+    let err = write_bytes_atomic_with(&path, b"text", None, &before_stage).unwrap_err();
+    assert_eq!(calls.get(), FOLDER_VANISHED_RETRIES + 1);
+    assert_eq!(err, fs::File::create(&path).unwrap_err().to_string());
+    assert!(!folder.exists());
+  }
+
+  #[test]
+  fn a_write_does_not_retry_while_its_folder_is_there() {
+    let dir = tempdir().unwrap();
+    let folder = dir.path().join("existing");
+    fs::create_dir(&folder).unwrap();
+    let calls = Cell::new(0);
+    let err = write_bytes_atomic_with(&folder.join(".."), b"text", None, &|| {
+      calls.set(calls.get() + 1)
+    })
+    .unwrap_err();
+    assert_eq!(err, "path has no file name");
+    assert_eq!(calls.get(), 1);
+  }
+
+  #[test]
+  fn only_a_named_folder_that_is_missing_counts_as_vanished() {
+    let dir = tempdir().unwrap();
+    assert!(!folder_vanished(Path::new("")));
+    assert!(!folder_vanished(dir.path()));
+    assert!(folder_vanished(&dir.path().join("gone")));
+  }
+
+  #[test]
+  fn a_write_whose_folder_is_the_empty_path_does_not_retry() {
+    let calls = Cell::new(0);
+    let err = write_bytes_atomic_with(Path::new(".."), b"text", None, &|| {
+      calls.set(calls.get() + 1)
+    })
+    .unwrap_err();
+    assert_eq!(err, "path has no file name");
+    assert_eq!(calls.get(), 1);
+  }
+
+  #[cfg(unix)]
+  #[test]
+  fn a_recreated_private_folder_is_owner_only() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = tempdir().unwrap();
+    let folder = dir.path().join("new");
+    let path = folder.join("data.json");
+    let calls = Cell::new(0);
+    let before_stage = || {
+      calls.set(calls.get() + 1);
+      if calls.get() == 1 {
+        fs::remove_dir(&folder).unwrap();
+      }
+    };
+    write_bytes_atomic_with(&path, b"{}", Some(PRIVATE), &before_stage).unwrap();
+    assert_eq!(calls.get(), 2);
+    let mode = |p: &Path| fs::metadata(p).unwrap().permissions().mode() & 0o777;
+    assert_eq!(mode(&folder), 0o700);
+    assert_eq!(mode(&path), 0o600);
   }
 }
