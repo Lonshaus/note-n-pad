@@ -122,6 +122,12 @@ pub struct AppSettings {
   pub workspace_width: f64,
   #[serde(default = "default_workspace_height")]
   pub workspace_height: f64,
+  /// Size the user last gave a document window, used for new document windows.
+  /// None until one has been resized. Not shown on the settings page.
+  #[serde(default)]
+  pub document_width: Option<f64>,
+  #[serde(default)]
+  pub document_height: Option<f64>,
   /// Root folders of the project trees shown in the workspace sidebar. Empty
   /// until the user adds one; each entry is a sibling top-level node.
   #[serde(default)]
@@ -291,6 +297,8 @@ impl Default for AppSettings {
       workspace_y: None,
       workspace_width: default_workspace_width(),
       workspace_height: default_workspace_height(),
+      document_width: None,
+      document_height: None,
       project_roots: Vec::new(),
       project_expanded: BTreeMap::new(),
       show_tray_icon: default_show_tray_icon(),
@@ -501,6 +509,14 @@ fn repair(settings: &mut AppSettings) -> Vec<String> {
     settings.workspace_height = default_workspace_height();
     repaired.push("workspace_height".to_string());
   }
+  if !valid_document_size(settings.document_width) {
+    settings.document_width = None;
+    repaired.push("document_width".to_string());
+  }
+  if !valid_document_size(settings.document_height) {
+    settings.document_height = None;
+    repaired.push("document_height".to_string());
+  }
   if !(9.0..=32.0).contains(&settings.editor_font_size) {
     settings.editor_font_size = default_editor_font_size();
     repaired.push("editor_font_size".to_string());
@@ -526,6 +542,13 @@ fn repair(settings: &mut AppSettings) -> Vec<String> {
     repaired.push("default_encoding".to_string());
   }
   repaired
+}
+/// A remembered document-window dimension: unset, or any finite number above 0.
+fn valid_document_size(v: Option<f64>) -> bool {
+  match v {
+    None => true,
+    Some(n) => n.is_finite() && n > 0.0,
+  }
 }
 
 fn validate(settings: &AppSettings) -> Result<(), String> {
@@ -553,6 +576,10 @@ fn validate(settings: &AppSettings) -> Result<(), String> {
     || !(320.0..=4000.0).contains(&settings.workspace_height)
   {
     return Err("workspace size out of range".to_string());
+  }
+  if !valid_document_size(settings.document_width) || !valid_document_size(settings.document_height)
+  {
+    return Err("document size out of range".to_string());
   }
   if !(9.0..=32.0).contains(&settings.editor_font_size) {
     return Err("editor font size out of range".to_string());
@@ -793,6 +820,8 @@ fn tolerant_settings(
       default_workspace_height,
       &mut dropped,
     ),
+    document_width: field_or_default(obj, "document_width", || None, &mut dropped),
+    document_height: field_or_default(obj, "document_height", || None, &mut dropped),
     project_roots: field_or_default(obj, "project_roots", Vec::new, &mut dropped),
     project_expanded: field_or_default(obj, "project_expanded", BTreeMap::new, &mut dropped),
     show_tray_icon: field_or_default(obj, "show_tray_icon", default_show_tray_icon, &mut dropped),
@@ -1444,6 +1473,8 @@ mod tests {
       workspace_y: Some(60.0),
       workspace_width: 320.0,
       workspace_height: 600.0,
+      document_width: Some(1000.0),
+      document_height: Some(700.0),
       project_roots: vec!["/tmp/project".into(), "/tmp/other".into()],
       project_expanded: BTreeMap::from([(
         "/tmp/project".to_string(),
@@ -1465,6 +1496,51 @@ mod tests {
     assert_eq!(settings.workspace_y, None);
     assert_eq!(settings.workspace_width, 300.0);
     assert_eq!(settings.workspace_height, 560.0);
+  }
+
+  #[test]
+  fn legacy_json_defaults_document_size_to_none() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("settings.json");
+    std::fs::write(&path, r#"{"theme":"dark"}"#).unwrap();
+    let (loaded, repaired) = load_from_with_report(&path).unwrap();
+    assert_eq!(loaded.document_width, None);
+    assert_eq!(loaded.document_height, None);
+    assert!(repaired.is_empty());
+  }
+
+  #[test]
+  fn invalid_document_size_is_repaired_and_rejected() {
+    for bad in [0.0, -5.0, f64::NAN, f64::INFINITY] {
+      let mut settings = AppSettings {
+        document_width: Some(bad),
+        document_height: Some(bad),
+        ..AppSettings::default()
+      };
+      let dir = tempdir().unwrap();
+      let path = dir.path().join("settings.json");
+      assert!(save_to(&path, &settings).is_err());
+      let repaired = repair(&mut settings);
+      assert!(repaired.contains(&"document_width".to_string()));
+      assert!(repaired.contains(&"document_height".to_string()));
+      assert_eq!(settings.document_width, None);
+      assert_eq!(settings.document_height, None);
+    }
+  }
+
+  #[test]
+  fn valid_document_sizes_round_trip() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("settings.json");
+    for (w, h) in [(1.0, 1.0), (150.0, 90.0), (12000.0, 8000.0)] {
+      let settings = AppSettings {
+        document_width: Some(w),
+        document_height: Some(h),
+        ..AppSettings::default()
+      };
+      save_to(&path, &settings).unwrap();
+      assert_eq!(load_from(&path).unwrap(), settings);
+    }
   }
 
   #[test]

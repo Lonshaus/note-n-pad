@@ -211,6 +211,9 @@
         pin_mode: 'none',
         pin_app: null,
         kind: 'document',
+        // A new document window takes the remembered document size, not the sticky's.
+        width: null,
+        height: null,
         dirty: false,
         window_group: note.id,
         tab_index: 0,

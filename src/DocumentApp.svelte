@@ -81,6 +81,7 @@
     widestRow,
   } from './lib/util/csv';
   import { debounce } from './lib/util/debounce';
+  import { rememberStep, type DocumentSize } from './lib/util/documentSize';
   import {
     documentWindow,
     LARGE_EDIT_MAX,
@@ -1452,6 +1453,14 @@
         documentWindow.cycle(-1);
       }
     };
+    // The size the window last had; null until the mount-time read resolves, so
+    // opening a window (restored or new) never counts as a resize by the user.
+    let knownSize: DocumentSize | null = null;
+    void (async (): Promise<void> => {
+      const scale = await win.scaleFactor();
+      const size = (await win.innerSize()).toLogical(scale);
+      knownSize = { width: size.width, height: size.height };
+    })();
     // Persist logical bounds after the user finishes moving or resizing.
     const captureBounds = debounce(() => {
       void (async (): Promise<void> => {
@@ -1459,6 +1468,25 @@
         const pos = (await win.outerPosition()).toLogical(scale);
         const size = (await win.innerSize()).toLogical(scale);
         documentWindow.setBounds(pos.x, pos.y, size.width, size.height);
+        const skip =
+          (await win.isMaximized()) ||
+          (await win.isFullscreen()) ||
+          (await win.isMinimized());
+        if (knownSize === null) {
+          return;
+        }
+        const step = rememberStep(
+          knownSize,
+          { width: size.width, height: size.height },
+          skip,
+        );
+        knownSize = step.known;
+        if (step.write) {
+          void settingsState.save({
+            document_width: size.width,
+            document_height: size.height,
+          });
+        }
       })();
     }, 300);
     // Window close handshake. The OS close of a document window is intercepted

@@ -631,6 +631,14 @@ const DOC_MIN_HEIGHT: f64 = 300.0;
 fn document_open_size(width: f64, height: f64) -> (f64, f64) {
   (width.max(DOC_MIN_WIDTH), height.max(DOC_MIN_HEIGHT))
 }
+/// Size for a new document window: the size the user last gave one, else the
+/// fixed default.
+fn new_document_size(s: &crate::settings::AppSettings) -> (f64, f64) {
+  match (s.document_width, s.document_height) {
+    (Some(w), Some(h)) => (w, h),
+    _ => (DOC_DEFAULT_WIDTH, DOC_DEFAULT_HEIGHT),
+  }
+}
 /// The URL a document window loads, carrying the window group (and, for a fresh
 /// open, an initial file path and project root) so the frontend can load every
 /// tab in the group and restore it.
@@ -723,6 +731,7 @@ pub fn open_document_labeled(
   project: Option<&str>,
 ) -> Result<String, String> {
   let group = uuid::Uuid::new_v4().to_string();
+  let new_size = new_document_size(&crate::settings::app_settings(app));
   build_document_window(
     app,
     &group,
@@ -733,8 +742,8 @@ pub fn open_document_labeled(
     WindowBounds {
       x: None,
       y: None,
-      width: DOC_DEFAULT_WIDTH,
-      height: DOC_DEFAULT_HEIGHT,
+      width: new_size.0,
+      height: new_size.1,
     },
   )?;
   Ok(format!("doc-{group}"))
@@ -743,6 +752,7 @@ pub fn open_document_labeled(
 /// group. The tab is created by the frontend, which stores it on first edit.
 pub fn new_blank_document(app: &AppHandle) -> Result<(), String> {
   let group = uuid::Uuid::new_v4().to_string();
+  let new_size = new_document_size(&crate::settings::app_settings(app));
   build_document_window(
     app,
     &group,
@@ -753,8 +763,8 @@ pub fn new_blank_document(app: &AppHandle) -> Result<(), String> {
     WindowBounds {
       x: None,
       y: None,
-      width: DOC_DEFAULT_WIDTH,
-      height: DOC_DEFAULT_HEIGHT,
+      width: new_size.0,
+      height: new_size.1,
     },
   )
 }
@@ -763,6 +773,7 @@ pub fn new_blank_document(app: &AppHandle) -> Result<(), String> {
 /// its first tab (`convert_handoff`).
 pub fn open_empty_document(app: &AppHandle) -> Result<String, String> {
   let group = uuid::Uuid::new_v4().to_string();
+  let new_size = new_document_size(&crate::settings::app_settings(app));
   build_document_window(
     app,
     &group,
@@ -773,8 +784,8 @@ pub fn open_empty_document(app: &AppHandle) -> Result<String, String> {
     WindowBounds {
       x: None,
       y: None,
-      width: DOC_DEFAULT_WIDTH,
-      height: DOC_DEFAULT_HEIGHT,
+      width: new_size.0,
+      height: new_size.1,
     },
   )?;
   Ok(format!("doc-{group}"))
@@ -786,6 +797,7 @@ pub fn create_document_window(
   plan: &crate::note_store::DocWindowPlan,
   tab: Option<i64>,
 ) -> Result<(), String> {
+  let new_size = new_document_size(&crate::settings::app_settings(app));
   // Restored windows adopt their project from the group's stored notes, so no
   // project rides in the URL here.
   build_document_window(
@@ -798,8 +810,8 @@ pub fn create_document_window(
     WindowBounds {
       x: plan.x,
       y: plan.y,
-      width: plan.width.unwrap_or(DOC_DEFAULT_WIDTH),
-      height: plan.height.unwrap_or(DOC_DEFAULT_HEIGHT),
+      width: plan.width.unwrap_or(new_size.0),
+      height: plan.height.unwrap_or(new_size.1),
     },
   )
 }
@@ -1493,6 +1505,19 @@ mod tests {
     let body = &body[..body.find("\n}\n").unwrap()];
     assert!(body.contains(".min_inner_size(STICKY_MIN_WIDTH, STICKY_MIN_HEIGHT)"));
     assert!(body.contains("sticky_open_height(note.height)"));
+  }
+
+  #[test]
+  fn a_new_document_window_uses_the_remembered_size_only_when_complete() {
+    let mut s = crate::settings::AppSettings::default();
+    assert_eq!(super::new_document_size(&s), (800.0, 600.0));
+    s.document_width = Some(1000.0);
+    assert_eq!(super::new_document_size(&s), (800.0, 600.0));
+    s.document_width = None;
+    s.document_height = Some(700.0);
+    assert_eq!(super::new_document_size(&s), (800.0, 600.0));
+    s.document_width = Some(1000.0);
+    assert_eq!(super::new_document_size(&s), (1000.0, 700.0));
   }
 
   #[test]
