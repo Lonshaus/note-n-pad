@@ -519,6 +519,25 @@ fn cascade_position(app: &AppHandle) -> (f64, f64) {
 fn sticky_open_width(stored: Option<f64>) -> f64 {
   stored.unwrap_or(DEFAULT_WIDTH).max(STICKY_MIN_WIDTH)
 }
+/// Whether a sticky floats always-on-top. A top pin floats in both editions;
+/// pin to app is full-only, so an app pin never floats while `lite`. Without
+/// foreground detection (e.g. Wayland) an app pin degrades to permanent
+/// on-top so the sticky stays visible.
+pub(crate) fn pin_on_top(
+  mode: &str,
+  pin_app: Option<&str>,
+  front: Option<&str>,
+  detection: bool,
+  lite: bool,
+) -> bool {
+  match mode {
+    "top" => true,
+    "app" if lite => false,
+    "app" if !detection => true,
+    "app" => pin_app.is_some() && pin_app == front,
+    _ => false,
+  }
+}
 /// Open a frameless sticky window for `note` at its saved bounds (or a cascade
 /// fallback), reflecting its pinned and opacity state.
 pub fn create_sticky_window(app: &AppHandle, note: &NoteSnapshot) -> Result<(), String> {
@@ -526,20 +545,13 @@ pub fn create_sticky_window(app: &AppHandle, note: &NoteSnapshot) -> Result<(), 
   let url = WebviewUrl::App(format!("index.html?mode=sticky&note={}", note.id).into());
   // Float on top for a "top" pin, or an "app" pin whose target app is frontmost
   // right now; app_watch keeps the "app" case in sync afterwards.
-  let on_top = match note.pin_mode.as_str() {
-    "top" => true,
-    "app" => {
-      if !crate::app_watch::detection_available() {
-        // Foreground detection is unavailable (e.g. Wayland): an app-pinned
-        // sticky degrades to permanent always-on-top so it stays visible.
-        true
-      } else {
-        note.pin_app.is_some()
-          && note.pin_app.as_deref() == crate::app_watch::frontmost_id().as_deref()
-      }
-    }
-    _ => false,
-  };
+  let on_top = pin_on_top(
+    note.pin_mode.as_str(),
+    note.pin_app.as_deref(),
+    crate::app_watch::frontmost_id().as_deref(),
+    crate::app_watch::detection_available(),
+    crate::edition::is_lite(),
+  );
   // Invisible in normal use (sticky windows have no decorations), but it
   // surfaces in the Windows taskbar/Alt-Tab and some Linux WM switchers, so it
   // must still be localized rather than a hardcoded English word. A dedicated
@@ -1625,6 +1637,30 @@ mod window_command_threading_tests {
     "focus_note_window",
     "sticky_row_action",
   ];
+
+  #[test]
+  fn pin_on_top_decides_every_mode() {
+    use super::pin_on_top;
+    for detection in [true, false] {
+      assert!(pin_on_top("top", None, None, detection, true));
+      assert!(pin_on_top("top", None, None, detection, false));
+      for mode in ["none", "bogus"] {
+        assert!(!pin_on_top(mode, Some("a"), Some("a"), detection, true));
+        assert!(!pin_on_top(mode, Some("a"), Some("a"), detection, false));
+      }
+      // An app pin never floats while lite, whatever the frontmost app is.
+      assert!(!pin_on_top("app", Some("a"), Some("a"), detection, true));
+      assert!(!pin_on_top("app", Some("a"), Some("b"), detection, true));
+    }
+    // Full edition with detection: float only for the bound app.
+    assert!(pin_on_top("app", Some("a"), Some("a"), true, false));
+    assert!(!pin_on_top("app", Some("a"), Some("b"), true, false));
+    assert!(!pin_on_top("app", Some("a"), None, true, false));
+    assert!(!pin_on_top("app", None, None, true, false));
+    // Full edition without detection: permanent on-top.
+    assert!(pin_on_top("app", Some("a"), Some("b"), false, false));
+    assert!(pin_on_top("app", None, None, false, false));
+  }
 
   #[test]
   fn building_a_sticky_never_propagates_an_opacity_failure() {

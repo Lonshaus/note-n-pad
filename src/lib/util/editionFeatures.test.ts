@@ -32,6 +32,7 @@ describe('featureRows', () => {
       'edition.row.themes',
       'edition.row.languageFiles',
       'edition.row.workspace',
+      'edition.row.stickyPinApp',
     ]);
   });
 
@@ -77,13 +78,36 @@ describe('featureRows', () => {
       'edition.row.languageEdit',
       'edition.row.trayIcon',
       'edition.row.globalShortcuts',
-      'sticky.pin.toApp',
-      'sticky.paperColor',
     ]) {
       expect(featureRows('macos').find((r) => r.label === label)?.lite).toBe(
         true,
       );
     }
+  });
+});
+
+describe('the sticky pin rows', () => {
+  it('lists pin to app as a full-version feature, not the menu key', () => {
+    const rows = featureRows('macos');
+    const index = rows.findIndex((r) => r.label === 'edition.row.stickyPinApp');
+    expect(rows[index]?.lite).toBe(false);
+    expect(index).toBeLessThan(rows.findIndex((r) => r.lite));
+    expect(labels('macos')).not.toContain('sticky.pin.toApp');
+  });
+
+  it('lists pin on top as a shared feature right after the basics', () => {
+    const rows = featureRows('macos');
+    const index = rows.findIndex((r) => r.label === 'edition.row.stickies');
+    expect(rows[index + 1]?.label).toBe('edition.row.stickyPinTop');
+    expect(rows[index + 1]?.lite).toBe(true);
+  });
+
+  it('has no separate paper colour row; the basics row covers it', () => {
+    expect(labels('macos')).not.toContain('sticky.paperColor');
+    expect(
+      featureRows('macos').find((r) => r.label === 'edition.row.stickies')
+        ?.note,
+    ).toBe('edition.row.stickiesNote');
   });
 });
 
