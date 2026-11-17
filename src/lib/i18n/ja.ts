@@ -134,6 +134,7 @@ export const ja = {
   'settings.general.openTargetWindow': '新しいウィンドウ',
   'settings.general.showTrayIcon': 'ステータスバーにアイコンを表示',
   'settings.general.openWorkspaceOnStartup': '起動時にワークスペースを開く',
+  'settings.general.showHiddenFiles': '隠しファイルを表示',
   // Settings — language (list lives on the language tab)
   'settings.language.label': '言語',
   'settings.language.system': 'システムに合わせる',

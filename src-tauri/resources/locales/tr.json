@@ -94,6 +94,7 @@
     "settings.general.openTargetWindow": "Yeni pencere",
     "settings.general.showTrayIcon": "Simgeyi durum çubuğunda göster",
     "settings.general.openWorkspaceOnStartup": "Başlangıçta çalışma alanını aç",
+    "settings.general.showHiddenFiles": "Gizli dosyaları göster",
     "settings.language.label": "Dil",
     "settings.language.system": "Sistemi izle",
     "settings.language.import": "Dili içe aktar",

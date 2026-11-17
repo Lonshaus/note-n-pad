@@ -307,26 +307,6 @@ export function targetVolumeOfPath(
     ? unknown
     : { volume: entry.target_volume, volumeError: entry.target_volume_error };
 }
-/** What is in `folder`: its listing when that is up to date, else a fresh read
- *  (the folder was never opened, could not be read, or is marked to be read
- *  again). */
-export async function folderEntries(
-  cache: TreeCache,
-  root: string,
-  folder: string,
-  list: (dir: string) => Promise<readonly { name: string }[]>,
-): Promise<readonly { name: string }[]> {
-  const listing = cache.get(root, folder);
-  if (
-    listing !== undefined &&
-    listing.error === null &&
-    !cache.isStale(root, folder)
-  ) {
-    return listing.entries;
-  }
-  return list(folder);
-}
-
 export interface DialogModel {
   message: string;
   items: { label: string; detail: string }[];

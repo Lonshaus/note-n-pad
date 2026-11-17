@@ -135,6 +135,7 @@ export const en = {
   'settings.general.openTargetWindow': 'New window',
   'settings.general.showTrayIcon': 'Show icon in the status bar',
   'settings.general.openWorkspaceOnStartup': 'Open the workspace at startup',
+  'settings.general.showHiddenFiles': 'Show hidden files',
   // Settings — language (list lives on the language tab)
   'settings.language.label': 'Language',
   'settings.language.system': 'Follow system',

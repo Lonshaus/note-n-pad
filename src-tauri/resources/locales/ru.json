@@ -94,6 +94,7 @@
     "settings.general.openTargetWindow": "Новом окне",
     "settings.general.showTrayIcon": "Показывать значок в строке состояния",
     "settings.general.openWorkspaceOnStartup": "Открывать рабочую область при запуске",
+    "settings.general.showHiddenFiles": "Показывать скрытые файлы",
     "settings.language.label": "Язык",
     "settings.language.system": "Как в системе",
     "settings.language.import": "Импортировать язык",

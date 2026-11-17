@@ -1378,6 +1378,18 @@
         </label>
       {/if}
 
+      {#if ui.showHiddenFiles}
+        <label class="toggle">
+          <input
+            type="checkbox"
+            checked={settingsState.showHiddenFiles}
+            onchange={(e) =>
+              settingsState.setShowHiddenFiles(e.currentTarget.checked)}
+          />
+          <span>{t('settings.general.showHiddenFiles')}</span>
+        </label>
+      {/if}
+
       <label class="toggle">
         <input
           type="checkbox"

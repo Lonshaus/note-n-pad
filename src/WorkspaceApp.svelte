@@ -5,8 +5,9 @@
   import { onMount, tick } from 'svelte';
   import { invoke } from '@tauri-apps/api/core';
   import { getCurrentWindow } from '@tauri-apps/api/window';
+  import { listen } from '@tauri-apps/api/event';
   import { open } from '@tauri-apps/plugin-dialog';
-  import { settingsState } from './lib/state/settings.svelte';
+  import { settingsState, type AppSettings } from './lib/state/settings.svelte';
   import { revealWhenThemed } from './lib/util/reveal';
   import { onFileDragOver, onFileDrop } from './lib/util/fileDrop';
   import { applyTheme, applyChrome } from './lib/theme/applyTheme';
@@ -48,7 +49,6 @@
     dropDecision,
     dropFolder,
     failureDialog,
-    folderEntries,
     hoverFeedback,
     modifierOp,
     outcomeDialogs,
@@ -742,9 +742,11 @@
       await loadRootVolume(root);
       let children: readonly { name: string }[];
       try {
-        children = await folderEntries(cache, root, folder, (dir) =>
-          invoke<TreeEntry[]>('list_project_dir', { dir }),
-        );
+        // Everything in the folder, hidden items included, whatever the setting.
+        children = await invoke<TreeEntry[]>('list_project_dir', {
+          dir: folder,
+          all: true,
+        });
       } catch (e) {
         showDialogs([
           failureDialog(
@@ -1035,6 +1037,18 @@
     const unlistenChanges = settingsState.listenChanges();
     const unlistenThemes = themeRegistry.listen();
     const unlistenLocales = localeRegistry.listen();
+    // The tree follows "Show hidden files": when the setting flips, every
+    // listing is read again.
+    // The loaded value only seeds it when no event has set it first.
+    let shownHidden = false;
+    let hiddenFromEvent = false;
+    const unlistenHidden = listen<AppSettings>('settings-changed', (event) => {
+      hiddenFromEvent = true;
+      if (event.payload.show_hidden_files !== shownHidden) {
+        shownHidden = event.payload.show_hidden_files;
+        refreshAll();
+      }
+    });
     const uninstallPaste = installPasteWindow();
     // Reveal the window only after the theme is loaded and applied, so a
     // dark-theme window never flashes its default white background.
@@ -1044,7 +1058,12 @@
     // the visible folders. A list an older version left with nested projects is
     // folded into the outer ones, and the result is saved back.
     void (async (): Promise<void> => {
-      const loaded = await invoke<LoadedProjectRoots>('load_settings');
+      const loaded = await invoke<
+        LoadedProjectRoots & { settings: { show_hidden_files?: boolean } }
+      >('load_settings');
+      if (!hiddenFromEvent) {
+        shownHidden = loaded.settings.show_hidden_files ?? false;
+      }
       const saved = projectRootsFrom(loaded);
       const merged = normalizeRoots(saved, caseInsensitive);
       await invoke('forget_project_rebinds', { roots: merged.roots });
@@ -1249,6 +1268,7 @@
       void unlistenChanges.then((u) => u());
       void unlistenThemes.then((u) => u());
       void unlistenLocales.then((u) => u());
+      void unlistenHidden.then((u) => u());
       void unlistenStore.then((u) => u());
       void unlistenFocus.then((u) => u());
       void unlistenCtx.then((u) => u());
