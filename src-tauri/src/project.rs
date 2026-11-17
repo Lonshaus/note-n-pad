@@ -22,14 +22,38 @@ pub struct TreeEntry {
   pub target_volume: Option<u64>,
   pub target_volume_error: Option<String>,
 }
-/// Read one directory level. An unreadable entry is skipped.
-fn read_level(dir: &Path) -> Result<Vec<TreeEntry>, String> {
+#[cfg(windows)]
+const FILE_ATTRIBUTE_HIDDEN: u32 = 0x2;
+/// Whether the system file browser hides this entry by default. macOS: a name
+/// starting with `.` or the `UF_HIDDEN` flag. Windows: the hidden attribute
+/// (a leading `.` alone does not hide). Elsewhere: a name starting with `.`.
+/// `meta` is the entry's own metadata, not a link target's.
+fn hidden_by_system(name: &str, meta: Option<&std::fs::Metadata>) -> bool {
+  #[cfg(target_os = "macos")]
+  {
+    use std::os::macos::fs::MetadataExt;
+    name.starts_with('.') || meta.is_some_and(|m| m.st_flags() & libc::UF_HIDDEN != 0)
+  }
+  #[cfg(windows)]
+  {
+    use std::os::windows::fs::MetadataExt;
+    let _ = name;
+    meta.is_some_and(|m| m.file_attributes() & FILE_ATTRIBUTE_HIDDEN != 0)
+  }
+  #[cfg(not(any(target_os = "macos", windows)))]
+  {
+    let _ = meta;
+    name.starts_with('.')
+  }
+}
+/// Read one directory level. An unreadable entry is skipped; a hidden one is
+/// skipped unless `show_hidden`.
+fn read_level(dir: &Path, show_hidden: bool) -> Result<Vec<TreeEntry>, String> {
   let read = std::fs::read_dir(dir).map_err(|e| e.to_string())?;
   let mut entries = Vec::new();
   for entry in read.flatten() {
     let name = entry.file_name().to_string_lossy().to_string();
-    // Skip dotfiles/dotfolders.
-    if name.starts_with('.') {
+    if !show_hidden && hidden_by_system(&name, entry.metadata().ok().as_ref()) {
       continue;
     }
     let path = entry.path();
@@ -56,15 +80,30 @@ fn read_level(dir: &Path) -> Result<Vec<TreeEntry>, String> {
   Ok(entries)
 }
 /// List the entries directly inside `dir`, one level only. Errors when `dir` is
-/// missing or is not a directory. Async so a slow volume never blocks the UI
-/// thread.
-#[tauri::command(async)]
-pub fn list_project_dir(dir: String) -> Result<Vec<TreeEntry>, String> {
-  let path = Path::new(&dir);
+/// missing or is not a directory.
+fn list_dir(dir: &str, show_hidden: bool) -> Result<Vec<TreeEntry>, String> {
+  let path = Path::new(dir);
   if !path.is_dir() {
     return Err(format!("not a directory: {dir}"));
   }
-  read_level(path)
+  read_level(path, show_hidden)
+}
+/// Hidden entries are listed when the caller asks for everything, else when the
+/// setting is on.
+fn show_hidden_for(all: Option<bool>, stored: bool) -> bool {
+  all == Some(true) || stored
+}
+/// List the entries directly inside `dir`, one level only. `all: true` lists
+/// hidden entries whatever the setting. Async so a slow volume never blocks the
+/// UI thread.
+#[tauri::command(async)]
+pub fn list_project_dir(
+  app: AppHandle,
+  dir: String,
+  all: Option<bool>,
+) -> Result<Vec<TreeEntry>, String> {
+  let stored = crate::settings::app_settings(&app).show_hidden_files;
+  list_dir(&dir, show_hidden_for(all, stored))
 }
 /// A stored document tab, reduced to what the window choice looks at.
 struct StoredTab<'a> {
@@ -178,7 +217,7 @@ mod tests {
   }
 
   fn list(dir: &Path) -> Vec<TreeEntry> {
-    list_project_dir(dir.to_string_lossy().to_string()).unwrap()
+    list_dir(&dir.to_string_lossy(), false).unwrap()
   }
 
   #[test]
@@ -215,13 +254,68 @@ mod tests {
   }
 
   #[test]
-  fn hidden_entries_are_filtered() {
+  fn dot_names_are_hidden_except_on_windows() {
     let dir = tempdir().unwrap();
     let root = dir.path();
     fs::write(root.join(".secret"), "x").unwrap();
     fs::create_dir(root.join(".git")).unwrap();
     fs::write(root.join("visible.txt"), "x").unwrap();
-    assert_eq!(names(&list(root)), vec!["visible.txt"]);
+    let hidden = list_dir(&root.to_string_lossy(), false).unwrap();
+    if cfg!(windows) {
+      assert_eq!(names(&hidden), vec![".git", ".secret", "visible.txt"]);
+    } else {
+      assert_eq!(names(&hidden), vec!["visible.txt"]);
+    }
+    let all = list_dir(&root.to_string_lossy(), true).unwrap();
+    assert_eq!(names(&all), vec![".git", ".secret", "visible.txt"]);
+  }
+
+  #[cfg(target_os = "macos")]
+  #[test]
+  fn uf_hidden_flag_hides_a_file_on_macos() {
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt;
+    let dir = tempdir().unwrap();
+    let root = dir.path();
+    fs::write(root.join("flagged.txt"), "x").unwrap();
+    fs::write(root.join("plain.txt"), "x").unwrap();
+    let c = CString::new(root.join("flagged.txt").as_os_str().as_bytes()).unwrap();
+    assert_eq!(
+      unsafe { libc::chflags(c.as_ptr(), libc::UF_HIDDEN as _) },
+      0
+    );
+    let hidden = list_dir(&root.to_string_lossy(), false).unwrap();
+    assert_eq!(names(&hidden), vec!["plain.txt"]);
+    let all = list_dir(&root.to_string_lossy(), true).unwrap();
+    assert_eq!(names(&all), vec!["flagged.txt", "plain.txt"]);
+  }
+
+  #[cfg(windows)]
+  #[test]
+  fn hidden_attribute_hides_a_file_on_windows() {
+    let dir = tempdir().unwrap();
+    let root = dir.path();
+    fs::write(root.join("flagged.txt"), "x").unwrap();
+    fs::write(root.join("plain.txt"), "x").unwrap();
+    let status = std::process::Command::new("attrib")
+      .arg("+h")
+      .arg(root.join("flagged.txt"))
+      .status()
+      .unwrap();
+    assert!(status.success());
+    let hidden = list_dir(&root.to_string_lossy(), false).unwrap();
+    assert_eq!(names(&hidden), vec!["plain.txt"]);
+    let all = list_dir(&root.to_string_lossy(), true).unwrap();
+    assert_eq!(names(&all), vec!["flagged.txt", "plain.txt"]);
+  }
+
+  #[test]
+  fn show_hidden_for_follows_all_then_the_setting() {
+    for stored in [false, true] {
+      assert!(show_hidden_for(Some(true), stored));
+      assert_eq!(show_hidden_for(Some(false), stored), stored);
+      assert_eq!(show_hidden_for(None, stored), stored);
+    }
   }
 
   #[test]
@@ -304,7 +398,7 @@ mod tests {
   fn missing_dir_errors() {
     let dir = tempdir().unwrap();
     let missing = dir.path().join("does-not-exist");
-    assert!(list_project_dir(missing.to_string_lossy().to_string()).is_err());
+    assert!(list_dir(&missing.to_string_lossy(), false).is_err());
   }
 
   #[test]
@@ -312,7 +406,7 @@ mod tests {
     let dir = tempdir().unwrap();
     let file = dir.path().join("file.txt");
     fs::write(&file, "x").unwrap();
-    assert!(list_project_dir(file.to_string_lossy().to_string()).is_err());
+    assert!(list_dir(&file.to_string_lossy(), false).is_err());
   }
 
   fn tab<'a>(group: &'a str, file: Option<&'a str>, project: Option<&'a str>) -> StoredTab<'a> {

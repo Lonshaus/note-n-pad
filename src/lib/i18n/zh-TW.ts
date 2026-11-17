@@ -128,6 +128,7 @@ export const zhTW = {
   'settings.general.openTargetWindow': '新視窗',
   'settings.general.showTrayIcon': '在狀態列顯示圖示',
   'settings.general.openWorkspaceOnStartup': '啟動時開啟工作區',
+  'settings.general.showHiddenFiles': '顯示隱藏檔',
   // Settings — language (list lives on the language tab)
   'settings.language.label': '語言',
   'settings.language.system': '跟隨系統',

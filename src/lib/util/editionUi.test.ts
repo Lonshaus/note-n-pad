@@ -23,6 +23,11 @@ describe('editionUi', () => {
     expect(editionUi(false).rangeEdit).toBe(true);
   });
 
+  it('hides "Show hidden files" in lite and shows it in full', () => {
+    expect(editionUi(true).showHiddenFiles).toBe(false);
+    expect(editionUi(false).showHiddenFiles).toBe(true);
+  });
+
   it('hides every removed control in lite', () => {
     const ui = editionUi(true);
     expect(Object.values(ui)).toEqual(Object.values(ui).map(() => false));

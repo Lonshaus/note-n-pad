@@ -94,6 +94,7 @@
     "settings.general.openTargetWindow": "Cửa sổ mới",
     "settings.general.showTrayIcon": "Hiển thị biểu tượng trên thanh trạng thái",
     "settings.general.openWorkspaceOnStartup": "Mở không gian làm việc khi khởi động",
+    "settings.general.showHiddenFiles": "Hiển thị tệp ẩn",
     "settings.language.label": "Ngôn ngữ",
     "settings.language.system": "Theo hệ thống",
     "settings.language.import": "Nhập ngôn ngữ",

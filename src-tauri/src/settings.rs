@@ -140,6 +140,10 @@ pub struct AppSettings {
   /// restored sticky/document windows. Off by default (unchanged behavior).
   #[serde(default = "default_open_workspace_on_startup")]
   pub open_workspace_on_startup: bool,
+  /// Whether the workspace's project tree lists hidden files (what the system
+  /// file browser hides by default). Off by default.
+  #[serde(default)]
+  pub show_hidden_files: bool,
   /// Recently opened file paths for the File > Open Recent menu, newest first,
   /// de-duplicated and capped at `RECENT_FILES_MAX`. Empty until the first open.
   #[serde(default)]
@@ -295,6 +299,7 @@ impl Default for AppSettings {
       project_expanded: BTreeMap::new(),
       show_tray_icon: default_show_tray_icon(),
       open_workspace_on_startup: default_open_workspace_on_startup(),
+      show_hidden_files: false,
       recent_files: Vec::new(),
     }
   }
@@ -799,6 +804,7 @@ fn tolerant_settings(
       default_open_workspace_on_startup,
       &mut dropped,
     ),
+    show_hidden_files: field_or_default(obj, "show_hidden_files", || false, &mut dropped),
     recent_files: field_or_default(obj, "recent_files", Vec::new, &mut dropped),
   };
   if !dropped.is_empty() {
@@ -1414,6 +1420,7 @@ mod tests {
       )]),
       show_tray_icon: false,
       open_workspace_on_startup: true,
+      show_hidden_files: true,
       recent_files: vec!["/tmp/a.txt".into(), "/tmp/b.txt".into()],
     };
     save_to(&path, &settings).unwrap();
@@ -1719,6 +1726,30 @@ mod tests {
     let settings = load_json(legacy);
     assert!(settings.show_tray_icon);
     assert!(!settings.open_workspace_on_startup);
+  }
+
+  #[test]
+  fn legacy_json_defaults_show_hidden_files_to_false() {
+    assert!(!load_json(r#"{"theme":"dark"}"#).show_hidden_files);
+  }
+
+  #[test]
+  fn tolerant_reader_defaults_show_hidden_files_to_false() {
+    // A wrong-typed field sends the load through the field-by-field reader.
+    let settings = load_json(r#"{"show_tray_icon":"yes"}"#);
+    assert!(!settings.show_hidden_files);
+  }
+
+  #[test]
+  fn show_hidden_files_round_trips() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("settings.json");
+    let on = AppSettings {
+      show_hidden_files: true,
+      ..AppSettings::default()
+    };
+    save_to(&path, &on).unwrap();
+    assert!(load_from(&path).unwrap().show_hidden_files);
   }
 
   #[test]

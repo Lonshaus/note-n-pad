@@ -94,6 +94,7 @@
     "settings.general.openTargetWindow": "Nowym oknie",
     "settings.general.showTrayIcon": "Pokazuj ikonę na pasku stanu",
     "settings.general.openWorkspaceOnStartup": "Otwórz obszar roboczy przy uruchamianiu",
+    "settings.general.showHiddenFiles": "Pokaż ukryte pliki",
     "settings.language.label": "Język",
     "settings.language.system": "Zgodnie z systemem",
     "settings.language.import": "Importuj język",
