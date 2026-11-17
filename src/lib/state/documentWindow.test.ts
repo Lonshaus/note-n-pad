@@ -12,9 +12,12 @@ import {
 import type { NoteSnapshot } from './stickyNote.svelte';
 import { t } from '../i18n';
 import { settingsState } from './settings.svelte';
+import { convertController } from './convertController.svelte';
 import { editionState } from './edition.svelte';
 import {
   documentWindow,
+  DocumentWindowState,
+  editedWhileClosing,
   windowedRefusalReason,
   windowedSnapshotDirty,
   windowedSnapshotLarge,
@@ -2578,5 +2581,1032 @@ describe('windowedApplied (the dirty flag follows the clean flag)', () => {
     expect(await documentWindow.saveWindowed(tab, false)).toBe('ok');
     expect(tab.windowed?.dirty).toBe(true);
     expect(tab.windowed?.fingerprint).toEqual(SAVED_AS.fingerprint);
+  });
+});
+
+describe('an edit made while a save is out', () => {
+  let writes: { content: string; release: () => void }[];
+  let upserts: NoteSnapshot[];
+  let readHeld: { release: () => void } | null;
+  /** Writes wait for `release`; a re-decode waits for `readHeld`. */
+  function backendHoldingWrites(): void {
+    writes = [];
+    upserts = [];
+    readHeld = null;
+    mockInvoke.mockReset();
+    mockInvoke.mockImplementation(((cmd: string, args?: unknown) => {
+      const a = (args ?? {}) as Record<string, unknown>;
+      if (cmd === 'write_file_encoded') {
+        return new Promise<null>((resolve) => {
+          writes.push({
+            content: a['content'] as string,
+            release: () => resolve(null),
+          });
+        });
+      }
+      if (cmd === 'read_file_as') {
+        const decoded = {
+          content: 'decoded from disk',
+          encoding: a['encoding'],
+          had_bom: false,
+          lossy: false,
+        };
+        return new Promise<typeof decoded>((resolve) => {
+          readHeld = { release: () => resolve(decoded) };
+        });
+      }
+      if (cmd === 'upsert_note') {
+        upserts.push(a['note'] as NoteSnapshot);
+      }
+      return Promise.resolve(null);
+    }) as typeof invoke);
+  }
+
+  function dirtyTab(id: string, text: string): DocTab {
+    return baseTab({
+      id,
+      path: `/tmp/${id}.txt`,
+      content: Text.of([text]),
+      savedContent: Text.empty,
+    });
+  }
+
+  function cleanTab(id: string, text: string, index = 0): DocTab {
+    const content = Text.of([text]);
+    return baseTab({
+      id,
+      path: `/tmp/${id}.txt`,
+      content,
+      savedContent: content,
+      tabIndex: index,
+    });
+  }
+
+  function open(...tabs: DocTab[]): void {
+    documentWindow.tabs.length = 0;
+    documentWindow.tabs.push(...tabs);
+    documentWindow.activeIndex = 0;
+  }
+  const settle = (): Promise<void> => new Promise((r) => setTimeout(r, 0));
+
+  beforeEach(() => {
+    backendHoldingWrites();
+    mockSave.mockReset();
+  });
+
+  describe.each([
+    ['saveActive', (): Promise<boolean> => documentWindow.saveActive()],
+    ['saveAs', (): Promise<boolean> => documentWindow.saveAs('/tmp/as.txt')],
+  ])('%s', (_name, save) => {
+    it('records what was written as saved, so text typed during the write stays unsaved', async () => {
+      open(dirtyTab('w', 'one'));
+      const saving = save();
+      await settle();
+      documentWindow.updateContentById('w', Text.of(['one two']));
+      writes[0]!.release();
+      expect(await saving).toBe(true);
+      const tab = documentWindow.tabs[0]!;
+      expect(writes[0]!.content).toBe('one');
+      expect(tab.savedContent.toString()).toBe('one');
+      expect(tab.content.toString()).toBe('one two');
+      expect(documentWindow.isDirty(tab)).toBe(true);
+    });
+
+    it('records the line ending that was written, so a switch during the write stays unsaved', async () => {
+      open(dirtyTab('w', 'one'));
+      const saving = save();
+      await settle();
+      documentWindow.setLineEnding('CRLF');
+      writes[0]!.release();
+      expect(await saving).toBe(true);
+      const tab = documentWindow.tabs[0]!;
+      expect(writes[0]!.content).toBe('one');
+      expect(tab.savedLineEnding).toBe('LF');
+      expect(tab.lineEnding).toBe('CRLF');
+      expect(documentWindow.isDirty(tab)).toBe(true);
+    });
+
+    it('leaves the tab clean, with the same document as its baseline, when nothing was typed', async () => {
+      open(dirtyTab('w', 'one'));
+      const saving = save();
+      await settle();
+      writes[0]!.release();
+      expect(await saving).toBe(true);
+      const tab = documentWindow.tabs[0]!;
+      expect(documentWindow.isDirty(tab)).toBe(false);
+      expect(tab.savedContent).toBe(tab.content);
+    });
+  });
+
+  it('re-decodes a clean tab with its text and encoding replaced when nothing was typed meanwhile', async () => {
+    open(cleanTab('e', 'abc'));
+    const deciding = documentWindow.setEncoding('Shift-JIS');
+    await settle();
+    readHeld!.release();
+    await deciding;
+    const tab = documentWindow.tabs[0]!;
+    expect(tab.content.toString()).toBe('decoded from disk');
+    expect(tab.encoding).toBe('Shift-JIS');
+    expect(documentWindow.isDirty(tab)).toBe(false);
+  });
+
+  it('keeps text typed during a re-decode and only changes the encoding used at save', async () => {
+    open(cleanTab('e', 'abc'));
+    const seq = documentWindow.reloadSeq;
+    const deciding = documentWindow.setEncoding('Shift-JIS');
+    await settle();
+    documentWindow.updateContentById('e', Text.of(['abc typed']));
+    readHeld!.release();
+    await deciding;
+    const tab = documentWindow.tabs[0]!;
+    expect(tab.content.toString()).toBe('abc typed');
+    expect(tab.encoding).toBe('Shift-JIS');
+    expect(documentWindow.isDirty(tab)).toBe(true);
+    expect(documentWindow.reloadSeq).toBe(seq);
+  });
+
+  it('keeps a line ending switched during a re-decode, and the tab changed', async () => {
+    open(cleanTab('e', 'abc'));
+    const deciding = documentWindow.setEncoding('Shift-JIS');
+    await settle();
+    documentWindow.setLineEnding('CRLF');
+    readHeld!.release();
+    await deciding;
+    const tab = documentWindow.tabs[0]!;
+    expect(tab.content.toString()).toBe('abc');
+    expect(tab.lineEnding).toBe('CRLF');
+    expect(tab.encoding).toBe('Shift-JIS');
+    expect(documentWindow.isDirty(tab)).toBe(true);
+  });
+
+  it('stores the tab the re-decode was for when another tab became active meanwhile', async () => {
+    open(cleanTab('a', 'abc'), cleanTab('b', 'other', 1));
+    const deciding = documentWindow.setEncoding('Shift-JIS');
+    await settle();
+    documentWindow.activeIndex = 1;
+    documentWindow.updateContentById('a', Text.of(['abc typed']));
+    await settle();
+    upserts.length = 0;
+    readHeld!.release();
+    await deciding;
+    expect(upserts.map((n) => n.id)).toEqual(['a']);
+    expect(upserts[0]!.encoding).toBe('Shift-JIS');
+    expect(upserts[0]!.content).toBe('abc typed');
+  });
+
+  it('stores the re-decoded tab when another tab became active and nothing was typed', async () => {
+    open(cleanTab('a', 'abc'), cleanTab('b', 'other', 1));
+    const deciding = documentWindow.setEncoding('Shift-JIS');
+    await settle();
+    documentWindow.activeIndex = 1;
+    upserts.length = 0;
+    readHeld!.release();
+    await deciding;
+    expect(upserts.map((n) => n.id)).toEqual(['a']);
+    expect(upserts[0]!.encoding).toBe('Shift-JIS');
+  });
+
+  it('writes no record for a tab that was closed during the re-decode', async () => {
+    open(cleanTab('e', 'abc'));
+    const deciding = documentWindow.setEncoding('Shift-JIS');
+    await settle();
+    documentWindow.updateContentById('e', Text.of(['abc typed']));
+    await documentWindow.deleteTab(0);
+    upserts.length = 0;
+    readHeld!.release();
+    await deciding;
+    await documentWindow.flushAll();
+    expect(upserts).toEqual([]);
+    expect(
+      mockInvoke.mock.calls.map(([cmd]) => cmd).lastIndexOf('delete_note'),
+    ).toBe(mockInvoke.mock.calls.length - 1);
+  });
+});
+
+describe('editedWhileClosing', () => {
+  const content = Text.of(['one']);
+  const same = { content, lineEnding: 'LF' as const, generation: 3 };
+
+  it('is false when nothing changed', () => {
+    expect(editedWhileClosing(same, { ...same, pending: false })).toBe(false);
+  });
+
+  it('is true for another document, even an equal one', () => {
+    expect(
+      editedWhileClosing(same, {
+        ...same,
+        content: Text.of(['one']),
+        pending: false,
+      }),
+    ).toBe(true);
+  });
+
+  it('is true for another line ending', () => {
+    expect(
+      editedWhileClosing(same, { ...same, lineEnding: 'CRLF', pending: false }),
+    ).toBe(true);
+  });
+
+  it('is true for a newer or a first generation', () => {
+    expect(
+      editedWhileClosing(same, { ...same, generation: 4, pending: false }),
+    ).toBe(true);
+    expect(
+      editedWhileClosing(
+        { ...same, generation: undefined },
+        { ...same, generation: 1, pending: false },
+      ),
+    ).toBe(true);
+  });
+
+  it('is true for input not in the core yet', () => {
+    expect(editedWhileClosing(same, { ...same, pending: true })).toBe(true);
+  });
+});
+
+describe('deleteTab and text typed while the record goes', () => {
+  let w: DocumentWindowState;
+  let deletes: { id: string; release: () => void; fail: () => void }[];
+  /** How many tabs the window had when `convert_release` was sent. */
+  let tabsAtRelease: number | null;
+  const settle = (): Promise<void> => new Promise((r) => setTimeout(r, 0));
+  const sentCmds = (): string[] => mockInvoke.mock.calls.map(([cmd]) => cmd);
+  const sentArgs = (cmd: string): Record<string, unknown>[] =>
+    mockInvoke.mock.calls
+      .filter(([c]) => c === cmd)
+      .map(([, a]) => a as Record<string, unknown>);
+  const ids = (): string[] => w.tabs.map((tab) => tab.id);
+
+  function clean(id: string, index = 0): DocTab {
+    const content = Text.of([`text of ${id}`]);
+    return baseTab({
+      id,
+      path: `/tmp/${id}.txt`,
+      content,
+      savedContent: content,
+      tabIndex: index,
+    });
+  }
+
+  function windowedTab(id: string, sessionId: number, index = 0): DocTab {
+    return baseTab({
+      id,
+      path: `/tmp/${id}.log`,
+      tabIndex: index,
+      windowed: {
+        sessionId,
+        totalBytes: 10,
+        totalLines: 1,
+        fingerprint: null,
+        dirty: false,
+        topLine: 0,
+      },
+    });
+  }
+
+  function open(active: number, ...tabs: DocTab[]): void {
+    w.tabs.push(...tabs);
+    w.activeIndex = active;
+  }
+
+  beforeEach(() => {
+    w = new DocumentWindowState();
+    deletes = [];
+    tabsAtRelease = null;
+    mockInvoke.mockReset();
+    mockInvoke.mockImplementation(((cmd: string, args?: unknown) => {
+      const a = (args ?? {}) as Record<string, unknown>;
+      if (cmd === 'delete_note') {
+        return new Promise<null>((resolve, reject) => {
+          deletes.push({
+            id: a['id'] as string,
+            release: () => resolve(null),
+            fail: () => reject(new Error('gone')),
+          });
+        });
+      }
+      if (cmd === 'convert_release') {
+        tabsAtRelease = w.tabs.length;
+      }
+      if (cmd === 'read_range') {
+        return Promise.resolve({ text: 'one\ntwo\n', lossy: false });
+      }
+      if (cmd === 'file_fingerprint') {
+        return Promise.resolve({ size: 100, mtime_ms: 1 });
+      }
+      return Promise.resolve(null);
+    }) as typeof invoke);
+  });
+
+  afterEach(async () => {
+    // Nothing of a test may fire a debounced write into the next one.
+    await w.flushAll();
+  });
+
+  it('keeps the tab, marked changed with the typed text, and writes its record back', async () => {
+    open(0, clean('a'), clean('b', 1));
+    const closing = w.deleteTab(0);
+    w.updateContentById('a', Text.of(['typed']));
+    deletes[0]!.release();
+
+    expect(await closing).toBe(false);
+    expect(ids()).toEqual(['a', 'b']);
+    expect(w.activeIndex).toBe(0);
+    expect(w.isDirty(w.tabs[0]!)).toBe(true);
+    expect(w.tabs[0]!.content.toString()).toBe('typed');
+    const written = sentArgs('upsert_note').map(
+      (a) => (a['note'] as NoteSnapshot).id,
+    );
+    expect(written).toEqual(['a']);
+    expect(sentCmds().indexOf('upsert_note')).toBeGreaterThan(
+      sentCmds().indexOf('delete_note'),
+    );
+  });
+
+  it('keeps the tab when only the line ending was switched meanwhile', async () => {
+    open(0, clean('a'), clean('b', 1));
+    const closing = w.deleteTab(0);
+    w.setLineEnding('CRLF');
+    deletes[0]!.release();
+
+    expect(await closing).toBe(false);
+    expect(ids()).toEqual(['a', 'b']);
+    expect(w.tabs[0]!.lineEnding).toBe('CRLF');
+    expect(w.isDirty(w.tabs[0]!)).toBe(true);
+    expect(sentArgs('upsert_note')).toHaveLength(1);
+  });
+
+  it('closes the tab when nothing was typed, without writing a record', async () => {
+    open(0, clean('a'), clean('b', 1));
+    const closing = w.deleteTab(0);
+    deletes[0]!.release();
+
+    expect(await closing).toBe(true);
+    expect(ids()).toEqual(['b']);
+    expect(sentArgs('upsert_note')).toEqual([]);
+  });
+
+  it('closes a changed tab that was discarded and not touched again', async () => {
+    const changed = clean('a');
+    changed.content = Text.of(['changed']);
+    open(0, changed, clean('b', 1));
+    const closing = w.deleteTab(0);
+    deletes[0]!.release();
+
+    expect(await closing).toBe(true);
+    expect(ids()).toEqual(['b']);
+    expect(sentArgs('upsert_note')).toEqual([]);
+  });
+
+  describe('a large-file tab', () => {
+    const generations = (): Map<number, number> =>
+      (w as unknown as { windowedGenerations: Map<number, number> })
+        .windowedGenerations;
+
+    it('stays when a newer generation arrived, and its session is not closed', async () => {
+      open(0, windowedTab('w', 7), clean('b', 1));
+      w.windowedApplied(7, 10, 1, true, 1);
+      const closing = w.deleteTab(0);
+      w.windowedApplied(7, 11, 1, false, 2);
+      deletes[0]!.release();
+
+      expect(await closing).toBe(false);
+      expect(ids()).toEqual(['w', 'b']);
+      expect(sentCmds()).not.toContain('windowed_close');
+      expect(generations().has(7)).toBe(true);
+    });
+
+    it('stays while the active editor holds input that is not in the core', async () => {
+      open(0, windowedTab('w', 7), clean('b', 1));
+      let pending = false;
+      w.windowedPending = () => pending;
+      const closing = w.deleteTab(0);
+      pending = true;
+      deletes[0]!.release();
+
+      expect(await closing).toBe(false);
+      expect(ids()).toEqual(['w', 'b']);
+      expect(sentCmds()).not.toContain('windowed_close');
+    });
+
+    it('does not look at the input of an editor that is not the tab', async () => {
+      open(0, clean('b'), windowedTab('w', 7, 1));
+      w.windowedPending = () => true;
+      const closing = w.deleteTab(1);
+      deletes[0]!.release();
+
+      expect(await closing).toBe(true);
+      expect(ids()).toEqual(['b']);
+    });
+
+    it('closes its session once, after the record is gone', async () => {
+      open(0, windowedTab('w', 7), clean('b', 1));
+      w.windowedApplied(7, 10, 1, true, 1);
+      const closing = w.deleteTab(0);
+      await settle();
+      expect(sentCmds()).not.toContain('windowed_close');
+      deletes[0]!.release();
+
+      expect(await closing).toBe(true);
+      expect(sentArgs('windowed_close')).toEqual([{ sessionId: 7 }]);
+      expect(sentCmds().indexOf('windowed_close')).toBeGreaterThan(
+        sentCmds().indexOf('delete_note'),
+      );
+      expect(generations().has(7)).toBe(false);
+    });
+
+    it('is left alone, session included, when the record cannot be deleted', async () => {
+      open(0, windowedTab('w', 7), clean('b', 1));
+      const closing = w.deleteTab(0);
+      deletes[0]!.fail();
+
+      await expect(closing).rejects.toThrow('gone');
+      expect(ids()).toEqual(['w', 'b']);
+      expect(sentCmds()).not.toContain('windowed_close');
+    });
+  });
+
+  describe('a sticky note that became a tab and was never saved', () => {
+    function stickyTab(): DocTab {
+      return baseTab({
+        id: 's',
+        path: '',
+        tabIndex: 0,
+        converted: {
+          target: null,
+          encoding: 'UTF-8',
+          bom: false,
+          origin: 'sticky',
+          noteId: 'n1',
+          saved: false,
+        },
+      });
+    }
+
+    it('comes back once, after the tab is gone', async () => {
+      open(0, stickyTab(), clean('b', 1));
+      const closing = w.deleteTab(0);
+      deletes[0]!.release();
+
+      expect(await closing).toBe(true);
+      expect(sentArgs('convert_release')).toEqual([{ noteId: 'n1' }]);
+      expect(tabsAtRelease).toBe(1);
+    });
+
+    it('does not come back when the tab stays', async () => {
+      open(0, stickyTab(), clean('b', 1));
+      const closing = w.deleteTab(0);
+      w.updateContentById('s', Text.of(['typed']));
+      deletes[0]!.release();
+
+      expect(await closing).toBe(false);
+      expect(sentCmds()).not.toContain('convert_release');
+    });
+  });
+
+  describe('two closes under way', () => {
+    it('closes only one tab when the same one is closed twice', async () => {
+      open(0, clean('a'), clean('b', 1));
+      const first = w.deleteTab(0);
+      const second = w.deleteTab(0);
+
+      expect(await second).toBe(false);
+      expect(deletes).toHaveLength(1);
+      deletes[0]!.release();
+      expect(await first).toBe(true);
+      expect(ids()).toEqual(['b']);
+      expect(deletes).toHaveLength(1);
+    });
+
+    it('removes the tabs they were asked for, wherever they have moved to', async () => {
+      open(2, clean('a'), clean('b', 1), clean('c', 2));
+      const closeB = w.deleteTab(1);
+      const closeA = w.deleteTab(0);
+      expect(deletes.map((d) => d.id)).toEqual(['b', 'a']);
+      deletes[1]!.release();
+      expect(await closeA).toBe(true);
+      expect(ids()).toEqual(['b', 'c']);
+      deletes[0]!.release();
+      expect(await closeB).toBe(true);
+
+      expect(ids()).toEqual(['c']);
+      expect(w.activeIndex).toBe(0);
+      expect(w.activeTab?.id).toBe('c');
+    });
+  });
+
+  describe('the tab leaves in the same step as its session', () => {
+    it('for a large-file tab', async () => {
+      open(0, windowedTab('w', 7), clean('b', 1));
+      let stillThere: boolean | null = null;
+      mockInvoke.mockImplementation(((cmd: string) => {
+        if (cmd === 'windowed_close') {
+          const tab = w.tabs.find((t) => t.id === 'w');
+          queueMicrotask(() => {
+            stillThere = w.tabs.includes(tab!);
+          });
+        }
+        return Promise.resolve(null);
+      }) as typeof invoke);
+
+      expect(await w.deleteTab(0)).toBe(true);
+      await settle();
+      expect(stillThere).toBe(false);
+    });
+
+    it('for an ordinary tab', async () => {
+      open(0, clean('a'), clean('b', 1));
+      let stillThere: boolean | null = null;
+      mockInvoke.mockImplementation((() =>
+        Promise.resolve(null)) as typeof invoke);
+      const spy = vi
+        .spyOn(convertController, 'cancelTab')
+        .mockImplementation(() => {
+          const tab = w.tabs.find((t) => t.id === 'a');
+          queueMicrotask(() => {
+            stillThere = w.tabs.includes(tab!);
+          });
+        });
+      try {
+        expect(await w.deleteTab(0)).toBe(true);
+        await settle();
+        expect(spy).toHaveBeenCalledTimes(1);
+        expect(stillThere).toBe(false);
+      } finally {
+        spy.mockRestore();
+      }
+    });
+  });
+
+  it('drops the edit box before waiting, so it cannot take typing meanwhile', async () => {
+    const viewer = baseTab({
+      id: 'v',
+      path: '/tmp/big.log',
+      large: { size: 1 },
+    });
+    open(0, viewer, clean('b', 1));
+    await w.openRangeBox(w.tabs[0]!, {
+      startByte: 0,
+      endByte: 8,
+      startLine: 1,
+      endLine: 2,
+    });
+    expect(w.rangeBox).not.toBeNull();
+    const closing = w.deleteTab(0);
+    expect(w.rangeBox).toBeNull();
+    deletes[0]!.release();
+    expect(await closing).toBe(true);
+  });
+});
+
+describe('an open does not take the screen while holdActive says so', () => {
+  let w: DocumentWindowState;
+  let hold: boolean;
+  let notes: NoteSnapshot[];
+  let reads: Record<string, string>;
+  let blockRead: Promise<void> | null;
+  let blockUpsert: Promise<void> | null;
+  let windowedOpenFails: boolean;
+  let readySpy: ReturnType<typeof vi.spyOn>;
+  const settle = (): Promise<void> => new Promise((r) => setTimeout(r, 0));
+  const sentArgs = (cmd: string): Record<string, unknown>[] =>
+    mockInvoke.mock.calls
+      .filter(([c]) => c === cmd)
+      .map(([, a]) => a as Record<string, unknown>);
+  const priv = (): {
+    adoptWhenShown: Map<string, NoteSnapshot>;
+    unlockWhenShown: Set<string>;
+  } => w as unknown as ReturnType<typeof priv>;
+
+  function clean(id: string, text: string, index = 0): DocTab {
+    const content = Text.of([text]);
+    return baseTab({
+      id,
+      path: `/tmp/${id}.txt`,
+      content,
+      savedContent: content,
+      tabIndex: index,
+    });
+  }
+
+  beforeEach(async () => {
+    readySpy = vi.spyOn(editionState, 'ready').mockResolvedValue();
+    // The large-file questions and the edit box exist in the full edition only.
+    editionState.lite = false;
+    hold = false;
+    notes = [];
+    reads = {};
+    blockRead = null;
+    blockUpsert = null;
+    windowedOpenFails = false;
+    mockInvoke.mockReset();
+    mockInvoke.mockImplementation(((cmd: string, args?: unknown) => {
+      const a = (args ?? {}) as Record<string, unknown>;
+      switch (cmd) {
+        case 'list_notes':
+          return Promise.resolve(notes);
+        case 'live_doc_groups':
+          return Promise.resolve([]);
+        case 'path_writable':
+          return Promise.resolve(true);
+        case 'stat_file':
+          return Promise.resolve({ size: 10 });
+        case 'read_file_auto':
+        case 'read_file_as': {
+          const decoded = {
+            content: reads[a['path'] as string] ?? 'text',
+            encoding: 'UTF-8',
+            had_bom: false,
+            lossy: false,
+          };
+          return blockRead === null
+            ? Promise.resolve(decoded)
+            : blockRead.then(() => decoded);
+        }
+        case 'windowed_open':
+        case 'windowed_open_converted':
+          return windowedOpenFails
+            ? Promise.reject('not-utf8')
+            : Promise.resolve({
+                session_id: 9,
+                total_bytes: 10,
+                total_lines: 1,
+                fingerprint: { size: 10, mtime_ms: 1 },
+              });
+        case 'upsert_note':
+          return blockUpsert === null
+            ? Promise.resolve(null)
+            : blockUpsert.then(() => null);
+        case 'read_range':
+          return Promise.resolve({ text: 'one\ntwo\n', lossy: false });
+        case 'file_fingerprint':
+          return Promise.resolve({ size: 100, mtime_ms: 1 });
+        default:
+          return Promise.resolve(null);
+      }
+    }) as typeof invoke);
+    settingsState.askLongLineOpen = true;
+    settingsState.largeOpenMode = 'ask';
+    await settingsState.init().catch(() => {});
+    settingsState.askLongLineOpen = true;
+    settingsState.largeOpenMode = 'ask';
+    w = new DocumentWindowState();
+    await w.init('g', null, null);
+    w.holdActive = () => hold;
+    w.tabs.push(clean('base', 'base text'));
+    w.activeIndex = 0;
+  });
+
+  afterEach(async () => {
+    readySpy.mockRestore();
+    editionState.lite = true;
+    await w.flushAll();
+  });
+
+  const entries: [string, () => Promise<void>, boolean][] = [
+    [
+      'newTab',
+      async () => {
+        await w.newTab();
+      },
+      true,
+    ],
+    [
+      'openTab of a file that is open',
+      async () => {
+        await w.openTab('/tmp/two.txt');
+      },
+      false,
+    ],
+    [
+      'openTab of a new file',
+      async () => {
+        await w.openTab('/tmp/new.txt');
+      },
+      true,
+    ],
+    [
+      'the long-line question answered',
+      async () => {
+        reads['/tmp/long.txt'] = 'x'.repeat(10_001);
+        await w.openTab('/tmp/long.txt');
+        expect(w.pendingLongLineOpen).not.toBeNull();
+        w.confirmLongLineOpen('asis');
+        await settle();
+      },
+      true,
+    ],
+    [
+      'an orphaned record adopted',
+      async () => {
+        notes = [
+          baseNote({
+            id: 'orphan',
+            file_path: '/tmp/orph.txt',
+            window_group: 'other',
+            dirty: true,
+            content: 'edited',
+          }),
+        ];
+        await w.openTab('/tmp/orph.txt');
+      },
+      true,
+    ],
+    [
+      'the large-file question answered',
+      async () => {
+        w.pendingLargeOpen = { path: '/tmp/big.log', size: 200 * 1024 * 1024 };
+        w.confirmLargeOpen();
+        await settle();
+      },
+      true,
+    ],
+    [
+      'a sticky note handed over',
+      async () => {
+        await w.openClaimed({
+          convert_id: 'c',
+          note_id: 'n',
+          language: null,
+          encoding: 'UTF-8',
+          line_ending: 'LF',
+        });
+      },
+      true,
+    ],
+    [
+      'openWindowedTab',
+      async () => {
+        await w.openWindowedTab('/tmp/win.log');
+      },
+      true,
+    ],
+  ];
+
+  describe.each(entries)('%s', (_name, run, adds) => {
+    beforeEach(() => {
+      w.tabs.push(clean('two', 'two text', 1));
+    });
+
+    it('adds the tab and leaves the active one while held', async () => {
+      hold = true;
+      await run();
+      expect(w.tabs).toHaveLength(adds ? 3 : 2);
+      expect(w.activeIndex).toBe(0);
+    });
+
+    it('shows the tab when nothing holds', async () => {
+      await run();
+      expect(w.tabs).toHaveLength(adds ? 3 : 2);
+      expect(w.activeIndex).toBe(adds ? 2 : 1);
+    });
+  });
+
+  it('shows the first tab of an empty window even while held', async () => {
+    w.tabs.length = 0;
+    hold = true;
+    await w.openTab('/tmp/first.txt');
+    expect(w.tabs).toHaveLength(1);
+    expect(w.activeTab?.path).toBe('/tmp/first.txt');
+  });
+
+  it('judges at the moment the tab would be shown, not when the open began', async () => {
+    let release: () => void = () => {};
+    blockRead = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const opening = w.openTab('/tmp/slow.txt');
+    await settle();
+    hold = true;
+    release();
+    await opening;
+    expect(w.tabs).toHaveLength(2);
+    expect(w.activeIndex).toBe(0);
+  });
+
+  it('judges again after the outgoing tab was written', async () => {
+    w.tabs.push(clean('two', 'two text', 1));
+    w.updateActiveContent(Text.of(['changed']));
+    let release: () => void = () => {};
+    blockUpsert = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const switching = w.switchTo(1, true);
+    await settle();
+    hold = true;
+    release();
+    await switching;
+    expect(w.activeIndex).toBe(0);
+  });
+
+  it('does not flush or end a composition for a switch that is held from the start', async () => {
+    w.tabs.push(clean('two', 'two text', 1));
+    w.updateActiveContent(Text.of(['changed']));
+    const end = vi.fn(() => Promise.resolve());
+    w.endComposition = end;
+    hold = true;
+    await w.switchTo(1, true);
+    w.endComposition = null;
+    expect(end).not.toHaveBeenCalled();
+    expect(sentArgs('upsert_note')).toEqual([]);
+    expect(w.activeIndex).toBe(0);
+  });
+
+  it('still switches for a plain switchTo while held', async () => {
+    w.tabs.push(clean('two', 'two text', 1));
+    hold = true;
+    await w.switchTo(1);
+    expect(w.activeIndex).toBe(1);
+  });
+
+  describe('the edit box asks for a new file', () => {
+    beforeEach(async () => {
+      w.tabs.length = 0;
+      w.tabs.push(
+        baseTab({ id: 'v', path: '/tmp/big.log', large: { size: 100 } }),
+      );
+      w.activeIndex = 0;
+      await w.openRangeBox(w.tabs[0]!, {
+        startByte: 0,
+        endByte: 8,
+        startLine: 1,
+        endLine: 2,
+      });
+    });
+
+    it('shows the new file even while held: it is the answer of a dialog', async () => {
+      hold = true;
+      expect(await w.rangeConflictSaveAs('/tmp/out.txt')).toBe(true);
+      expect(w.activeTab?.path).toBe('/tmp/out.txt');
+    });
+
+    it('shows nothing when the new file is not among the tabs', async () => {
+      hold = true;
+      mockInvoke.mockImplementation(((cmd: string) =>
+        cmd === 'stat_file'
+          ? Promise.resolve({ size: LARGE_FILE_THRESHOLD + 1 })
+          : Promise.resolve(
+              cmd === 'list_notes' ? [] : null,
+            )) as typeof invoke);
+      expect(await w.rangeConflictSaveAs('/tmp/out.txt')).toBe(true);
+      expect(w.activeTab?.id).toBe('v');
+      expect(w.pendingLargeOpen).not.toBeNull();
+    });
+  });
+
+  describe('saveRangeAs', () => {
+    const range = {
+      startByte: 0,
+      endByte: 1,
+      pathOverride: '/tmp/out.txt',
+    };
+
+    it('adds the file and leaves the active tab while held', async () => {
+      hold = true;
+      expect(await w.saveRangeAs('/tmp/big.log', range)).toBe(true);
+      expect(w.tabs).toHaveLength(2);
+      expect(w.activeIndex).toBe(0);
+    });
+
+    it('shows the file when nothing holds', async () => {
+      expect(await w.saveRangeAs('/tmp/big.log', range)).toBe(true);
+      expect(w.activeTab?.path).toBe('/tmp/out.txt');
+    });
+  });
+
+  describe('a dirty orphan of a file an open tab shows', () => {
+    const orphan = (): NoteSnapshot =>
+      baseNote({
+        id: 'orphan',
+        file_path: '/tmp/two.txt',
+        window_group: 'other',
+        dirty: true,
+        content: 'snap',
+      });
+    const orphanDeletes = (): number =>
+      sentArgs('delete_note').filter((a) => a['id'] === 'orphan').length;
+
+    beforeEach(() => {
+      w.tabs.push(clean('two', 'disk', 1));
+      notes = [orphan()];
+    });
+
+    it('is merged at once when nothing holds', async () => {
+      await w.openTab('/tmp/two.txt');
+      expect(w.activeIndex).toBe(1);
+      expect(w.tabs[1]!.content.toString()).toBe('snap');
+      expect(orphanDeletes()).toBe(1);
+    });
+
+    it('waits, record included, until the tab is shown, and is merged once', async () => {
+      hold = true;
+      const seq = w.reloadSeq;
+      await w.openTab('/tmp/two.txt');
+      expect(w.activeIndex).toBe(0);
+      expect(orphanDeletes()).toBe(0);
+      expect(w.tabs[1]!.content.toString()).toBe('disk');
+      expect(w.reloadSeq).toBe(seq);
+
+      await w.switchTo(1);
+      await settle();
+      expect(w.tabs[1]!.content.toString()).toBe('snap');
+      expect(orphanDeletes()).toBe(1);
+      expect(w.reloadTargetId).toBe('two');
+      expect(w.reloadSeq).toBe(seq + 1);
+
+      expect(await w.saveActive()).toBe(true);
+      await w.switchTo(0);
+      await w.switchTo(1);
+      await settle();
+      expect(w.tabs[1]!.content.toString()).toBe('snap');
+      expect(orphanDeletes()).toBe(1);
+      expect(w.reloadSeq).toBe(seq + 1);
+    });
+
+    it('is merged when closing the active tab brings the tab forward', async () => {
+      hold = true;
+      await w.openTab('/tmp/two.txt');
+      await w.deleteTab(0);
+      await settle();
+      expect(w.activeTab?.id).toBe('two');
+      expect(w.tabs[0]!.content.toString()).toBe('snap');
+      expect(orphanDeletes()).toBe(1);
+    });
+
+    it('is not merged into a tab that was closed first, and its record stays', async () => {
+      hold = true;
+      await w.openTab('/tmp/two.txt');
+      expect(priv().adoptWhenShown.has('two')).toBe(true);
+      await w.deleteTab(1);
+      expect(priv().adoptWhenShown.has('two')).toBe(false);
+      expect(orphanDeletes()).toBe(0);
+    });
+  });
+
+  describe('a large file opened for editing while held', () => {
+    let unlock: ReturnType<typeof vi.spyOn>;
+    const openForEdit = async (): Promise<void> => {
+      w.pendingLargeOpen = { path: '/tmp/big.log', size: 200 * 1024 * 1024 };
+      w.confirmLargeOpen(true);
+      await settle();
+    };
+    const windowedOpens = (): number => sentArgs('windowed_open').length;
+
+    beforeEach(() => {
+      hold = true;
+      unlock = vi.spyOn(w, 'unlockLargeTab');
+    });
+
+    afterEach(() => {
+      unlock.mockRestore();
+    });
+
+    it('does not unlock the tab that is shown, and unlocks the new one once it is shown', async () => {
+      await openForEdit();
+      expect(w.activeIndex).toBe(0);
+      expect(unlock).not.toHaveBeenCalled();
+      expect(priv().unlockWhenShown.size).toBe(1);
+
+      await w.switchTo(1);
+      expect(unlock).toHaveBeenCalledTimes(1);
+      expect(windowedOpens()).toBe(1);
+      expect(w.tabs[1]!.windowed).toBeDefined();
+    });
+
+    it('asks the core once even when it refuses and the tab is shown again', async () => {
+      windowedOpenFails = true;
+      await openForEdit();
+      await w.switchTo(1);
+      await settle();
+      expect(windowedOpens()).toBe(1);
+      expect(w.tabs[1]!.large).toBeDefined();
+      await w.switchTo(0);
+      await w.switchTo(1);
+      await settle();
+      expect(windowedOpens()).toBe(1);
+    });
+
+    it('unlocks when closing the active tab brings the tab forward', async () => {
+      await openForEdit();
+      await w.deleteTab(0);
+      await settle();
+      expect(w.activeTab?.path).toBe('/tmp/big.log');
+      expect(unlock).toHaveBeenCalledTimes(1);
+      expect(windowedOpens()).toBe(1);
+    });
+
+    it('forgets a tab that was closed first', async () => {
+      await openForEdit();
+      await w.deleteTab(1);
+      expect(priv().unlockWhenShown.size).toBe(0);
+    });
+
+    it('unlocks at once when nothing holds', async () => {
+      hold = false;
+      await openForEdit();
+      expect(w.activeIndex).toBe(1);
+      expect(unlock).toHaveBeenCalledTimes(1);
+      expect(priv().unlockWhenShown.size).toBe(0);
+    });
   });
 });

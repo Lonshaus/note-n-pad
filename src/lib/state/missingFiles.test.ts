@@ -12,8 +12,13 @@ import { invoke } from '@tauri-apps/api/core';
 import { save } from '@tauri-apps/plugin-dialog';
 import { CloseGate, type GateHost } from './closeGate.svelte';
 import { DocumentWindowState, type DocTab } from './documentWindow.svelte';
-import { MissingFiles } from './missingFiles.svelte';
+import {
+  MissingFiles,
+  sameTabStillActive,
+  type MissingHost,
+} from './missingFiles.svelte';
 import { editionState } from './edition.svelte';
+import { settingsState } from './settings.svelte';
 import { SNAPSHOT_CONTENT_MAX } from '../util/snapshotPolicy';
 import type { NoteSnapshot } from './stickyNote.svelte';
 
@@ -95,16 +100,19 @@ function clean(id: string, path: string, index = 0): DocTab {
 }
 
 let win: DocumentWindowState;
-let host: GateHost & {
-  finishWindowClose: ReturnType<typeof vi.fn>;
-  closeEmptyWindow: ReturnType<typeof vi.fn<() => Promise<void>>>;
-  finishTabClose: ReturnType<
-    typeof vi.fn<(keepWindow?: boolean) => Promise<void>>
-  >;
-  focusWindow: ReturnType<typeof vi.fn>;
-};
+let host: GateHost &
+  MissingHost & {
+    finishWindowClose: ReturnType<typeof vi.fn>;
+    closeEmptyWindow: ReturnType<typeof vi.fn<() => Promise<void>>>;
+    finishTabClose: ReturnType<
+      typeof vi.fn<(keepWindow?: boolean) => Promise<void>>
+    >;
+    focusWindow: ReturnType<typeof vi.fn>;
+  };
 let gate: CloseGate;
 let missing: MissingFiles;
+/** Whether a dialog the host reports (not one of the module's own) is up. */
+let dialogUp: boolean;
 /** The window was destroyed by closing its last tab. */
 let destroyed: boolean;
 /** How many times the window was destroyed. */
@@ -132,6 +140,7 @@ function open(tabs: DocTab[], active: string): void {
 let readySpy: ReturnType<typeof vi.spyOn>;
 
 beforeEach(() => {
+  dialogUp = false;
   destroyed = false;
   destroyCalls = 0;
   gone = new Set();
@@ -159,6 +168,8 @@ beforeEach(() => {
     }),
     focusWindow: vi.fn(() => Promise.resolve()),
     promptBlocked: () => missing.current() !== null,
+    promptRefused: () => missing.otherDialogUp(),
+    dialogOpen: () => dialogUp,
   };
   gate = new CloseGate(win, host);
   missing = new MissingFiles(win, gate, host);
@@ -528,6 +539,90 @@ describe('closing a tab', () => {
     expect(missing.confirmClose).toBe(false);
     expect(calls('write_file_encoded')).toHaveLength(1);
     expect(ids()).toEqual([]);
+  });
+  /** Every `write_file_encoded` waits; `disk` is what the last released one wrote. */
+  function holdWrites(): {
+    pending: { content: string; release: () => void; fail: () => void }[];
+    disk: () => string | null;
+  } {
+    const pending: {
+      content: string;
+      release: () => void;
+      fail: () => void;
+    }[] = [];
+    let disk: string | null = null;
+    const base = mockInvoke.getMockImplementation()!;
+    mockInvoke.mockImplementation(((cmd: string, args?: unknown) => {
+      if (cmd !== 'write_file_encoded') {
+        return base(cmd, args as Record<string, unknown> | undefined);
+      }
+      const content = (args as { content: string }).content;
+      return new Promise<null>((resolve, reject) => {
+        pending.push({
+          content,
+          release: () => {
+            disk = content;
+            resolve(null);
+          },
+          fail: () => reject(new Error('disk full')),
+        });
+      });
+    }) as typeof invoke);
+    return { pending, disk: () => disk };
+  }
+  const settle = (): Promise<void> => new Promise((r) => setTimeout(r, 0));
+
+  it('saves again what was typed during the write, and closes once a write finds nothing new', async () => {
+    open([dirty('a', '/p/a.txt', 'A')], 'a');
+    missing.requestClose();
+    const writes = holdWrites();
+    const saving = missing.confirmSave();
+    await settle();
+    win.updateContentById('a', Text.of(['AB']));
+    writes.pending[0]!.release();
+    await settle();
+    expect(writes.pending).toHaveLength(2);
+    expect(writes.pending[1]!.content).toBe('AB');
+    expect(ids()).toEqual(['a']);
+    expect(host.finishTabClose).not.toHaveBeenCalled();
+    writes.pending[1]!.release();
+    await saving;
+    expect(writes.pending).toHaveLength(2);
+    expect(writes.disk()).toBe('AB');
+    expect(missing.confirmClose).toBe(false);
+    expect(ids()).toEqual([]);
+  });
+
+  it('closes nothing when the window moved to another tab during the write', async () => {
+    open([dirty('a', '/p/a.txt', 'A'), dirty('b', '/p/b.txt', 'B', 1)], 'a');
+    missing.requestClose();
+    const writes = holdWrites();
+    const saving = missing.confirmSave();
+    await settle();
+    win.activeIndex = 1;
+    writes.pending[0]!.release();
+    await saving;
+    expect(missing.confirmClose).toBe(false);
+    expect(host.finishTabClose).not.toHaveBeenCalled();
+    expect(ids()).toEqual(['a', 'b']);
+    expect(win.isDirty(tab('b'))).toBe(true);
+  });
+
+  it('keeps the tab and the dialog when the second write fails', async () => {
+    open([dirty('a', '/p/a.txt', 'A')], 'a');
+    missing.requestClose();
+    const writes = holdWrites();
+    const saving = missing.confirmSave();
+    await settle();
+    win.updateContentById('a', Text.of(['AB']));
+    writes.pending[0]!.release();
+    await settle();
+    writes.pending[1]!.fail();
+    await saving;
+    expect(win.saveFailed?.path).toBe('/p/a.txt');
+    expect(missing.confirmClose).toBe(true);
+    expect(host.finishTabClose).not.toHaveBeenCalled();
+    expect(ids()).toEqual(['a']);
   });
 
   it('shows the dialog of a tab whose file is gone instead of asking', async () => {
@@ -1106,5 +1201,506 @@ describe('a quit or close held back behind the dialog of the last tab', () => {
     await missing.discard();
     expect(destroyed).toBe(true);
     expect(sent()).not.toContain('request_exit');
+  });
+});
+
+const wait = (): Promise<void> => new Promise((r) => setTimeout(r, 0));
+/** Every `command` waits until the returned function is called. */
+function holdCommand(command: string): () => void {
+  let release: () => void = () => {};
+  const held = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  const base = mockInvoke.getMockImplementation()!;
+  mockInvoke.mockImplementation(((cmd: string, args?: unknown) =>
+    cmd === command
+      ? held.then(() => base(cmd, args as Record<string, unknown>))
+      : base(cmd, args as Record<string, unknown>)) as typeof invoke);
+  return () => release();
+}
+/** A dirty tab too large to snapshot. */
+function huge(id: string, path: string, index = 0): DocTab {
+  return dirty(id, path, 'x'.repeat(SNAPSHOT_CONTENT_MAX + 1), index);
+}
+/** A clean windowed tab. */
+function windowedClean(id: string, index = 0): DocTab {
+  const found = clean(id, `/p/${id}.log`, index);
+  found.windowed = {
+    sessionId: 7,
+    totalBytes: 1,
+    totalLines: 1,
+    fingerprint: null,
+    dirty: false,
+    topLine: 0,
+  };
+  return found;
+}
+/** A large-file viewer with an edit box that has changes. */
+async function boxOnViewer(): Promise<void> {
+  const viewer = clean('v', '/p/big.log', 0);
+  viewer.large = { size: 100 };
+  open([viewer], 'v');
+  await win.openRangeBox(tab('v'), {
+    startByte: 0,
+    endByte: 8,
+    startLine: 1,
+    endLine: 2,
+  });
+  win.rangeBoxEdited(Text.of(['one', 'two', 'three']));
+}
+
+describe('sameTabStillActive', () => {
+  it('is true for the same tab and for no other', () => {
+    const a = clean('a', '/p/a.txt');
+    expect(sameTabStillActive(a, a)).toBe(true);
+    expect(sameTabStillActive(a, clean('a', '/p/a.txt'))).toBe(false);
+    expect(sameTabStillActive(a, null)).toBe(false);
+    expect(sameTabStillActive(null, null)).toBe(false);
+    expect(sameTabStillActive(undefined, null)).toBe(false);
+  });
+});
+
+describe('the close confirmation belongs to the tab it asks about', () => {
+  it.each([['confirmDiscard'], ['confirmSave']] as const)(
+    '%s only closes the dialog when another tab was switched to',
+    async (action) => {
+      open(
+        [dirty('a', '/p/a.txt', 'A', 0), dirty('b', '/p/b.txt', 'B', 1)],
+        'a',
+      );
+      missing.requestClose();
+      expect(missing.confirmClose).toBe(true);
+      win.activeIndex = 1;
+      await missing[action]();
+
+      expect(missing.confirmClose).toBe(false);
+      expect(ids()).toEqual(['a', 'b']);
+      expect(win.isDirty(tab('b'))).toBe(true);
+      expect(calls('delete_note')).toEqual([]);
+      expect(calls('write_file_encoded')).toEqual([]);
+      expect(host.finishTabClose).not.toHaveBeenCalled();
+    },
+  );
+
+  it('keeps the tab and the text typed while the last record is deleted', async () => {
+    open([dirty('a', '/p/a.txt', 'A')], 'a');
+    missing.requestClose();
+    const release = holdCommand('delete_note');
+    const saving = missing.confirmSave();
+    await wait();
+    expect(calls('write_file_encoded')).toHaveLength(1);
+    win.updateContentById('a', Text.of(['AB']));
+    release();
+    await saving;
+
+    expect(ids()).toEqual(['a']);
+    expect(tab('a').content.toString()).toBe('AB');
+    expect(missing.confirmClose).toBe(false);
+    await win.flushAll();
+  });
+
+  it('opens a file behind it without leaving the tab, and the window survives 不儲存', async () => {
+    answers['list_notes'] = [];
+    answers['live_doc_groups'] = [];
+    answers['stat_file'] = { size: 10 };
+    answers['path_writable'] = true;
+    answers['read_file_auto'] = {
+      content: 'new',
+      encoding: 'UTF-8',
+      had_bom: false,
+      lossy: false,
+    };
+    await settingsState.init().catch(() => {});
+    await win.init('g', null, null);
+    open([dirty('a', '/p/a.txt', 'A')], 'a');
+    missing.requestClose();
+    expect(win.holdActive?.()).toBe(true);
+    await win.openTab('/p/n.txt');
+    expect(win.activeTab?.id).toBe('a');
+    expect(win.tabs).toHaveLength(2);
+
+    await missing.confirmDiscard();
+    expect(win.tabs).toHaveLength(1);
+    expect(win.tabs[0]!.path).toBe('/p/n.txt');
+    expect(host.closeEmptyWindow).not.toHaveBeenCalled();
+    expect(destroyed).toBe(false);
+  });
+});
+
+describe('closing a tab by its own button', () => {
+  it('closes the tab clicked when the switch to it ends undisturbed', async () => {
+    open(
+      [
+        clean('t0', '/p/0.txt', 0),
+        clean('t1', '/p/1.txt', 1),
+        clean('t2', '/p/2.txt', 2),
+      ],
+      't0',
+    );
+    await missing.requestCloseAt(1);
+    expect(host.finishTabClose).toHaveBeenCalledTimes(1);
+    expect(ids()).toEqual(['t0', 't2']);
+  });
+
+  it('closes nothing when another tab became active while the switch waited for the write', async () => {
+    open(
+      [
+        dirty('t0', '/p/0.txt', 'zero', 0),
+        clean('t1', '/p/1.txt', 1),
+        clean('t2', '/p/2.txt', 2),
+      ],
+      't0',
+    );
+    win.updateActiveContent(Text.of(['changed']));
+    const release = holdCommand('upsert_note');
+    const closing = missing.requestCloseAt(1);
+    const other = win.switchTo(2);
+    await wait();
+    release();
+    await closing;
+    await other;
+
+    expect(win.activeTab?.id).toBe('t2');
+    expect(ids()).toEqual(['t0', 't1', 't2']);
+    expect(calls('delete_note')).toEqual([]);
+    expect(host.finishTabClose).not.toHaveBeenCalled();
+  });
+
+  it('closes nothing when the switch gave up because another tab was switched to', async () => {
+    open(
+      [
+        clean('t0', '/p/0.txt', 0),
+        clean('t1', '/p/1.txt', 1),
+        clean('t2', '/p/2.txt', 2),
+      ],
+      't0',
+    );
+    let finish: () => void = () => {};
+    win.endComposition = () =>
+      new Promise<void>((resolve) => {
+        finish = resolve;
+      });
+    const closing = missing.requestCloseAt(1);
+    win.activeIndex = 2;
+    finish();
+    await closing;
+
+    expect(win.activeTab?.id).toBe('t2');
+    expect(ids()).toEqual(['t0', 't1', 't2']);
+    expect(calls('delete_note')).toEqual([]);
+    win.endComposition = null;
+  });
+});
+
+describe('what locks the tabs', () => {
+  it('locks navigation for the confirmation, the gate and a dialog of the window, each alone', () => {
+    open([clean('a', '/p/a.txt')], 'a');
+    expect(missing.navigationLocked()).toBe(false);
+    missing.confirmClose = true;
+    expect(missing.navigationLocked()).toBe(true);
+    missing.confirmClose = false;
+    gate.visible = true;
+    expect(missing.navigationLocked()).toBe(true);
+    gate.visible = false;
+    dialogUp = true;
+    expect(missing.navigationLocked()).toBe(true);
+    dialogUp = false;
+    expect(missing.navigationLocked()).toBe(false);
+    expect(missing.tabsLocked()).toBe(false);
+  });
+
+  it('keeps the tabs of an open edit box locked, though ⌘W still works', async () => {
+    await boxOnViewer();
+    expect(missing.navigationLocked()).toBe(false);
+    expect(missing.tabsLocked()).toBe(true);
+    expect(win.holdActive?.()).toBe(true);
+    missing.requestClose();
+    await wait();
+    expect(gate.visible).toBe(true);
+    expect(gate.reason).toBe('rangeBox');
+  });
+
+  it.each([
+    ['the close confirmation', () => (missing.confirmClose = true)],
+    ['the gate', () => (gate.visible = true)],
+  ])('does not close the active tab while %s is up', (_name, raise) => {
+    open([clean('a', '/p/a.txt')], 'a');
+    raise();
+    missing.requestClose();
+    expect(host.finishTabClose).not.toHaveBeenCalled();
+  });
+
+  it('asks nothing of the edit box while a dialog of the window is up', async () => {
+    await boxOnViewer();
+    dialogUp = true;
+    missing.requestClose();
+    await wait();
+    expect(gate.visible).toBe(false);
+  });
+
+  it('closes tabs as before with only an error banner showing (no dialog)', async () => {
+    open([clean('a', '/p/a.txt', 0), clean('b', '/p/b.txt', 1)], 'a');
+    missing.requestClose();
+    expect(host.finishTabClose).toHaveBeenCalledTimes(1);
+    await wait();
+    expect(ids()).toEqual(['b']);
+    await missing.requestCloseAt(0);
+    expect(ids()).toEqual([]);
+  });
+
+  it.each([
+    [
+      'a dialog is up',
+      async (): Promise<void> => {
+        dialogUp = true;
+      },
+    ],
+    ['the edit box is open', boxOnViewer],
+  ])(
+    'does not switch or close by a close button when %s',
+    async (_name, raise) => {
+      open([clean('a', '/p/a.txt', 0), clean('b', '/p/b.txt', 1)], 'a');
+      await raise();
+      const before = ids();
+      await missing.requestCloseAt(1);
+      expect(win.activeTab?.id).toBe(before[0]);
+      expect(ids()).toEqual(before);
+      expect(host.finishTabClose).not.toHaveBeenCalled();
+    },
+  );
+});
+
+describe('a quit or close does not raise its question over another dialog', () => {
+  const raisers: [string, () => void][] = [
+    [
+      'the close confirmation',
+      () => {
+        missing.requestClose();
+        expect(missing.confirmClose).toBe(true);
+      },
+    ],
+    [
+      'a dialog of the window',
+      () => {
+        dialogUp = true;
+      },
+    ],
+  ];
+  let vetoed: ReturnType<typeof vi.fn<() => void>>;
+
+  function watchVeto(): void {
+    vetoed = vi.fn<() => void>();
+    const keepEmpty = gate.onVetoed;
+    gate.onVetoed = () => {
+      vetoed();
+      keepEmpty?.();
+    };
+  }
+
+  describe.each(raisers)('with %s up', (_name, raise) => {
+    beforeEach(() => {
+      open([dirty('a', '/p/a.txt', 'A', 0), huge('x', '/p/x.txt', 1)], 'a');
+      raise();
+      watchVeto();
+    });
+
+    it('calls a quit off at once and stays on the tab', async () => {
+      await gate.onFlushRequest();
+      expect(win.activeTab?.id).toBe('a');
+      expect(gate.visible).toBe(false);
+      expect(gate.held).toBe(false);
+      expect(calls('flush_cancel')).toHaveLength(1);
+      expect(vetoed).toHaveBeenCalledTimes(1);
+      expect(sent()).not.toContain('request_exit');
+    });
+
+    it('calls a window close off and stays on the tab', async () => {
+      await gate.onCloseFlushRequest();
+      expect(win.activeTab?.id).toBe('a');
+      expect(gate.visible).toBe(false);
+      expect(gate.held).toBe(false);
+      expect(vetoed).toHaveBeenCalledTimes(1);
+      expect(host.finishWindowClose).not.toHaveBeenCalled();
+    });
+  });
+
+  it('calls the quit off for good when a dialog came up during the save, even after it is gone', async () => {
+    open([huge('x', '/p/x.txt')], 'x');
+    await gate.onFlushRequest();
+    expect(gate.visible).toBe(true);
+    const release = holdCommand('write_file_encoded');
+    const saving = gate.save();
+    await wait();
+    dialogUp = true;
+    release();
+    await saving;
+
+    expect(gate.visible).toBe(false);
+    expect(gate.held).toBe(false);
+    dialogUp = false;
+    await wait();
+    expect(sent()).not.toContain('request_exit');
+  });
+
+  it('calls off a quit whose input arrived late, even when nothing is left to ask', async () => {
+    open([clean('c', '/p/c.txt')], 'c');
+    dialogUp = true;
+    win.windowedPending = () => true;
+    win.endComposition = () => Promise.resolve();
+    const quitting = gate.onFlushRequest();
+    await wait();
+    gate.onFlushCancelled();
+    await quitting;
+
+    expect(calls('flush_cancel')).toHaveLength(1);
+    expect(sent()).not.toContain('request_exit');
+    win.windowedPending = null;
+    win.endComposition = null;
+  });
+
+  it('still waits behind the dialog of a tab whose file is gone', async () => {
+    open([dirty('a', '/p/a.txt', 'A', 0), huge('x', '/p/x.txt', 1)], 'a');
+    gone.add('/p/a.txt');
+    await missing.check();
+    expect(missing.current()?.tabId).toBe('a');
+    await gate.onFlushRequest();
+    expect(gate.held).toBe(true);
+    expect(gate.visible).toBe(false);
+  });
+
+  describe('a quit held behind the dialog of a missing file', () => {
+    async function heldQuit(tabs: DocTab[]): Promise<void> {
+      open(tabs, 'a');
+      gone.add('/p/a.txt');
+      await missing.check();
+      win.windowedPending = () => true;
+      win.endComposition = () => Promise.resolve();
+      const quitting = gate.onFlushRequest();
+      await wait();
+      gate.onFlushCancelled();
+      await quitting;
+      win.windowedPending = null;
+      win.endComposition = null;
+      expect(gate.held).toBe(true);
+      watchVeto();
+    }
+
+    it('is called off when a dialog is up as the dialog is answered, and an emptied window closes', async () => {
+      await heldQuit([dirty('a', '/p/a.txt', 'A')]);
+      dialogUp = true;
+      await missing.discard();
+      await wait();
+
+      expect(gate.held).toBe(false);
+      expect(sent()).not.toContain('request_exit');
+      expect(host.finishWindowClose).not.toHaveBeenCalled();
+      expect(vetoed).toHaveBeenCalledTimes(1);
+      expect(host.closeEmptyWindow).toHaveBeenCalledTimes(1);
+    });
+
+    it('leaves the window open when it still has tabs', async () => {
+      await heldQuit([
+        dirty('a', '/p/a.txt', 'A', 0),
+        clean('c', '/p/c.txt', 1),
+      ]);
+      dialogUp = true;
+      await missing.discard();
+      await wait();
+
+      expect(gate.held).toBe(false);
+      expect(sent()).not.toContain('request_exit');
+      expect(vetoed).toHaveBeenCalledTimes(1);
+      expect(host.closeEmptyWindow).not.toHaveBeenCalled();
+    });
+  });
+});
+
+describe('looking for missing files while a dialog is up', () => {
+  it('does not look at all', async () => {
+    open([dirty('a', '/p/a.txt', 'A', 0), dirty('b', '/p/b.txt', 'B', 1)], 'b');
+    gone.add('/p/a.txt');
+    dialogUp = true;
+    await missing.check();
+
+    expect(calls('missing_paths')).toEqual([]);
+    expect(win.activeTab?.id).toBe('b');
+    expect(tab('a').missing).not.toBe(true);
+  });
+
+  it('marks nothing when a dialog came up while it asked, and looks again later', async () => {
+    open([dirty('a', '/p/a.txt', 'A', 0), dirty('b', '/p/b.txt', 'B', 1)], 'b');
+    gone.add('/p/a.txt');
+    let release: () => void = () => {};
+    holdAnswer = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const checking = missing.check();
+    dialogUp = true;
+    release();
+    await checking;
+
+    expect(calls('missing_paths')).toHaveLength(1);
+    expect(tab('a').missing).not.toBe(true);
+    expect(win.activeTab?.id).toBe('b');
+
+    dialogUp = false;
+    holdAnswer = null;
+    await missing.check();
+    expect(tab('a').missing).toBe(true);
+    expect(win.activeTab?.id).toBe('a');
+  });
+
+  it('goes on to the next tab of the queue after an answer, whatever dialog is up', async () => {
+    open(
+      [
+        dirty('a', '/p/a.txt', 'A', 0),
+        dirty('b', '/p/b.txt', 'B', 1),
+        clean('c', '/p/c.txt', 2),
+      ],
+      'c',
+    );
+    gone.add('/p/a.txt');
+    gone.add('/p/b.txt');
+    await missing.check();
+    expect(win.activeTab?.id).toBe('a');
+    dialogUp = true;
+    await missing.discard();
+    expect(win.activeTab?.id).toBe('b');
+  });
+});
+
+describe('a close that waited for typed input', () => {
+  it.each([
+    [
+      'the close confirmation',
+      () => {
+        missing.confirmClose = true;
+      },
+      true,
+    ],
+    [
+      'a dialog of the window',
+      () => {
+        dialogUp = true;
+      },
+      false,
+    ],
+  ])('stops when %s came up meanwhile', async (_name, raise, confirming) => {
+    open([windowedClean('w')], 'w');
+    let landed: () => void = () => {};
+    win.windowedPending = () => true;
+    win.endComposition = () =>
+      new Promise<void>((resolve) => {
+        landed = resolve;
+      });
+    missing.requestClose();
+    raise();
+    landed();
+    await wait();
+
+    expect(host.finishTabClose).not.toHaveBeenCalled();
+    expect(missing.confirmClose).toBe(confirming);
+    win.windowedPending = null;
+    win.endComposition = null;
   });
 });

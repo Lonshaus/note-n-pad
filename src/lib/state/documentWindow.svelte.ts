@@ -32,9 +32,12 @@ import {
 import {
   isRangeBoxDirty,
   nextRangeBox,
+  nextWriteBack,
   openRangeBox,
   rangeBoxWriteText,
+  rebaseRangeBox,
   type RangeBox,
+  type RangeWriteOutcome,
 } from '../util/rangeEditBox';
 import { detectBreakStyle } from '../util/windowedEdit';
 import { createOpGate, type OpGate } from '../util/windowedGate';
@@ -212,10 +215,11 @@ interface WindowedIndexSnapshot {
 /** Result of a range edit box write-back: written, refused for a conflict (the
  *  conflict modal is now up), or failed for another reason. */
 export type SpliceResult = 'ok' | 'mismatch' | 'error';
-/** What `spliceRange` found: the source rewritten (with its new fingerprint),
- *  changed since `expected` was taken, or refused for another reason. */
+/** What `spliceRange` found: the source rewritten (with its new fingerprint and
+ *  the span the replacement took), changed since `expected` was taken, or
+ *  refused for another reason. */
 export type SpliceOutcome =
-  | { status: 'ok'; fingerprint: Fingerprint }
+  | ({ status: 'ok' } & RangeWriteOutcome)
   | { status: 'mismatch' }
   | { status: 'error'; error: string };
 /** Replace `[startByte, endByte)` of `sourcePath` with `replacement`, and
@@ -232,9 +236,9 @@ export async function spliceRange(
   replacement: string,
   expected: Fingerprint | null,
 ): Promise<SpliceOutcome> {
-  let fingerprint: Fingerprint;
+  let written: RangeWriteOutcome;
   try {
-    fingerprint = await invoke<Fingerprint>('splice_file', {
+    written = await invoke<RangeWriteOutcome>('splice_file', {
       path: target.sourcePath,
       start: target.startByte,
       end: target.endByte,
@@ -251,7 +255,7 @@ export async function spliceRange(
   }
   // Every window, this one included.
   void emit(RANGE_SPLICED_EVENT, target.sourcePath);
-  return { status: 'ok', fingerprint };
+  return { status: 'ok', ...written };
 }
 /** A byte slice decoded as text plus whether the decode was lossy (invalid
  *  UTF-8 replaced), mirroring the Rust `ReadRange`. */
@@ -288,6 +292,27 @@ export const LARGE_EDIT_MAX = 512 * 1024 * 1024;
  *  Lite edition has no viewer: every size opens in the ordinary editor. */
 export function opensInLargeViewer(size: number, lite: boolean): boolean {
   return !lite && size > LARGE_FILE_THRESHOLD;
+}
+/** What a tab close compares across its wait for the core. */
+export interface TabCloseState {
+  content: Text;
+  lineEnding: LineEnding;
+  /** A windowed tab's newest content generation, or undefined. */
+  generation: number | undefined;
+}
+/** Whether the tab was edited while its close waited: another document, another
+ *  line ending, a newer windowed generation, or windowed input not in the core
+ *  yet (`pending`). */
+export function editedWhileClosing(
+  before: TabCloseState,
+  now: TabCloseState & { pending: boolean },
+): boolean {
+  return (
+    now.pending ||
+    before.content !== now.content ||
+    before.lineEnding !== now.lineEnding ||
+    before.generation !== now.generation
+  );
 }
 /** One open document tab. The buffer (`content`) is always LF-normalized. It is a
  *  CodeMirror `Text` (rope), not a string, so a keystroke costs O(edit) instead of
@@ -496,6 +521,15 @@ export class DocumentWindowState {
   /** The newest content generation each windowed session has reported, by
    *  session id: a result with a lower one is stale and changes nothing. */
   private windowedGenerations = new Map<number, number>();
+  /** Tabs whose close is waiting for the core, so a repeated close of the same
+   *  tab does nothing. */
+  private closingTabs = new Set<DocTab>();
+  /** Ids of large tabs opened for editing while another tab was held in front:
+   *  they unlock once they are shown. */
+  private unlockWhenShown = new Set<string>();
+  /** Orphaned records of a file an open tab already shows, by tab id, merged
+   *  into the tab once it is shown. */
+  private adoptWhenShown = new Map<string, NoteSnapshot>();
   viewTopLine(id: string): number | undefined {
     return this.viewPos.get(id)?.top;
   }
@@ -1243,9 +1277,16 @@ export class DocumentWindowState {
    *  windowed editor is in the core, leaving a composition open. A save waits
    *  for it, so it writes what was typed. */
   windowedFlushed: (() => Promise<void>) | null = null;
-  /** Switch tabs, flushing the outgoing tab's pending upsert first. */
-  async switchTo(index: number): Promise<void> {
+  /** Set by the window: whether a tab that is opening must stay behind the
+   *  active one (a dialog or the edit box is up). */
+  holdActive: (() => boolean) | null = null;
+  /** Switch tabs, flushing the outgoing tab's pending upsert first. An `opening`
+   *  switch does not take the screen while `holdActive` says so. */
+  async switchTo(index: number, opening = false): Promise<void> {
     if (index === this.activeIndex || index < 0 || index >= this.tabs.length) {
+      return;
+    }
+    if (opening && this.holdActive?.() === true) {
       return;
     }
     const from = this.activeIndex;
@@ -1256,7 +1297,27 @@ export class DocumentWindowState {
     }
     this.persistActive.flush();
     await this.lastSave;
+    if (opening && this.holdActive?.() === true) {
+      return;
+    }
     this.activeIndex = index;
+    this.consumeUnlock();
+  }
+  /** Do what a tab was waiting to be shown for: unlock a large tab opened for
+   *  editing, and merge the orphaned record of a file it already showed. */
+  private consumeUnlock(): void {
+    const tab = this.activeTab;
+    if (tab === null) {
+      return;
+    }
+    if (this.unlockWhenShown.delete(tab.id)) {
+      void this.unlockLargeTab(0);
+    }
+    const note = this.adoptWhenShown.get(tab.id);
+    if (note !== undefined) {
+      this.adoptWhenShown.delete(tab.id);
+      void this.adoptIntoExisting(this.activeIndex, note);
+    }
   }
   /** Run `op` once every earlier operation on `tab` has settled, so a tab does
    *  one thing at a time: a restore, an unlock or a view-mode copy. Starts at
@@ -1452,7 +1513,7 @@ export class DocumentWindowState {
       tabIndex: this.allocIndex(),
     };
     this.tabs.push(tab);
-    await this.switchTo(this.tabs.length - 1);
+    await this.switchTo(this.tabs.length - 1, true);
     await this.upsertTab(tab);
   }
   /** Open `path` as a new tab, or activate its existing tab (dedupe by path).
@@ -1492,12 +1553,19 @@ export class DocumentWindowState {
     const existing =
       path === '' ? -1 : this.tabs.findIndex((t) => t.path === path);
     if (existing !== -1) {
-      await this.switchTo(existing);
+      const shown = this.tabs[existing];
+      await this.switchTo(existing, true);
       // A dirty orphan of a file this window already shows clean: pull its
       // unsaved edits in (snapshot wins over disk) and retire the orphan record.
       // A dirty local tab is left untouched — two-sided edits are not merged.
+      // The tab takes them once it is shown: only the active tab's editor
+      // refreshes, and the record stays until then.
       if (route.kind === 'adopt' && route.note.dirty) {
-        await this.adoptIntoExisting(existing, route.note);
+        if (shown !== undefined && this.activeTab === shown) {
+          await this.adoptIntoExisting(this.activeIndex, route.note);
+        } else if (shown !== undefined) {
+          this.adoptWhenShown.set(shown.id, route.note);
+        }
       }
       return;
     }
@@ -1561,7 +1629,7 @@ export class DocumentWindowState {
       return;
     }
     this.tabs.push(tab);
-    await this.switchTo(this.tabs.length - 1);
+    await this.switchTo(this.tabs.length - 1, true);
     await this.upsertTab(tab);
   }
   /** Open-dialog choice. 'asis' commits the buffer unchanged (it opens in the
@@ -1586,7 +1654,7 @@ export class DocumentWindowState {
     }
     this.tabs.push(tab);
     void (async (): Promise<void> => {
-      await this.switchTo(this.tabs.length - 1);
+      await this.switchTo(this.tabs.length - 1, true);
       await this.upsertTab(tab);
     })();
   }
@@ -1648,7 +1716,7 @@ export class DocumentWindowState {
     }
     tab.tabIndex = this.allocIndex();
     this.tabs.push(tab);
-    await this.switchTo(this.tabs.length - 1);
+    await this.switchTo(this.tabs.length - 1, true);
     await this.upsertTab(tab);
   }
   /** Bring a dirty orphan's unsaved edits into an existing clean tab for the same
@@ -1708,7 +1776,7 @@ export class DocumentWindowState {
     this.tabs.push(tab);
     const index = this.tabs.length - 1;
     void (async (): Promise<void> => {
-      await this.switchTo(index);
+      await this.switchTo(index, true);
       try {
         tab.readOnlyFile = !(await invoke<boolean>('path_writable', {
           path: tab.path,
@@ -1723,7 +1791,12 @@ export class DocumentWindowState {
       // lock explains why). ponytail: reuses the in-place unlock path, no second
       // open route.
       if (edit && tab.large !== undefined && tab.large.size < LARGE_EDIT_MAX) {
-        await this.unlockLargeTab(0);
+        // Only the active tab can be unlocked; a tab held back unlocks once shown.
+        if (this.activeTab?.id === tab.id) {
+          await this.unlockLargeTab(0);
+        } else {
+          this.unlockWhenShown.add(tab.id);
+        }
       }
     })();
   }
@@ -1944,7 +2017,7 @@ export class DocumentWindowState {
       },
     };
     this.tabs.push(tab);
-    await this.switchTo(this.tabs.length - 1);
+    await this.switchTo(this.tabs.length - 1, true);
     return tab.id;
   }
   /** A paste that was too big to edit was saved to `path`: the tab shows that
@@ -2077,8 +2150,12 @@ export class DocumentWindowState {
     }
     // Apply the line ending on the LF buffer, then let Rust encode (BOM handled
     // there: UTF-8 honours hadBom, UTF-16 always writes one, legacy ignores it).
+    // The baseline below is what was written, not what the tab holds by then:
+    // typing during the write must stay unsaved.
+    const written = tab.content;
+    const writtenEnding = tab.lineEnding;
     // Flush point: materialize the rope to a string for the write.
-    const out = applyLineEnding(tab.content.toString(), tab.lineEnding);
+    const out = applyLineEnding(written.toString(), writtenEnding);
     try {
       await invoke('write_file_encoded', {
         path: tab.path,
@@ -2096,8 +2173,8 @@ export class DocumentWindowState {
       this.saveFailed = { path: tab.path, error: String(e) };
       return false;
     }
-    tab.savedContent = tab.content;
-    tab.savedLineEnding = tab.lineEnding;
+    tab.savedContent = written;
+    tab.savedLineEnding = writtenEnding;
     await this.upsertTab(tab);
     return true;
   }
@@ -2137,8 +2214,11 @@ export class DocumentWindowState {
     if (isLargeKind(tab)) {
       return false;
     }
+    // As in `saveActive`: the baseline is what was written.
+    const written = tab.content;
+    const writtenEnding = tab.lineEnding;
     // Flush point: materialize the rope for the save-as write.
-    const out = applyLineEnding(tab.content.toString(), tab.lineEnding);
+    const out = applyLineEnding(written.toString(), writtenEnding);
     try {
       await invoke('write_file_encoded', {
         path: chosen,
@@ -2157,8 +2237,8 @@ export class DocumentWindowState {
     if (!tab.explicit) {
       tab.language = detectByFilename(chosen);
     }
-    tab.savedContent = tab.content;
-    tab.savedLineEnding = tab.lineEnding;
+    tab.savedContent = written;
+    tab.savedLineEnding = writtenEnding;
     await this.upsertTab(tab);
     void invoke('add_recent_file', { path: chosen });
     return true;
@@ -2296,45 +2376,89 @@ export class DocumentWindowState {
   rangeBoxDirty(): boolean {
     return this.rangeBox !== null && isRangeBoxDirty(this.rangeBox);
   }
+  /** The write-back of the open box that is out now, with the id of the box it
+   *  was sent from. */
+  #rangeWrite: { session: number; done: Promise<SpliceResult> } | null = null;
   /** Write the open box back into its source. `force` skips the conflict check.
    *  Success closes the box; a changed source raises the conflict modal and
-   *  keeps it; any other failure is reported and keeps it too. */
-  private async writeBack(force: boolean): Promise<SpliceResult> {
+   *  keeps it; any other failure is reported and keeps it too. A save while a
+   *  write of the same box is out sends nothing and answers with that write. */
+  private writeBack(force: boolean): Promise<SpliceResult> {
     const box = this.rangeBox;
     if (box === null) {
-      return 'error';
+      return Promise.resolve('error');
     }
-    // Flush point: materialize the rope for the write-back.
-    const outcome = await spliceRange(
+    const running = this.#rangeWrite;
+    if (running !== null && running.session === box.session) {
+      return running.done;
+    }
+    const done: Promise<SpliceResult> = this.writeBackUntilSettled(
       box,
-      rangeBoxWriteText(box),
-      force ? null : box.fingerprint,
-    );
-    if (outcome.status === 'mismatch') {
-      this.rangeBox = nextRangeBox(this.rangeBox, { kind: 'mismatch' });
-      return 'mismatch';
-    }
-    if (outcome.status === 'error') {
-      // Every failure past the conflict check is reported: the write-back is a
-      // save, and a save that did not happen has to say so or the box is left
-      // dirty with nothing on screen to explain it. A read-only source also
-      // marks the viewer tab, so its padlock catches up without a reopen.
-      if (outcome.error === READ_ONLY_DESTINATION) {
-        const tab = this.tabs.find((t) => t.id === box.tabId);
-        if (tab !== undefined) {
-          tab.readOnlyFile = true;
-        }
+      force,
+    ).finally(() => {
+      if (this.#rangeWrite?.done === done) {
+        this.#rangeWrite = null;
       }
-      this.saveFailed = { path: box.sourcePath, error: outcome.error };
-      return 'error';
+    });
+    this.#rangeWrite = { session: box.session, done };
+    return done;
+  }
+  /** Write `first`, then again for what was typed while the write was out, until
+   *  a write finds the buffer as it sent it. Only the box with the id it started
+   *  from is changed; a box cancelled or replaced meanwhile is left alone. */
+  private async writeBackUntilSettled(
+    first: RangeBox,
+    force: boolean,
+  ): Promise<SpliceResult> {
+    let box = first;
+    let unchecked = force;
+    for (;;) {
+      const sentContent = box.content;
+      // Flush point: materialize the rope for the write-back.
+      const written = rangeBoxWriteText(box);
+      const outcome = await spliceRange(
+        box,
+        written,
+        unchecked ? null : box.fingerprint,
+      );
+      const open = this.rangeBox;
+      const current = open?.session === box.session ? open : null;
+      if (outcome.status === 'mismatch') {
+        if (current !== null) {
+          this.rangeBox = nextRangeBox(current, { kind: 'mismatch' });
+        }
+        return 'mismatch';
+      }
+      if (outcome.status === 'error') {
+        // Every failure past the conflict check is reported: the write-back is a
+        // save, and a save that did not happen has to say so or the box is left
+        // dirty with nothing on screen to explain it. A read-only source also
+        // marks the viewer tab, so its padlock catches up without a reopen.
+        if (outcome.error === READ_ONLY_DESTINATION) {
+          const tab = this.tabs.find((t) => t.id === box.tabId);
+          if (tab !== undefined) {
+            tab.readOnlyFile = true;
+          }
+        }
+        this.saveFailed = { path: box.sourcePath, error: outcome.error };
+        return 'error';
+      }
+      // The viewer's size stands for the rewritten file now.
+      const viewer = this.tabs.find((t) => t.id === box.tabId);
+      if (viewer?.large !== undefined) {
+        viewer.large.size = outcome.fingerprint.size;
+      }
+      if (current === null) {
+        return 'ok';
+      }
+      if (nextWriteBack(sentContent, current.content) === 'done') {
+        this.rangeBox = nextRangeBox(current, { kind: 'saved' });
+        return 'ok';
+      }
+      box = rebaseRangeBox(current, written, outcome);
+      this.rangeBox = box;
+      unchecked = false;
     }
-    this.rangeBox = nextRangeBox(this.rangeBox, { kind: 'saved' });
-    // The viewer's size stands for the rewritten file now.
-    const viewer = this.tabs.find((t) => t.id === box.tabId);
-    if (viewer?.large !== undefined) {
-      viewer.large.size = outcome.fingerprint.size;
-    }
-    return 'ok';
   }
   /** Box 儲存: write back with the conflict check. */
   rangeBoxSave(): Promise<SpliceResult> {
@@ -2378,6 +2502,12 @@ export class DocumentWindowState {
     }
     this.rangeBox = nextRangeBox(this.rangeBox, { kind: 'cancel' });
     await this.openTab(chosen);
+    // An answer of the dialog itself: the new file is shown even where other
+    // opens are held back.
+    const index = this.tabs.findIndex((t) => t.path === chosen);
+    if (index !== -1) {
+      await this.switchTo(index);
+    }
     return true;
   }
   /** Conflict choice: dismiss the modal, back to the box with its text. */
@@ -2499,7 +2629,7 @@ export class DocumentWindowState {
       },
     };
     this.tabs.push(tab);
-    await this.switchTo(this.tabs.length - 1);
+    await this.switchTo(this.tabs.length - 1, true);
     await this.upsertTab(tab);
     return null;
   }
@@ -3156,6 +3286,8 @@ export class DocumentWindowState {
       this.persistActive();
       return;
     }
+    const readContent = tab.content;
+    const readEnding = tab.lineEnding;
     let decoded: Decoded;
     try {
       decoded = await invoke<Decoded>('read_file_as', {
@@ -3164,6 +3296,18 @@ export class DocumentWindowState {
       });
     } catch {
       this.encodingFailed = tab.path;
+      return;
+    }
+    // Closed during the read: writing its record now would bring the tab back.
+    if (!this.tabs.includes(tab)) {
+      return;
+    }
+    // Edited during the read: the tab is changed now, so it takes the rule above
+    // and only the save-time encoding changes. Not `persistActive`, the user
+    // may have switched tabs meanwhile.
+    if (tab.content !== readContent || tab.lineEnding !== readEnding) {
+      tab.encoding = label;
+      await this.upsertTab(tab);
       return;
     }
     // Re-decode replaces the buffer wholesale; one shared rope keeps the fresh
@@ -3179,7 +3323,7 @@ export class DocumentWindowState {
     // The editor doc for this tab is already mounted, so push the new buffer in.
     this.reloadTargetId = tab.id;
     this.reloadSeq += 1;
-    this.persistActive();
+    await this.upsertTab(tab);
   }
   /** Persist all logical bounds onto every tab so the lowest-index one (used on
    *  restore) always carries fresh bounds. */
@@ -3282,56 +3426,99 @@ export class DocumentWindowState {
     }
     void this.upsertTab(tab);
   }
-  /** Remove a tab's store entry and drop it from the window. */
-  async deleteTab(index: number): Promise<void> {
+  /** Remove a tab's store entry and drop it from the window. True when this call
+   *  closed the tab; false when it stays (it was edited while the record went,
+   *  and the record is written back), was closed by another call, or is being
+   *  closed already. */
+  async deleteTab(index: number): Promise<boolean> {
     const tab = this.tabs[index];
-    if (tab === undefined) {
-      return;
+    if (tab === undefined || this.closingTabs.has(tab)) {
+      return false;
     }
-    if (index === this.activeIndex) {
-      this.persistActive.cancel();
-    }
-    // Release the Rust windowed session before dropping the tab.
-    if (tab.windowed !== undefined) {
-      void invoke('windowed_close', { sessionId: tab.windowed.sessionId });
-      this.windowedGates.delete(tab.windowed.sessionId);
-      this.windowedGenerations.delete(tab.windowed.sessionId);
-    }
-    // A paste still turning the tab into a large file is given up.
-    convertController.cancelTab(tab.id);
-    // A sticky note whose text was handed over and never saved comes back.
-    const conv = tab.converted;
-    if (conv?.saved === false && conv.origin === 'sticky') {
-      if (conv.noteId !== undefined) {
+    this.closingTabs.add(tab);
+    try {
+      if (index === this.activeIndex) {
+        this.persistActive.cancel();
+      }
+      if (tab === this.windowedConflict) {
+        this.windowedConflict = null;
+      }
+      if (this.rangeBox?.tabId === tab.id) {
+        this.rangeBox = null;
+      }
+      const before: TabCloseState = {
+        content: tab.content,
+        lineEnding: tab.lineEnding,
+        generation: this.generationOf(tab),
+      };
+      await invoke('delete_note', { id: tab.id });
+      const pending =
+        tab === this.activeTab && this.windowedPending?.() === true;
+      if (
+        editedWhileClosing(before, {
+          content: tab.content,
+          lineEnding: tab.lineEnding,
+          generation: this.generationOf(tab),
+          pending,
+        })
+      ) {
+        await this.upsertTab(tab);
+        return false;
+      }
+      const at = this.tabs.indexOf(tab);
+      if (at === -1) {
+        return false;
+      }
+      // Nothing below waits: the tab leaves `tabs` in the same step as its
+      // session, so nothing can be typed into it in between.
+      if (tab.windowed !== undefined) {
+        void invoke('windowed_close', { sessionId: tab.windowed.sessionId });
+        this.windowedGates.delete(tab.windowed.sessionId);
+        this.windowedGenerations.delete(tab.windowed.sessionId);
+      }
+      // A paste still turning the tab into a large file is given up.
+      convertController.cancelTab(tab.id);
+      const conv = tab.converted;
+      this.releaseTabView(tab.id);
+      this.unlockWhenShown.delete(tab.id);
+      this.adoptWhenShown.delete(tab.id);
+      this.tabs.splice(at, 1);
+      // Always write `activeIndex`, even when the computed value equals the
+      // current one: closing the active tab can leave the numeric index
+      // unchanged while the tab now living at that index is a different tab
+      // (e.g. closing tab 0 while a pending windowed-restore tab sits at index
+      // 1 shifts it down to index 0). The setter is what notices that and
+      // kicks off its restore — see the `activeIndex` accessor.
+      let newActive = this.activeIndex;
+      if (newActive > at) {
+        newActive -= 1;
+      } else if (newActive >= this.tabs.length) {
+        newActive = Math.max(0, this.tabs.length - 1);
+      }
+      this.activeIndex = newActive;
+      this.consumeUnlock();
+      // A sticky note whose text was handed over and never saved comes back.
+      if (
+        conv?.saved === false &&
+        conv.origin === 'sticky' &&
+        conv.noteId !== undefined
+      ) {
         try {
           await invoke('convert_release', { noteId: conv.noteId });
         } catch (e) {
           console.error('convert_release failed', e);
         }
       }
+      return true;
+    } finally {
+      this.closingTabs.delete(tab);
     }
-    if (tab === this.windowedConflict) {
-      this.windowedConflict = null;
-    }
-    if (this.rangeBox?.tabId === tab.id) {
-      this.rangeBox = null;
-    }
-    await invoke('delete_note', { id: tab.id });
-    this.releaseTabView(tab.id);
-    this.tabs.splice(index, 1);
-    // Always write `activeIndex`, even when the computed value equals the
-    // current one: closing the active tab can leave the numeric index
-    // unchanged while the tab now living at that index is a different tab
-    // (e.g. closing tab 0 while a pending windowed-restore tab sits at index
-    // 1 shifts it down to index 0). The setter is what notices that and
-    // kicks off its restore — see the `activeIndex` accessor.
-    let newActive = this.activeIndex;
-    if (newActive > index) {
-      newActive -= 1;
-    } else if (newActive >= this.tabs.length) {
-      newActive = Math.max(0, this.tabs.length - 1);
-    }
-    this.activeIndex = newActive;
+  }
+  /** The newest content generation of a windowed tab's session, if it has one. */
+  private generationOf(tab: DocTab): number | undefined {
+    return tab.windowed === undefined
+      ? undefined
+      : this.windowedGenerations.get(tab.windowed.sessionId);
   }
   /** Drop the store entry of every clean tab as this window closes, so the next
    *  launch does not reopen a document the user had already closed. Without it

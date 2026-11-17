@@ -3,6 +3,7 @@
 
 import { invoke } from '@tauri-apps/api/core';
 import type { DocumentWindowState } from './documentWindow.svelte';
+import { sameTabStillActive } from './missingFiles.svelte';
 /** What raises the gate: a dirty tab too large to snapshot ('oversized'), a
  *  snapshot write that was attempted and failed ('unwritable'), or an open
  *  range edit box with changes ('rangeBox'). */
@@ -26,6 +27,10 @@ export interface GateHost {
   /** Whether another dialog of this window must be answered first. While it is,
    *  the prompt waits and is raised again by `resumeDeferred`. */
   promptBlocked?(): boolean;
+  /** Whether another dialog of this window, one that cannot wait behind the
+   *  prompt, is up. The prompt is then called off: the quit or close it guards
+   *  does not go through, and the window stays on its tab. */
+  promptRefused?(): boolean;
 }
 
 type GateWindow = Pick<
@@ -48,6 +53,7 @@ type GateWindow = Pick<
   | 'saveActive'
   | 'saveAs'
   | 'switchTo'
+  | 'tabs'
   | 'windowedPending'
 >;
 /** The gate before a quit, a window close or a tab close that would lose
@@ -74,6 +80,12 @@ export class CloseGate {
   private quitting = false;
   /** A prompt was asked for while another dialog held the window. */
   private deferred = false;
+  /** A prompt is switching to the tab it asks about. */
+  private asking = false;
+  /** The tab a tab close was asked for. */
+  private tabCloseTarget: GateWindow['activeTab'] = null;
+  /** The tab the dialog on screen asks about. */
+  private askedTab: GateWindow['activeTab'] = null;
   /** Callers waiting for the next `flush-cancelled`. */
   private cancelWaiters: (() => void)[] = [];
   /** Called when the gate has no more say: the dialog was cancelled or left
@@ -86,6 +98,10 @@ export class CloseGate {
   private hide(): void {
     this.visible = false;
     this.onDismissed?.();
+  }
+  /** Whether the gate holds the window on its tab: its dialog is up or coming. */
+  get busy(): boolean {
+    return this.visible || this.asking;
   }
 
   private readonly win: GateWindow;
@@ -111,6 +127,10 @@ export class CloseGate {
   /** Show the dialog for the first thing that blocks, or resume the pending
    *  action when nothing does. */
   async prompt(): Promise<void> {
+    if (this.host.promptRefused?.() === true) {
+      this.cancel();
+      return;
+    }
     if (this.host.promptBlocked?.() === true) {
       this.deferred = true;
       return;
@@ -121,6 +141,11 @@ export class CloseGate {
       if (this.continuation === 'close') {
         await this.host.finishWindowClose();
       } else if (this.continuation === 'tab') {
+        // The active tab is no longer the one the close was asked for.
+        if (!sameTabStillActive(this.tabCloseTarget, this.win.activeTab)) {
+          this.hide();
+          return;
+        }
         await this.host.finishTabClose();
       } else {
         await invoke('request_exit');
@@ -128,14 +153,23 @@ export class CloseGate {
       this.onDismissed?.();
       return;
     }
-    await this.win.switchTo(blocking.index);
-    this.reason =
-      blocking.rangeBox === true
-        ? 'rangeBox'
-        : blocking.oversized
-          ? 'oversized'
-          : 'unwritable';
-    this.visible = true;
+    // Taken before the wait: the tabs may shift meanwhile, an index would then
+    // name another one.
+    const asked = this.win.tabs[blocking.index] ?? null;
+    this.asking = true;
+    try {
+      await this.win.switchTo(blocking.index);
+      this.reason =
+        blocking.rangeBox === true
+          ? 'rangeBox'
+          : blocking.oversized
+            ? 'oversized'
+            : 'unwritable';
+      this.askedTab = asked;
+      this.visible = true;
+    } finally {
+      this.asking = false;
+    }
     await this.host.focusWindow();
   }
   /** Whether a prompt is being held back behind another dialog. */
@@ -154,10 +188,21 @@ export class CloseGate {
   /** Closing the active tab, which holds an edit box with changes. */
   async promptTabClose(): Promise<void> {
     this.continuation = 'tab';
+    this.tabCloseTarget = this.win.activeTab;
     await this.prompt();
+  }
+  /** Whether the tab the dialog asks about is still the active one. When not
+   *  (a switch that was under way when the dialog came up), the dialog only
+   *  closes: nothing is written, discarded or closed. */
+  private askedTabActive(): boolean {
+    return sameTabStillActive(this.askedTab, this.win.activeTab);
   }
 
   async save(): Promise<void> {
+    if (!this.askedTabActive()) {
+      this.hide();
+      return;
+    }
     // The oversized gate resaves in place (a dialog only for an untitled tab).
     // A write-failure gate always prompts Save As: the failure is in the
     // snapshot folder, a different location from the tab's own file, but
@@ -194,6 +239,10 @@ export class CloseGate {
   }
 
   async discard(): Promise<void> {
+    if (!this.askedTabActive()) {
+      this.hide();
+      return;
+    }
     if (this.reason === 'rangeBox') {
       this.win.rangeBoxCancel();
     } else if (this.win.activeTab?.windowed !== undefined) {

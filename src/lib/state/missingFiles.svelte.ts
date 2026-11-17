@@ -9,6 +9,7 @@ type MissingWindow = Pick<
   DocumentWindowState,
   | 'activeTab'
   | 'endComposition'
+  | 'holdActive'
   | 'isDirty'
   | 'onConflictClosed'
   | 'onRestored'
@@ -27,6 +28,7 @@ type MissingWindow = Pick<
 /** What it needs from the close gate. */
 type MissingGate = Pick<
   CloseGate,
+  | 'busy'
   | 'held'
   | 'onDismissed'
   | 'onVetoed'
@@ -42,6 +44,17 @@ export interface MissingHost {
   /** Destroy the window, which a held-back quit or close kept open and which
    *  has no tab left. */
   closeEmptyWindow(): Promise<void>;
+  /** Whether a dialog of the window other than the ones this module owns is up
+   *  (a message, a question about a large file, a conversion, a conflict of the
+   *  edit box). */
+  dialogOpen(): boolean;
+}
+/** Whether `active` is the tab `target` was asked about. */
+export function sameTabStillActive(
+  target: object | null | undefined,
+  active: object | null,
+): boolean {
+  return target !== null && target !== undefined && target === active;
 }
 /** A tab, or the range edit box over a tab, whose file is gone. */
 interface Entry {
@@ -73,6 +86,8 @@ export class MissingFiles {
   private keptEmpty = false;
   /** A tab close is waiting for typed input to reach the core. */
   private closing = false;
+  /** The tab the close confirmation is about. */
+  private confirmTarget: MissingWindow['activeTab'] = null;
   private readonly win: MissingWindow;
   private readonly gate: MissingGate;
   private readonly host: MissingHost;
@@ -81,6 +96,7 @@ export class MissingFiles {
     this.win = win;
     this.gate = gate;
     this.host = host;
+    win.holdActive = () => this.tabsLocked();
     win.onRestored = () => {
       void this.check();
     };
@@ -195,6 +211,10 @@ export class MissingFiles {
    *  path, and the edit box. Called when the app comes to the front and once the
    *  window has restored its tabs. */
   async check(): Promise<void> {
+    // Another dialog is up: the next time the app comes to the front looks again.
+    if (this.host.dialogOpen()) {
+      return;
+    }
     this.prune();
     const targets = this.targets();
     if (targets.length === 0) {
@@ -207,6 +227,9 @@ export class MissingFiles {
       });
     } catch (error) {
       console.error('missing_paths failed', error);
+      return;
+    }
+    if (this.host.dialogOpen()) {
       return;
     }
     const missing = new Set(gone);
@@ -235,10 +258,25 @@ export class MissingFiles {
   pending(): MissingItem[] {
     return this.queue.flatMap((entry) => this.resolve(entry) ?? []);
   }
-  /** While the dialog is up the window stays on its tab: nothing switches,
+  /** While a dialog is up the window stays on its tab: nothing switches,
    *  opens or closes a tab. */
   navigationLocked(): boolean {
-    return this.current() !== null;
+    return (
+      this.current() !== null ||
+      this.confirmClose ||
+      this.gate.busy ||
+      this.host.dialogOpen()
+    );
+  }
+  /** The same, and the edit box covers the tabs too. Closing the active tab
+   *  stays possible with the box open: it leads to the box's own question. */
+  tabsLocked(): boolean {
+    return this.navigationLocked() || this.win.rangeBox !== null;
+  }
+  /** Whether a dialog is up that a quit or close must not be raised over. The
+   *  dialog for a missing file is not one: it waits for the answer. */
+  otherDialogUp(): boolean {
+    return this.confirmClose || this.host.dialogOpen();
   }
   /** Make the tab of `item` the active one. False when it is gone, or another
    *  switch got in the way. */
@@ -349,6 +387,18 @@ export class MissingFiles {
     }
     this.closeNow(tab);
   }
+  /** Close the tab at `index` (its close button). It is closed only if it is
+   *  still the active tab once the switch to it has finished. */
+  async requestCloseAt(index: number): Promise<void> {
+    if (this.tabsLocked()) {
+      return;
+    }
+    const target = this.win.tabs[index];
+    await this.win.switchTo(index);
+    if (sameTabStillActive(target, this.win.activeTab)) {
+      this.requestClose();
+    }
+  }
   private async closeWhenSettled(
     tab: NonNullable<MissingWindow['activeTab']>,
   ): Promise<void> {
@@ -357,7 +407,7 @@ export class MissingFiles {
     } finally {
       this.closing = false;
     }
-    if (this.win.activeTab !== tab) {
+    if (this.win.activeTab !== tab || this.navigationLocked()) {
       return;
     }
     this.closeNow(tab);
@@ -369,6 +419,7 @@ export class MissingFiles {
     } else if (box !== null && this.win.rangeBoxDirty()) {
       void this.gate.promptTabClose();
     } else if (this.win.isDirty(tab)) {
+      this.confirmTarget = tab;
       this.confirmClose = true;
     } else {
       void this.host.finishTabClose();
@@ -384,23 +435,46 @@ export class MissingFiles {
     ];
   }
   /** "儲存" in the close confirmation. A cancelled save keeps the tab and the
-   *  dialog. */
+   *  dialog. Text typed while the write was out is saved again before the tab
+   *  closes; a save that fails then keeps the tab too. */
   async confirmSave(): Promise<void> {
-    if (!(await this.win.saveActive())) {
+    const target = this.confirmTarget;
+    if (!sameTabStillActive(target, this.win.activeTab)) {
+      this.confirmClose = false;
+      this.confirmTarget = null;
+      await this.revealCurrent();
       return;
     }
+    do {
+      if (!(await this.win.saveActive())) {
+        return;
+      }
+    } while (
+      target !== null &&
+      this.win.activeTab === target &&
+      this.win.isDirty(target)
+    );
     this.confirmClose = false;
-    await this.host.finishTabClose();
+    this.confirmTarget = null;
+    // `finishTabClose` closes the active tab, which is no longer the saved one.
+    if (this.win.activeTab === target) {
+      await this.host.finishTabClose();
+    }
     await this.revealCurrent();
   }
   /** "不儲存" in the close confirmation. */
   async confirmDiscard(): Promise<void> {
+    const target = this.confirmTarget;
     this.confirmClose = false;
-    await this.host.finishTabClose();
+    this.confirmTarget = null;
+    if (sameTabStillActive(target, this.win.activeTab)) {
+      await this.host.finishTabClose();
+    }
     await this.revealCurrent();
   }
   cancelClose(): void {
     this.confirmClose = false;
+    this.confirmTarget = null;
     void this.revealCurrent();
   }
   /** Open `path` as a tab (the workspace tree, the shell) while the dialog may

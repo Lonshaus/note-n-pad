@@ -143,12 +143,14 @@
     finishTabClose: () => finishTabClose(),
     focusWindow: () => win.setFocus(),
     promptBlocked: () => missing.current() !== null,
+    promptRefused: () => missing.otherDialogUp(),
   });
   // The tabs whose file is gone, and the close confirmation they share a rule
   // with; see MissingFiles.
   const missing: MissingFiles = new MissingFiles(documentWindow, gate, {
     finishTabClose: (keepWindow) => finishTabClose(keepWindow),
     closeEmptyWindow: () => win.destroy(),
+    dialogOpen: () => dialogOpen,
   });
   // The dialog for the first tab whose file is gone, if it is showing.
   const missingItem = $derived(missing.current());
@@ -803,24 +805,38 @@
   // failed scan used to leave the status bar spinning "indexing…" forever
   // with no other sign anything had gone wrong.
   let indexFailed = $state<string | null>(null);
+  // The dialogs that neither the close confirmation, the close gate nor the
+  // missing-file dialog own.
+  const otherDialogs = $derived(
+    pendingLarge !== null ||
+      pendingLongLine !== null ||
+      documentWindow.openFailed !== null ||
+      documentWindow.discardFailed !== null ||
+      documentWindow.restoreUnreadable.length > 0 ||
+      documentWindow.saveFailed !== null ||
+      documentWindow.windowedConflict !== null ||
+      documentWindow.encodingFailed !== null ||
+      revealFailed !== null ||
+      indexFailed !== null,
+  );
   // Any dialog/modal currently up. The automatic focus handoff is suppressed
   // while one is open so a gate/confirm keeps the keyboard.
   const anyModalOpen = $derived(
     missing.confirmClose ||
       missingItem !== null ||
       gate.visible ||
-      pendingLarge !== null ||
-      pendingLongLine !== null ||
       windowedError !== null ||
-      documentWindow.openFailed !== null ||
-      documentWindow.discardFailed !== null ||
-      documentWindow.restoreUnreadable.length > 0 ||
-      documentWindow.saveFailed !== null ||
       documentWindow.rangeBox !== null ||
-      documentWindow.windowedConflict !== null ||
-      documentWindow.encodingFailed !== null ||
-      revealFailed !== null ||
-      indexFailed !== null,
+      otherDialogs,
+  );
+  // A dialog the tabs must not move under: the ones above and the conversion
+  // and edit-box conflict dialogs. Not the close confirmation, the close gate or
+  // the missing-file dialog (MissingFiles judges those itself), the error banner
+  // or the edit box.
+  const dialogOpen = $derived(
+    otherDialogs ||
+      convertController.dialog !== null ||
+      documentWindow.rangeBox?.conflict === true,
   );
   // Hand keyboard focus to the active editor when the window regains focus, so a
   // programmatically opened or restored window types without a click. Large
@@ -1200,12 +1216,12 @@
     }
     switch (action) {
       case 'new-tab':
-        if (!missing.navigationLocked()) {
+        if (!missing.tabsLocked()) {
           void documentWindow.newTab();
         }
         break;
       case 'open':
-        if (!missing.navigationLocked()) {
+        if (!missing.tabsLocked()) {
           void openInThisWindow();
         }
         break;
@@ -1248,7 +1264,11 @@
     // by the time it resolves there is nothing left to look the id up from and
     // its `viewModes` entry would sit there for the life of the window.
     const closing = documentWindow.activeTab;
-    await documentWindow.deleteTab(documentWindow.activeIndex);
+    // A tab that stayed (edited meanwhile, or closed by another call) is left as
+    // it is.
+    if (!(await documentWindow.deleteTab(documentWindow.activeIndex))) {
+      return;
+    }
     if (closing !== null) {
       viewModes.delete(closing.id);
     }
@@ -1287,12 +1307,8 @@
     await invoke('convert_done', { handoffId, tabId }).catch(() => {});
   }
 
-  async function requestCloseTab(index: number): Promise<void> {
-    if (missing.navigationLocked()) {
-      return;
-    }
-    await documentWindow.switchTo(index);
-    closeActive();
+  function requestCloseTab(index: number): Promise<void> {
+    return missing.requestCloseAt(index);
   }
   // Finish closing this window: clean tabs leave the store (a closed document
   // must not reopen on the next launch), dirty ones keep their snapshot, then
@@ -1420,7 +1436,7 @@
         }
       }
       // The box covers the tab bar: the tabs stay as they are until it closes.
-      if (documentWindow.rangeBox !== null || missing.navigationLocked()) {
+      if (missing.tabsLocked()) {
         return;
       }
       const next = shortcutsState.accel('window.next-tab');
@@ -1484,7 +1500,7 @@
     const unlistenSwitchTab = win.listen<number>(
       'workspace-switch-tab',
       (event) => {
-        if (missing.navigationLocked()) {
+        if (missing.tabsLocked()) {
           return;
         }
         const index = documentWindow.tabs.findIndex(
@@ -1500,7 +1516,7 @@
     const unlistenCloseTab = win.listen<number>(
       'workspace-close-tab',
       (event) => {
-        if (missing.navigationLocked()) {
+        if (missing.tabsLocked()) {
           return;
         }
         const index = documentWindow.tabs.findIndex(
@@ -1523,6 +1539,9 @@
     const unlistenFocusTab = win.listen<{ tab_id: string }>(
       'convert-focus-tab',
       (event) => {
+        if (missing.tabsLocked()) {
+          return;
+        }
         const index = documentWindow.tabs.findIndex(
           (t) => t.id === event.payload.tab_id,
         );

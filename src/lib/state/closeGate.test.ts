@@ -21,8 +21,14 @@ const mockSave = vi.mocked(save);
 vi.stubGlobal('window', globalThis);
 
 const SRC = '/tmp/big.log';
-/** What `splice_file` answers: a fingerprint, or the error to reject with. */
-let splice: { fingerprint: { size: number; mtime_ms: number } } | string;
+/** What `splice_file` answers: where it wrote, or the error to reject with. */
+let splice:
+  | {
+      fingerprint: { size: number; mtime_ms: number };
+      writtenStart: number;
+      writtenEnd: number;
+    }
+  | string;
 /** Whether `upsert_note` reaches the disk. */
 let snapshotsWork: boolean;
 
@@ -37,7 +43,7 @@ function backend(): void {
       case 'splice_file':
         return typeof splice === 'string'
           ? Promise.reject(splice)
-          : Promise.resolve(splice.fingerprint);
+          : Promise.resolve(splice);
       case 'upsert_note':
         return snapshotsWork
           ? Promise.resolve(null)
@@ -97,7 +103,11 @@ async function withBox(typed: boolean): Promise<void> {
 }
 
 beforeEach(() => {
-  splice = { fingerprint: { size: 101, mtime_ms: 2 } };
+  splice = {
+    fingerprint: { size: 101, mtime_ms: 2 },
+    writtenStart: 0,
+    writtenEnd: 14,
+  };
   snapshotsWork = true;
   backend();
   win = new DocumentWindowState();
@@ -109,6 +119,12 @@ beforeEach(() => {
   };
   gate = new CloseGate(win, host);
 });
+/** Puts the gate dialog up for the tab at `index`, as its prompt would. */
+function showFor(index: number): void {
+  (gate as unknown as { askedTab: DocTab | null }).askedTab =
+    win.tabs[index] ?? null;
+  gate.visible = true;
+}
 
 describe('a quit with an edit box that has changes', () => {
   it('vetoes the quit first, then shows the box prompt in this window', async () => {
@@ -523,6 +539,36 @@ describe('input still on its way into a windowed editor', () => {
   });
 });
 
+describe('a save that text typed during the write overtook', () => {
+  it('asks about the same tab again instead of letting the quit through', async () => {
+    const huge = 'x'.repeat(SNAPSHOT_CONTENT_MAX + 1);
+    win.tabs.push(
+      tab({ id: 'huge', path: '/tmp/huge.txt', content: Text.of([huge]) }),
+    );
+    win.activeIndex = 0;
+    let release: () => void = () => {};
+    mockInvoke.mockImplementation(((cmd: string) => {
+      if (cmd === 'write_file_encoded') {
+        return new Promise<null>((resolve) => {
+          release = () => resolve(null);
+        });
+      }
+      return Promise.resolve(null);
+    }) as typeof invoke);
+    await gate.onFlushRequest();
+    const saving = gate.save();
+    await Promise.resolve();
+    win.updateContentById('huge', Text.of([huge + 'y']));
+    release();
+    await saving;
+
+    expect(gate.visible).toBe(true);
+    expect(gate.reason).toBe('oversized');
+    expect(win.activeTab?.id).toBe('huge');
+    expect(sent()).not.toContain('request_exit');
+  });
+});
+
 describe('放棄變更 of a windowed tab', () => {
   async function discarding(worked: boolean) {
     win.tabs.push(
@@ -546,7 +592,7 @@ describe('放棄變更 of a windowed tab', () => {
     const prompt = vi.spyOn(gate, 'prompt').mockResolvedValue();
     const vetoed = vi.fn();
     gate.onVetoed = vetoed;
-    gate.visible = true;
+    showFor(0);
     await gate.discard();
     return { discard, prompt, vetoed };
   }
@@ -565,4 +611,198 @@ describe('放棄變更 of a windowed tab', () => {
     expect(vetoed).toHaveBeenCalledTimes(1);
     expect(gate.visible).toBe(false);
   });
+});
+
+const settle = (): Promise<void> => new Promise((r) => setTimeout(r, 0));
+/** A dirty tab too large to snapshot, which the quit gate asks about. */
+function hugeTab(id: string, index: number): DocTab {
+  return tab({
+    id,
+    path: `/tmp/${id}.txt`,
+    content: Text.of(['x'.repeat(SNAPSHOT_CONTENT_MAX + 1)]),
+    tabIndex: index,
+  });
+}
+/** A small tab with changes. */
+function smallTab(id: string, index: number): DocTab {
+  return tab({
+    id,
+    path: `/tmp/${id}.txt`,
+    content: Text.of([`${id} text`]),
+    tabIndex: index,
+  });
+}
+/** Every `command` waits until the returned function is called. */
+function holdCommand(command: string): () => void {
+  let release: () => void = () => {};
+  const held = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  const base = mockInvoke.getMockImplementation()!;
+  mockInvoke.mockImplementation(((cmd: string, args?: unknown) =>
+    cmd === command
+      ? held.then(() => base(cmd, args as Record<string, unknown>))
+      : base(cmd, args as Record<string, unknown>)) as typeof invoke);
+  return () => release();
+}
+
+describe('busy', () => {
+  it('holds from the start of a prompt that switches tabs, through its dialog, until the gate is hidden', async () => {
+    win.tabs.push(tab({}), hugeTab('huge', 1));
+    win.activeIndex = 0;
+    let release: () => void = () => {};
+    win.endComposition = () =>
+      new Promise<void>((resolve) => {
+        release = resolve;
+      });
+    expect(gate.busy).toBe(false);
+    const prompting = gate.onFlushRequest();
+    await settle();
+    expect(gate.visible).toBe(false);
+    expect(gate.busy).toBe(true);
+    release();
+    await prompting;
+    expect(gate.visible).toBe(true);
+    expect(gate.busy).toBe(true);
+    gate.cancel();
+    expect(gate.busy).toBe(false);
+  });
+
+  it('is not left on when the switch throws', async () => {
+    win.tabs.push(tab({}), hugeTab('huge', 1));
+    win.activeIndex = 0;
+    vi.spyOn(win, 'switchTo').mockRejectedValue(new Error('boom'));
+    await expect(gate.onFlushRequest()).rejects.toThrow('boom');
+    expect(gate.busy).toBe(false);
+  });
+
+  it('holds while the save writes', async () => {
+    win.tabs.push(hugeTab('huge', 0));
+    win.activeIndex = 0;
+    await gate.onFlushRequest();
+    const release = holdCommand('write_file_encoded');
+    const saving = gate.save();
+    await settle();
+    expect(gate.busy).toBe(true);
+    release();
+    await saving;
+    expect(gate.busy).toBe(false);
+  });
+});
+
+describe('a tab close asked of a tab the window has left', () => {
+  async function boxAndOther(): Promise<void> {
+    await withBox(true);
+    win.tabs.push(tab({ id: 'other', tabIndex: 1 }));
+  }
+
+  it.each([
+    ['the tab is still the active one', false],
+    ['another tab was switched to during the write', true],
+  ])('after the box was saved: %s', async (_name, switchAway) => {
+    await boxAndOther();
+    const dismissed = vi.fn();
+    gate.onDismissed = dismissed;
+    await gate.promptTabClose();
+    const release = holdCommand('splice_file');
+    const saving = gate.save();
+    await settle();
+    if (switchAway) {
+      await win.switchTo(1);
+    }
+    release();
+    await saving;
+
+    expect(host.finishTabClose).toHaveBeenCalledTimes(switchAway ? 0 : 1);
+    expect(gate.visible).toBe(false);
+    expect(dismissed).toHaveBeenCalledTimes(1);
+    expect(win.tabs).toHaveLength(2);
+  });
+
+  it('closes nothing when the prompt is raised again after a switch', async () => {
+    await boxAndOther();
+    const dismissed = vi.fn();
+    gate.onDismissed = dismissed;
+    let blocked = true;
+    host.promptBlocked = () => blocked;
+    await gate.promptTabClose();
+    expect(gate.held).toBe(true);
+    win.rangeBoxCancel();
+    await win.switchTo(1);
+    blocked = false;
+    await gate.resumeDeferred();
+
+    expect(host.finishTabClose).not.toHaveBeenCalled();
+    expect(gate.visible).toBe(false);
+    expect(dismissed).toHaveBeenCalledTimes(1);
+    expect(win.tabs).toHaveLength(2);
+  });
+
+  it('does not apply to a quit or a window close', async () => {
+    win.tabs.push(hugeTab('huge', 0));
+    win.activeIndex = 0;
+    await gate.onFlushRequest();
+    await gate.discard();
+    expect(sent()).toContain('request_exit');
+  });
+});
+
+describe('a dialog asks about the tab it was raised for', () => {
+  it.each([['discard'], ['save']] as const)(
+    'does not %s another tab that was switched to while a quit asks',
+    async (action) => {
+      win.tabs.push(hugeTab('A', 0), smallTab('B', 1));
+      win.activeIndex = 0;
+      await gate.onFlushRequest();
+      expect(gate.visible).toBe(true);
+      await win.switchTo(1);
+      await gate[action]();
+
+      expect(win.tabs[1]!.content.toString()).toBe('B text');
+      expect(win.isDirty(win.tabs[1]!)).toBe(true);
+      expect(sent()).not.toContain('write_file_encoded');
+      expect(sent()).not.toContain('request_exit');
+      expect(gate.visible).toBe(false);
+    },
+  );
+
+  it.each([['discard'], ['save']] as const)(
+    'does not %s the edit box of a tab close after another tab was switched to',
+    async (action) => {
+      await withBox(true);
+      win.tabs.push(tab({ id: 'other', tabIndex: 1 }));
+      await gate.promptTabClose();
+      await win.switchTo(1);
+      await gate[action]();
+
+      expect(sent()).not.toContain('splice_file');
+      expect(win.rangeBox).not.toBeNull();
+      expect(win.rangeBoxDirty()).toBe(true);
+      expect(host.finishTabClose).not.toHaveBeenCalled();
+      expect(gate.visible).toBe(false);
+    },
+  );
+
+  it.each([['discard'], ['save']] as const)(
+    'does not %s the tab that moved into its place while a switch waited',
+    async (action) => {
+      win.tabs.push(smallTab('X', 0), hugeTab('A', 1), smallTab('B', 2));
+      win.activeIndex = 0;
+      win.updateActiveContent(Text.of(['X typed']));
+      const release = holdCommand('upsert_note');
+      const asking = gate.onFlushRequest();
+      await settle();
+      expect(gate.busy).toBe(true);
+      await win.deleteTab(0);
+      release();
+      await asking;
+      expect(win.activeTab?.id).toBe('B');
+      await gate[action]();
+
+      expect(win.activeTab?.content.toString()).toBe('B text');
+      expect(win.isDirty(win.activeTab!)).toBe(true);
+      expect(sent()).not.toContain('write_file_encoded');
+      expect(gate.visible).toBe(false);
+    },
+  );
 });
