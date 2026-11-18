@@ -9,6 +9,7 @@ import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { Text } from '@codemirror/state';
 import { invoke } from '@tauri-apps/api/core';
 import type { NoteSnapshot } from './stickyNote.svelte';
+import { toPayload } from '../util/tabPayload';
 import { settingsState } from './settings.svelte';
 import { editionState } from './edition.svelte';
 import {
@@ -213,6 +214,19 @@ function parkComposition(): { release: () => void; parked: () => boolean } {
     return ended;
   };
   return { release: () => release(), parked: () => parked };
+}
+
+/** Make `win.tabs` store a proxy of what it is given, as a `$state` array does,
+ *  so the raw object is no longer the stored one. */
+function proxyStore(): void {
+  const wrap = (items: DocTab[]): DocTab[] =>
+    items.map((item) => new Proxy(item, {}));
+  const tabs = win.tabs;
+  const push = tabs.push.bind(tabs);
+  const splice = tabs.splice.bind(tabs);
+  tabs.push = (...items: DocTab[]) => push(...wrap(items));
+  tabs.splice = ((start: number, remove: number, ...items: DocTab[]) =>
+    splice(start, remove, ...wrap(items))) as typeof tabs.splice;
 }
 
 /** The id of the active tab after every write of `activeIndex`. */
@@ -719,6 +733,51 @@ describe('a tab is held by identity across an await', () => {
 
     expect(win.activeTab?.path).toBe('/p/huge.log');
     expect(win.tabs[0]?.windowed).toBeUndefined();
+  });
+
+  it('confirmLargeOpen unlocks its tab when the window stores a proxy of it', async () => {
+    await windowOf('a');
+    proxyStore();
+    backend({
+      stat_file: { size: SIZE },
+      windowed_open: {
+        session_id: 9,
+        total_bytes: 1,
+        total_lines: 1,
+        fingerprint: { size: 1, mtime_ms: 1 },
+      },
+    });
+    await win.openTab('/p/huge.log');
+
+    win.confirmLargeOpen(true);
+    await until(() => win.tabs.length === 2);
+    await until(() => win.tabs[1]?.windowed !== undefined);
+
+    expect(win.activeTab?.path).toBe('/p/huge.log');
+    expect(win.tabs[1]?.large).toBeUndefined();
+  });
+
+  it('acceptIncoming activates the tab and returns it when the window stores a proxy of it', async () => {
+    await windowOf('a', 'b');
+    proxyStore();
+    const sender = tab('x', 40);
+    const payload = JSON.parse(
+      JSON.stringify(
+        toPayload(sender, {
+          editor: null,
+          scroll: null,
+          view: null,
+          viewMode: null,
+        }),
+      ),
+    ) as Parameters<typeof win.holdIncoming>[1];
+    win.holdIncoming(9, payload, null);
+
+    const accepted = win.acceptIncoming(9, true);
+    await until(() => win.activeTab?.id === 'x');
+
+    expect(accepted).toBe(win.tabs.find((t) => t.id === 'x'));
+    expect(win.tabs.indexOf(accepted!)).toBe(win.activeIndex);
   });
 
   it('confirmLargeOpen leaves another large tab alone when the switch lost', async () => {

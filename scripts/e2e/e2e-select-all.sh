@@ -702,7 +702,7 @@ expected_order() {
   local dap="$1" edition="$2" list
   list="Appearance|Show icon in the status bar|Snapshot location|Open files in"
   if [ "$edition" = "full" ]; then
-    list="$list|Open the workspace at startup"
+    list="$list|Open the workspace at startup|Show hidden files"
   fi
   list="$list|Show local images and clickable links in preview"
   if [ "$edition" = "full" ]; then

@@ -48,6 +48,7 @@
   } from '../util/clipRouting';
   import {
     movesSelection,
+    nothingSelectableBefore,
     wholeFileAfter,
     type SelectAllEntry,
     type WholeFileEvent,
@@ -738,6 +739,43 @@
     sel.addRange(next);
     updateWholeFile({ type: 'selectAll', entry });
   }
+  function notSelectable(node: Node): boolean {
+    const el = node.parentElement;
+    if (el === null) {
+      return true;
+    }
+    const style = getComputedStyle(el);
+    return style.userSelect === 'none' || style.webkitUserSelect === 'none';
+  }
+  // Whether nothing selectable lies between the start of the document and the
+  // range's start (the tab bar is not selectable, so a select-all starts inside
+  // the viewer).
+  function startsBeforeViewer(range: Range): boolean {
+    const before: { text: string; unselectable: boolean }[] = [];
+    const walker = document.createTreeWalker(
+      document.body,
+      NodeFilter.SHOW_TEXT,
+    );
+    for (let n = walker.nextNode(); n !== null; n = walker.nextNode()) {
+      const text = n.textContent ?? '';
+      if (range.comparePoint(n, text.length) >= 0) {
+        break;
+      }
+      before.push({ text, unselectable: notSelectable(n) });
+    }
+    const first = range.startContainer;
+    return nothingSelectableBefore(
+      before,
+      first.nodeType === Node.TEXT_NODE
+        ? {
+            text: first.textContent ?? '',
+            offset: range.startOffset,
+            unselectable: notSelectable(first),
+          }
+        : null,
+    );
+  }
+  let pointerSelection = false;
   // A native select-all (keyboard) starts before the viewer and ends at or
   // after the last rendered row; narrow it to the rows fully on screen.
   function onSelectionChange(): void {
@@ -763,7 +801,9 @@
         ? (endNode.textContent ?? '').length
         : endNode.childNodes.length;
     if (
-      range.compareBoundaryPoints(Range.START_TO_START, root) >= 0 ||
+      (range.compareBoundaryPoints(Range.START_TO_START, root) >= 0 &&
+        // A pointer selection keeps the start-before-the-viewer rule.
+        (pointerSelection || !startsBeforeViewer(range))) ||
       range.comparePoint(endNode, endOffset) !== 0
     ) {
       return;
@@ -846,6 +886,14 @@
     e.preventDefault();
     e.clipboardData.setData('text/plain', joinSelectedRows(rows));
   }
+  function onPointerDown(e: PointerEvent): void {
+    if (e.button === 0) {
+      pointerSelection = true;
+    }
+  }
+  function onContextMenu(): void {
+    pointerSelection = false;
+  }
   // A click in the viewer starts a new selection.
   function onMouseDown(e: MouseEvent): void {
     if (e.target instanceof Node && wrap?.contains(e.target) === true) {
@@ -856,6 +904,12 @@
   // menu accelerator (it never reaches this listener), so DocumentApp routes it
   // to `openSearch` instead.
   function onWindowKeydown(e: KeyboardEvent): void {
+    if (
+      (platform.isMacOS ? e.metaKey : e.ctrlKey) &&
+      (e.key === 'a' || e.key === 'A' || e.code === 'KeyA' || e.keyCode === 65)
+    ) {
+      pointerSelection = false;
+    }
     if (movesSelection(e.key)) {
       updateWholeFile({ type: 'key' });
     }
@@ -1039,6 +1093,8 @@
     // Only mounted while a large tab is active, so this shortcut never fires in
     // the normal editor (which has no LargeFileView).
     window.addEventListener('keydown', onWindowKeydown);
+    document.addEventListener('pointerdown', onPointerDown, true);
+    document.addEventListener('contextmenu', onContextMenu, true);
     document.addEventListener('mousedown', onMouseDown);
     document.addEventListener('selectionchange', onSelectionChange);
     document.addEventListener('copy', onCopy);
@@ -1141,6 +1197,8 @@
       destroyed = true;
       observer?.disconnect();
       window.removeEventListener('keydown', onWindowKeydown);
+      document.removeEventListener('pointerdown', onPointerDown, true);
+      document.removeEventListener('contextmenu', onContextMenu, true);
       document.removeEventListener('mousedown', onMouseDown);
       document.removeEventListener('selectionchange', onSelectionChange);
       document.removeEventListener('copy', onCopy);

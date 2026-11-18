@@ -386,7 +386,9 @@ if [ "$BIG_OPENED" = "true" ]; then
   check "and it still shows the header text" "$(cell_value "$DL" 0 0)" "col a"
   evl "$DL" "__auto.setHeaderRow(false)" >/dev/null
   evl "$DL" "__auto.closeActiveTab()" >/dev/null
-  sleep 2
+  # The edits above raise the close confirmation; small.csv would open behind it.
+  e2e_wait_eval "$DL" "String(__auto.answerCloseConfirm('discard'))" "true"
+  e2e_wait_eval "$DL" "String(__auto.getTabs().some((t)=>(t.path||'').endsWith('big.csv')))" "false"
 else
   echo "SKIP: B-F need the 270k table, which never opened"
 fi

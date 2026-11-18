@@ -2294,8 +2294,10 @@ export class DocumentWindowState {
     this.incoming.delete(t);
     const empty = this.activeTab === null;
     this.insertByOrder(tab, copy.renumber);
+    // The $state array stores a proxy of `tab`: identity checks need the stored one.
+    const stored = this.tabs.find((t) => t.id === tab.id) ?? tab;
     if (activate && !empty) {
-      void this.switchTo(this.tabs.indexOf(tab));
+      void this.switchTo(this.tabs.indexOf(stored));
     }
     if (copy.renumber) {
       this.tabs.forEach((other, i) => {
@@ -2303,9 +2305,9 @@ export class DocumentWindowState {
       });
       void Promise.all(this.tabs.map((other) => this.upsertTab(other)));
     } else {
-      void this.upsertTab(tab);
+      void this.upsertTab(stored);
     }
-    return tab;
+    return stored;
   }
   cycle(delta: number): void {
     const count = this.tabs.length;
@@ -2625,27 +2627,33 @@ export class DocumentWindowState {
     };
     this.tabs.push(tab);
     const index = this.tabs.length - 1;
+    // The $state array stores a proxy of `tab`: identity checks need the stored one.
+    const shown = this.tabs[index]!;
     void (async (): Promise<void> => {
       await this.switchTo(index, true);
       try {
-        tab.readOnlyFile = !(await invoke<boolean>('path_writable', {
-          path: tab.path,
+        shown.readOnlyFile = !(await invoke<boolean>('path_writable', {
+          path: shown.path,
         }));
       } catch {
-        tab.readOnlyFile = false;
+        shown.readOnlyFile = false;
       }
-      await this.upsertTab(tab);
+      await this.upsertTab(shown);
       // Edit choice: unlock straight into in-place editing right after the tab
       // opens, so an editable large file lands the user directly in edit mode. A
       // non-UTF-8 or oversized file silently stays in the read-only view (the tab
       // lock explains why). ponytail: reuses the in-place unlock path, no second
       // open route.
-      if (edit && tab.large !== undefined && tab.large.size < LARGE_EDIT_MAX) {
+      if (
+        edit &&
+        shown.large !== undefined &&
+        shown.large.size < LARGE_EDIT_MAX
+      ) {
         // Only the active tab can be unlocked; a tab held back unlocks once shown.
-        if (this.activeTab === tab) {
-          await this.unlockLargeTab(tab, 0);
+        if (this.activeTab === shown) {
+          await this.unlockLargeTab(shown, 0);
         } else {
-          this.unlockWhenShown.add(tab.id);
+          this.unlockWhenShown.add(shown.id);
         }
       }
     })();
