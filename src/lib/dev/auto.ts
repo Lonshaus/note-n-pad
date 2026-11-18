@@ -182,6 +182,8 @@ export interface DocumentHooks {
   openTabSettled: (path: string) => Promise<void>;
   newTab: () => void;
   closeActiveTab: () => void;
+  /** Answer the close confirmation when it is up; false when it was not. */
+  answerCloseConfirm: (choice: 'save' | 'discard' | 'cancel') => boolean;
   /** `openNormal` swallows `loadTab`'s exception and only sets this, so a
    *  failed open is otherwise indistinguishable from no open at all. */
   openFailed: () => string | null;

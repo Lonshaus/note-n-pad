@@ -1948,6 +1948,19 @@
           openTabSettled: (p: string) => documentWindow.openTab(p),
           newTab: () => void documentWindow.newTab(),
           closeActiveTab: () => closeActive(),
+          answerCloseConfirm: (choice: 'save' | 'discard' | 'cancel') => {
+            if (!missing.confirmClose) {
+              return false;
+            }
+            if (choice === 'save') {
+              void missing.confirmSave();
+            } else if (choice === 'discard') {
+              void missing.confirmDiscard();
+            } else {
+              missing.cancelClose();
+            }
+            return true;
+          },
           openFailed: () => documentWindow.openFailed,
           toggleLineEnding: () => documentWindow.toggleLineEnding(),
           setEncoding: (label: string) =>

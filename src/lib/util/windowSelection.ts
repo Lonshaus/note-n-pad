@@ -457,3 +457,19 @@ export function isNativeSelectAll(s: {
     s.to >= s.viewportTo
   );
 }
+/** Whether nothing selectable lies before a selection's start: every text node
+ *  wholly before it, and the part of the start's own text node before its
+ *  offset (`start`, null when the start is not in a text node), is whitespace
+ *  only or not user-selectable. */
+export function nothingSelectableBefore(
+  before: readonly { text: string; unselectable: boolean }[],
+  start: { text: string; offset: number; unselectable: boolean } | null,
+): boolean {
+  const inert = (text: string, unselectable: boolean): boolean =>
+    unselectable || text.trim() === '';
+  return (
+    before.every((node) => inert(node.text, node.unselectable)) &&
+    (start === null ||
+      inert(start.text.slice(0, start.offset), start.unselectable))
+  );
+}

@@ -516,22 +516,22 @@ open_fresh() {
   evl "$DL" "__t.focus()" >/dev/null
   e2e_wait_eval "$DL" "String(document.activeElement===__t.content())" "true"
 }
-# Close every tab but the first, whatever they hold: changes are discarded first.
+# Close every tab but the first: discard the active one, answer its prompts, wait until it is gone.
 back_to_seed() {
-  local n now
+  local n
   n=$(tab_count)
   while [ "$n" -gt 1 ]; do
-    evl "$DL" "(async()=>{if(__auto.isWindowedTab()){await __auto.windowedDiscard();}__auto.closeActiveTab();})();1" >/dev/null
-    sleep 2
-    if [ "$(e2e_read "$DL" "String(__auto.oversizedGateVisible())")" = "true" ]; then
-      evl "$DL" "__auto.oversizedGateDiscard()" >/dev/null
-      sleep 1
-    fi
-    now=$(tab_count)
-    if [ "$now" = "$n" ]; then
+    evl "$DL" "(async()=>{window.__bts='run';window.__btsId=null;try{window.__btsId=__auto.getTabs().find((t)=>t.active).id;if(__auto.isWindowedTab()){await __auto.windowedDiscard();}if(__auto.getTabs().some((t)=>t.active && t.id===window.__btsId)){__auto.closeActiveTab();}}finally{window.__bts='done';}})();1" >/dev/null
+    if ! e2e_wait_eval "$DL" "String(window.__bts)" "done"; then
       break
     fi
-    n=$now
+    if [ "$(e2e_read "$DL" "String(window.__btsId!==null)")" != "true" ]; then
+      break
+    fi
+    if ! e2e_wait_eval "$DL" "(__auto.answerCloseConfirm('discard'),__auto.oversizedGateVisible()&&__auto.oversizedGateDiscard(),String(!__auto.getTabs().some((t)=>t.id===window.__btsId)))" "true"; then
+      break
+    fi
+    n=$(tab_count)
   done
 }
 # One diagnostic line: shortened in the log, whole in $DIAG_LOG.

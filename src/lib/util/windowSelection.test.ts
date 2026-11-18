@@ -15,6 +15,7 @@ import {
   isNativeSelectAll,
   movedEnds,
   movesSelection,
+  nothingSelectableBefore,
   needsGlobalOp,
   queuedClipboardAction,
   queuedSelectEnds,
@@ -956,5 +957,60 @@ describe('a window with a part of a line not loaded', () => {
       expect(!coreOp(sel(0, 0, 5000, 0), holes(null))).toBe(false);
       expect(!coreOp(plain, holes(plain))).toBe(true);
     });
+  });
+});
+
+describe('nothingSelectableBefore', () => {
+  // The span before row 0 of the viewer: body whitespace, the tab bar, the
+  // space between the tab bar and the body, row 0's gutter number, its space.
+  const before = [
+    { text: '\n    ', unselectable: false },
+    { text: 'a.log', unselectable: true },
+    { text: ' ', unselectable: false },
+    { text: '1', unselectable: true },
+    { text: ' ', unselectable: false },
+  ];
+
+  it('is true for a select-all starting at the start of row 0', () => {
+    expect(
+      nothingSelectableBefore(before, {
+        text: 'abc',
+        offset: 0,
+        unselectable: false,
+      }),
+    ).toBe(true);
+  });
+
+  it('is false when selectable text of the start node lies before the start', () => {
+    expect(
+      nothingSelectableBefore(before, {
+        text: 'abc',
+        offset: 2,
+        unselectable: false,
+      }),
+    ).toBe(false);
+  });
+
+  it('is false when a selectable node lies before an element start', () => {
+    expect(
+      nothingSelectableBefore(
+        [...before, { text: 'abc', unselectable: false }],
+        null,
+      ),
+    ).toBe(false);
+  });
+
+  it('is true when nothing but the span lies before an element start', () => {
+    expect(nothingSelectableBefore(before, null)).toBe(true);
+    expect(nothingSelectableBefore([], null)).toBe(true);
+  });
+
+  it('ignores a selectable whitespace-only node', () => {
+    expect(
+      nothingSelectableBefore(
+        [...before, { text: '\t\n', unselectable: false }],
+        null,
+      ),
+    ).toBe(true);
   });
 });
