@@ -486,6 +486,7 @@ describe('tabs opened while full, after the edition turns lite', () => {
       encoding: 'UTF-8',
       lossy: false,
       tabIndex: 9,
+      order: 9,
       windowed: {
         sessionId: 5,
         totalBytes: 10,
@@ -609,7 +610,9 @@ describe('unlocking a large-file tab', () => {
   it('in lite asks the core for nothing and records no refusal', async () => {
     await onLargeTab();
     editionState.lite = true;
-    expect(await documentWindow.unlockLargeTab(0)).toBeNull();
+    expect(
+      await documentWindow.unlockLargeTab(documentWindow.activeTab!, 0),
+    ).toBeNull();
     expect(opens()).toBe(0);
     const tab = documentWindow.activeTab!;
     expect(tab.large).toEqual({ size: SIZE });
@@ -620,9 +623,11 @@ describe('unlocking a large-file tab', () => {
   it('works again, from a clean lock, once the edition is full', async () => {
     await onLargeTab();
     editionState.lite = true;
-    await documentWindow.unlockLargeTab(0);
+    await documentWindow.unlockLargeTab(documentWindow.activeTab!, 0);
     editionState.lite = false;
-    expect(await documentWindow.unlockLargeTab(3)).toBeNull();
+    expect(
+      await documentWindow.unlockLargeTab(documentWindow.activeTab!, 3),
+    ).toBeNull();
     expect(opens()).toBe(1);
     const tab = documentWindow.activeTab!;
     expect(tab.large).toBeUndefined();
@@ -639,14 +644,14 @@ describe('unlocking a large-file tab', () => {
         );
       },
     });
-    await documentWindow.unlockLargeTab(0);
+    await documentWindow.unlockLargeTab(documentWindow.activeTab!, 0);
     expect(opens()).toBe(1);
     expect(documentWindow.activeTab?.large?.unlockRefused).toBeUndefined();
   });
 
   it('still records a refusal that is about the file, in full', async () => {
     await onLargeTab({ windowed_open: () => Promise.reject('not-utf8') });
-    await documentWindow.unlockLargeTab(0);
+    await documentWindow.unlockLargeTab(documentWindow.activeTab!, 0);
     expect(documentWindow.activeTab?.large?.unlockRefused).toBeDefined();
   });
 });
@@ -718,6 +723,7 @@ describe('discarding a dirty windowed tab after the edition turned lite', () => 
       encoding: 'UTF-8',
       lossy: false,
       tabIndex: 9,
+      order: 9,
       windowed: {
         sessionId: 5,
         totalBytes: 10,
@@ -754,7 +760,7 @@ describe('a refusal that arrives before the edition-changed event', () => {
     documentWindow.activeIndex = documentWindow.tabs.findIndex(
       (t) => t.id === 'large',
     );
-    await documentWindow.unlockLargeTab(0);
+    await documentWindow.unlockLargeTab(documentWindow.activeTab!, 0);
     expect(documentWindow.activeTab?.large?.unlockRefused).toBeUndefined();
   });
 });

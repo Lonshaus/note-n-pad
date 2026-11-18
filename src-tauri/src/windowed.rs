@@ -1699,6 +1699,37 @@ pub fn windowed_index(
   );
   Ok(snapshot)
 }
+/// What a session holds now, for a window that takes over a tab: whether it has
+/// unsaved changes and its size.
+#[derive(Serialize, Debug, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionStats {
+  pub dirty: bool,
+  pub total_bytes: u64,
+  pub total_lines: u64,
+}
+/// Core of `windowed_stats`.
+fn stats_core(state: &WindowedState, session_id: u64) -> Result<SessionStats, String> {
+  let map = state.lock_idle(session_id)?;
+  let session = map
+    .get(&session_id)
+    .ok_or_else(|| UNKNOWN_SESSION.to_string())?;
+  let stats = session.stats();
+  Ok(SessionStats {
+    dirty: !stats.clean,
+    total_bytes: stats.total_bytes,
+    total_lines: stats.total_lines,
+  })
+}
+/// A session's dirty flag and totals, waiting for a running replace-all as every
+/// read does.
+#[tauri::command(async)]
+pub fn windowed_stats(
+  state: State<WindowedState>,
+  session_id: u64,
+) -> Result<SessionStats, String> {
+  stats_core(&state, session_id)
+}
 /// Read the line window `[start_line, end_line)` (0-based, end exclusive) of a
 /// session, clamping to the current line range. Returns the window text plus the
 /// byte range it spans and the current global statistics. The content must be
@@ -10861,6 +10892,7 @@ mod heavy_io_command_threading_tests {
     "windowed_open_converted",
     "windowed_reopen_converted",
     "windowed_set_encoding",
+    "windowed_stats",
   ];
 
   #[test]
@@ -15033,6 +15065,29 @@ mod converted_tests {
     rig.state.sessions.lock().unwrap().clear();
     rig.open(TEXT, Some(&target), "UTF-8", false, false);
     assert!(rig.with(|s| s.clean()));
+  }
+
+  #[test]
+  fn session_stats_say_whether_it_is_dirty_and_how_big_it_is() {
+    let rig = Rig::new();
+    let target = rig.target("a.txt");
+    rig.open(TEXT, Some(&target), "UTF-8", false, false);
+    let clean = stats_core(&rig.state, ID).unwrap();
+    assert!(!clean.dirty);
+    assert_eq!(clean.total_bytes, TEXT.len() as u64);
+    assert_eq!(clean.total_lines, 4);
+    rig.type_at_start("x");
+    let typed = stats_core(&rig.state, ID).unwrap();
+    assert!(typed.dirty);
+    assert_eq!(typed.total_bytes, TEXT.len() as u64 + 1);
+    assert_eq!(
+      serde_json::to_string(&typed).unwrap(),
+      format!(
+        r#"{{"dirty":true,"totalBytes":{},"totalLines":{}}}"#,
+        typed.total_bytes, typed.total_lines
+      )
+    );
+    assert_eq!(stats_core(&rig.state, 99), Err(UNKNOWN_SESSION.to_string()));
   }
 
   #[test]

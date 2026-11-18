@@ -36,6 +36,7 @@ function tab(id: string, path: string, over: Partial<DocTab> = {}): DocTab {
     encoding: 'UTF-8',
     lossy: false,
     tabIndex: 0,
+    order: 0,
     ...over,
   };
 }

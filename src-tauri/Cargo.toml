@@ -67,6 +67,8 @@ objc2-app-kit = { version = "0.3.2", features = [
   "NSFontManager",
   "NSPasteboard",
   "NSPasteboardItem",
+  "NSWindow",
+  "NSScreen",
 ] }
 objc2-foundation = { version = "0.3.2", features = [
   "NSArray",
@@ -94,6 +96,7 @@ windows-sys = { version = "0.60", features = [
   "Win32_Security",
   "Win32_Security_Authorization",
   "Win32_Graphics_Gdi",
+  "Win32_Graphics_Dwm",
   "Win32_System_DataExchange",
   "Win32_System_Memory",
 ] }

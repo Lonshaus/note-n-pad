@@ -109,6 +109,27 @@
   import { pasteLocks } from './lib/util/pasteLock';
   import { shortcutsState } from './lib/state/shortcuts.svelte';
   import { matchWindowShortcut } from './lib/util/windowShortcut';
+  import {
+    IDLE,
+    dragStep,
+    slideOffset,
+    type CancelReason,
+    type DragInput,
+    type DragOutcome,
+    type DragState,
+    type TabBarGeometry,
+  } from './lib/util/tabDrag';
+  import { closeDocumentWindow } from './lib/state/windowClose';
+  import { IncomingTransfers } from './lib/state/incomingTransfer.svelte';
+  import { menuActionAllowed } from './lib/util/menuActionGate';
+  import {
+    QUEUED_TRANSFER,
+    TRANSFER_EVENT,
+    type TransferEventPayload,
+  } from './lib/util/tabTransferWire';
+  import type { PasteLock } from './lib/util/pasteLock';
+  import type { ScrollRecord } from './lib/editor/editorSeed';
+  import type { EditorState } from '@codemirror/state';
   import { settleViewComposition } from './lib/editor/composition';
   import { isSaveKey } from './lib/editor/imeShortcuts';
   import type { EditorView } from '@codemirror/view';
@@ -135,13 +156,16 @@
   const initialTab = parseInitialTab(params.get('tab'));
   // A window made by New Window starts with one blank tab.
   const startBlank = params.get('blank') === '1';
+  // A window made for a tab dropped outside every window: it shows itself once
+  // the tab is in it, and closes if it never gets it.
+  const receive = params.get('receive') === '1';
   // The gate before a quit, a window close or a tab close that would lose what no
   // snapshot can carry; see CloseGate. Its host callbacks are function
   // declarations below, so they are ready by the time a handshake runs.
   const gate: CloseGate = new CloseGate(documentWindow, {
     label: win.label,
     finishWindowClose: () => finishWindowClose(),
-    finishTabClose: () => finishTabClose(),
+    finishTabClose: (tab, keepWindow) => finishTabClose(tab, keepWindow),
     focusWindow: () => win.setFocus(),
     promptBlocked: () => missing.current() !== null,
     promptRefused: () => missing.otherDialogUp(),
@@ -149,8 +173,8 @@
   // The tabs whose file is gone, and the close confirmation they share a rule
   // with; see MissingFiles.
   const missing: MissingFiles = new MissingFiles(documentWindow, gate, {
-    finishTabClose: (keepWindow) => finishTabClose(keepWindow),
-    closeEmptyWindow: () => win.destroy(),
+    finishTabClose: (tab, keepWindow) => finishTabClose(tab, keepWindow),
+    closeEmptyWindow: () => closeThisWindow(),
     dialogOpen: () => dialogOpen,
   });
   // The dialog for the first tab whose file is gone, if it is showing.
@@ -351,14 +375,26 @@
     } catch (err) {
       console.warn('launch_window_collapsing failed', err);
     }
-    await win.destroy();
+    await closeThisWindow();
+  }
+  // Close this window. The transfers it has are settled first, and the close is
+  // one: asked for twice it is still one.
+  let windowClosing: Promise<void> | null = null;
+  function closeThisWindow(): Promise<void> {
+    windowClosing ??= closeDocumentWindow(documentWindow, () =>
+      win.destroy(),
+    ).catch((error: unknown) => {
+      windowClosing = null;
+      throw error;
+    });
+    return windowClosing;
   }
 
   function onLargeCancel(): void {
     documentWindow.cancelLargeOpen();
     // A window opened solely for this file has no other tab; close it rather
     // than leave an empty shell.
-    if (documentWindow.tabs.length === 0) {
+    if (documentWindow.isEmpty) {
       void collapseWindow();
     }
   }
@@ -368,7 +404,7 @@
 
   function onLongLineCancel(): void {
     documentWindow.cancelLongLineOpen();
-    if (documentWindow.tabs.length === 0) {
+    if (documentWindow.isEmpty) {
       void collapseWindow();
     }
   }
@@ -376,7 +412,7 @@
   // that could not be read has nothing left to show once the report is closed.
   function onOpenFailedClose(): void {
     documentWindow.dismissOpenFailed();
-    if (documentWindow.tabs.length === 0) {
+    if (documentWindow.isEmpty) {
       void collapseWindow();
     }
   }
@@ -384,8 +420,8 @@
   // left once the report is closed.
   function onRestoreUnreadableClose(): void {
     documentWindow.dismissRestoreUnreadable();
-    if (documentWindow.tabs.length === 0) {
-      void win.destroy();
+    if (documentWindow.isEmpty) {
+      void closeThisWindow();
     }
   }
   // Unlike the failed-open report above, the tab whose encoding change failed
@@ -431,6 +467,7 @@
       return Promise.resolve(null);
     }
     return documentWindow.unlockLargeTab(
+      tab,
       Math.max(0, largeStatus.firstLine - 1),
     );
   }
@@ -456,7 +493,11 @@
     }
     if (i !== documentWindow.activeIndex) {
       await documentWindow.switchTo(i);
-      await documentWindow.unlockLargeTab(0);
+      // Another switch or a reorder may have won while this one waited.
+      if (documentWindow.activeTab !== tab) {
+        return;
+      }
+      await documentWindow.unlockLargeTab(tab, 0);
     } else {
       await unlockActiveLarge();
     }
@@ -568,7 +609,7 @@
   );
 
   function setViewMode(mode: ViewMode): void {
-    if (active === null) {
+    if (active === null || active.transferring === true) {
       return;
     }
     const leavingTable = activeViewMode === 'table' && mode === 'source';
@@ -691,6 +732,11 @@
   // by the editor's keymap), so this fallback must never steal it. Select All
   // leaves a focused text field (a cell being edited) to select its own text.
   function onWindowKeydown(e: KeyboardEvent): void {
+    if (e.key === 'Escape' && dragState.phase !== 'idle') {
+      e.preventDefault();
+      cancelDrag('escape');
+      return;
+    }
     if (!overlayShown || e.defaultPrevented || active?.windowed !== undefined) {
       return;
     }
@@ -793,6 +839,13 @@
   // global state. The editor stays mounted (hidden) while a windowed or large
   // tab is active, so every use goes through `liveView`.
   let heldView: EditorView | null = null;
+  // The editor component, for what the window state asks of it when a tab is
+  // frozen for a move to another window.
+  let editorRef = $state<{
+    showLock: (id: string, lock: PasteLock | undefined) => void;
+    editorStateOf: (id: string) => EditorState | null;
+    scrollOf: (id: string) => ScrollRecord | null;
+  } | null>(null);
   function liveView(): EditorView | null {
     return activeOrdinary ? heldView : null;
   }
@@ -1118,6 +1171,10 @@
   // to its handler. Parameterized Format actions (set-line-ending / set-encoding
   // / set-language) carry their argument after a colon. Unknown actions ignored.
   function runMenuAction(action: string): void {
+    // A tab on its way to another window is not changed from the menu.
+    if (!menuActionAllowed(action, active?.transferring === true)) {
+      return;
+    }
     // The range edit box is modal: only the actions below act while it is open.
     if (documentWindow.rangeBox !== null && !isEditAction(action)) {
       runBoxAction(action);
@@ -1263,26 +1320,30 @@
   // Close the current active tab; its store entry is removed and the window
   // closes when it was the last tab, unless a held-back quit or close is about
   // to end it (`keepWindow`).
-  async function finishTabClose(keepWindow = false): Promise<void> {
-    // Read the tab before deleting it: `deleteTab` splices it out of `tabs`, so
-    // by the time it resolves there is nothing left to look the id up from and
-    // its `viewModes` entry would sit there for the life of the window.
-    const closing = documentWindow.activeTab;
-    // A tab that stayed (edited meanwhile, or closed by another call) is left as
-    // it is.
-    if (!(await documentWindow.deleteTab(documentWindow.activeIndex))) {
+  async function finishTabClose(
+    tab: DocTab,
+    keepWindow = false,
+  ): Promise<void> {
+    const index = documentWindow.tabs.indexOf(tab);
+    if (index === -1) {
       return;
     }
-    if (closing !== null) {
-      viewModes.delete(closing.id);
+    // A tab that stayed (edited meanwhile, closed by another call, or on its way
+    // to another window) is left as it is, and its view mode with it.
+    if (!(await documentWindow.deleteTab(index))) {
+      return;
     }
-    if (documentWindow.tabs.length === 0 && !keepWindow) {
-      await win.destroy();
+    viewModes.delete(tab.id);
+    if (documentWindow.isEmpty && !keepWindow) {
+      await closeThisWindow();
     }
   }
 
   function closeActive(): void {
-    missing.requestClose();
+    const tab = documentWindow.activeTab;
+    if (tab !== null) {
+      missing.requestClose(tab);
+    }
   }
   // A sticky note handed over as a tab: the window claims the handoff, opens the
   // tab over the file the note's text was written to, and says it is done. A
@@ -1303,24 +1364,184 @@
     }
     if (tabId === null) {
       await invoke('convert_failed', { handoffId }).catch(() => {});
-      if (documentWindow.tabs.length === 0) {
+      if (documentWindow.isEmpty) {
         void collapseWindow();
       }
       return;
     }
-    await invoke('convert_done', { handoffId, tabId }).catch(() => {});
+    try {
+      await invoke('convert_done', { handoffId, tabId }).catch(() => {});
+    } finally {
+      documentWindow.endHandingOver(tabId);
+    }
   }
 
   function requestCloseTab(index: number): Promise<void> {
     return missing.requestCloseAt(index);
   }
+  // Tab drag. The state machine in tabDrag.ts decides; this forwards the pointer
+  // events to it and acts on what it decides.
+  let tabbarEl = $state<HTMLElement | null>(null);
+  let dragState = $state.raw<DragState>(IDLE);
+  // How far the pressed tab follows the pointer, in CSS pixels.
+  let dragDx = $state(0);
+  let dragPointer = -1;
+  let dragTab: DocTab | null = null;
+  // The tab boxes in the bar's content coordinates, measured at the press: a
+  // slide transform would otherwise move them under the pointer.
+  let dragRects: { left: number; width: number }[] = [];
+  // The tab boxes in the bar's content coordinates (the scroll offset not
+  // applied).
+  function tabRects(bar: HTMLElement): { left: number; width: number }[] {
+    const box = bar.getBoundingClientRect();
+    return [...bar.querySelectorAll<HTMLElement>(':scope > .tab')].map((el) => {
+      const tabBox = el.getBoundingClientRect();
+      return {
+        left: tabBox.left - box.left + bar.scrollLeft,
+        width: tabBox.width,
+      };
+    });
+  }
+  // Where the tabs are drawn now, for a tab dropped on this window.
+  function currentGeometry(): TabBarGeometry | null {
+    const bar = tabbarEl;
+    if (bar === null) {
+      return null;
+    }
+    const box = bar.getBoundingClientRect();
+    return {
+      tabs: tabRects(bar),
+      scrollLeft: bar.scrollLeft,
+      bar: {
+        left: box.left,
+        right: box.right,
+        top: box.top,
+        bottom: box.bottom,
+      },
+    };
+  }
+  function dragGeometry(bar: HTMLElement): TabBarGeometry {
+    const box = bar.getBoundingClientRect();
+    return {
+      tabs: dragRects,
+      scrollLeft: bar.scrollLeft,
+      bar: {
+        left: box.left,
+        right: box.right,
+        top: box.top,
+        bottom: box.bottom,
+      },
+    };
+  }
+  function feedDrag(input: DragInput): DragOutcome | null {
+    const result = dragStep(dragState, input);
+    dragState = result.state;
+    return result.outcome;
+  }
+  function onTabPointerDown(e: PointerEvent, index: number): void {
+    const bar = tabbarEl;
+    if (
+      bar === null ||
+      e.button !== 0 ||
+      !e.isPrimary ||
+      documentWindow.dragLocked()
+    ) {
+      return;
+    }
+    dragRects = tabRects(bar);
+    dragPointer = e.pointerId;
+    dragTab = documentWindow.tabs[index] ?? null;
+    dragDx = 0;
+    feedDrag({ kind: 'down', x: e.clientX, y: e.clientY, index });
+    (e.currentTarget as HTMLElement).setPointerCapture(e.pointerId);
+  }
+  function onTabPointerMove(e: PointerEvent): void {
+    const bar = tabbarEl;
+    if (bar === null || e.pointerId !== dragPointer) {
+      return;
+    }
+    feedDrag({
+      kind: 'move',
+      x: e.clientX,
+      y: e.clientY,
+      geometry: dragGeometry(bar),
+    });
+    const mine = dragRects[dragState.index];
+    const first = dragRects[0];
+    const last = dragRects[dragRects.length - 1];
+    if (dragState.phase === 'dragging' && mine && first && last) {
+      // The tab stays inside the bar.
+      const lowest = first.left - mine.left;
+      const highest = last.left + last.width - (mine.left + mine.width);
+      dragDx = Math.min(
+        highest,
+        Math.max(lowest, e.clientX - dragState.startX),
+      );
+    }
+  }
+  function onTabPointerUp(e: PointerEvent): void {
+    const bar = tabbarEl;
+    if (bar === null || e.pointerId !== dragPointer) {
+      return;
+    }
+    const outcome = feedDrag({
+      kind: 'up',
+      x: e.clientX,
+      y: e.clientY,
+      geometry: dragGeometry(bar),
+    });
+    const tab = dragTab;
+    dragTab = null;
+    dragPointer = -1;
+    // Every release asks the core where it landed: the own window reorders the
+    // tab or returns it to its slot, anything else moves it.
+    if (outcome?.kind === 'release' && tab !== null) {
+      void documentWindow.releaseTab(tab, {
+        x: e.clientX,
+        y: e.clientY,
+        dpr: window.devicePixelRatio,
+        slot: outcome.slot,
+        overBar: outcome.overBar,
+      });
+    }
+  }
+  function cancelDrag(reason: CancelReason): void {
+    feedDrag({ kind: 'cancel', reason });
+    dragTab = null;
+    dragPointer = -1;
+  }
+  function onTabClick(index: number): void {
+    const result = dragStep(dragState, { kind: 'click' });
+    dragState = result.state;
+    if (!result.swallowed) {
+      void documentWindow.switchTo(index, false, true);
+    }
+  }
+  // The transform of the tab at `index` while a drag is over the own tab bar.
+  function tabTransform(index: number): string | undefined {
+    if (dragState.phase !== 'dragging' || !dragState.overBar) {
+      return undefined;
+    }
+    if (index === dragState.index) {
+      return `translateX(${dragDx}px)`;
+    }
+    const width = dragRects[dragState.index]?.width ?? 0;
+    const shift = slideOffset(index, dragState.index, dragState.slot, width);
+    return shift === 0 ? undefined : `translateX(${shift}px)`;
+  }
   // Finish closing this window: clean tabs leave the store (a closed document
   // must not reopen on the next launch), dirty ones keep their snapshot, then
   // the backend destroys the window.
   async function finishWindowClose(): Promise<void> {
-    convertController.cancelAll();
-    await documentWindow.dropClosedTabs(win.label);
-    await invoke('confirm_close', { label: win.label });
+    await closeDocumentWindow(
+      documentWindow,
+      async () => {
+        convertController.cancelAll();
+        await documentWindow.dropClosedTabs(win.label);
+        await invoke('confirm_close', { label: win.label });
+      },
+      () => gate.abandonClose(),
+    );
   }
 
   onMount(() => {
@@ -1344,14 +1565,21 @@
     // Reveal the window only after the theme is loaded and applied, so a
     // dark-theme window never flashes its default white background. File
     // content is loaded separately below and paints onto the themed surface.
-    void revealWhenThemed();
+    // A window made for a tab on its way waits for the tab.
+    if (!receive) {
+      void revealWhenThemed();
+    }
     // Settles once the `open-file-here` listener below is registered.
     let openFileListening: Promise<unknown> = Promise.resolve();
     // Announce the window to the core and open the files it queued meanwhile.
     // Each path opens on its own, so one failure leaves the rest.
     const announceReady = async (): Promise<void> => {
       const queued = await invoke<
-        ({ kind: 'path'; value: string } | { kind: 'handoff'; value: number })[]
+        (
+          | { kind: 'path'; value: string }
+          | { kind: 'handoff'; value: number }
+          | { kind: typeof QUEUED_TRANSFER; value: number }
+        )[]
       >('doc_window_ready', {
         label: win.label,
       });
@@ -1360,11 +1588,83 @@
           await openHandoff(item.value);
           continue;
         }
+        if (item.kind === QUEUED_TRANSFER) {
+          await incomingTransfers.take(item.value);
+          continue;
+        }
         await documentWindow.openTab(item.value).catch((err: unknown) => {
           console.error('opening a queued file failed', err);
         });
       }
     };
+    // The size the window last had; null until the mount-time read resolves, so
+    // opening a window (restored or new) never counts as a resize by the user.
+    let knownSize: DocumentSize | null = null;
+    void (async (): Promise<void> => {
+      const scale = await win.scaleFactor();
+      const size = (await win.innerSize()).toLogical(scale);
+      knownSize = { width: size.width, height: size.height };
+    })();
+    // Persist logical bounds after the user finishes moving or resizing.
+    const captureBounds = debounce(() => {
+      void (async (): Promise<void> => {
+        const scale = await win.scaleFactor();
+        const pos = (await win.outerPosition()).toLogical(scale);
+        const size = (await win.innerSize()).toLogical(scale);
+        documentWindow.setBounds(pos.x, pos.y, size.width, size.height);
+        const skip =
+          (await win.isMaximized()) ||
+          (await win.isFullscreen()) ||
+          (await win.isMinimized());
+        if (knownSize === null) {
+          return;
+        }
+        const step = rememberStep(
+          knownSize,
+          { width: size.width, height: size.height },
+          skip,
+        );
+        knownSize = step.known;
+        if (step.write) {
+          void settingsState.save({
+            document_width: size.width,
+            document_height: size.height,
+          });
+        }
+      })();
+    }, 300);
+    // The tabs that arrive from other windows, and the events that tell this
+    // window of a transfer. Registered before the window announces itself, so it
+    // never misses what the core tells it.
+    const incomingTransfers = new IncomingTransfers(documentWindow, {
+      receive,
+      modalOpen: () => anyModalOpen,
+      arrived: (tab) => {
+        missing.enqueue(tab);
+        void missing.check();
+        captureBounds();
+      },
+      reveal: () =>
+        receive ? revealWhenThemed() : invoke('reveal_self').then(() => {}),
+      closeWindow: () => closeThisWindow(),
+    });
+    const transferListeners = Promise.all([
+      win.listen<TransferEventPayload>(TRANSFER_EVENT.in, (event) => {
+        void incomingTransfers.take(event.payload.t);
+      }),
+      win.listen<TransferEventPayload>(TRANSFER_EVENT.release, (event) => {
+        documentWindow.onTransferRelease(event.payload.t);
+      }),
+      win.listen<TransferEventPayload>(TRANSFER_EVENT.cancel, (event) => {
+        documentWindow.onTransferCancel(event.payload.t);
+      }),
+      win.listen<TransferEventPayload>(TRANSFER_EVENT.abort, (event) => {
+        incomingTransfers.onAbort(event.payload.t);
+      }),
+    ]).then((unlisten) => {
+      documentWindow.transferListening = true;
+      return unlisten;
+    });
     void (async (): Promise<void> => {
       let collapsing = false;
       try {
@@ -1406,6 +1706,7 @@
         // Also reached when init throws, so later files are not queued forever.
         if (!collapsing) {
           await openFileListening;
+          await transferListeners;
           await announceReady();
         }
       }
@@ -1453,42 +1754,6 @@
         documentWindow.cycle(-1);
       }
     };
-    // The size the window last had; null until the mount-time read resolves, so
-    // opening a window (restored or new) never counts as a resize by the user.
-    let knownSize: DocumentSize | null = null;
-    void (async (): Promise<void> => {
-      const scale = await win.scaleFactor();
-      const size = (await win.innerSize()).toLogical(scale);
-      knownSize = { width: size.width, height: size.height };
-    })();
-    // Persist logical bounds after the user finishes moving or resizing.
-    const captureBounds = debounce(() => {
-      void (async (): Promise<void> => {
-        const scale = await win.scaleFactor();
-        const pos = (await win.outerPosition()).toLogical(scale);
-        const size = (await win.innerSize()).toLogical(scale);
-        documentWindow.setBounds(pos.x, pos.y, size.width, size.height);
-        const skip =
-          (await win.isMaximized()) ||
-          (await win.isFullscreen()) ||
-          (await win.isMinimized());
-        if (knownSize === null) {
-          return;
-        }
-        const step = rememberStep(
-          knownSize,
-          { width: size.width, height: size.height },
-          skip,
-        );
-        knownSize = step.known;
-        if (step.write) {
-          void settingsState.save({
-            document_width: size.width,
-            document_height: size.height,
-          });
-        }
-      })();
-    }, 300);
     // Window close handshake. The OS close of a document window is intercepted
     // in Rust, which asks this webview to flush before destroying it, so unsaved
     // edits are never dropped. Dirty tabs are snapshotted (a restart restores
@@ -1518,6 +1783,7 @@
       'paths-moved',
       (event) => {
         documentWindow.retargetPaths(event.payload.from, event.payload.to);
+        incomingTransfers.retargetPaths(event.payload.from, event.payload.to);
       },
     );
     // Cmd+W (routed from the app menu) closes the active tab, not the window.
@@ -1538,7 +1804,7 @@
           (t) => t.tabIndex === event.payload,
         );
         if (index !== -1) {
-          void documentWindow.switchTo(index);
+          void documentWindow.switchTo(index, false, true);
         }
       },
     );
@@ -1577,7 +1843,7 @@
           (t) => t.id === event.payload.tab_id,
         );
         if (index !== -1) {
-          void documentWindow.switchTo(index);
+          void documentWindow.switchTo(index, false, true);
         }
       },
     );
@@ -1630,6 +1896,28 @@
       windowedRef?.pendingInput() ?? false;
     documentWindow.windowedFlushed = (): Promise<void> =>
       windowedRef?.flushed() ?? Promise.resolve();
+    documentWindow.dragHost = {
+      navigationLocked: () => missing.navigationLocked(),
+      gateVisible: () => gate.visible,
+      modalOpen: () => anyModalOpen,
+      closing: () => gate.closing,
+      quitting: () => gate.quitting,
+    };
+    documentWindow.transferHost = {
+      showLock: (id, lock) => editorRef?.showLock(id, lock),
+      editorStateOf: (id) => editorRef?.editorStateOf(id) ?? null,
+      scrollOf: (id) => editorRef?.scrollOf(id) ?? null,
+      viewModeOf: (id) => viewModes.get(id),
+      setViewMode: (id, mode) => {
+        viewModes.set(id, mode);
+      },
+      forgetTab: (id) => {
+        viewModes.delete(id);
+      },
+      dropGeometry: () => currentGeometry(),
+      modalOpen: () => anyModalOpen,
+      closeWindow: () => closeThisWindow(),
+    };
     // DEV-only automation hook; dynamic import keeps it out of production.
     if (import.meta.env.DEV) {
       void import('./lib/dev/auto').then((m) =>
@@ -1643,6 +1931,8 @@
               path: t.path,
               dirty: documentWindow.isDirty(t),
               active: i === documentWindow.activeIndex,
+              tabIndex: t.tabIndex,
+              order: t.order,
               lineEnding: t.lineEnding,
               hadBom: t.hadBom,
               encoding: t.encoding,
@@ -1874,6 +2164,14 @@
       documentWindow.endComposition = null;
       documentWindow.windowedPending = null;
       documentWindow.windowedFlushed = null;
+      documentWindow.dragHost = null;
+      documentWindow.transferHost = null;
+      documentWindow.transferListening = false;
+      void transferListeners.then((unlisten) => {
+        for (const off of unlisten) {
+          off();
+        }
+      });
       offEdition();
       unlistenTheme();
       void unlistenChanges.then((u) => u());
@@ -1904,9 +2202,10 @@
   ondragovercapture={onFileDragOver}
   ondropcapture={onFileDrop}
   onkeydown={onWindowKeydown}
+  onblur={() => cancelDrag('blur')}
 />
 <div class="app">
-  <div class="tabbar" role="tablist">
+  <div class="tabbar" role="tablist" bind:this={tabbarEl}>
     {#each documentWindow.tabs as tab, i (tab.id)}
       {@const lock = largeLock(tab)}
       <div
@@ -1916,10 +2215,27 @@
         tabindex="-1"
         aria-selected={i === documentWindow.activeIndex}
         title={tab.path}
-        onclick={() => documentWindow.switchTo(i)}
+        style:transform={tabTransform(i)}
+        class:dragged={dragState.phase === 'dragging' &&
+          i === dragState.index &&
+          dragState.overBar}
+        class:dim={tab.transferring === true ||
+          (dragState.phase === 'dragging' &&
+            i === dragState.index &&
+            !dragState.overBar)}
+        class:sliding={dragState.phase === 'dragging' &&
+          dragState.overBar &&
+          i !== dragState.index}
+        onpointerdown={(e) => onTabPointerDown(e, i)}
+        onpointermove={onTabPointerMove}
+        onpointerup={onTabPointerUp}
+        onpointercancel={() => cancelDrag('pointercancel')}
+        onlostpointercapture={() => cancelDrag('lostcapture')}
+        ondragstart={(e) => e.preventDefault()}
+        onclick={() => onTabClick(i)}
         onkeydown={(e) => {
           if (e.key === 'Enter') {
-            void documentWindow.switchTo(i);
+            void documentWindow.switchTo(i, false, true);
           }
         }}
       >
@@ -1965,6 +2281,7 @@
             title={lock.title}
             aria-label={lock.title}
             disabled={lock.disabled}
+            onpointerdown={(e) => e.stopPropagation()}
             onclick={(e) => {
               e.stopPropagation();
               void unlockTab(i);
@@ -1994,6 +2311,7 @@
           class="tab-close"
           title={t('doc.tab.close')}
           aria-label={t('doc.tab.close')}
+          onpointerdown={(e) => e.stopPropagation()}
           onclick={(e) => {
             e.stopPropagation();
             void requestCloseTab(i);
@@ -2059,6 +2377,7 @@
           wordWrap={settingsState.editorWordWrap}
           lineNumbers={settingsState.editorLineNumbers}
           modalOpen={anyModalOpen}
+          frozen={active.transferring === true}
           onapplied={(sessionId, totalBytes, totalLines, clean, generation) =>
             documentWindow.windowedApplied(
               sessionId,
@@ -2142,6 +2461,7 @@
         inert={!activeOrdinary}
       >
         <DocumentEditor
+          bind:this={editorRef}
           activeId={held.id}
           content={held.content}
           language={effectiveLanguage(held.language)}
@@ -2168,6 +2488,8 @@
             }
           }}
           onview={(v) => (heldView = v)}
+          takeSeed={(id) => documentWindow.takeSeed(id)}
+          onseeded={(id, doc) => documentWindow.seededDoc(id, doc)}
           onlongline={(on) => (longLineActive = on)}
         />
       </div>
@@ -2523,6 +2845,8 @@
     overflow-y: hidden;
     border-bottom: 1px solid var(--topbar-border);
     scrollbar-width: thin;
+    user-select: none;
+    -webkit-user-select: none;
   }
   .tab {
     display: flex;
@@ -2542,6 +2866,20 @@
   .tab.active {
     opacity: 1;
     background: var(--topbar-border);
+  }
+  /* Over the own tab bar the pressed tab follows the pointer and the others
+     slide aside; elsewhere it stays in its slot, dimmed. */
+  .tab.dragged {
+    position: relative;
+    z-index: 1;
+    opacity: 1;
+    background: var(--topbar-border);
+  }
+  .tab.sliding {
+    transition: transform 0.12s ease;
+  }
+  .tab.dim {
+    opacity: 0.35;
   }
   .tab-name {
     overflow: hidden;

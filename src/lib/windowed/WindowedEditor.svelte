@@ -2,7 +2,7 @@
   // Copyright © 2026 Lonshaus
   // SPDX-License-Identifier: GPL-3.0-only
 
-  import { onMount } from 'svelte';
+  import { onMount, untrack } from 'svelte';
   import { invoke } from '@tauri-apps/api/core';
   import { devTrace } from '../dev/devTrace';
   import { listen, type UnlistenFn } from '@tauri-apps/api/event';
@@ -376,6 +376,9 @@
     // True while any dialog/modal is up in the host window; suppresses the
     // automatic focus handoff so a gate/confirm keeps the keyboard.
     modalOpen?: boolean;
+    // True while the tab is frozen on its way to another window: input is
+    // dropped, and undo, redo and replace do nothing.
+    frozen?: boolean;
     // Fired once with the first window's line-ending style when the tab has
     // none yet (null: no line break in the window). Returns the separator
     // typed breaks get: the detected one, or the user's default for a null.
@@ -425,6 +428,7 @@
     wordWrap,
     lineNumbers: showLineNumbers,
     modalOpen = false,
+    frozen = false,
     ondetectending,
     onapplied,
     onstatus,
@@ -579,7 +583,9 @@
   }
   function isReadOnly(): boolean {
     return (
-      (locked || swapping || holds > 0 || gate.readOnly()) && !swapKeepsInput()
+      frozen ||
+      ((locked || swapping || holds > 0 || gate.readOnly()) &&
+        !swapKeepsInput())
     );
   }
   // The swap back to the caret leaves the editor editable, so focus and the
@@ -1282,7 +1288,7 @@
   // a composition is open, a swap runs or the shadow does, so it runs in the
   // order it was pressed in; otherwise it runs now.
   function runUndo(dir: 'undo' | 'redo'): void {
-    if (locked) {
+    if (locked || frozen) {
       return;
     }
     if (
@@ -1577,7 +1583,7 @@
     swapping = true;
     view?.dispatch({
       effects: readOnlyCompartment.reconfigure(
-        readOnlyExtension(!swapKeepsInput()),
+        readOnlyExtension(frozen || !swapKeepsInput()),
       ),
     });
     if (swapKeepsInput()) {
@@ -5296,6 +5302,9 @@
   // to it first, and what is selected must still match the query. If it does
   // not, Replace acts as Find Next.
   async function replaceOne(fromList = false): Promise<void> {
+    if (frozen) {
+      return;
+    }
     const query = findQuery;
     if (query === '') {
       openFind();
@@ -5355,6 +5364,9 @@
   // read-only from here until the window has been read again, and nothing typed
   // meanwhile is queued.
   async function replaceAll(): Promise<void> {
+    if (frozen) {
+      return;
+    }
     const owner = sessionId;
     const query = findQuery;
     if (query === '') {
@@ -5749,6 +5761,12 @@
       }
       view = undefined;
     };
+  });
+  // A tab frozen for a move to another window takes no input, and takes it
+  // again when it comes back.
+  $effect(() => {
+    void frozen;
+    untrack(syncReadOnly);
   });
   // Live theme toggle.
   $effect(() => {

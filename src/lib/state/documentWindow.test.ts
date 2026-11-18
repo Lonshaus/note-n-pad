@@ -59,6 +59,7 @@ function baseTab(overrides: Partial<DocTab>): DocTab {
     encoding: 'UTF-8',
     lossy: false,
     tabIndex: 0,
+    order: 0,
     ...overrides,
   };
 }
@@ -1215,7 +1216,10 @@ describe('a large tab does one thing at a time (switching modes vs Save As)', ()
     }) as typeof invoke);
     const tab = pushViewerTab('h1-unlock-then-saveas');
 
-    const unlocking = documentWindow.unlockLargeTab(0);
+    const unlocking = documentWindow.unlockLargeTab(
+      documentWindow.activeTab!,
+      0,
+    );
     const saving = documentWindow.saveAs('/tmp/new.log');
     await settle();
 
@@ -1265,7 +1269,10 @@ describe('a large tab does one thing at a time (switching modes vs Save As)', ()
     await vi.waitFor(() => {
       expect(mockInvoke).toHaveBeenCalledWith('copy_range', expect.anything());
     });
-    const unlocking = documentWindow.unlockLargeTab(0);
+    const unlocking = documentWindow.unlockLargeTab(
+      documentWindow.activeTab!,
+      0,
+    );
     await settle();
 
     expect(mockInvoke).not.toHaveBeenCalledWith(
@@ -1297,7 +1304,10 @@ describe('a large tab does one thing at a time (switching modes vs Save As)', ()
       }
     }) as typeof invoke);
     pushViewerTab('h1-unlock-then-close');
-    const unlocking = documentWindow.unlockLargeTab(0);
+    const unlocking = documentWindow.unlockLargeTab(
+      documentWindow.activeTab!,
+      0,
+    );
     const saving = documentWindow.saveAs('/tmp/new.log');
     await settle();
     documentWindow.tabs.length = 0;
@@ -1334,7 +1344,10 @@ describe('a large tab does one thing at a time (switching modes vs Save As)', ()
     await vi.waitFor(() => {
       expect(mockInvoke).toHaveBeenCalledWith('copy_range', expect.anything());
     });
-    const unlocking = documentWindow.unlockLargeTab(0);
+    const unlocking = documentWindow.unlockLargeTab(
+      documentWindow.activeTab!,
+      0,
+    );
     documentWindow.tabs.length = 0;
     copy.resolve(null);
     expect(await saving).toBe(true);
@@ -1407,8 +1420,13 @@ describe('a large tab does one thing at a time (switching modes vs Save As)', ()
 // the three outcomes are now distinguishable: a genuine failure rejects
 // instead of resolving.
 describe('openRangeBox distinguishes failure from success and refusal', () => {
-  const viewer = (): DocTab =>
-    baseTab({ id: 'v', path: '/tmp/big.log', large: { size: 1000 } });
+  // The viewer tab is open in the window, as it always is under a box.
+  const viewer = (): DocTab => {
+    documentWindow.tabs.push(
+      baseTab({ id: 'v', path: '/tmp/big.log', large: { size: 1000 } }),
+    );
+    return documentWindow.tabs[0]!;
+  };
   const info = { startByte: 0, endByte: 10, startLine: 1, endLine: 2 };
 
   beforeEach(() => {
@@ -1446,7 +1464,7 @@ describe('openRangeBox distinguishes failure from success and refusal', () => {
     expect(documentWindow.rangeBox?.tabId).toBe('v');
     expect(documentWindow.rangeBox?.sourcePath).toBe('/tmp/big.log');
     // The box is not a tab.
-    expect(documentWindow.tabs).toHaveLength(0);
+    expect(documentWindow.tabs).toHaveLength(1);
   });
 
   it('resolves a message when the range is refused for being lossy (contrast with the failure above)', async () => {
