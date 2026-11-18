@@ -648,6 +648,7 @@ fn document_window_query(
   project: Option<&str>,
   tab: Option<i64>,
   blank: bool,
+  receive: bool,
 ) -> String {
   let mut query = format!("index.html?mode=document&group={}", percent_encode(group));
   if let Some(path) = initial_path {
@@ -667,9 +668,17 @@ fn document_window_query(
   if blank {
     query.push_str("&blank=1");
   }
+  // A window made for a tab dropped outside every window: it reveals itself
+  // only once the tab is in it.
+  if receive {
+    query.push_str("&receive=1");
+  }
   query
 }
-/// Build a normal-chrome document window labeled `doc-{group}`.
+/// Build a normal-chrome document window labeled `doc-{group}`. A `receive`
+/// window is made for a tab on its way: it is not forced into view after a
+/// grace, and it never joins the window tabs of macOS.
+#[allow(clippy::too_many_arguments)]
 fn build_document_window(
   app: &AppHandle,
   group: &str,
@@ -677,6 +686,7 @@ fn build_document_window(
   project: Option<&str>,
   tab: Option<i64>,
   blank: bool,
+  receive: bool,
   bounds: WindowBounds,
 ) -> Result<(), String> {
   let WindowBounds {
@@ -687,7 +697,7 @@ fn build_document_window(
   } = bounds;
   let size = document_open_size(width, height);
   let label = format!("doc-{group}");
-  let query = document_window_query(group, initial_path, project, tab, blank);
+  let query = document_window_query(group, initial_path, project, tab, blank, receive);
   let url = WebviewUrl::App(query.into());
   // Set a real title at birth so macOS never shows its own empty-title
   // placeholder (e.g. "無題" on Japanese systems) before the frontend loads and
@@ -712,10 +722,32 @@ fn build_document_window(
   #[cfg(windows)]
   let builder = builder.disable_drag_drop_handler();
   let window = builder.build().map_err(|e| e.to_string())?;
+  #[cfg(target_os = "macos")]
+  if receive {
+    disallow_tabbing(&window);
+  }
   crate::file_drop::attach(&window);
   fix_inner_size(&window, size);
-  show_after_grace(window);
+  if !receive {
+    show_after_grace(window);
+  }
   Ok(())
+}
+/// A window of a tab on its way is its own window, never a native tab of
+/// another. AppKit's calls belong to the main thread.
+#[cfg(target_os = "macos")]
+fn disallow_tabbing(window: &tauri::WebviewWindow) {
+  let Ok(ns_window) = window.ns_window() else {
+    return;
+  };
+  let ptr = ns_window as usize;
+  let _ = window.run_on_main_thread(move || {
+    use objc2_app_kit::{NSWindow, NSWindowTabbingMode};
+    // Safety: the pointer is the window's own NSWindow, which outlives this
+    // call on the main thread that runs it.
+    let ns_window = unsafe { &*(ptr as *const NSWindow) };
+    ns_window.setTabbingMode(NSWindowTabbingMode::Disallowed);
+  });
 }
 /// Open a fresh document window for a file on disk, minting a new window group.
 /// The frontend creates the first tab's store entry once the file is read (and
@@ -739,6 +771,7 @@ pub fn open_document_labeled(
     project,
     None,
     false,
+    false,
     WindowBounds {
       x: None,
       y: None,
@@ -760,6 +793,7 @@ pub fn new_blank_document(app: &AppHandle) -> Result<(), String> {
     None,
     None,
     true,
+    false,
     WindowBounds {
       x: None,
       y: None,
@@ -781,6 +815,7 @@ pub fn open_empty_document(app: &AppHandle) -> Result<String, String> {
     None,
     None,
     false,
+    false,
     WindowBounds {
       x: None,
       y: None,
@@ -789,6 +824,33 @@ pub fn open_empty_document(app: &AppHandle) -> Result<String, String> {
     },
   )?;
   Ok(format!("doc-{group}"))
+}
+/// Open the window that receives a tab dropped outside every window, labeled
+/// `doc-{group}`: `size` is its inner size and `at` its top left where the
+/// window system takes a position at build time (macOS). It is built hidden and
+/// not forced into view; it reveals itself once the tab is in it.
+pub fn open_receiving_document(
+  app: &AppHandle,
+  group: &str,
+  project: Option<&str>,
+  size: (f64, f64),
+  at: Option<(f64, f64)>,
+) -> Result<(), String> {
+  build_document_window(
+    app,
+    group,
+    None,
+    project,
+    None,
+    false,
+    true,
+    WindowBounds {
+      x: at.map(|(x, _)| x),
+      y: at.map(|(_, y)| y),
+      width: size.0,
+      height: size.1,
+    },
+  )
 }
 /// Recreate a stored document window (one per group) at the saved bounds of its
 /// lowest-tab_index tab on startup restore.
@@ -806,6 +868,7 @@ pub fn create_document_window(
     None,
     None,
     tab,
+    false,
     false,
     WindowBounds {
       x: plan.x,
@@ -849,6 +912,7 @@ fn blank_sticky(id: String, width: f64, height: f64, paper: String) -> NoteSnaps
     dirty: false,
     window_group: None,
     tab_index: 0,
+    tab_order: None,
     line_ending: "LF".to_string(),
     had_bom: false,
     encoding: "UTF-8".to_string(),
@@ -1825,13 +1889,50 @@ mod document_window_query_tests {
 
   #[test]
   fn a_blank_window_asks_for_one_blank_tab() {
-    let query = document_window_query("g1", None, None, None, true);
+    let query = document_window_query("g1", None, None, None, true, false);
     assert_eq!(query, "index.html?mode=document&group=g1&blank=1");
   }
 
   #[test]
   fn restored_and_file_windows_never_ask_for_a_blank_tab() {
-    assert!(!document_window_query("g1", None, None, Some(2), false).contains("blank"));
-    assert!(!document_window_query("g1", Some("/a b.txt"), None, None, false).contains("blank"));
+    assert!(!document_window_query("g1", None, None, Some(2), false, false).contains("blank"));
+    assert!(
+      !document_window_query("g1", Some("/a b.txt"), None, None, false, false).contains("blank")
+    );
+  }
+
+  #[test]
+  fn only_a_window_made_for_a_dropped_tab_asks_to_be_revealed_late() {
+    let receiving = document_window_query("g1", None, Some("/proj"), None, false, true);
+    assert_eq!(
+      receiving,
+      "index.html?mode=document&group=g1&project=%2Fproj&receive=1"
+    );
+    assert!(!document_window_query("g1", None, None, None, true, false).contains("receive"));
+  }
+
+  #[test]
+  fn a_receiving_window_is_built_without_the_forced_reveal_and_with_no_window_tabs() {
+    let source = include_str!("windows.rs");
+    let at = source.find("fn build_document_window(").unwrap();
+    let body = &source[at..];
+    let body = &body[..body.find("\n}\n").unwrap()];
+    assert!(body.contains("if !receive {\n    show_after_grace(window);"));
+    assert!(body.contains("disallow_tabbing(&window)"));
+    let at = source.find("fn disallow_tabbing(").unwrap();
+    let body = &source[at..];
+    let body = &body[..body.find("\n}\n").unwrap()];
+    assert!(body.contains("NSWindowTabbingMode::Disallowed"));
+    assert!(body.contains("run_on_main_thread"));
+  }
+
+  #[test]
+  fn the_receiving_window_is_built_by_the_one_document_builder() {
+    let source = include_str!("windows.rs");
+    let at = source.find("pub fn open_receiving_document(").unwrap();
+    let body = &source[at..];
+    let body = &body[..body.find("\n}\n").unwrap()];
+    assert!(body.contains("build_document_window("));
+    assert!(!body.contains("WebviewWindowBuilder"));
   }
 }

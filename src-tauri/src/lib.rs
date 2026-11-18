@@ -57,12 +57,14 @@ mod spill;
 mod store_state;
 #[cfg(all(target_os = "macos", feature = "storekit"))]
 mod storekit;
+mod tab_transfer;
 #[cfg(test)]
 mod test_alloc;
 mod theme_store;
 mod transfer;
 mod webview2_runtime;
 mod win_menu_gray;
+mod window_at;
 mod windowed;
 mod windowed_scan;
 mod windows;
@@ -244,14 +246,19 @@ pub(crate) fn flush_then_exit(app: &tauri::AppHandle) {
   // handing over to an instance that is about to exit.
   #[cfg(target_os = "macos")]
   mac_single_instance::mark_quitting();
+  // A tab on its way is called off before anything waits: the windows this
+  // destroys (those made for it) will never ack.
+  let destroyed = tab_transfer::quit_call_off(app);
   // Every sticky and document window flushes its state and acks; the quit is
   // always silent now, and restore brings unsaved documents back afterward.
-  let labels: HashSet<String> = app
-    .webview_windows()
-    .keys()
-    .filter(|l| l.starts_with("note-") || l.starts_with("doc-"))
-    .cloned()
-    .collect();
+  let labels: HashSet<String> = tab_transfer::ack_set(
+    app
+      .webview_windows()
+      .keys()
+      .filter(|l| l.starts_with("note-") || l.starts_with("doc-"))
+      .cloned(),
+    &destroyed,
+  );
   if labels.is_empty() {
     // Guard is intentionally not released: we are exiting now.
     app.exit(0);
@@ -844,6 +851,8 @@ fn handle_page_load(webview: &tauri::Webview, payload: &tauri::webview::PageLoad
   if payload.event() == tauri::webview::PageLoadEvent::Started {
     clipboard_store::window_reset(webview.label());
     encoding::window_gone(webview.app_handle(), webview.label());
+    // A page that loads again has lost what its tabs were doing.
+    tab_transfer::page_started(webview.app_handle(), webview.label());
   }
 }
 /// The app's single window-event handler: keeps the menu's focus-dependent
@@ -977,6 +986,12 @@ fn handle_window_event(window: &tauri::Window, event: &tauri::WindowEvent) {
       items.on_top.lock().unwrap().remove(window.label());
     }
     release_pending_opens(window.app_handle(), window.label());
+    tab_transfer::window_gone(window.app_handle(), window.label());
+    // The Jump List listed the window's tabs; `destroy()` sends no other word.
+    #[cfg(target_os = "windows")]
+    if window.label().starts_with("doc-") {
+      jumplist::rebuild(window.app_handle());
+    }
     convert_handoff::window_destroyed(window.app_handle(), window.label());
     convert::window_destroyed(window.app_handle(), window.label());
     clipboard_store::window_destroyed(window.label());
@@ -2833,6 +2848,7 @@ pub fn run() {
       app.manage(windows::OpenDocTabs::default());
       app.manage(encoding::DocIoState::new());
       app.manage(pending_opens::PendingOpens::default());
+      app.manage(tab_transfer::TransferState::default());
       app.manage(MenuLists::default());
       app.manage(preview_img::PreviewBases::default());
       let store = app.state::<NoteStore>();
@@ -3020,6 +3036,16 @@ pub fn run() {
       windows::set_window_opacity,
       windows::reveal_self,
       pending_opens::doc_window_ready,
+      tab_transfer::tab_drop_target,
+      tab_transfer::tab_move_window,
+      tab_transfer::tab_transfer_begin,
+      tab_transfer::tab_transfer_claim,
+      tab_transfer::tab_transfer_answer,
+      tab_transfer::tab_transfer_committed,
+      tab_transfer::tab_transfer_cancel,
+      tab_transfer::tab_transfer_released,
+      tab_transfer::tab_transfer_status,
+      tab_transfer::tab_transfer_settle_window,
       windows::show_workspace_window,
       windows::show_settings_window,
       windows::show_about_window,
@@ -3056,6 +3082,7 @@ pub fn run() {
       windowed::windowed_open,
       windowed::windowed_reopen,
       windowed::windowed_index,
+      windowed::windowed_stats,
       windowed::windowed_read,
       windowed::windowed_offset_pos,
       windowed::windowed_pos_offset,
@@ -3857,6 +3884,68 @@ mod page_load_tests {
       .unwrap()..];
     let event = &event[..event.find("\n  }\n").unwrap()];
     assert!(event.contains("encoding::window_gone(window.app_handle(), window.label())"));
+  }
+}
+
+#[cfg(test)]
+mod tab_transfer_hook_tests {
+  /// The text of the function that starts with `head`, up to its closing brace.
+  fn body<'a>(source: &'a str, head: &str) -> &'a str {
+    let at = source.find(head).unwrap();
+    let rest = &source[at..];
+    &rest[..rest.find("\n}\n").unwrap()]
+  }
+
+  #[test]
+  fn a_page_that_loads_again_is_told_to_the_transfers() {
+    let source = include_str!("lib.rs");
+    let load = body(source, "fn handle_page_load(");
+    let started = load.find("PageLoadEvent::Started").unwrap();
+    let told = load
+      .find("tab_transfer::page_started(webview.app_handle(), webview.label())")
+      .unwrap();
+    assert!(started < told);
+  }
+
+  #[test]
+  fn a_destroyed_window_is_told_to_the_transfers_and_a_document_window_to_the_jump_list() {
+    let source = include_str!("lib.rs");
+    let event = body(source, "fn handle_window_event(");
+    let destroyed = &event[event.find("WindowEvent::Destroyed = event").unwrap()..];
+    assert!(destroyed.contains("tab_transfer::window_gone(window.app_handle(), window.label())"));
+    let rebuild = destroyed
+      .find("jumplist::rebuild(window.app_handle())")
+      .unwrap();
+    let guard = destroyed[..rebuild]
+      .rfind("window.label().starts_with(\"doc-\")")
+      .unwrap();
+    assert!(destroyed[..guard].contains("#[cfg(target_os = \"windows\")]"));
+  }
+
+  #[test]
+  fn the_transfers_are_managed_and_their_commands_registered() {
+    let source = include_str!("lib.rs");
+    let run = &source[source.find("pub fn run()").unwrap()..];
+    let run = &run[..run.find("\n#[cfg(test)]").unwrap()];
+    assert!(run.contains("app.manage(tab_transfer::TransferState::default())"));
+    for command in [
+      "tab_drop_target",
+      "tab_move_window",
+      "tab_transfer_begin",
+      "tab_transfer_claim",
+      "tab_transfer_answer",
+      "tab_transfer_committed",
+      "tab_transfer_cancel",
+      "tab_transfer_released",
+      "tab_transfer_status",
+      "tab_transfer_settle_window",
+    ] {
+      assert!(
+        run.contains(&format!("tab_transfer::{command},")),
+        "{command}"
+      );
+    }
+    assert!(run.contains("windowed::windowed_stats,"));
   }
 }
 

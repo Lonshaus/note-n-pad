@@ -8,18 +8,24 @@ import type { DocumentWindowState } from './documentWindow.svelte';
 type MissingWindow = Pick<
   DocumentWindowState,
   | 'activeTab'
+  | 'clickSeq'
+  | 'clicksInWait'
   | 'endComposition'
   | 'holdActive'
   | 'isDirty'
   | 'onConflictClosed'
   | 'onRestored'
   | 'openTab'
+  | 'pendingClicks'
+  | 'preparingTab'
   | 'rangeBox'
   | 'rangeBoxCancel'
   | 'rangeBoxDirty'
   | 'rangeConflictSaveAs'
-  | 'saveActive'
   | 'saveAs'
+  | 'saveTab'
+  | 'settleTab'
+  | 'settled'
   | 'switchTo'
   | 'tabs'
   | 'windowedConflict'
@@ -31,6 +37,7 @@ type MissingGate = Pick<
   | 'busy'
   | 'held'
   | 'onDismissed'
+  | 'onTabCloseEnded'
   | 'onVetoed'
   | 'promptTabClose'
   | 'resumeDeferred'
@@ -38,9 +45,12 @@ type MissingGate = Pick<
 >;
 /** What it needs from the window around it. */
 export interface MissingHost {
-  /** Close the active tab and drop its record. With `keepWindow` the window
-   *  stays when it was the last tab. */
-  finishTabClose(keepWindow?: boolean): Promise<void>;
+  /** Close `tab` and drop its record. With `keepWindow` the window stays when
+   *  it was the last tab. */
+  finishTabClose(
+    tab: NonNullable<MissingWindow['activeTab']>,
+    keepWindow?: boolean,
+  ): Promise<void>;
   /** Destroy the window, which a held-back quit or close kept open and which
    *  has no tab left. */
   closeEmptyWindow(): Promise<void>;
@@ -65,6 +75,27 @@ interface Entry {
 interface Target extends Entry {
   path: string;
 }
+/** How a tab close ended: the tab is gone, it stays, or another tab was the
+ *  active one when it was asked for, which the close is asked for again. */
+type CloseEnd = 'closed' | 'kept' | 'retry';
+type DocTab = NonNullable<MissingWindow['activeTab']>;
+/** A close button's click, waiting for its turn. */
+interface QueuedClose {
+  tab: DocTab;
+  /** The window's click count when the button was clicked. */
+  seq: number;
+  /** A tab was clicked in the same wait before it, or the tab clicked is the
+   *  one the window ends on. */
+  clicked: boolean;
+  resolve: () => void;
+}
+/** The tab close `closeTab` is waiting for, and the token of the deferred
+ *  close it started. */
+interface PendingClose {
+  tab: DocTab;
+  owner: object;
+  resolve: (end: CloseEnd) => void;
+}
 /** The entry the dialog is about, with the file name to show. */
 export interface MissingItem extends Entry {
   path: string;
@@ -80,14 +111,23 @@ export interface MissingItem extends Entry {
 export class MissingFiles {
   /** The "save changes before closing?" dialog is up. */
   confirmClose = $state(false);
+  /** The tab that dialog is about: Save and Don't Save act on it, whichever tab
+   *  is active by the time it is answered. */
+  private closeTarget: NonNullable<MissingWindow['activeTab']> | null = null;
   private queue = $state<Entry[]>([]);
   /** The last tab was discarded and the window kept open for a quit or close
    *  that was held back; it must not outlive that quit or close. */
   private keptEmpty = false;
   /** A tab close is waiting for typed input to reach the core. */
   private closing = false;
-  /** The tab the close confirmation is about. */
-  private confirmTarget: MissingWindow['activeTab'] = null;
+  /** A windowed close is waiting for input: resolved when it has ended. */
+  private closingEnd: Promise<void> | null = null;
+  private endClosing: (() => void) | null = null;
+  /** The close buttons clicked, in click order, each waiting for the one before
+   *  to end. */
+  private closeQueue: QueuedClose[] = [];
+  private running = false;
+  private pendingClose: PendingClose | null = null;
   private readonly win: MissingWindow;
   private readonly gate: MissingGate;
   private readonly host: MissingHost;
@@ -110,6 +150,9 @@ export class MissingFiles {
     };
     gate.onVetoed = () => {
       void this.closeIfKeptEmpty();
+    };
+    gate.onTabCloseEnded = (tab) => {
+      this.closeEnded(tab.id);
     };
   }
   private tabOf(id: string): MissingWindow['tabs'][number] | undefined {
@@ -142,6 +185,11 @@ export class MissingFiles {
       return box?.missing === true ? { ...entry, path: box.sourcePath } : null;
     }
     return tab.missing === true ? { ...entry, path: tab.path } : null;
+  }
+  /** Whether the tab of `entry` is on its way to another window: it shows no
+   *  dialog until it is back or gone. */
+  private onItsWay(entry: Entry): boolean {
+    return this.tabOf(entry.tabId)?.transferring === true;
   }
   private prune(): void {
     this.queue = this.queue.filter((entry) => this.resolve(entry) !== null);
@@ -248,15 +296,29 @@ export class MissingFiles {
     }
     for (const entry of this.queue) {
       const item = this.resolve(entry);
-      if (item !== null) {
+      if (item !== null && !this.onItsWay(entry)) {
         return item;
       }
     }
     return null;
   }
-  /** Every tab still waiting, shown or not, in the order they are asked about. */
+  /** Every tab still waiting, shown or not, in the order they are asked about.
+   *  A tab on its way to another window is not waiting for this window. */
   pending(): MissingItem[] {
-    return this.queue.flatMap((entry) => this.resolve(entry) ?? []);
+    return this.queue.flatMap((entry) =>
+      this.onItsWay(entry) ? [] : (this.resolve(entry) ?? []),
+    );
+  }
+  /** A tab that arrived from another window already marked as missing: it waits
+   *  in this window's queue as well. */
+  enqueue(tab: NonNullable<MissingWindow['activeTab']>): void {
+    const entry = { tabId: tab.id, box: false };
+    const queued = this.queue.some(
+      (e) => e.tabId === entry.tabId && e.box === entry.box,
+    );
+    if (tab.missing === true && !queued) {
+      this.queue.push(entry);
+    }
   }
   /** While a dialog is up the window stays on its tab: nothing switches,
    *  opens or closes a tab. */
@@ -316,6 +378,7 @@ export class MissingFiles {
     }
     if (!(await this.reveal(item))) {
       this.drop(item);
+      this.closeEnded(item.tabId);
       this.settle();
       await this.revealCurrent();
       return false;
@@ -325,6 +388,7 @@ export class MissingFiles {
       : await this.win.saveAs(pathOverride);
     if (saved) {
       this.drop(item);
+      this.closeEnded(item.tabId);
       this.settle();
       await this.revealCurrent();
     }
@@ -339,6 +403,7 @@ export class MissingFiles {
     }
     if (!(await this.reveal(item))) {
       this.drop(item);
+      this.closeEnded(item.tabId);
       this.settle();
       await this.revealCurrent();
       return;
@@ -350,7 +415,14 @@ export class MissingFiles {
     // A quit or close held back behind the dialog ends the window itself; the
     // last tab closing must not destroy the window before it gets there.
     const held = this.gate.held;
-    await this.host.finishTabClose(held);
+    const tab = this.tabOf(item.tabId);
+    if (tab !== undefined) {
+      try {
+        await this.host.finishTabClose(tab, held);
+      } finally {
+        this.closeEnded(tab.id);
+      }
+    }
     this.keptEmpty = held && this.win.tabs.length === 0;
     this.settle();
     await this.revealCurrent();
@@ -366,63 +438,247 @@ export class MissingFiles {
       await this.host.closeEmptyWindow();
     }
   }
-  /** Close the active tab (⌘W, the close button). A tab whose file is gone
-   *  shows its own dialog instead; one with changes asks first. */
-  requestClose(): void {
-    if (this.navigationLocked()) {
-      return;
+  /** Close `tab`, the active tab (⌘W). A tab whose file is gone shows its own
+   *  dialog instead; one with changes asks first. Nothing happens when `tab` is
+   *  no longer the active one. False when no close was started. `owner` is the
+   *  token of the close button's close that asked, which a deferred close
+   *  reports to. */
+  requestClose(tab: DocTab, owner?: object): boolean {
+    if (this.navigationLocked() || this.win.activeTab !== tab) {
+      return false;
     }
-    const tab = this.win.activeTab;
-    if (tab === null) {
-      return;
+    // A tab on its way: the move is called off first (or the tab, already in
+    // the other window, is not this window's to close).
+    if (tab.transferring === true || this.win.preparingTab === tab) {
+      void this.closeAfterSettle(tab, owner);
+      return true;
     }
     // Input of a windowed editor that is not in the core yet would be lost:
     // the close waits for it, then goes on with what the tab is by then.
     if (tab.windowed !== undefined && this.win.windowedPending?.() === true) {
-      if (!this.closing) {
-        this.closing = true;
-        void this.closeWhenSettled(tab);
+      if (this.closing) {
+        return false;
+      }
+      this.closing = true;
+      this.closingEnd = new Promise<void>((resolve) => {
+        this.endClosing = resolve;
+      });
+      void this.closeWhenSettled(tab, owner);
+      return true;
+    }
+    this.closeNow(tab);
+    return true;
+  }
+  /** Close the tab at `index` (its close button). The close waits for the ones
+   *  clicked before it, and resolves once it has ended. */
+  requestCloseAt(index: number): Promise<void> {
+    const tab = this.win.tabs[index];
+    if (this.tabsLocked() || tab === undefined) {
+      return Promise.resolve();
+    }
+    return new Promise<void>((resolve) => {
+      this.closeQueue.push({
+        tab,
+        seq: this.win.clickSeq,
+        clicked: this.win.pendingClicks > 0 || this.win.clicksInWait > 0,
+        resolve,
+      });
+      if (!this.running) {
+        this.running = true;
+        void this.runCloseQueue();
+      }
+    });
+  }
+  /** Whether no close button's close is waiting or under way. */
+  get closeQueueIdle(): boolean {
+    return this.closeQueue.length === 0 && !this.running;
+  }
+  private async runCloseQueue(): Promise<void> {
+    try {
+      for (;;) {
+        const entry = this.closeQueue.shift();
+        if (entry === undefined) {
+          return;
+        }
+        try {
+          await this.closeOne(entry);
+        } catch (error) {
+          console.error('closing a tab failed', error);
+        }
+        this.pendingClose = null;
+        entry.resolve();
+      }
+    } finally {
+      this.running = false;
+    }
+  }
+  /** Close the tab of one close button, whichever tabs were clicked meanwhile:
+   *  a tab that is closed without a question does not take the screen, and a
+   *  question is asked on the tab it is about, after which the window goes to
+   *  the tab clicked last. */
+  private async closeOne(entry: QueuedClose): Promise<void> {
+    const tab = entry.tab;
+    for (;;) {
+      await this.win.settled();
+      if (!this.win.tabs.includes(tab)) {
+        return;
+      }
+      const clicked = entry.clicked || this.win.clickSeq !== entry.seq;
+      const back = this.win.activeTab;
+      let to: DocTab | null = null;
+      if (!clicked || (back !== tab && !this.asksNothing(tab))) {
+        if (this.navigationLocked()) {
+          return;
+        }
+        await this.win.switchTo(this.win.tabs.indexOf(tab));
+        await this.win.settled();
+        if (this.win.activeTab !== tab) {
+          continue;
+        }
+        to = clicked ? back : null;
+      } else if (back !== tab) {
+        if (this.navigationLocked()) {
+          return;
+        }
+        await this.host.finishTabClose(tab);
+        return;
+      }
+      const end = await this.closeTab(tab);
+      if (end === 'retry') {
+        continue;
+      }
+      if (
+        end === 'closed' &&
+        to !== null &&
+        this.win.tabs.includes(to) &&
+        !this.navigationLocked()
+      ) {
+        await this.win.switchTo(this.win.tabs.indexOf(to));
       }
       return;
     }
-    this.closeNow(tab);
   }
-  /** Close the tab at `index` (its close button). It is closed only if it is
-   *  still the active tab once the switch to it has finished. */
-  async requestCloseAt(index: number): Promise<void> {
-    if (this.tabsLocked()) {
+  /** Whether closing `tab` goes ahead without a question or a dialog. */
+  private asksNothing(tab: DocTab): boolean {
+    const box = this.boxOf(tab.id);
+    return (
+      tab.missing !== true &&
+      box?.missing !== true &&
+      !(box !== null && this.win.rangeBoxDirty()) &&
+      !this.win.isDirty(tab) &&
+      tab.transferring !== true &&
+      this.win.preparingTab !== tab &&
+      !(tab.windowed !== undefined && this.win.windowedPending?.() === true)
+    );
+  }
+  /** Close the active `tab` and resolve once that has ended. */
+  private async closeTab(tab: DocTab): Promise<CloseEnd> {
+    // A windowed close that waits for input ends first.
+    while (this.closingEnd !== null) {
+      await this.closingEnd;
+    }
+    return new Promise<CloseEnd>((resolve) => {
+      const owner = {};
+      this.pendingClose = { tab, owner, resolve };
+      if (!this.requestClose(tab, owner)) {
+        this.closeEnded(
+          tab.id,
+          this.win.activeTab !== tab ? 'other-active' : undefined,
+        );
+      }
+    });
+  }
+  /** The close of the tab `id` has ended. A report that carries the `owner` of
+   *  a deferred close counts only for the close that started it. */
+  private closeEnded(
+    id: string,
+    reason?: 'other-active',
+    owner?: object,
+  ): void {
+    const pending = this.pendingClose;
+    if (pending === null || pending.tab.id !== id) {
       return;
     }
-    const target = this.win.tabs[index];
-    await this.win.switchTo(index);
-    if (sameTabStillActive(target, this.win.activeTab)) {
-      this.requestClose();
+    if (owner !== undefined && owner !== pending.owner) {
+      return;
+    }
+    this.pendingClose = null;
+    if (!this.win.tabs.includes(pending.tab)) {
+      pending.resolve('closed');
+    } else {
+      pending.resolve(reason === 'other-active' ? 'retry' : 'kept');
     }
   }
-  private async closeWhenSettled(
-    tab: NonNullable<MissingWindow['activeTab']>,
-  ): Promise<void> {
+  private async closeAfterSettle(tab: DocTab, owner?: object): Promise<void> {
+    let started = false;
     try {
-      await this.win.endComposition?.();
+      await this.win.settleTab(tab);
+      if (this.win.activeTab !== tab || tab.transferring === true) {
+        return;
+      }
+      started = this.requestClose(tab, owner);
     } finally {
-      this.closing = false;
+      if (!started) {
+        this.deferredEnded(tab, owner);
+      }
     }
-    if (this.win.activeTab !== tab || this.navigationLocked()) {
+  }
+  private async closeWhenSettled(tab: DocTab, owner?: object): Promise<void> {
+    let reached = false;
+    try {
+      try {
+        await this.win.endComposition?.();
+      } finally {
+        this.closing = false;
+        this.closingEnd = null;
+        this.endClosing?.();
+        this.endClosing = null;
+      }
+      if (this.win.activeTab !== tab || this.navigationLocked()) {
+        return;
+      }
+      reached = true;
+      this.closeNow(tab);
+    } finally {
+      if (!reached) {
+        this.deferredEnded(tab, owner);
+      }
+    }
+  }
+  /** A deferred close ended without reaching a close of its own. */
+  private deferredEnded(tab: DocTab, owner?: object): void {
+    if (owner === undefined) {
       return;
     }
-    this.closeNow(tab);
+    this.closeEnded(
+      tab.id,
+      this.win.tabs.includes(tab) && this.win.activeTab !== tab
+        ? 'other-active'
+        : undefined,
+      owner,
+    );
   }
-  private closeNow(tab: NonNullable<MissingWindow['activeTab']>): void {
+  private closeNow(tab: DocTab): void {
     const box = this.boxOf(tab.id);
     if (tab.missing === true || box?.missing === true) {
       this.promote({ tabId: tab.id, box: tab.missing !== true });
     } else if (box !== null && this.win.rangeBoxDirty()) {
-      void this.gate.promptTabClose();
+      void this.gate.promptTabClose(tab);
     } else if (this.win.isDirty(tab)) {
-      this.confirmTarget = tab;
+      this.closeTarget = tab;
       this.confirmClose = true;
     } else {
-      void this.host.finishTabClose();
+      void this.finishClean(tab);
+    }
+  }
+  /** Close a tab that asks nothing; a failure is logged and ends the close. */
+  private async finishClean(tab: DocTab): Promise<void> {
+    try {
+      await this.host.finishTabClose(tab);
+    } catch (error) {
+      console.error('closing a tab failed', error);
+    } finally {
+      this.closeEnded(tab.id);
     }
   }
   /** Put `entry` first in the queue, adding it when it is not there. */
@@ -438,43 +694,45 @@ export class MissingFiles {
    *  dialog. Text typed while the write was out is saved again before the tab
    *  closes; a save that fails then keeps the tab too. */
   async confirmSave(): Promise<void> {
-    const target = this.confirmTarget;
-    if (!sameTabStillActive(target, this.win.activeTab)) {
-      this.confirmClose = false;
-      this.confirmTarget = null;
-      await this.revealCurrent();
+    const tab = this.closeTarget;
+    if (tab === null) {
       return;
     }
     do {
-      if (!(await this.win.saveActive())) {
+      if (!(await this.win.saveTab(tab))) {
         return;
       }
-    } while (
-      target !== null &&
-      this.win.activeTab === target &&
-      this.win.isDirty(target)
-    );
+    } while (this.win.tabs.includes(tab) && this.win.isDirty(tab));
     this.confirmClose = false;
-    this.confirmTarget = null;
-    // `finishTabClose` closes the active tab, which is no longer the saved one.
-    if (this.win.activeTab === target) {
-      await this.host.finishTabClose();
+    this.closeTarget = null;
+    try {
+      await this.host.finishTabClose(tab);
+    } finally {
+      this.closeEnded(tab.id);
     }
     await this.revealCurrent();
   }
   /** "不儲存" in the close confirmation. */
   async confirmDiscard(): Promise<void> {
-    const target = this.confirmTarget;
+    const tab = this.closeTarget;
     this.confirmClose = false;
-    this.confirmTarget = null;
-    if (sameTabStillActive(target, this.win.activeTab)) {
-      await this.host.finishTabClose();
+    this.closeTarget = null;
+    if (tab !== null) {
+      try {
+        await this.host.finishTabClose(tab);
+      } finally {
+        this.closeEnded(tab.id);
+      }
     }
     await this.revealCurrent();
   }
   cancelClose(): void {
+    const tab = this.closeTarget;
     this.confirmClose = false;
-    this.confirmTarget = null;
+    this.closeTarget = null;
+    if (tab !== null) {
+      this.closeEnded(tab.id);
+    }
     void this.revealCurrent();
   }
   /** Open `path` as a tab (the workspace tree, the shell) while the dialog may

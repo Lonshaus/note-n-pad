@@ -203,6 +203,7 @@ function viewerTab(): DocTab {
     encoding: 'UTF-8',
     lossy: false,
     tabIndex: 0,
+    order: 0,
     large: { size: disk.length },
   };
   documentWindow.tabs.push(tab);
