@@ -3,6 +3,7 @@
 import {
   EditorSelection,
   EditorState,
+  MapMode,
   Prec,
   RangeSet,
   RangeValue,
@@ -903,15 +904,15 @@ export type GotoTarget =
 /** A request that waits for the end of an input-method composition, in the form
  *  it was made: the goto box with its parsed target, a goto by line, a find hit
  *  as the call that produced it, Replace, a marker click as the hole's global
- *  line and the byte its hole starts at (valid while the same window is
- *  installed, `installs`). */
+ *  position of the placeholder in the view (valid while the same window is
+ *  installed, `installs`; `unmatched` once an edit removed the placeholder). */
 export type KeptRequest =
   | { kind: 'goto'; line: number }
   | { kind: 'panel'; target: GotoTarget }
   | { kind: 'find'; backward: boolean }
   | { kind: 'result'; index: number }
   | { kind: 'replace' }
-  | { kind: 'marker'; line: number; start: number; installs: number };
+  | { kind: 'marker'; pos: number; unmatched: boolean; installs: number };
 /** The list of kept requests after `request` was made: added when a composition
  *  is open or captured (`composing`), which then leaves the selection alone;
  *  otherwise unchanged and `kept` false, so the request runs now. A request the
@@ -1035,18 +1036,38 @@ export function keptSchedule(run: (released: boolean) => void): {
     },
   };
 }
+/** The kept requests after a document change: a marker's position follows the
+ *  text, and a marker whose placeholder the change deleted stays unmatched. */
+export function mapKeptRequests(
+  list: readonly KeptRequest[],
+  changes: ChangeDesc,
+): readonly KeptRequest[] {
+  return list.map((request) => {
+    if (request.kind !== 'marker' || request.unmatched) {
+      return request;
+    }
+    const pos = changes.mapPos(request.pos, 1, MapMode.TrackAfter);
+    return pos === null ? { ...request, unmatched: true } : { ...request, pos };
+  });
+}
 /** The document position of the marker a kept request names, null when it is
- *  dropped: another window has been installed since, or no hole starts at its
- *  byte. */
+ *  dropped: another window has been installed since, its placeholder was
+ *  deleted, or no placeholder is at its position. */
 export function keptMarkerPos(
   request: Extract<KeptRequest, { kind: 'marker' }>,
   state: EditorState,
   startLine: number,
   installs: number,
 ): number | null {
-  return request.installs === installs
-    ? markerAtByte(state, request.line, startLine, request.start)
-    : null;
+  if (
+    request.installs !== installs ||
+    request.unmatched ||
+    request.pos > state.doc.length ||
+    markerStart(state, request.pos, startLine) === null
+  ) {
+    return null;
+  }
+  return request.pos;
 }
 /** Where a part that ends at the end of a hole's range ends on its line: just
  *  before the line's right placeholder, or at the line end when it has none. */
@@ -1062,6 +1083,47 @@ export function newPartEnd(
     right ||= from === line.to - 1 && to === line.to;
   });
   return right ? line.to - 1 : line.to;
+}
+/** Where the caret goes after a marker click installed its read: the first
+ *  character the newly shown part starts with, or (a part that ends at the
+ *  hole's end) the position the part ends at. */
+export function clickCaretPos(
+  state: EditorState,
+  line: { from: number; to: number },
+  fromEnd: boolean,
+): number {
+  return fromEnd ? newPartEnd(state, line) : Math.min(line.to, line.from + 1);
+}
+/** The span a marker click scrolls into view: from the placeholder next to the
+ *  newly shown part to the caret, so the placeholder is not left under the
+ *  gutter. Without a placeholder at that side it is the caret alone. */
+export function clickScrollSpan(
+  state: EditorState,
+  line: { from: number; to: number },
+  fromEnd: boolean,
+): { anchor: number; head: number } {
+  const head = clickCaretPos(state, line, fromEnd);
+  const from = fromEnd ? line.to - 1 : line.from;
+  let placeholder = false;
+  if (line.to > line.from) {
+    holesOf(state).between(from, from + 1, (a, b) => {
+      placeholder ||= a === from && b === from + 1;
+    });
+  }
+  if (!placeholder) {
+    return { anchor: head, head };
+  }
+  return { anchor: fromEnd ? line.to : line.from, head };
+}
+/** Whether a marker click moves the real caret: it is a caret, on the clicked
+ *  line, hidden in a part the new window does not hold. A range selection and a
+ *  caret the window shows or on another line stay where they are. */
+export function clickMovesCaret(s: {
+  empty: boolean;
+  onClickedLine: boolean;
+  hidden: boolean;
+}): boolean {
+  return s.empty && s.onClickedLine && s.hidden;
 }
 /** Whether a replayed key runs the command it was recorded with directly on
  *  the view: only a key the reaching-delete path queued (`reaching`) that the

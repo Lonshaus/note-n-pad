@@ -5,7 +5,7 @@
 // CodeMirror clamps the caret; its changes are captured, undone when it ends,
 // and the committed text is replayed at the real caret.
 
-import { ChangeSet, type Text } from '@codemirror/state';
+import { ChangeSet, type EditorSelection, type Text } from '@codemirror/state';
 /** The changes a composition made since the capture began, composed into one
  *  change set over the document the capture started from. */
 export interface ImeCapture {
@@ -160,5 +160,96 @@ export function captureStartAllowed(s: {
     s.holds === 0 &&
     s.wanted &&
     (s.replaySwap || (!s.swapping && s.outside))
+  );
+}
+/** What the focus-out timer does when it fires for a capture: 'end' ends it,
+ *  'wait' arms the timer again, 'none' stops the timer (the capture is gone, or
+ *  the composition ends it with focus back in the editor). */
+export function focusOutCaptureAction(s: {
+  /** The capture is the one whose focus-out armed the timer. */
+  sameCapture: boolean;
+  composing: boolean;
+  focused: boolean;
+  sinceFirstFocusOutMs: number;
+  limitMs: number;
+}): 'end' | 'wait' | 'none' {
+  if (!s.sameCapture) {
+    return 'none';
+  }
+  if (!s.composing) {
+    return 'end';
+  }
+  if (s.focused) {
+    return 'none';
+  }
+  return s.sinceFirstFocusOutMs >= s.limitMs ? 'end' : 'wait';
+}
+/** Whether a keydown proves an open capture lost its compositionend: a key that
+ *  is no input method key and no bare modifier, with focus in the editor. */
+export function staleCaptureKey(s: {
+  capturing: boolean;
+  imeKey: boolean;
+  modifier: boolean;
+  focused: boolean;
+}): boolean {
+  return s.capturing && !s.imeKey && !s.modifier && s.focused;
+}
+/** Why a capture ends. */
+export type CaptureEndReason =
+  'compositionend' | 'focus-out' | 'stale-key' | 'stale-start' | 'limit';
+/** How a capture ends: `keepSelection` keeps the view's selection through the
+ *  revert, `synthesizeEnd` sends the compositionend that was lost so CodeMirror
+ *  stops composing. */
+export function endCaptureMode(reason: CaptureEndReason): {
+  keepSelection: boolean;
+  synthesizeEnd: boolean;
+} {
+  switch (reason) {
+    case 'stale-key':
+    case 'stale-start':
+      return { keepSelection: true, synthesizeEnd: true };
+    case 'limit':
+      return { keepSelection: false, synthesizeEnd: true };
+    default:
+      return { keepSelection: false, synthesizeEnd: false };
+  }
+}
+/** What a compositionstart does about an open capture: compositions do not
+ *  nest, so an open capture lost its end ('end'); otherwise the composition is
+ *  judged for a capture of its own ('judge'). */
+export function compositionStartAction(s: {
+  capturing: boolean;
+}): 'end' | 'judge' {
+  return s.capturing ? 'end' : 'judge';
+}
+/** The selection a capture's revert leaves: the view's own selection mapped
+ *  through the revert when `keepSelection`, else the selection of the start. */
+export function revertSelection(
+  current: EditorSelection,
+  startSelection: EditorSelection,
+  revert: ChangeSet,
+  keepSelection: boolean,
+): EditorSelection {
+  return keepSelection ? current.map(revert) : startSelection;
+}
+/** Whether a keydown is the input method's own commit key: on macOS WebKit
+ *  sends the Enter that commits a composition as the first key event after the
+ *  compositionend, with keyCode 229 and no composing flag. It must not reach
+ *  CodeMirror, which would insert a newline when its own 100 ms window passed. */
+export function imeCommitKey(s: {
+  mac: boolean;
+  key: string;
+  keyCode: number;
+  composing: boolean;
+  afterCompositionEnd: boolean;
+  inEditor: boolean;
+}): boolean {
+  return (
+    s.mac &&
+    s.key === 'Enter' &&
+    s.keyCode === 229 &&
+    !s.composing &&
+    s.afterCompositionEnd &&
+    s.inEditor
   );
 }

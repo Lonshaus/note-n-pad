@@ -12,10 +12,16 @@ import {
   accumulate,
   capturedInput,
   captureStartAllowed,
+  compositionStartAction,
+  endCaptureMode,
   finishCapture,
+  focusOutCaptureAction,
+  imeCommitKey,
   imeKeyAction,
   outsideInputAction,
+  revertSelection,
   selectQueued,
+  staleCaptureKey,
   startCapture,
   toCaptureStart,
   updateActions,
@@ -459,5 +465,181 @@ describe('capturedInput', () => {
     expect(capturedInput(true, 'delete.line')).toBe(false);
     expect(capturedInput(true, 'input.paste')).toBe(false);
     expect(capturedInput(true, undefined)).toBe(false);
+  });
+});
+
+describe('focusOutCaptureAction', () => {
+  const base = {
+    sameCapture: true,
+    composing: false,
+    focused: false,
+    sinceFirstFocusOutMs: 300,
+    limitMs: 30000,
+  };
+  it('does nothing for a capture that is not the one that armed it', () => {
+    expect(focusOutCaptureAction({ ...base, sameCapture: false })).toBe('none');
+  });
+  it('ends a capture whose view is not composing', () => {
+    expect(focusOutCaptureAction(base)).toBe('end');
+  });
+  it('leaves a composition with focus back in the editor to its own end', () => {
+    expect(
+      focusOutCaptureAction({ ...base, composing: true, focused: true }),
+    ).toBe('none');
+  });
+  it('waits while a composition runs with focus away', () => {
+    expect(focusOutCaptureAction({ ...base, composing: true })).toBe('wait');
+  });
+  it('ends a composition that ran with focus away up to the limit', () => {
+    expect(
+      focusOutCaptureAction({
+        ...base,
+        composing: true,
+        sinceFirstFocusOutMs: 29999,
+      }),
+    ).toBe('wait');
+    expect(
+      focusOutCaptureAction({
+        ...base,
+        composing: true,
+        sinceFirstFocusOutMs: 30000,
+      }),
+    ).toBe('end');
+  });
+});
+
+describe('staleCaptureKey', () => {
+  const base = {
+    capturing: true,
+    imeKey: false,
+    modifier: false,
+    focused: true,
+  };
+  it('is a typed key of an open capture with focus in the editor', () => {
+    expect(staleCaptureKey(base)).toBe(true);
+  });
+  it('is not an input method key', () => {
+    expect(staleCaptureKey({ ...base, imeKey: true })).toBe(false);
+  });
+  it('is not a bare modifier', () => {
+    expect(staleCaptureKey({ ...base, modifier: true })).toBe(false);
+  });
+  it('needs an open capture', () => {
+    expect(staleCaptureKey({ ...base, capturing: false })).toBe(false);
+  });
+  it('needs focus in the editor', () => {
+    expect(staleCaptureKey({ ...base, focused: false })).toBe(false);
+  });
+});
+
+describe('endCaptureMode', () => {
+  it('leaves a compositionend end and a focus-out end as they were', () => {
+    expect(endCaptureMode('compositionend')).toEqual({
+      keepSelection: false,
+      synthesizeEnd: false,
+    });
+    expect(endCaptureMode('focus-out')).toEqual({
+      keepSelection: false,
+      synthesizeEnd: false,
+    });
+  });
+  it('keeps the selection and ends the composition for a stale key', () => {
+    expect(endCaptureMode('stale-key')).toEqual({
+      keepSelection: true,
+      synthesizeEnd: true,
+    });
+  });
+  it('keeps the selection and ends the composition for a stale start', () => {
+    expect(endCaptureMode('stale-start')).toEqual({
+      keepSelection: true,
+      synthesizeEnd: true,
+    });
+  });
+  it('ends the composition only at the limit', () => {
+    expect(endCaptureMode('limit')).toEqual({
+      keepSelection: false,
+      synthesizeEnd: true,
+    });
+  });
+});
+
+describe('compositionStartAction', () => {
+  it('ends an open capture first', () => {
+    expect(compositionStartAction({ capturing: true })).toBe('end');
+  });
+  it('judges a composition with no capture open', () => {
+    expect(compositionStartAction({ capturing: false })).toBe('judge');
+  });
+  it('judges the capture again on the state after the end', () => {
+    const afterEnd = {
+      capturing: false,
+      locked: false,
+      swapping: false,
+      replaySwap: false,
+      draining: false,
+      holds: 0,
+      wanted: true,
+      outside: true,
+      selectAllPending: false,
+    };
+    expect(captureStartAllowed(afterEnd)).toBe(true);
+    expect(captureStartAllowed({ ...afterEnd, draining: true })).toBe(false);
+    expect(captureStartAllowed({ ...afterEnd, locked: true })).toBe(false);
+  });
+});
+
+describe('revertSelection', () => {
+  // The capture inserted 'abc' at 2; the revert deletes it again.
+  const start = EditorState.create({ doc: 'xxxxxx' });
+  const changes = ChangeSet.of({ from: 2, insert: 'abc' }, 6);
+  const revert = changes.invert(start.doc);
+  const startSelection = EditorSelection.single(1);
+  it('maps the current selection through the revert when it is kept', () => {
+    expect(
+      revertSelection(EditorSelection.single(7), startSelection, revert, true)
+        .main.head,
+    ).toBe(4);
+    expect(
+      revertSelection(EditorSelection.single(1), startSelection, revert, true)
+        .main.head,
+    ).toBe(1);
+  });
+  it('restores the selection of the start otherwise', () => {
+    expect(
+      revertSelection(EditorSelection.single(7), startSelection, revert, false)
+        .main.head,
+    ).toBe(1);
+  });
+});
+
+describe('imeCommitKey', () => {
+  const commit = {
+    mac: true,
+    key: 'Enter',
+    keyCode: 229,
+    composing: false,
+    afterCompositionEnd: true,
+    inEditor: true,
+  };
+  it('is the Enter the input method sends right after its compositionend', () => {
+    expect(imeCommitKey(commit)).toBe(true);
+  });
+  it('is false off macOS', () => {
+    expect(imeCommitKey({ ...commit, mac: false })).toBe(false);
+  });
+  it('is false for another key', () => {
+    expect(imeCommitKey({ ...commit, key: 'a' })).toBe(false);
+  });
+  it('is false for a real Enter (keyCode 13) after a commit', () => {
+    expect(imeCommitKey({ ...commit, keyCode: 13 })).toBe(false);
+  });
+  it('is false while the composition still runs', () => {
+    expect(imeCommitKey({ ...commit, composing: true })).toBe(false);
+  });
+  it('is false when no compositionend came right before', () => {
+    expect(imeCommitKey({ ...commit, afterCompositionEnd: false })).toBe(false);
+  });
+  it('is false for a commit Enter in the find or Go To field', () => {
+    expect(imeCommitKey({ ...commit, inEditor: false })).toBe(false);
   });
 });

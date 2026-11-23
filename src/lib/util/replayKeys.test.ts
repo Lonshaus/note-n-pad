@@ -246,7 +246,7 @@ const redo: Command = () => true;
 const NEVER: ReadonlySet<Command> = new Set([toggleTabFocusMode, undo, redo]);
 
 function layersFor(
-  os: 'macos' | 'windows',
+  os: 'macos' | 'windows' | 'linux',
   overrides: Record<string, string | null> = {},
 ): KeyLayers {
   const accel = (id: string): string | null => {
@@ -265,6 +265,21 @@ function layersFor(
   });
   return [offscreen, core, normal];
 }
+
+describe('windowed redo keys', () => {
+  it('runs redo for Ctrl+Y on Windows only', () => {
+    const y = ev('y', { keyCode: 89, ctrlKey: true });
+    expect(commandChain(layersFor('windows'), y, 'windows')[0]).toBe(redo);
+    expect(commandChain(layersFor('linux'), y, 'linux')).not.toContain(redo);
+    expect(
+      commandChain(
+        layersFor('macos'),
+        ev('y', { keyCode: 89, metaKey: true }),
+        'macos',
+      ),
+    ).not.toContain(redo);
+  });
+});
 
 describe('chordReplaysAtEdge', () => {
   const mac = layersFor('macos');
@@ -1093,8 +1108,14 @@ describe('parkedUndoKey', () => {
       key(ev('Z', { keyCode: 90, metaKey: true, shiftKey: true }), 'macos'),
     ).toBe('redo');
   });
-  it('leaves Ctrl+Y and every other chord to the decision it had', () => {
-    expect(key(ev('y', { keyCode: 89, ctrlKey: true }), 'windows')).toBeNull();
+  it('turns Ctrl+Y on Windows into a redo, and only there', () => {
+    expect(key(ev('y', { keyCode: 89, ctrlKey: true }), 'windows')).toBe(
+      'redo',
+    );
+    expect(key(ev('y', { keyCode: 89, ctrlKey: true }), 'linux')).toBeNull();
+    expect(key(ev('y', { keyCode: 89, metaKey: true }), 'macos')).toBeNull();
+  });
+  it('leaves every other chord to the decision it had', () => {
     expect(key(ev('s', { keyCode: 83, ctrlKey: true }), 'windows')).toBeNull();
     expect(key(ev('z', { keyCode: 90 }), 'windows')).toBeNull();
     expect(key(ev('a', { keyCode: 65, ctrlKey: true }), 'windows')).toBeNull();

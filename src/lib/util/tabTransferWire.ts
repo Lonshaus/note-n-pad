@@ -82,6 +82,19 @@ export const TRANSFER_EVENT = {
 export interface TransferEventPayload {
   t: number;
 }
+/** The events of a tab dragged over a window: not part of a transfer, so no `t`. */
+export const HOVER_EVENT = {
+  hover: 'tab-transfer-hover',
+  end: 'tab-transfer-hover-end',
+} as const;
+/** Where the dragged tab is over the receiving window: `x` and `y` are the
+ *  offset from its inner origin in native units, `width` is the tab's width in
+ *  CSS pixels. */
+export interface HoverPayload {
+  x: number;
+  y: number;
+  width: number;
+}
 /** The `kind` of a transfer in the queue `doc_window_ready` hands over. */
 export const QUEUED_TRANSFER = 'transfer';
 export interface QueuedTransfer {

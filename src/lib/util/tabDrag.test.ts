@@ -6,9 +6,14 @@ import {
   DRAG_THRESHOLD,
   IDLE,
   dragStep,
+  hoverAccepted,
+  hoverCall,
+  hoverGap,
+  hoverShift,
   overTabBar,
   slideOffset,
   slotAt,
+  translateXOf,
   type CancelReason,
   type DragInput,
   type DragOutcome,
@@ -54,24 +59,36 @@ const up = (x: number, y = 15, scrollLeft = 0): DragInput => ({
 });
 
 describe('slotAt', () => {
-  it('is the tab under the pointer', () => {
-    expect(slotAt(0, bar())).toBe(0);
-    expect(slotAt(99, bar())).toBe(0);
-    expect(slotAt(100, bar())).toBe(1);
-    expect(slotAt(250, bar())).toBe(2);
+  it('counts the other tabs whose midpoint is left of the pointer', () => {
+    // Midpoints at 50, 150, 250 and 350; the dragged tab is the first.
+    expect(slotAt(149, bar(), 0)).toBe(0);
+    expect(slotAt(151, bar(), 0)).toBe(1);
+    expect(slotAt(251, bar(), 0)).toBe(2);
+    // The dragged tab is the third.
+    expect(slotAt(49, bar(), 2)).toBe(0);
+    expect(slotAt(51, bar(), 2)).toBe(1);
+    expect(slotAt(149, bar(), 2)).toBe(1);
+    expect(slotAt(151, bar(), 2)).toBe(2);
+  });
+
+  it('ignores the midpoint of the dragged tab', () => {
+    // Past its own midpoint (150) the tab still takes slot 1: only tab 0 is left.
+    expect(slotAt(160, bar(), 1)).toBe(1);
+    expect(slotAt(260, bar(), 1)).toBe(2);
   });
 
   it('is the first before the first tab and the last past the last', () => {
-    expect(slotAt(-40, bar())).toBe(0);
-    expect(slotAt(399, bar())).toBe(3);
-    expect(slotAt(5000, bar())).toBe(3);
+    expect(slotAt(-40, bar(), 1)).toBe(0);
+    expect(slotAt(5000, bar(), 0)).toBe(3);
+    expect(slotAt(5000, bar(), 3)).toBe(3);
   });
 
   it('adds the scroll offset of the bar', () => {
-    // 150 px scrolled: the pointer at 10 is over content 160, the second tab.
-    expect(slotAt(10, bar(150))).toBe(1);
-    expect(slotAt(10, bar(0))).toBe(0);
-    expect(slotAt(10, bar(300))).toBe(3);
+    // 150 px scrolled: the pointer at 10 is over content 160, right of the
+    // midpoints 50 and 150.
+    expect(slotAt(10, bar(150), 3)).toBe(2);
+    expect(slotAt(10, bar(0), 3)).toBe(0);
+    expect(slotAt(10, bar(400), 0)).toBe(3);
   });
 
   it('is measured from the left edge of the bar, not of the viewport', () => {
@@ -79,12 +96,12 @@ describe('slotAt', () => {
       ...bar(),
       bar: { left: 50, right: 350, top: 0, bottom: 30 },
     };
-    expect(slotAt(60, shifted)).toBe(0);
-    expect(slotAt(160, shifted)).toBe(1);
+    expect(slotAt(60, shifted, 3)).toBe(0);
+    expect(slotAt(160, shifted, 3)).toBe(1);
   });
 
   it('is 0 for a bar without tabs', () => {
-    expect(slotAt(10, { ...bar(), tabs: [] })).toBe(0);
+    expect(slotAt(10, { ...bar(), tabs: [] }, null)).toBe(0);
   });
 });
 
@@ -150,7 +167,8 @@ describe('the slot and the bar while dragging', () => {
   });
 
   it('uses the scroll offset of the bar at the time of the move', () => {
-    expect(play([down(1), move(10, 15, 200)]).state.slot).toBe(2);
+    expect(play([down(1), move(10, 15, 300)]).state.slot).toBe(2);
+    expect(play([down(1), move(10, 15, 0)]).state.slot).toBe(0);
   });
 
   it('is past the end for a pointer right of the last tab', () => {
@@ -284,5 +302,146 @@ describe('cancelling', () => {
     ]);
     expect(play([move(100)], cancelled.state).state.phase).toBe('idle');
     expect(play([up(100)], cancelled.state).outcome).toBeNull();
+  });
+});
+
+describe('hoverCall', () => {
+  it('hovers while dragging off the own bar, whether or not it hovered before', () => {
+    expect(
+      hoverCall({
+        dragging: true,
+        overBar: false,
+        hovering: false,
+        transferable: true,
+      }),
+    ).toBe('hover');
+    expect(
+      hoverCall({
+        dragging: true,
+        overBar: false,
+        hovering: true,
+        transferable: true,
+      }),
+    ).toBe('hover');
+  });
+
+  it('ends a hover when the pointer is back over the own bar', () => {
+    expect(
+      hoverCall({
+        dragging: true,
+        overBar: true,
+        hovering: true,
+        transferable: true,
+      }),
+    ).toBe('end');
+    expect(
+      hoverCall({
+        dragging: true,
+        overBar: true,
+        hovering: false,
+        transferable: true,
+      }),
+    ).toBe('none');
+  });
+
+  it('ends a hover once the drag is over, and does nothing without one', () => {
+    expect(
+      hoverCall({
+        dragging: false,
+        overBar: false,
+        hovering: true,
+        transferable: true,
+      }),
+    ).toBe('end');
+    expect(
+      hoverCall({
+        dragging: false,
+        overBar: true,
+        hovering: true,
+        transferable: true,
+      }),
+    ).toBe('end');
+    expect(
+      hoverCall({
+        dragging: false,
+        overBar: false,
+        hovering: false,
+        transferable: true,
+      }),
+    ).toBe('none');
+  });
+});
+
+describe('hoverCall for a tab that cannot be transferred', () => {
+  it('does nothing off the own bar without a hover, and ends one', () => {
+    expect(
+      hoverCall({
+        dragging: true,
+        overBar: false,
+        hovering: false,
+        transferable: false,
+      }),
+    ).toBe('none');
+    expect(
+      hoverCall({
+        dragging: true,
+        overBar: false,
+        hovering: true,
+        transferable: false,
+      }),
+    ).toBe('end');
+  });
+});
+
+describe('hoverAccepted', () => {
+  it('accepts a window that is ready and not locked', () => {
+    expect(hoverAccepted({ ready: true, locked: false })).toBe(true);
+    expect(hoverAccepted({ ready: false, locked: false })).toBe(false);
+    expect(hoverAccepted({ ready: true, locked: true })).toBe(false);
+  });
+});
+
+describe('hoverShift', () => {
+  it('moves the tabs from the slot on, by the width of the gap', () => {
+    expect([0, 1, 2, 3].map((i) => hoverShift(i, 2, 90))).toEqual([
+      0, 0, 90, 90,
+    ]);
+    expect([0, 1].map((i) => hoverShift(i, 2, 90))).toEqual([0, 0]);
+  });
+});
+
+describe('translateXOf', () => {
+  it('is 0 for none', () => {
+    expect(translateXOf('none')).toBe(0);
+  });
+
+  it('is the e of a 2D matrix', () => {
+    expect(translateXOf('matrix(1, 0, 0, 1, 90, 0)')).toBe(90);
+    expect(translateXOf('matrix(1, 0, 0, 1, -37.5, 0)')).toBe(-37.5);
+  });
+
+  it('is the 13th value of a 3D matrix', () => {
+    expect(
+      translateXOf('matrix3d(1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 42, 7, 0, 1)'),
+    ).toBe(42);
+  });
+});
+
+describe('hoverGap', () => {
+  it('takes the width through unchanged and the offset to a client point', () => {
+    const payload = { x: 450, y: 225, width: 90 };
+    const one = hoverGap(payload, 'windows', 1);
+    const two = hoverGap(payload, 'windows', 2);
+    expect(one.width).toBe(90);
+    expect(two.width).toBe(90);
+    expect(one.point).toEqual({ x: 450, y: 225 });
+    expect(two.point).toEqual({ x: 225, y: 112.5 });
+  });
+
+  it('keeps a macOS offset as it is', () => {
+    expect(hoverGap({ x: 10, y: 20, width: 90 }, 'macos', 2)).toEqual({
+      point: { x: 10, y: 20 },
+      width: 90,
+    });
   });
 });

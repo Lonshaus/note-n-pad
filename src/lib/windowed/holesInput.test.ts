@@ -3,6 +3,7 @@
 
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import {
+  ChangeSet,
   EditorSelection,
   EditorState,
   Text,
@@ -39,6 +40,9 @@ import {
   PLACEHOLDER,
   PLACEHOLDER_DELETES,
   REACHING_DELETES,
+  clickCaretPos,
+  clickMovesCaret,
+  clickScrollSpan,
   dragRefused,
   holeExtensions,
   holeSetOf,
@@ -48,6 +52,7 @@ import {
   keptRequest,
   keptSchedule,
   livePos,
+  mapKeptRequests,
   markerAtByte,
   markerStart,
   newPartEnd,
@@ -620,8 +625,8 @@ describe('the list of kept requests', () => {
   const replace: KeptRequest = { kind: 'replace' };
   const marker: KeptRequest = {
     kind: 'marker',
-    line: 700,
-    start: 12,
+    pos: 12,
+    unmatched: false,
     installs: 3,
   };
 
@@ -712,41 +717,139 @@ describe('the list of kept requests', () => {
     );
   });
 
-  it('keeps a marker whose window is still installed and whose hole is there', () => {
+  const kept = (
+    pos: number,
+    extra: Partial<Extract<KeptRequest, { kind: 'marker' }>> = {},
+  ): Extract<KeptRequest, { kind: 'marker' }> => ({
+    kind: 'marker',
+    pos,
+    unmatched: false,
+    installs: 3,
+    ...extra,
+  });
+
+  it('keeps a marker whose window is still installed and whose placeholder is there', () => {
     const state = make(
       [`${P}mid${P}`],
       [hole(0, 0, 7, { bytes: 9 }), hole(0, 4, 8, { bytes: 11 })],
     );
-    const kept: Extract<KeptRequest, { kind: 'marker' }> = {
-      kind: 'marker',
-      line: 700,
-      start: 12,
-      installs: 3,
-    };
-    expect(keptMarkerPos(kept, state, 700, 3)).toBe(4);
+    expect(keptMarkerPos(kept(4), state, 700, 3)).toBe(4);
+    expect(keptMarkerPos(kept(0), state, 700, 3)).toBe(0);
+  });
+
+  it('follows the placeholder when an edit before it changes the text length', () => {
+    // A composition typed three characters (nine bytes) before the clicked
+    // placeholder; its byte offset on the line is no longer the same.
+    const before = make([`abc${P}mid`], [hole(0, 3, 7)]);
+    const after = make([`aかんじbc${P}mid`], [hole(0, 6, 7)]);
+    const changes = ChangeSet.of(
+      { from: 1, insert: 'かんじ' },
+      before.doc.length,
+    );
+    const [moved] = mapKeptRequests([kept(3)], changes);
+    expect(moved).toEqual(kept(6));
+    expect(keptMarkerPos(moved as ReturnType<typeof kept>, after, 700, 3)).toBe(
+      6,
+    );
   });
 
   it('drops a marker once a window has been installed since', () => {
     const state = make([`${P}mid`], [hole(0, 0, 7, { bytes: 9 })]);
-    const kept: Extract<KeptRequest, { kind: 'marker' }> = {
-      kind: 'marker',
-      line: 700,
-      start: 0,
-      installs: 3,
-    };
-    expect(keptMarkerPos(kept, state, 700, 3)).toBe(0);
-    expect(keptMarkerPos(kept, state, 700, 4)).toBeNull();
+    expect(keptMarkerPos(kept(0), state, 700, 3)).toBe(0);
+    expect(keptMarkerPos(kept(0), state, 700, 4)).toBeNull();
   });
 
-  it('drops a marker whose hole is gone', () => {
-    const state = make(['mid'], []);
-    const kept: Extract<KeptRequest, { kind: 'marker' }> = {
-      kind: 'marker',
-      line: 700,
-      start: 0,
-      installs: 3,
-    };
-    expect(keptMarkerPos(kept, state, 700, 3)).toBeNull();
+  it('drops a marker that was unmatched', () => {
+    const state = make([`${P}mid`], [hole(0, 0, 7, { bytes: 9 })]);
+    expect(
+      keptMarkerPos(kept(0, { unmatched: true }), state, 700, 3),
+    ).toBeNull();
+  });
+
+  it('drops a marker where an ordinary character is, or past the document', () => {
+    const state = make([`a${P}mid`], [hole(0, 1, 7, { bytes: 9 })]);
+    expect(keptMarkerPos(kept(0), state, 700, 3)).toBeNull();
+    expect(keptMarkerPos(kept(2), state, 700, 3)).toBeNull();
+    expect(keptMarkerPos(kept(99), state, 700, 3)).toBeNull();
+  });
+});
+
+describe('the kept markers through document changes', () => {
+  const marker = (pos: number): KeptRequest => ({
+    kind: 'marker',
+    pos,
+    unmatched: false,
+    installs: 3,
+  });
+  const goto: KeptRequest = { kind: 'goto', line: 40 };
+  // A 20-character document with the placeholder at 10.
+  const change = (spec: { from: number; to?: number; insert?: string }) =>
+    ChangeSet.of(spec, 20);
+
+  it('moves a marker by an insertion before it or at its position', () => {
+    expect(
+      mapKeptRequests([marker(10)], change({ from: 4, insert: 'ab' })),
+    ).toEqual([marker(12)]);
+    expect(
+      mapKeptRequests([marker(10)], change({ from: 10, insert: 'abc' })),
+    ).toEqual([marker(13)]);
+  });
+
+  it('leaves a marker an insertion after it', () => {
+    expect(
+      mapKeptRequests([marker(10)], change({ from: 11, insert: 'ab' })),
+    ).toEqual([marker(10)]);
+    expect(
+      mapKeptRequests([marker(10)], change({ from: 15, insert: 'ab' })),
+    ).toEqual([marker(10)]);
+  });
+
+  it('moves a marker back by a deletion before it', () => {
+    expect(mapKeptRequests([marker(10)], change({ from: 2, to: 5 }))).toEqual([
+      marker(7),
+    ]);
+  });
+
+  it('marks a marker unmatched when its placeholder is deleted', () => {
+    const [gone] = mapKeptRequests([marker(10)], change({ from: 10, to: 11 }));
+    expect(gone).toEqual({ ...marker(10), unmatched: true });
+  });
+
+  it('marks a marker unmatched when a deletion spans its placeholder', () => {
+    const [gone] = mapKeptRequests([marker(10)], change({ from: 6, to: 14 }));
+    expect(gone).toMatchObject({ unmatched: true });
+  });
+
+  it('never matches an unmatched marker again, although a placeholder ends up at the deletion', () => {
+    // `a¤b¤c`: the first placeholder is deleted, the second ends up where it was.
+    const before = make([`a${P}b${P}c`], [hole(0, 1, 7), hole(0, 3, 7)]);
+    const after = make([`ab${P}c`], [hole(0, 2, 7)]);
+    const [gone] = mapKeptRequests(
+      [marker(1)],
+      ChangeSet.of({ from: 1, to: 3 }, before.doc.length),
+    );
+    expect(gone).toMatchObject({ unmatched: true });
+    expect(
+      keptMarkerPos(
+        gone as Extract<KeptRequest, { kind: 'marker' }>,
+        after,
+        700,
+        3,
+      ),
+    ).toBeNull();
+  });
+
+  it('keeps an unmatched marker unmatched through later changes', () => {
+    const gone = { ...marker(10), unmatched: true };
+    expect(mapKeptRequests([gone], change({ from: 2, insert: 'x' }))).toEqual([
+      gone,
+    ]);
+  });
+
+  it('leaves the other requests as they were', () => {
+    expect(
+      mapKeptRequests([goto, marker(10)], change({ from: 4, insert: 'ab' })),
+    ).toEqual([goto, marker(12)]);
   });
 });
 
@@ -1073,6 +1176,84 @@ describe('where a part shown at the end of its hole ends', () => {
   it('ignores a hole that is not at the line end', () => {
     const state = make([`ab${PLACEHOLDER}cd`], [hole(0, 2, 5)]);
     expect(newPartEnd(state, state.doc.line(1))).toBe(5);
+  });
+});
+
+describe('where the caret goes after a marker click', () => {
+  it('is after the left placeholder for a part that starts at the hole', () => {
+    // The part shown starts at the hole's end: column 1,000 of the real line.
+    const state = make([`${P}abc${P}`], [hole(0, 0, 1000), hole(0, 4, 7)]);
+    const pos = clickCaretPos(state, state.doc.line(1), false);
+    expect(pos).toBe(1);
+    expect(livePos(state, pos)).toEqual({ line: 0, col: 1000 });
+  });
+
+  it('is before the right placeholder for a part that ends at the hole', () => {
+    const state = make([`${P}abc${P}`], [hole(0, 0, 5), hole(0, 4, 7)]);
+    expect(clickCaretPos(state, state.doc.line(1), true)).toBe(4);
+  });
+
+  it('is the line end for an empty line', () => {
+    const state = make(['', 'x'], []);
+    expect(clickCaretPos(state, state.doc.line(1), false)).toBe(0);
+  });
+});
+
+describe('the span a marker click scrolls into view', () => {
+  it('runs from the left placeholder to the caret for a part after it', () => {
+    const state = make([`${P}abc${P}`], [hole(0, 0, 1000), hole(0, 4, 7)]);
+    expect(clickScrollSpan(state, state.doc.line(1), false)).toEqual({
+      anchor: 0,
+      head: 1,
+    });
+  });
+
+  it('runs from the right placeholder to the caret for a part before it', () => {
+    const state = make([`${P}abc${P}`], [hole(0, 0, 5), hole(0, 4, 7)]);
+    expect(clickScrollSpan(state, state.doc.line(1), true)).toEqual({
+      anchor: 5,
+      head: 4,
+    });
+  });
+
+  it('is the caret alone without a placeholder at that side', () => {
+    const state = make(['abc', 'x'], []);
+    expect(clickScrollSpan(state, state.doc.line(1), false)).toEqual({
+      anchor: 1,
+      head: 1,
+    });
+    expect(clickScrollSpan(state, state.doc.line(1), true)).toEqual({
+      anchor: 3,
+      head: 3,
+    });
+  });
+
+  it('is the caret alone on an empty line', () => {
+    const state = make(['', 'x'], []);
+    expect(clickScrollSpan(state, state.doc.line(1), false)).toEqual({
+      anchor: 0,
+      head: 0,
+    });
+  });
+});
+
+describe('whether a marker click moves the caret', () => {
+  const hidden = { empty: true, onClickedLine: true, hidden: true };
+
+  it('moves a collapsed caret hidden in the new hole on the clicked line', () => {
+    expect(clickMovesCaret(hidden)).toBe(true);
+  });
+
+  it('leaves a range selection', () => {
+    expect(clickMovesCaret({ ...hidden, empty: false })).toBe(false);
+  });
+
+  it('leaves a caret on another line', () => {
+    expect(clickMovesCaret({ ...hidden, onClickedLine: false })).toBe(false);
+  });
+
+  it('leaves a caret the new window shows', () => {
+    expect(clickMovesCaret({ ...hidden, hidden: false })).toBe(false);
   });
 });
 

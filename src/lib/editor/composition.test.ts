@@ -4,6 +4,7 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import {
   COMPOSITION_END_TIMEOUT_MS,
+  composingKeyRuns,
   settleComposition,
   settleThenDrain,
   type CompositionHost,
@@ -122,5 +123,21 @@ describe('settleThenDrain', () => {
     release();
     await done;
     expect(order).toEqual(['settled', 'drain-start', 'drain-end', 'resolved']);
+  });
+});
+
+describe('composingKeyRuns', () => {
+  const on = { composing: true, handled: false, matches: true };
+  it('runs while composing, unhandled, on the matching key', () => {
+    expect(composingKeyRuns(on)).toBe(true);
+  });
+  it('does not run without a composition', () => {
+    expect(composingKeyRuns({ ...on, composing: false })).toBe(false);
+  });
+  it('does not run when an earlier handler took the key', () => {
+    expect(composingKeyRuns({ ...on, handled: true })).toBe(false);
+  });
+  it('does not run on another key', () => {
+    expect(composingKeyRuns({ ...on, matches: false })).toBe(false);
   });
 });

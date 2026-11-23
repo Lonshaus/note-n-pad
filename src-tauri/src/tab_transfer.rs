@@ -627,15 +627,94 @@ fn drop_target_for(
     Decision::Cancel => DropTarget::Cancel,
   }
 }
-/// The open transfers, and the windows whose first page has loaded (a later
-/// load is a reload: the page's state is gone).
+/// What the core tells a window about a tab dragged over it.
+#[derive(Clone, Debug, PartialEq)]
+pub enum HoverAction {
+  /// The tab is at (`x`, `y`) from the window's inner origin, in native units;
+  /// `width` is its width in CSS pixels, passed through.
+  Hover {
+    label: String,
+    x: f64,
+    y: f64,
+    width: f64,
+  },
+  /// The tab left the window.
+  End { label: String },
+}
+/// The next hovered window after a drag moved to `target`, and what to tell the
+/// windows involved: `prev` is the window the drag hovered before.
+fn hover_step(
+  prev: Option<&str>,
+  target: &DropTarget,
+  width: f64,
+) -> (Option<String>, Vec<HoverAction>) {
+  let mut actions = Vec::new();
+  let DropTarget::Doc { label, offset } = target else {
+    if let Some(prev) = prev {
+      actions.push(HoverAction::End {
+        label: prev.to_string(),
+      });
+    }
+    return (None, actions);
+  };
+  if let Some(prev) = prev.filter(|prev| *prev != label) {
+    actions.push(HoverAction::End {
+      label: prev.to_string(),
+    });
+  }
+  actions.push(HoverAction::Hover {
+    label: label.clone(),
+    x: offset.x,
+    y: offset.y,
+    width,
+  });
+  (Some(label.clone()), actions)
+}
+/// Window `label` is gone: a hover from it ends in its receiver, a hover over it
+/// is dropped. `record` is the (sender, receiver) pair; the new record and what
+/// to tell.
+fn hover_gone(
+  record: Option<(String, String)>,
+  label: &str,
+) -> (Option<(String, String)>, Vec<HoverAction>) {
+  match record {
+    Some((sender, receiver)) if sender == label => {
+      (None, vec![HoverAction::End { label: receiver }])
+    }
+    Some((_, receiver)) if receiver == label => (None, Vec::new()),
+    other => (other, Vec::new()),
+  }
+}
+/// The payload of `tab-transfer-hover`.
+#[derive(Clone, Copy, Serialize)]
+struct HoverEvent {
+  x: f64,
+  y: f64,
+  width: f64,
+}
+/// The open transfers, the windows whose first page has loaded (a later load is
+/// a reload: the page's state is gone), and the (sender, receiver) of the drag
+/// hovering over a window.
 #[derive(Default)]
 pub struct TransferState {
   book: Mutex<TransferBook>,
   loaded: Mutex<HashSet<String>>,
+  hover: Mutex<Option<(String, String)>>,
 }
 fn emit(app: &AppHandle, label: &str, event: &str, t: u64) {
   let _ = app.emit_to(label, event, TransferEvent { t });
+}
+fn run_hover(app: &AppHandle, actions: Vec<HoverAction>) {
+  for action in actions {
+    match action {
+      HoverAction::Hover { label, x, y, width } => {
+        let _ = app.emit_to(&label, "tab-transfer-hover", HoverEvent { x, y, width });
+      }
+      HoverAction::End { label } => {
+        let _ = app.emit_to(&label, "tab-transfer-hover-end", serde_json::json!({}));
+      }
+    }
+  }
 }
 /// Carry out what the book decided.
 fn run(app: &AppHandle, actions: Vec<Action>) {
@@ -680,6 +759,13 @@ pub fn window_gone(app: &AppHandle, label: &str) {
     return;
   };
   state.loaded.lock().unwrap().remove(label);
+  let hover_actions = {
+    let mut hover = state.hover.lock().unwrap();
+    let (next, actions) = hover_gone(hover.take(), label);
+    *hover = next;
+    actions
+  };
+  run_hover(app, hover_actions);
   let actions = state.book.lock().unwrap().window_gone(label);
   if actions.is_empty() {
     return;
@@ -742,6 +828,57 @@ pub fn tab_drop_target(
   let (hit, same_monitor) = window_at::locate(&app, &window, point);
   let fullscreen = window.is_fullscreen().unwrap_or(false);
   drop_target_for(&hit, fullscreen, same_monitor, only_tab, point)
+}
+/// The calling window's dragged tab is at the client point: tell the window under
+/// it, if it is a document window, and the one hovered before. Main thread, as
+/// `tab_drop_target`: the hit test reads window-system state.
+#[tauri::command]
+pub fn tab_drag_hover(
+  window: tauri::WebviewWindow,
+  state: State<TransferState>,
+  client_x: f64,
+  client_y: f64,
+  dpr: f64,
+  only_tab: bool,
+  width: f64,
+) {
+  let app = window.app_handle().clone();
+  let target = tab_drop_target(
+    app.clone(),
+    window.clone(),
+    client_x,
+    client_y,
+    dpr,
+    only_tab,
+  );
+  let actions = {
+    let mut hover = state.hover.lock().unwrap();
+    let prev = hover
+      .as_ref()
+      .filter(|(sender, _)| sender == window.label())
+      .map(|(_, receiver)| receiver.clone());
+    let (next, actions) = hover_step(prev.as_deref(), &target, width);
+    *hover = next.map(|receiver| (window.label().to_string(), receiver));
+    actions
+  };
+  run_hover(&app, actions);
+}
+/// The calling window's dragged tab is no longer over another window.
+#[tauri::command]
+pub fn tab_drag_hover_end(window: tauri::WebviewWindow, state: State<TransferState>) {
+  let actions = {
+    let mut hover = state.hover.lock().unwrap();
+    match hover.take() {
+      Some((sender, receiver)) if sender == window.label() => {
+        vec![HoverAction::End { label: receiver }]
+      }
+      other => {
+        *hover = other;
+        Vec::new()
+      }
+    }
+  };
+  run_hover(window.app_handle(), actions);
 }
 /// Move the calling window so that its top left is at `point`, un-maximizing it
 /// first. For the only tab of a window dropped outside it.
@@ -1943,6 +2080,113 @@ mod tests {
     );
   }
 
+  fn doc_at(label: &str, x: f64, y: f64) -> DropTarget {
+    DropTarget::Doc {
+      label: label.to_string(),
+      offset: Point { x, y },
+    }
+  }
+
+  fn hover(label: &str, x: f64, y: f64) -> HoverAction {
+    HoverAction::Hover {
+      label: label.to_string(),
+      x,
+      y,
+      width: 90.0,
+    }
+  }
+
+  fn end(label: &str) -> HoverAction {
+    HoverAction::End {
+      label: label.to_string(),
+    }
+  }
+
+  #[test]
+  fn the_first_hover_over_a_window_only_hovers() {
+    assert_eq!(
+      hover_step(None, &doc_at("doc-a", 10.0, 20.0), 90.0),
+      (Some("doc-a".to_string()), vec![hover("doc-a", 10.0, 20.0)])
+    );
+  }
+
+  #[test]
+  fn moving_within_a_window_hovers_again_without_an_end() {
+    assert_eq!(
+      hover_step(Some("doc-a"), &doc_at("doc-a", 30.0, 20.0), 90.0),
+      (Some("doc-a".to_string()), vec![hover("doc-a", 30.0, 20.0)])
+    );
+  }
+
+  #[test]
+  fn moving_to_another_window_ends_the_old_one_then_hovers_the_new() {
+    assert_eq!(
+      hover_step(Some("doc-a"), &doc_at("doc-b", 5.0, 6.0), 90.0),
+      (
+        Some("doc-b".to_string()),
+        vec![end("doc-a"), hover("doc-b", 5.0, 6.0)]
+      )
+    );
+  }
+
+  #[test]
+  fn leaving_to_the_sender_or_outside_ends_the_hover() {
+    for target in [
+      DropTarget::SelfWindow,
+      DropTarget::NewWindow {
+        point: Point { x: 1.0, y: 2.0 },
+      },
+      DropTarget::MoveWindow {
+        point: Point { x: 1.0, y: 2.0 },
+      },
+      DropTarget::Cancel,
+    ] {
+      assert_eq!(
+        hover_step(Some("doc-a"), &target, 90.0),
+        (None, vec![end("doc-a")])
+      );
+    }
+  }
+
+  #[test]
+  fn no_window_before_and_none_now_tells_nobody() {
+    assert_eq!(
+      hover_step(None, &DropTarget::SelfWindow, 90.0),
+      (None, Vec::new())
+    );
+  }
+
+  #[test]
+  fn a_gone_sender_ends_the_hover_in_its_receiver() {
+    let record = Some(("doc-s".to_string(), "doc-r".to_string()));
+    assert_eq!(hover_gone(record, "doc-s"), (None, vec![end("doc-r")]));
+  }
+
+  #[test]
+  fn a_gone_receiver_clears_the_hover_without_telling_it() {
+    let record = Some(("doc-s".to_string(), "doc-r".to_string()));
+    assert_eq!(hover_gone(record, "doc-r"), (None, Vec::new()));
+  }
+
+  #[test]
+  fn an_unrelated_gone_window_leaves_the_hover_as_it_is() {
+    let record = Some(("doc-s".to_string(), "doc-r".to_string()));
+    assert_eq!(hover_gone(record.clone(), "doc-x"), (record, Vec::new()));
+    assert_eq!(hover_gone(None, "doc-x"), (None, Vec::new()));
+  }
+
+  #[test]
+  fn the_hover_event_carries_its_point_and_width() {
+    assert_eq!(
+      json_of(&HoverEvent {
+        x: 10.5,
+        y: 20.0,
+        width: 90.0
+      }),
+      r#"{"x":10.5,"y":20.0,"width":90.0}"#
+    );
+  }
+
   #[test]
   fn the_first_load_of_a_window_is_its_start_and_a_later_one_a_reload() {
     let mut loaded = HashSet::new();
@@ -1967,6 +2211,8 @@ mod tests {
     let source = include_str!("tab_transfer.rs");
     for name in [
       "tab_drop_target",
+      "tab_drag_hover",
+      "tab_drag_hover_end",
       "tab_move_window",
       "tab_transfer_begin",
       "tab_transfer_claim",

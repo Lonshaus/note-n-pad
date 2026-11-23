@@ -30,7 +30,7 @@
     bracketMatching,
   } from '@codemirror/language';
   import { history } from '@codemirror/commands';
-  import { highlightSelectionMatches } from '@codemirror/search';
+  import { gotoLine, highlightSelectionMatches } from '@codemirror/search';
   import { searchWithInSelection } from './searchPanel';
   import { dialogMarquee } from './dialogMarquee';
   import { closeBrackets, autocompletion } from '@codemirror/autocomplete';
@@ -49,8 +49,8 @@
   import { focusEditorIfIdle } from '../util/editorFocus';
   import { readCspNonce } from '../util/cspNonce';
   import { keymapExtension } from './keymap';
-  import { compositionCancel } from './composition';
-  import { isUndoKey } from './imeShortcuts';
+  import { compositionCancel, compositionKey } from './composition';
+  import { isGotoLineKey, isUndoKey } from './imeShortcuts';
   import { stickyLineNumbers } from './stickyLineNumbers';
   import { cmPhraseExtension, cmPhraseSignature } from './cmPhrases';
   import { shortcutsState } from '../state/shortcuts.svelte';
@@ -330,6 +330,10 @@
       keymapCompartment.of(currentKeymap()),
       // Undo while composing cancels the composition, as TextEdit does.
       platform.isMacOS ? compositionCancel(isUndoKey, afterCancel) : [],
+      // Go to Line while composing, which the keymap skips.
+      platform.isMacOS
+        ? compositionKey(isGotoLineKey, (v) => void gotoLine(v))
+        : [],
       phraseCompartment.of(cmPhraseExtension()),
       dialogMarquee,
       gutterCompartment.of(gutterExtension(showLineNumbers)),

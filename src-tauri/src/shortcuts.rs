@@ -651,7 +651,7 @@ pub const ROWS: &[Row] = &[
     &[Scope::Editor, Scope::Window],
     "Alt+Cmd+G",
     "Ctrl+Alt+G",
-    None,
+    Some("goto-line"),
   ),
   custom(
     "editor.move-line-up",
@@ -2896,6 +2896,28 @@ mod tests {
   }
 
   #[test]
+  fn go_to_line_is_a_menu_item_with_its_own_key() {
+    let row = ROWS.iter().find(|row| row.id == "goto-line").unwrap();
+    assert_eq!(row.menu_id, Some("goto-line"));
+    assert_eq!(
+      defaults(MAC).menu_accelerator("goto-line").as_deref(),
+      Some("Alt+Super+G")
+    );
+    assert_eq!(
+      defaults(OTHER).menu_accelerator("goto-line").as_deref(),
+      Some("Ctrl+Alt+G")
+    );
+    assert_eq!(
+      defaults(MAC).menu_id_for_accelerator("Alt+Cmd+G"),
+      Some("goto-line")
+    );
+    assert_eq!(
+      defaults(OTHER).menu_id_for_accelerator("Ctrl+Alt+G"),
+      Some("goto-line")
+    );
+  }
+
+  #[test]
   fn every_mac_editor_default_passes_the_option_rule() {
     let resolved = defaults(MAC);
     for row in ROWS.iter().filter(|r| r.scopes.contains(&Scope::Editor)) {
@@ -3130,7 +3152,8 @@ mod tests {
     let list = defaults(OTHER).menu_accelerators();
     assert!(list.contains(&"Ctrl+S".to_string()));
     assert!(list.contains(&"Ctrl+Alt+F".to_string()));
-    for not_menu in ["Ctrl+Tab", "Ctrl+Alt+G", "Ctrl+Z", "Alt+ArrowUp"] {
+    assert!(list.contains(&"Ctrl+Alt+G".to_string()));
+    for not_menu in ["Ctrl+Tab", "Ctrl+Z", "Alt+ArrowUp"] {
       assert!(!list.contains(&not_menu.to_string()), "{not_menu}");
     }
   }

@@ -9,6 +9,7 @@
   import {
     Annotation,
     Compartment,
+    EditorSelection,
     EditorState,
     Prec,
     Text,
@@ -128,10 +129,17 @@
     finishCapture,
     imeKeyAction,
     captureStartAllowed,
+    compositionStartAction,
+    endCaptureMode,
+    focusOutCaptureAction,
+    imeCommitKey,
+    revertSelection,
     selectQueued,
+    staleCaptureKey,
     startCapture,
     toCaptureStart,
     updateActions,
+    type CaptureEndReason,
     type ImeCapture,
   } from '../util/imeCapture';
   import {
@@ -170,6 +178,9 @@
   import {
     budgetCheck,
     budgetPhase,
+    clickCaretPos,
+    clickMovesCaret,
+    clickScrollSpan,
     cutLines,
     docPos,
     forcedMoves,
@@ -184,9 +195,8 @@
     keptSchedule,
     lineLength,
     livePos,
+    mapKeptRequests,
     markerRead,
-    markerStart,
-    newPartEnd,
     placeOffset,
     placedHoles,
     pointerMoves,
@@ -209,6 +219,20 @@
     type ReadHole,
     type ReadMode,
   } from './holes';
+  import {
+    anchorArms,
+    anchorDisarms,
+    anchorStep,
+    docHasGapLine,
+    gapLineAfter,
+    hasGapLine,
+    heldEnds,
+    panelGrowthCovers,
+    panelInset,
+    swapAllowed,
+    type AnchorEvent,
+    type HeldEvent,
+  } from './lineAnchor';
   import { formatFileSize } from '../util/format';
   import { createSelectAllGate } from '../util/selectAllGate';
   import { lastLinewiseCopy, rememberCopy } from '../util/linewiseCopy';
@@ -247,7 +271,6 @@
     type FindHit,
   } from '../util/windowedFind';
   import type { OpGate } from '../util/windowedGate';
-  import { matchWindowShortcut } from '../util/windowShortcut';
   import FindPanels, { type FindResult } from '../large/FindPanels.svelte';
   import { t } from '../i18n';
   /** Result of a Rust `windowed_read`: the window text plus its global byte span,
@@ -497,6 +520,17 @@
   let docChangedDuringSwap = false;
   // Guards against re-entrant swaps while one is in flight.
   let swapInFlight = false;
+  // The position the screen is kept on while CodeMirror redraws a very long
+  // wrapped line (see lineAnchor.ts); null when the anchor is off.
+  let anchorPos: number | null = null;
+  const anchorKey = {};
+  // True while a press on the scroll bar is held, which stops swaps over a gap
+  // line (see `swapAllowed`).
+  let scrollbarHeld = false;
+  let heldTimer: ReturnType<typeof setTimeout> | undefined;
+  const heldKey = {};
+  // A held press with no scroll event for this long is taken as released.
+  const HELD_IDLE_MS = 400;
   let selRaf = 0;
   let topRaf = 0;
   // True while an undo/redo result is being mirrored into the CM document, so the
@@ -833,6 +867,8 @@
         cmPhraseExtension(),
         gutterCompartment.of(gutterExtension(showLineNumbers)),
         wrapCompartment.of(wordWrap ? EditorView.lineWrapping : []),
+        // The find panel floats over the bottom of the editor.
+        EditorView.scrollMargins.of(() => ({ bottom: findPanelInset() })),
         themeCompartment.of(varEditorTheme(dark)),
         readOnlyCompartment.of(readOnlyExtension(isReadOnly())),
         // Commands that ignore readOnly (insertTab) could still change the
@@ -908,6 +944,10 @@
           },
         }),
         EditorView.updateListener.of((update) => {
+          anchorOnUpdate(update);
+          if (update.docChanged && keptList.length > 0) {
+            keptList = mapKeptRequests(keptList, update.changes);
+          }
           // A click made while input is queued, or a composition is open,
           // joins the queue and takes effect in its place in the order.
           if (
@@ -1712,6 +1752,14 @@
   // Until then, the last text of a capture that ended may still arrive.
   let lateUntil = 0;
   const LATE_MS = 100;
+  // A capture whose composition runs this long with focus away is ended.
+  const FOCUS_OUT_CAPTURE_LIMIT_MS = 30_000;
+  // Counts the captures started, so a timer can tell its capture from a later one.
+  let captureGen = 0;
+  // When focus first left the editor during the open capture.
+  let captureFocusOutAt: number | null = null;
+  // The capture whose focus-out timer is running.
+  let focusOutTimerGen = -1;
   // How long after a commit the swap back to the caret waits for the next
   // composition of the run.
   const CHAIN_MS = 40;
@@ -3288,7 +3336,15 @@
       busy: false,
     };
     shadow = sh;
-    placeShadow(sh, res, readFor);
+    try {
+      placeShadow(sh, res, readFor);
+    } catch (e) {
+      // runShadow never gets the instance, so nothing else would remove it.
+      shadow = null;
+      v.destroy();
+      host.remove();
+      throw e;
+    }
     return sh;
   }
   function destroyShadow(sh: Shadow): void {
@@ -3798,6 +3854,7 @@
     }, 0);
   }
   function onViewKeydown(e: KeyboardEvent): void {
+    endHold('keydown');
     recordedKey = null;
     if (e.defaultPrevented) {
       claimedByEditor.add(e);
@@ -3915,8 +3972,39 @@
     }
     return true;
   }
-
+  // Set by a compositionend in the editor, cleared by the next keydown.
+  let afterCompositionEnd = false;
   function onDocKeydown(e: KeyboardEvent): void {
+    const afterEnd = afterCompositionEnd;
+    afterCompositionEnd = false;
+    // The input method's commit Enter must not also insert a newline.
+    if (
+      imeCommitKey({
+        mac: platform.isMacOS,
+        key: e.key,
+        keyCode: e.keyCode,
+        composing: e.isComposing,
+        afterCompositionEnd: afterEnd,
+        inEditor:
+          e.target instanceof Node &&
+          view?.contentDOM.contains(e.target) === true,
+      })
+    ) {
+      e.preventDefault();
+      e.stopPropagation();
+      return;
+    }
+    // A typed key during an open capture means its compositionend was lost.
+    if (
+      staleCaptureKey({
+        capturing: capture !== null,
+        imeKey: isImeKey(e),
+        modifier: isModifierKey(e.key),
+        focused: view?.hasFocus === true,
+      })
+    ) {
+      endCapture('stale-key');
+    }
     if (selectAllKeydown(e)) {
       return;
     }
@@ -4021,6 +4109,11 @@
 
   function onDocCompositionStart(): void {
     compositionGen += 1;
+    // Compositions do not nest: the open capture lost its compositionend.
+    if (compositionStartAction({ capturing: capture !== null }) === 'end') {
+      endCapture('stale-start');
+    }
+    // Judged on the state after that end, which may have started a drain.
     const v = view;
     if (
       v === undefined ||
@@ -4040,6 +4133,8 @@
     }
     capture = startCapture(v.state.doc.length);
     captureStart = v.state;
+    captureGen += 1;
+    captureFocusOutAt = null;
     pendingIme = false;
     // Everything queued from here on waits behind the composition's commit.
     replayQueue.enqueue({ kind: 'slot' });
@@ -4047,11 +4142,13 @@
   }
   // CodeMirror has read the composition's last text by the time this bubbles up
   // to the document; the capture ends in the next microtask.
-  function onDocCompositionEnd(): void {
+  function onDocCompositionEnd(e: CompositionEvent): void {
+    afterCompositionEnd =
+      e.target instanceof Node && view?.contentDOM.contains(e.target) === true;
     // The requests kept for the composition's end run a moment after it.
     scheduleKept(LATE_MS, false);
     if (capture !== null) {
-      queueMicrotask(endCapture);
+      queueMicrotask(() => endCapture('compositionend'));
     } else if (replayPending) {
       // A composition no capture covered held the queue back.
       queueMicrotask(resumeReplay);
@@ -4072,7 +4169,8 @@
   }
   // Undo the composition's changes, put the caret back, and replay what it
   // committed at the real caret.
-  function endCapture(): void {
+  function endCapture(reason: CaptureEndReason): void {
+    const mode = endCaptureMode(reason);
     const v = view;
     const cap = capture;
     const start = captureStart;
@@ -4088,7 +4186,12 @@
         // character back, and the holes of the start go with it.
         v.dispatch({
           changes: done.revert,
-          selection: start.selection,
+          selection: revertSelection(
+            v.state.selection,
+            start.selection,
+            done.revert,
+            mode.keepSelection,
+          ),
           effects: setHoles(holesOf(start)),
           annotations: captureMark.of(true),
         });
@@ -4100,6 +4203,12 @@
     capture = null;
     captureStart = null;
     lateUntil = Date.now() + LATE_MS;
+    // The lost compositionend: CodeMirror stops composing on it.
+    if (mode.synthesizeEnd && v !== undefined) {
+      v.contentDOM.dispatchEvent(
+        new CompositionEvent('compositionend', { bubbles: true }),
+      );
+    }
     // A capture that ends with no compositionend (the view still composes)
     // releases the kept requests; the compositionend of one that had it
     // schedules them itself.
@@ -4147,17 +4256,41 @@
       resumeReplay();
     }
   }
+  // The capture opened by the given count ends after a moment unless the view
+  // composes; with focus away it is ended at the limit.
+  function armFocusOutTimer(gen: number): void {
+    setTimeout(() => {
+      const composing = view?.compositionStarted === true;
+      const action = focusOutCaptureAction({
+        sameCapture: capture !== null && captureGen === gen,
+        composing,
+        focused: view?.hasFocus === true,
+        sinceFirstFocusOutMs: Date.now() - (captureFocusOutAt ?? Date.now()),
+        limitMs: FOCUS_OUT_CAPTURE_LIMIT_MS,
+      });
+      if (action === 'wait') {
+        armFocusOutTimer(gen);
+        return;
+      }
+      if (focusOutTimerGen === gen) {
+        focusOutTimerGen = -1;
+      }
+      if (action === 'end') {
+        endCapture(composing ? 'limit' : 'focus-out');
+      }
+    }, 300);
+  }
   // Focus leaving the editor ends the "input method key" state; a capture whose
   // compositionend never came is ended after a moment.
   function onViewFocusOut(): void {
+    disarmAnchor('blur');
     pendingIme = false;
-    const cap = capture;
-    if (cap !== null) {
-      setTimeout(() => {
-        if (capture === cap) {
-          endCapture();
-        }
-      }, 300);
+    if (capture !== null) {
+      captureFocusOutAt ??= Date.now();
+      if (focusOutTimerGen !== captureGen) {
+        focusOutTimerGen = captureGen;
+        armFocusOutTimer(captureGen);
+      }
     } else if (view?.compositionStarted === true) {
       // A composition that never ends releases the kept requests, as the wait
       // of `settleComposition` is given up.
@@ -4562,6 +4695,7 @@
         }).state,
       );
       devTrace('loadWindow setState after');
+      disarmAnchor('install');
       // Read back from the view: a hidden column has no position in it.
       lastLive = liveSelection(view.state);
       windowEndLine = windowStartLine + view.state.doc.lines;
@@ -4587,6 +4721,7 @@
                   { y: 'center' },
                 ),
               });
+              armAnchor(view.state.selection.main.head);
             } else if (anchor !== null) {
               restoreAnchor(anchor);
             }
@@ -4613,7 +4748,8 @@
     }
   }
   // After a marker click: the first character the read newly shows (the part
-  // starts at the hole's start) or the last (it ends at the hole's end).
+  // starts at the hole's start) or the last (it ends at the hole's end). A caret
+  // hidden in the new hole goes there too.
   function scrollToNewPart(click: { line: number; fromEnd: boolean }): void {
     if (view === undefined) {
       return;
@@ -4624,10 +4760,33 @@
       view.state.doc.lines,
     );
     const line = view.state.doc.line(local);
-    const pos = click.fromEnd
-      ? newPartEnd(view.state, line)
-      : Math.min(line.to, line.from + 1);
-    view.dispatch({ effects: EditorView.scrollIntoView(pos) });
+    const pos = clickCaretPos(view.state, line, click.fromEnd);
+    const head = globalSel.head;
+    const moves = clickMovesCaret({
+      empty:
+        globalSel.anchor.line === head.line &&
+        globalSel.anchor.col === head.col,
+      onClickedLine: head.line === click.line,
+      hidden: hasHiddenEnd(globalSel, windowHoles(view.state, windowStartLine)),
+    });
+    const span = clickScrollSpan(view.state, line, click.fromEnd);
+    const effects = [
+      EditorView.scrollIntoView(EditorSelection.range(span.anchor, span.head)),
+    ];
+    if (!moves) {
+      view.dispatch({ effects });
+      armAnchor(pos);
+      return;
+    }
+    // The caret hidden in the new left hole moves to where the part begins.
+    const live = livePos(view.state, pos);
+    view.dispatch({ selection: { anchor: pos }, effects });
+    armAnchor(pos);
+    setGlobalSel(
+      toGlobalSelection({ anchor: live, head: live }, windowStartLine),
+      'clickCaret',
+    );
+    lastLive = liveSelection(view.state);
   }
   // --- Marker clicks and the budget re-read -----------------------------------
   // Whether the editor is busy with something that a swap must not break into.
@@ -4643,27 +4802,20 @@
     );
   }
   // A click on the marker of the hole at `pos` shows the next part of its line.
-  // During a composition it is kept, as the hole's line and byte, for the end
+  // During a composition it is kept, as the placeholder's position, for the end
   // of the composition (see the list of kept requests).
   function onMarkerClick(v: EditorView, pos: number): void {
     if (v !== view) {
       return;
     }
     if (composingNow()) {
-      // While one is captured the view holds text the core does not.
-      const at =
-        capture !== null && captureStart !== null
-          ? toCaptureStart(capture.changes, captureStart.doc, pos)
-          : pos;
-      const hole = markerStart(captureBase(v.state), at, windowStartLine);
-      if (hole !== null) {
-        keepRequest({
-          kind: 'marker',
-          line: hole.line,
-          start: hole.start,
-          installs: windowInstalls,
-        });
-      }
+      // The position follows the text as the composition edits it.
+      keepRequest({
+        kind: 'marker',
+        pos,
+        unmatched: false,
+        installs: windowInstalls,
+      });
       return;
     }
     void openMarker(v, pos);
@@ -4911,12 +5063,245 @@
     const block = view.lineBlockAtHeight(y - view.documentTop);
     return windowStartLine + (view.state.doc.lineAt(block.from).number - 1);
   }
+  // --- Scroll anchor on a very long line --------------------------------------
+  // The window's gap-line answer for one document, kept up to date by edits.
+  let gapCache: { doc: Text; has: boolean } | null = null;
+  function windowGapLine(doc: Text): boolean {
+    if (gapCache === null || gapCache.doc !== doc) {
+      gapCache = { doc, has: docHasGapLine(doc) };
+    }
+    return gapCache.has;
+  }
+  // Whether the window holds a line CodeMirror gives line gaps.
+  function anchorWanted(state: EditorState): boolean {
+    return anchorArms({
+      wrapping: wordWrap,
+      windowHasGapLine: wordWrap && windowGapLine(state.doc),
+      scrolled: true,
+    });
+  }
+  function armAnchor(pos: number): void {
+    if (view === undefined || !anchorWanted(view.state)) {
+      return;
+    }
+    anchorPos = pos;
+    requestAnchorMeasure();
+  }
+  function disarmAnchor(event: AnchorEvent): void {
+    if (anchorDisarms(event)) {
+      anchorPos = null;
+    }
+  }
+  // The anchor's view of one update: it maps with the text, follows a scroll to
+  // the caret, ends on a pointer selection or a caret on another line, and
+  // corrects whenever the line was redrawn.
+  function anchorOnUpdate(update: ViewUpdate): void {
+    if (update.view !== view) {
+      return;
+    }
+    if (update.docChanged) {
+      if (!wordWrap) {
+        gapCache = null;
+      } else if (gapCache?.doc === update.startState.doc) {
+        gapCache = {
+          doc: update.state.doc,
+          has: gapLineAfter({
+            before: gapCache.has,
+            oldDoc: update.startState.doc,
+            newDoc: update.state.doc,
+            changes: update.changes,
+            rescan: docHasGapLine,
+          }),
+        };
+      }
+    }
+    if (update.transactions.some((tr) => tr.isUserEvent('select.pointer'))) {
+      disarmAnchor('pointer');
+      return;
+    }
+    let measure = false;
+    if (anchorPos !== null) {
+      anchorPos = update.changes.mapPos(anchorPos);
+    }
+    const head = update.state.selection.main.head;
+    if (update.transactions.some((tr) => tr.scrollIntoView)) {
+      if (anchorWanted(update.state)) {
+        anchorPos = head;
+        measure = true;
+      } else {
+        disarmAnchor('rearmFalse');
+      }
+    } else if (
+      anchorPos !== null &&
+      update.selectionSet &&
+      update.state.doc.lineAt(head).number !==
+        update.state.doc.lineAt(anchorPos).number
+    ) {
+      disarmAnchor('leftLine');
+    }
+    if (
+      anchorPos !== null &&
+      (measure ||
+        update.viewportChanged ||
+        update.heightChanged ||
+        update.geometryChanged)
+    ) {
+      requestAnchorMeasure();
+    }
+  }
+  // Layout is read in the read phase and scrollTop written in the write phase;
+  // an update inside a measure is refused, so a reveal waits for a microtask.
+  function requestAnchorMeasure(): void {
+    view?.requestMeasure({
+      key: anchorKey,
+      read: (v) => {
+        const pos = anchorPos;
+        if (pos === null) {
+          return null;
+        }
+        const caret = v.coordsAtPos(pos);
+        const rect = v.scrollDOM.getBoundingClientRect();
+        return {
+          pos,
+          step: anchorStep({
+            armed: true,
+            caretTop: caret?.top ?? null,
+            caretBottom: caret?.bottom ?? null,
+            viewTop: rect.top,
+            viewBottom: rect.bottom - findPanelInset(),
+            margin: v.state.facet(EditorView.cursorScrollMargin).y,
+          }),
+        };
+      },
+      write: (m, v) => {
+        if (m === null) {
+          return;
+        }
+        if (m.step.kind === 'scroll') {
+          v.scrollDOM.scrollTop += m.step.by;
+        } else if (m.step.kind === 'reveal') {
+          queueMicrotask(() => {
+            if (view === v && anchorPos === m.pos) {
+              v.dispatch({ effects: EditorView.scrollIntoView(m.pos) });
+            }
+          });
+        }
+      },
+    });
+  }
+  // How far the find panel covers the bottom of the editor.
+  function findPanelInset(): number {
+    return panelInset(panel === 'search', panels?.searchPanelHeight() ?? 0);
+  }
+  let shownInset = 0;
+  // A caret the growing find panel newly covers is centred again above it.
+  function onSearchResize(first: boolean): void {
+    if (first) {
+      shownInset = findPanelInset();
+      return;
+    }
+    view?.requestMeasure({
+      read: (v) => {
+        const before = shownInset;
+        const after = findPanelInset();
+        shownInset = after;
+        const head = v.state.selection.main.head;
+        const caret = v.coordsAtPos(head);
+        const rect = v.scrollDOM.getBoundingClientRect();
+        return panelGrowthCovers({
+          caretTop: caret?.top ?? null,
+          caretBottom: caret?.bottom ?? null,
+          viewTop: rect.top,
+          viewBottom: rect.bottom,
+          before,
+          after,
+        });
+      },
+      write: (covered, v) => {
+        if (!covered) {
+          return;
+        }
+        queueMicrotask(() => {
+          if (view === v) {
+            v.dispatch({
+              effects: EditorView.scrollIntoView(v.state.selection.main.head, {
+                y: 'center',
+              }),
+            });
+          }
+        });
+      },
+    });
+  }
+  function holdTimer(): void {
+    heldTimer = setTimeout(() => endHold('idle'), HELD_IDLE_MS);
+  }
+  // The end of a press on the scroll bar, or a scroll that keeps it; after an
+  // end one measured swap check runs, as the thumb moved the screen unseen.
+  function endHold(event: HeldEvent): void {
+    if (!scrollbarHeld) {
+      return;
+    }
+    clearTimeout(heldTimer);
+    if (!heldEnds(event)) {
+      holdTimer();
+      return;
+    }
+    scrollbarHeld = false;
+    view?.requestMeasure({
+      key: heldKey,
+      read: () => null,
+      write: () => queueMicrotask(() => void maybeSwap()),
+    });
+  }
+  function onHeldPointerEnd(e: PointerEvent): void {
+    endHold(e.type === 'pointercancel' ? 'pointercancel' : 'pointerup');
+  }
+  function onAnchorWheel(): void {
+    endHold('wheel');
+    disarmAnchor('wheel');
+  }
+  function onAnchorTouch(): void {
+    disarmAnchor('touch');
+  }
+  // A press in the text is a pointer selection, one on the scroll bar or the
+  // gutter is a scroll.
+  function onAnchorPointerDown(e: PointerEvent): void {
+    endHold('pointerdown');
+    // A press on the scroll bar itself has the scroller as its target.
+    if (e.target === view?.scrollDOM) {
+      scrollbarHeld = true;
+      holdTimer();
+    }
+    disarmAnchor(
+      e.target instanceof Node && view?.contentDOM.contains(e.target) === true
+        ? 'pointer'
+        : 'scrollbar',
+    );
+  }
   // On scroll, load the neighbouring window once the viewport nears a window edge.
   // IME composition defers the swap (full handling lands next segment): a swap
   // mid-composition would tear the composing text out from under the input.
   async function maybeSwap(): Promise<void> {
     devTrace('maybeSwap');
     if (view === undefined || swapBlocked()) {
+      return;
+    }
+    // Over a gap line the height map is not to be trusted.
+    const doc = view.state.doc;
+    const pos = anchorPos;
+    const armed = pos !== null;
+    if (
+      !swapAllowed({
+        armed,
+        anchoredOnGapLine: armed && hasGapLine(doc, pos, pos),
+        gapLineInViewport:
+          armed && hasGapLine(doc, view.viewport.from, view.viewport.to),
+        scrollbarHeld,
+        gapLineInWindow: scrollbarHeld && wordWrap && windowGapLine(doc),
+        wrapping: wordWrap,
+      })
+    ) {
       return;
     }
     const rect = view.scrollDOM.getBoundingClientRect();
@@ -4941,6 +5326,7 @@
   }
 
   function onScroll(): void {
+    endHold('scroll');
     if (!swapping) {
       void maybeSwap();
       triggerBudget();
@@ -5552,16 +5938,6 @@
       void submitGoto();
     }
   }
-  // The shortcut registry's `goto-line` key opens the goto box. Find and its
-  // relatives are native menu accelerators (they never reach this listener),
-  // so DocumentApp routes them to the exports below.
-  function onWindowKeydown(e: KeyboardEvent): void {
-    const accel = shortcutsState.accel('goto-line');
-    if (accel !== null && matchWindowShortcut(e, accel, platform.os)) {
-      e.preventDefault();
-      openGoto();
-    }
-  }
   // Esc closes whichever box is open, from the editor too.
   function closeBox(): boolean {
     if (panel === 'none') {
@@ -5679,6 +6055,13 @@
       const mountEpoch = budgetInstalled();
       requestAnimationFrame(() => budgetFrame(mountEpoch));
       v.scrollDOM.addEventListener('scroll', onScroll);
+      v.scrollDOM.addEventListener('wheel', onAnchorWheel, { passive: true });
+      v.scrollDOM.addEventListener('touchmove', onAnchorTouch, {
+        passive: true,
+      });
+      v.scrollDOM.addEventListener('pointerdown', onAnchorPointerDown);
+      window.addEventListener('pointerup', onHeldPointerEnd, true);
+      window.addEventListener('pointercancel', onHeldPointerEnd, true);
       v.dom.addEventListener('keydown', onViewKeydown);
       v.dom.addEventListener('focusout', onViewFocusOut);
       document.addEventListener('keydown', onDocKeydown, true);
@@ -5691,7 +6074,6 @@
       document.addEventListener('paste', onDocPaste, true);
       document.addEventListener('cut', onDocCopyCut, true);
       document.addEventListener('copy', onDocCopyCut, true);
-      window.addEventListener('keydown', onWindowKeydown);
       window.addEventListener('focus', refreshAltGr);
       refreshAltGr();
       reportSelection();
@@ -5718,7 +6100,6 @@
       clearTimeout(refreshTimer);
       unlistenHit?.();
       unlistenDone?.();
-      window.removeEventListener('keydown', onWindowKeydown);
       window.removeEventListener('focus', refreshAltGr);
       if (selRaf !== 0) {
         cancelAnimationFrame(selRaf);
@@ -5727,6 +6108,13 @@
         cancelAnimationFrame(topRaf);
       }
       view?.scrollDOM.removeEventListener('scroll', onScroll);
+      view?.scrollDOM.removeEventListener('wheel', onAnchorWheel);
+      view?.scrollDOM.removeEventListener('touchmove', onAnchorTouch);
+      view?.scrollDOM.removeEventListener('pointerdown', onAnchorPointerDown);
+      window.removeEventListener('pointerup', onHeldPointerEnd, true);
+      window.removeEventListener('pointercancel', onHeldPointerEnd, true);
+      clearTimeout(heldTimer);
+      scrollbarHeld = false;
       view?.dom.removeEventListener('keydown', onViewKeydown);
       view?.dom.removeEventListener('focusout', onViewFocusOut);
       document.removeEventListener('keydown', onDocKeydown, true);
@@ -5780,6 +6168,9 @@
   // Live word-wrap toggle.
   $effect(() => {
     const wrap = wordWrap;
+    if (!wrap) {
+      disarmAnchor('wrapOff');
+    }
     if (view !== undefined) {
       view.dispatch({
         effects: wrapCompartment.reconfigure(
@@ -5832,7 +6223,7 @@
   } {
     return { windowStartLine, totalLines, totalBytes };
   }
-  // Menu surface: Find, Find and Replace, Find Next, Find Previous.
+  // Menu surface: Find, Find and Replace, Find Next, Find Previous, Go to Line.
   export function openFind(): void {
     panel = 'search';
     requestAnimationFrame(() => panels?.focusQuery());
@@ -5846,6 +6237,9 @@
   }
   export function findPrevious(): void {
     void findStep(true);
+  }
+  export function openGotoBox(): void {
+    openGoto();
   }
   // Whether the find bar or the goto box is open.
   export function panelOpen(): boolean {
@@ -6099,6 +6493,7 @@
     onsearchkeydown={onSearchKeydown}
     onreplace={() => void replaceOne()}
     onreplaceall={() => void replaceAll()}
+    onsearchresize={onSearchResize}
   />
 </div>
 

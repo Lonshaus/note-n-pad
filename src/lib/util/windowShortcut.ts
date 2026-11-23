@@ -1,9 +1,9 @@
 // Copyright © 2026 Lonshaus
 // SPDX-License-Identifier: GPL-3.0-only
-// Matching a keydown against a window-scoped shortcut (tab switching, go to
-// line in the large-file view) given the canonical text the Rust registry
-// holds. The rules mirror CodeMirror's so a shortcut behaves the same in the
-// editor and in a window handler on the same layout.
+// Matching a keydown against a window-scoped shortcut (tab switching, and the
+// Undo and Save keys during a macOS composition) given the canonical text the
+// Rust registry holds. The rules mirror CodeMirror's so a shortcut behaves the
+// same in the editor and in a window handler on the same layout.
 
 import { eventKeyName, splitAccelerator, type KeyLike } from './accelerator';
 /** Whether CodeMirror would fall back from the typed character to the
