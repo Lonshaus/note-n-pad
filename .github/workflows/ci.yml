@@ -42,6 +42,9 @@ jobs:
 
       - name: Install npm dependencies
         run: npm ci
+      # The Tauri CLI refuses to build on an npm/crate major.minor mismatch and no CI step runs it.
+      - name: Tauri npm/crate versions
+        run: node scripts/check-tauri-versions.mjs
       # rustfmt and clippy are not in the minimal profile this action installs
       # by default, so both are requested explicitly.
       - name: Setup Rust toolchain
