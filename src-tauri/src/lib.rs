@@ -349,6 +349,7 @@ struct MenuItemRefs {
   find_replace: MenuItem<Wry>,
   find_next: MenuItem<Wry>,
   find_prev: MenuItem<Wry>,
+  goto_line: MenuItem<Wry>,
   format_menu: Submenu<Wry>,
   line_ending_lf: CheckMenuItem<Wry>,
   line_ending_crlf: CheckMenuItem<Wry>,
@@ -398,6 +399,7 @@ impl MenuItems {
     let _ = items.find_replace.set_enabled(f.find_replace);
     let _ = items.find_next.set_enabled(f.find_next);
     let _ = items.find_prev.set_enabled(f.find_prev);
+    let _ = items.goto_line.set_enabled(f.goto_line);
     // Document-only items: Save As, the Format submenu, and always-on-top.
     let is_doc = kind == FocusKind::Doc;
     let _ = items.save_as.set_enabled(is_doc);
@@ -552,7 +554,7 @@ fn minimize_focused(app: &tauri::AppHandle) {
     let _ = window.minimize();
   }
 }
-/// Enabled flags for the eight mode-dependent menu items.
+/// Enabled flags for the nine mode-dependent menu items.
 struct MenuFlags {
   new_tab: bool,
   open: bool,
@@ -562,22 +564,25 @@ struct MenuFlags {
   find_replace: bool,
   find_next: bool,
   find_prev: bool,
+  goto_line: bool,
 }
 /// Map a focused-window kind to which mode-dependent items are enabled. Document
-/// windows get everything; stickies have no search at all and cannot open or
-/// tab; the workspace closes (which hides it) and opens -- it holds no document
-/// of its own, but it is the one window a user can be left with when no document
-/// is up, and greying Open there leaves no way into a file from inside the app;
+/// windows get everything; stickies have no search at all (but do have go to
+/// line) and cannot open or tab; the workspace closes (which hides it) and
+/// opens -- it holds no document of its own, but it is the one window a user
+/// can be left with when no document is up, and greying Open there leaves no
+/// way into a file from inside the app;
 /// settings/about and the no-focus tray state disable every mode-dependent item.
 fn menu_flags(kind: FocusKind) -> MenuFlags {
-  // Order: new_tab, open, save, close, find, find_replace, find_next, find_prev.
-  let (nt, op, sv, cl, fd, fr, nx, pv) = match kind {
-    FocusKind::Doc => (true, true, true, true, true, true, true, true),
-    FocusKind::Sticky => (false, false, true, true, false, false, false, false),
-    FocusKind::Workspace => (false, true, false, true, false, false, false, false),
-    FocusKind::Settings | FocusKind::About | FocusKind::None => {
-      (false, false, false, false, false, false, false, false)
-    }
+  // Order: new_tab, open, save, close, find, find_replace, find_next, find_prev,
+  // goto_line.
+  let (nt, op, sv, cl, fd, fr, nx, pv, gl) = match kind {
+    FocusKind::Doc => (true, true, true, true, true, true, true, true, true),
+    FocusKind::Sticky => (false, false, true, true, false, false, false, false, true),
+    FocusKind::Workspace => (false, true, false, true, false, false, false, false, false),
+    FocusKind::Settings | FocusKind::About | FocusKind::None => (
+      false, false, false, false, false, false, false, false, false,
+    ),
   };
   MenuFlags {
     new_tab: nt,
@@ -588,6 +593,7 @@ fn menu_flags(kind: FocusKind) -> MenuFlags {
     find_replace: fr,
     find_next: nx,
     find_prev: pv,
+    goto_line: gl,
   }
 }
 /// Emit an event carrying `payload` to whichever window currently has focus.
@@ -1007,6 +1013,15 @@ fn handle_window_event(window: &tauri::Window, event: &tauri::WindowEvent) {
     if let Some(gate) = window.app_handle().try_state::<FlushGate>() {
       gate.ack(window.label());
     }
+    // Win32 destroys a window's menu with the window, and every window shares
+    // the app menu's one HMENU: windows built later get the dead handle and no
+    // bar. A fresh menu gives them, and the open windows, a live one.
+    #[cfg(target_os = "windows")]
+    {
+      let app = window.app_handle();
+      let locale = i18n::current_locale(&settings::app_settings(app).language);
+      rebuild_app_menu(app, locale);
+    }
   }
 }
 /// Populate (or repopulate) the File > Open Recent submenu from `recent`, newest
@@ -1185,7 +1200,7 @@ fn build_menu(
   )?;
   // Edit items: standard roles for native clipboard/undo/select behaviour (which
   // also enables Cmd+C/V in workspace and settings inputs), then our find family
-  // which emits `menu-action` to the focused window.
+  // and go to line, which emit `menu-action` to the focused window.
   let find = MenuItem::with_id(app, "find", tr(i18n::Key::Find), false, accel("find"))?;
   let find_replace = MenuItem::with_id(
     app,
@@ -1207,6 +1222,13 @@ fn build_menu(
     tr(i18n::Key::FindPrev),
     false,
     accel("find-prev"),
+  )?;
+  let goto_line = MenuItem::with_id(
+    app,
+    "goto-line",
+    tr(i18n::Key::GoToLine),
+    false,
+    accel("goto-line"),
   )?;
   // Undo/Redo/Cut/Copy/Paste/Select All: predefined items on macOS (needed for
   // the responder chain) and Windows (already dispatched natively through
@@ -1348,6 +1370,7 @@ fn build_menu(
       &find_replace,
       &find_next,
       &find_prev,
+      &goto_line,
     ],
   )?;
   // Format menu (document-focus only). Line-ending / encoding / syntax checks
@@ -1527,6 +1550,7 @@ fn build_menu(
       find_replace,
       find_next,
       find_prev,
+      goto_line,
       format_menu,
       line_ending_lf,
       line_ending_crlf,
@@ -1614,8 +1638,8 @@ fn handle_menu_id(app: &tauri::AppHandle, id: &str) {
     },
     "minimize" => minimize_focused(app),
     "new-tab" | "open" | "save" | "save-as" | "show-in-finder" | "copy-path" | "find"
-    | "find-replace" | "find-next" | "find-prev" | "undo" | "redo" | "cut" | "copy" | "paste"
-    | "select-all" => {
+    | "find-replace" | "find-next" | "find-prev" | "goto-line" | "undo" | "redo" | "cut"
+    | "copy" | "paste" | "select-all" => {
       #[cfg(target_os = "macos")]
       if edit_menu_route(id, any_webview_focused(app)) == EditMenuRoute::FirstResponder {
         send_to_first_responder(id);
@@ -1685,6 +1709,7 @@ fn accelerator_enabled(id: &str, kind: FocusKind) -> bool {
     "find-replace" => f.find_replace,
     "find-next" => f.find_next,
     "find-prev" => f.find_prev,
+    "goto-line" => f.goto_line,
     // Document-only, mirroring `save_as.set_enabled(is_doc)` in `MenuItems::apply`.
     "save-as" => kind == FocusKind::Doc,
     // The Format and Window items and the file-path items are document-only,
@@ -1738,7 +1763,7 @@ fn trigger_menu_accelerator(
 }
 /// Every canonical accelerator a native menu item currently carries, for the
 /// Windows frontend keydown listener to match against. Shortcuts that are not
-/// menu items (tab switching, go to line) are never in this list, so
+/// menu items (tab switching) are never in this list, so
 /// `trigger_menu_accelerator` can never intercept them.
 #[tauri::command]
 fn get_menu_accelerators(app: tauri::AppHandle) -> Vec<String> {
@@ -1833,8 +1858,19 @@ mod menu_accelerator_command_tests {
   fn non_menu_combos_resolve_to_none() {
     let keys = defaults(Platform::Other);
     assert_eq!(keys.menu_id_for_accelerator("Ctrl+Z"), None);
-    assert_eq!(keys.menu_id_for_accelerator("Ctrl+Alt+G"), None);
     assert_eq!(keys.menu_id_for_accelerator("Ctrl+Tab"), None);
+  }
+
+  #[test]
+  fn go_to_line_is_a_menu_key() {
+    assert_eq!(
+      defaults(Platform::Other).menu_id_for_accelerator("Ctrl+Alt+G"),
+      Some("goto-line")
+    );
+    assert_eq!(
+      defaults(Platform::MacOS).menu_id_for_accelerator("Alt+Cmd+G"),
+      Some("goto-line")
+    );
   }
 
   #[test]
@@ -1890,6 +1926,45 @@ mod menu_accelerator_command_tests {
       assert!(accelerator_enabled(id, FocusKind::Doc));
       assert!(!accelerator_enabled(id, FocusKind::Sticky));
     }
+  }
+
+  #[test]
+  fn go_to_line_is_enabled_for_doc_and_sticky_only() {
+    assert!(accelerator_enabled("goto-line", FocusKind::Doc));
+    assert!(accelerator_enabled("goto-line", FocusKind::Sticky));
+    for kind in [
+      FocusKind::Workspace,
+      FocusKind::Settings,
+      FocusKind::About,
+      FocusKind::None,
+    ] {
+      assert!(!accelerator_enabled("goto-line", kind), "{kind:?}");
+    }
+  }
+
+  #[test]
+  fn the_edit_menu_lists_go_to_line_right_after_find_previous() {
+    assert!(
+      SOURCE.contains("&find_prev,\n      &goto_line,\n    ],"),
+      "the Edit menu must end with find_prev, goto_line"
+    );
+  }
+
+  #[test]
+  fn go_to_line_is_routed_to_the_focused_window_like_find() {
+    let at = SOURCE
+      .find("fn handle_menu_id(")
+      .expect("handle_menu_id no longer exists in lib.rs");
+    let body = &SOURCE[at..];
+    let body = &body[..body.find("\n}\n").unwrap()];
+    let arm = body
+      .find("\"goto-line\"")
+      .expect("handle_menu_id does not name goto-line");
+    let emit = body
+      .find("emit_to_focused(app, \"menu-action\", id.to_string())")
+      .expect("the find-family arm no longer emits menu-action");
+    assert!(arm < emit);
+    assert_eq!(body[arm..emit].matches("=>").count(), 1);
   }
 
   #[test]
@@ -2274,6 +2349,24 @@ mod rebuild_app_menu_guard_tests {
       !body.contains(".state::<MenuItems>()"),
       "rebuild_app_menu must not call state::<MenuItems>(): it aborts the process \
        rather than returning, and the app never opens a window"
+    );
+  }
+
+  #[test]
+  fn a_destroyed_window_rebuilds_the_menu_on_windows() {
+    let at = SOURCE
+      .find("if let tauri::WindowEvent::Destroyed = event {")
+      .expect("the Destroyed branch no longer exists in lib.rs");
+    let rest = &SOURCE[at..];
+    let end = rest
+      .find("\n  }\n")
+      .expect("could not find the end of the Destroyed branch");
+    let body = &rest[..end];
+    assert!(
+      body.contains("#[cfg(target_os = \"windows\")]")
+        && body.contains("rebuild_app_menu(app, locale)"),
+      "the Destroyed branch must rebuild the app menu on Windows: the destroyed \
+       window took the shared HMENU with it"
     );
   }
 }
@@ -3037,6 +3130,8 @@ pub fn run() {
       windows::reveal_self,
       pending_opens::doc_window_ready,
       tab_transfer::tab_drop_target,
+      tab_transfer::tab_drag_hover,
+      tab_transfer::tab_drag_hover_end,
       tab_transfer::tab_move_window,
       tab_transfer::tab_transfer_begin,
       tab_transfer::tab_transfer_claim,
@@ -3307,6 +3402,7 @@ mod tests {
     let f = menu_flags(FocusKind::Doc);
     assert!(f.new_tab && f.open && f.save && f.close);
     assert!(f.find && f.find_replace && f.find_next && f.find_prev);
+    assert!(f.goto_line);
   }
 
   #[test]
@@ -3315,6 +3411,9 @@ mod tests {
     assert!(f.save && f.close);
     assert!(!f.new_tab && !f.open);
     assert!(!f.find && !f.find_replace && !f.find_next && !f.find_prev);
+    // A sticky has go to line through its editor, and on Windows a disabled
+    // item would swallow its key.
+    assert!(f.goto_line);
   }
 
   #[test]
@@ -3327,6 +3426,7 @@ mod tests {
     assert!(f.open);
     assert!(!f.new_tab && !f.save);
     assert!(!f.find && !f.find_replace && !f.find_next && !f.find_prev);
+    assert!(!f.goto_line);
   }
 
   #[test]
@@ -3335,6 +3435,7 @@ mod tests {
       let f = menu_flags(kind);
       assert!(!f.new_tab && !f.open && !f.save && !f.close);
       assert!(!f.find && !f.find_replace && !f.find_next && !f.find_prev);
+      assert!(!f.goto_line);
     }
   }
 
@@ -3930,6 +4031,8 @@ mod tab_transfer_hook_tests {
     assert!(run.contains("app.manage(tab_transfer::TransferState::default())"));
     for command in [
       "tab_drop_target",
+      "tab_drag_hover",
+      "tab_drag_hover_end",
       "tab_move_window",
       "tab_transfer_begin",
       "tab_transfer_claim",

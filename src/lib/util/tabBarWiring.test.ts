@@ -54,7 +54,14 @@ function startTag(marker: string): string {
   }
   throw new Error(`no end of the tag with ${marker}`);
 }
-const STOPS_THE_DRAG = 'onpointerdown={(e) => e.stopPropagation()}';
+/** The `onpointerdown` handler of a start tag: from its keyword to the next
+ *  attribute. */
+function pointerDownOf(tag: string): string {
+  const at = tag.indexOf('onpointerdown=');
+  expect(at).toBeGreaterThan(-1);
+  const end = tag.indexOf('onclick=', at);
+  return tag.slice(at, end < 0 ? undefined : end);
+}
 
 describe('the tab bar of a document window', () => {
   it('cannot be selected as text', () => {
@@ -64,8 +71,24 @@ describe('the tab bar of a document window', () => {
   });
 
   it('keeps a press on the close button or the lock from starting a drag', () => {
-    expect(startTag('class="tab-close"')).toContain(STOPS_THE_DRAG);
-    expect(startTag('class="tab-lock"')).toContain(STOPS_THE_DRAG);
+    expect(pointerDownOf(startTag('class="tab-close"'))).toContain(
+      'e.stopPropagation()',
+    );
+    expect(pointerDownOf(startTag('class="tab-lock"'))).toContain(
+      'e.stopPropagation()',
+    );
+  });
+
+  it('keeps the focus in the range edit box on a press on a tab bar button', () => {
+    for (const marker of [
+      'class="tab-lock"',
+      'class="tab-close"',
+      'class="tab-new"',
+    ]) {
+      expect(pointerDownOf(startTag(marker)), marker).toContain(
+        'keepsBoxFocus(',
+      );
+    }
   });
 
   it('forwards the pointer events of a tab and stops the browser drag', () => {
@@ -94,7 +117,11 @@ describe('the tab bar of a document window', () => {
     const host = source.slice(start, source.indexOf('};', start));
     expect(host).toContain('missing.navigationLocked()');
     expect(host).toContain('gate.visible');
-    expect(host).toContain('anyModalOpen');
+    expect(host).toContain('dragModalOpen(');
+    expect(host).not.toContain('anyModalOpen');
+    expect(host).toContain(
+      'boxConflict: documentWindow.rangeBox?.conflict === true',
+    );
   });
 
   it('reports the tab index and the order key of each tab to automation', () => {

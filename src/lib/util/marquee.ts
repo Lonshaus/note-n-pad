@@ -63,6 +63,74 @@ export interface MarqueeHandle {
   update(): void;
   destroy(): void;
 }
+/** What the shared document listeners reach of one marquee. */
+interface Member {
+  /** Re-read hover from the engine. */
+  sync(): void;
+}
+interface DocumentEntry {
+  buttons: WeakMap<Element, Set<Member>>;
+  size: number;
+  off: () => void;
+}
+// Keyed by document; elements and members are only reachable through the
+// weak map, so an undestroyed marquee never keeps its button alive.
+const registry = new Map<Document, DocumentEntry>();
+
+function syncAt(
+  buttons: WeakMap<Element, Set<Member>>,
+  at: EventTarget | null,
+): void {
+  const button = at instanceof Element ? at.closest('button') : null;
+  // Old WebKit drops pointerenter / pointerleave on a disabled button.
+  if (button !== null && button.disabled) {
+    buttons.get(button)?.forEach((member) => member.sync());
+  }
+}
+/** Adds `member` for `button`; returns the function that removes it. */
+function register(button: HTMLElement, member: Member): () => void {
+  const doc: Document | undefined = button.ownerDocument;
+  if (doc === undefined) {
+    return () => {};
+  }
+  let entry = registry.get(doc);
+  if (entry === undefined) {
+    const buttons = new WeakMap<Element, Set<Member>>();
+    const onOver = (event: PointerEvent): void => {
+      syncAt(buttons, event.target);
+    };
+    const onOut = (event: PointerEvent): void => {
+      syncAt(buttons, event.relatedTarget);
+    };
+    doc.addEventListener('pointerover', onOver, { passive: true });
+    doc.addEventListener('pointerout', onOut, { passive: true });
+    entry = {
+      buttons,
+      size: 0,
+      off: () => {
+        doc.removeEventListener('pointerover', onOver);
+        doc.removeEventListener('pointerout', onOut);
+        registry.delete(doc);
+      },
+    };
+    registry.set(doc, entry);
+  }
+  const current = entry;
+  let members = current.buttons.get(button);
+  if (members === undefined) {
+    members = new Set();
+    current.buttons.set(button, members);
+  }
+  members.add(member);
+  current.size += 1;
+  return () => {
+    members.delete(member);
+    current.size -= 1;
+    if (current.size === 0) {
+      current.off();
+    }
+  };
+}
 /**
  * Run the text of `label` (its one child) as a marquee while `button` is
  * hovered or focused and the text is wider than the label.
@@ -108,6 +176,8 @@ export function attachMarquee(
 
   const tick = (now: number): void => {
     frame = 0;
+    // The engine's `:hover` is right on a disabled button and after missed events.
+    hover = button.matches(':hover');
     const el = inner();
     if (destroyed || el === null || !label.isConnected || !active()) {
       stop();
@@ -178,6 +248,10 @@ export function attachMarquee(
     schedule();
   }
 
+  const unregister = register(button, {
+    sync: () => setActive('hover', button.matches(':hover')),
+  });
+
   return {
     update(): void {
       stop();
@@ -186,7 +260,11 @@ export function attachMarquee(
       }
     },
     destroy(): void {
+      if (destroyed) {
+        return;
+      }
       destroyed = true;
+      unregister();
       stop();
       button.removeEventListener('pointerenter', onEnter);
       button.removeEventListener('pointerleave', onLeave);

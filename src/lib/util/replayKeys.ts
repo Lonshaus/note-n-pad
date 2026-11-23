@@ -524,6 +524,8 @@ export function coreKeyBindings(commands: {
     { key: 'Mod-a', preventDefault: true, run: commands.selectVisible },
     { key: 'Mod-z', preventDefault: true, run: commands.undo },
     { key: 'Mod-Shift-z', preventDefault: true, run: commands.redo },
+    // Windows' Edit > Redo is a native item that sends Ctrl+Y.
+    { win: 'Mod-y', preventDefault: true, run: commands.redo },
   ];
 }
 /** Whether the keydown is Select All (Cmd+A on macOS, Ctrl+A elsewhere), read

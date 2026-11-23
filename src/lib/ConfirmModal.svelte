@@ -271,7 +271,8 @@
   .modal-backdrop {
     position: absolute;
     inset: 0;
-    z-index: 3;
+    /* Above the locked-editor banner (4). */
+    z-index: 5;
     display: flex;
     align-items: center;
     justify-content: center;
@@ -283,7 +284,7 @@
     border-radius: 8px;
     box-shadow: 0 6px 24px rgba(0, 0, 0, 0.3);
     padding: 0.85rem 1rem;
-    max-width: min(85%, calc(100% - 2rem));
+    max-width: calc(min(85%, 100% - 2rem) - 2rem);
     max-height: calc(85% - 1.7rem);
     display: flex;
     flex-direction: column;

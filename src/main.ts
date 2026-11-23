@@ -62,7 +62,7 @@ void editionState.ready();
 // (or another handler) already claimed, such as Ctrl+F or Ctrl+G, is left
 // alone. `get_menu_accelerators` (not `get_shortcuts`) is used deliberately:
 // it lists only the native menu items, so the frontend-only shortcuts (tab
-// switching, go to line) are never intercepted here. The list is fetched
+// switching) are never intercepted here. The list is fetched
 // again whenever the settings change, since the user can move a menu key, and
 // whenever the edition changes, since Lite has no workspace menu item.
 void (async (): Promise<void> => {

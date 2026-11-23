@@ -28,7 +28,7 @@ describe('ConfirmModal', () => {
 
   it('caps the box in both directions and lays it out as a column', () => {
     const modal = rule(source, '.modal');
-    expect(modal).toContain('max-width: min(85%, calc(100% - 2rem));');
+    expect(modal).toContain('max-width: calc(min(85%, 100% - 2rem) - 2rem);');
     expect(modal).toContain('max-height: calc(85% - 1.7rem);');
     expect(modal).toContain('display: flex;');
     expect(modal).toContain('flex-direction: column;');

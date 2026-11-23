@@ -1,6 +1,6 @@
 // Copyright © 2026 Lonshaus
 // SPDX-License-Identifier: GPL-3.0-only
-// The effective Undo and Save keys as the macOS composition handlers see them.
+// The effective Undo, Save and Go to Line keys as the macOS composition handlers see them.
 
 import { shortcutsState } from '../state/shortcuts.svelte';
 import { platform } from '../state/platform.svelte';
@@ -15,4 +15,7 @@ export function isUndoKey(event: KeyboardEvent): boolean {
 }
 export function isSaveKey(event: KeyboardEvent): boolean {
   return matchesEffective('menu.save', event);
+}
+export function isGotoLineKey(event: KeyboardEvent): boolean {
+  return matchesEffective('goto-line', event);
 }

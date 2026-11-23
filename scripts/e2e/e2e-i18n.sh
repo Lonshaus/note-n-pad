@@ -79,7 +79,7 @@ _label_is() {
 # `evl` against a window that does not exist yet fails, and every assertion in
 # the settings section runs in that window.
 _settings_auto_ready() {
-  [ "$(evl settings "String(typeof __auto)")" = "object" ]
+  [ "$(evl settings "typeof __auto === 'object' ? __auto.settingsReady() : false")" = "true" ]
 }
 launch() {
   e2e_require_clean_slate

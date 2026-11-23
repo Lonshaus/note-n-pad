@@ -695,6 +695,8 @@ export function installSettingsAuto(hooks: SettingsHooks): void {
       language: settingsState.language,
       resolvedLocale: settingsState.resolvedLocale,
     }),
+    // True once this window's stored settings are loaded and applied.
+    settingsReady: () => settingsState.ready.then(() => true),
     getLanguage: () => settingsState.language,
     setLanguage: (l: Language) => settingsState.setLanguage(l),
     setThemeId: (id: string) => settingsState.setThemeId(id),

@@ -46,6 +46,7 @@
   } from './lib/util/editorClipboard';
   import type { EditorView } from '@codemirror/view';
   import { undo, redo, selectAll } from '@codemirror/commands';
+  import { gotoLine } from '@codemirror/search';
   import { installPasteWindow } from './lib/util/pasteEnv';
   import ConvertDialogs from './lib/ConvertDialogs.svelte';
   import { convertController } from './lib/state/convertController.svelte';
@@ -290,11 +291,13 @@
     stickyNote.updateContent(v);
   }
   // The sticky's CodeMirror view, supplied by EditorShell for the edit actions
-  // below. Stickies have no search at all (no Find, no Find and Replace).
+  // below. Stickies have no search at all (no Find, no Find and Replace) but do
+  // have Go to Line.
   let editorView: EditorView | null = null;
   // Menu accelerators arrive from the Rust menu as a string payload. Save routes
-  // to the sticky's save-and-convert flow. New Tab, Open, Find and Find and
-  // Replace never reach an enabled sticky menu item, so they are ignored here.
+  // to the sticky's save-and-convert flow and Go to Line opens CodeMirror's box.
+  // New Tab, Open, Find and Find and Replace never reach an enabled sticky
+  // menu item, so they are ignored here.
   function runMenuAction(action: string): void {
     // The find field keeps its own undo history.
     if (
@@ -344,6 +347,11 @@
     switch (action) {
       case 'save':
         void saveAndConvert();
+        break;
+      case 'goto-line':
+        if (editorView !== null) {
+          gotoLine(editorView);
+        }
         break;
     }
   }

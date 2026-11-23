@@ -37,9 +37,7 @@
   import { platform } from '../state/platform.svelte';
   import { isLite } from '../state/edition.svelte';
   import { editionUi } from '../util/editionUi';
-  import { shortcutsState } from '../state/shortcuts.svelte';
   import { settingsState } from '../state/settings.svelte';
-  import { matchWindowShortcut } from '../util/windowShortcut';
   import {
     clipCopyRoute,
     clipFileRange,
@@ -900,9 +898,8 @@
       updateWholeFile({ type: 'click' });
     }
   }
-  // The shortcut registry's `goto-line` key opens goto. Cmd/Ctrl+F is a native
-  // menu accelerator (it never reaches this listener), so DocumentApp routes it
-  // to `openSearch` instead.
+  // Cmd/Ctrl+A ends a pointer selection; a selection-moving key updates the
+  // whole-file state.
   function onWindowKeydown(e: KeyboardEvent): void {
     if (
       (platform.isMacOS ? e.metaKey : e.ctrlKey) &&
@@ -913,13 +910,8 @@
     if (movesSelection(e.key)) {
       updateWholeFile({ type: 'key' });
     }
-    const accel = shortcutsState.accel('goto-line');
-    if (accel !== null && matchWindowShortcut(e, accel, platform.os)) {
-      e.preventDefault();
-      openGoto();
-    }
   }
-  // DEV/automation surface, driven by DocumentApp's hooks.
+  // Driven by DocumentApp: Edit > Go to Line and the DEV/automation hooks.
   export function largeGotoOpen(): void {
     openGoto();
   }

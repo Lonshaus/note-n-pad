@@ -685,7 +685,7 @@ fi
 echo "=== 10. the General page, full edition ==="
 evl "$DL" "window.__TAURI_INTERNALS__.invoke('show_settings_window')" >/dev/null
 settings_ready() {
-  [ "$(evl settings "String(typeof __auto)")" = "object" ]
+  [ "$(evl settings "typeof __auto === 'object' ? __auto.settingsReady() : false")" = "true" ]
 }
 # The names of the page's fields and toggles in document order, and
 # whether this platform has the default apps page.

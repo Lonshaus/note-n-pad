@@ -12,6 +12,7 @@
 
   interface Props {
     box: RangeBox;
+    top: number;
     dark: boolean;
     fontSize: number;
     fontFamily: string;
@@ -25,6 +26,7 @@
 
   let {
     box,
+    top,
     dark,
     fontSize,
     fontFamily,
@@ -41,7 +43,7 @@
   const OPEN_IDS = [ID];
 </script>
 
-<div class="backdrop" role="presentation">
+<div class="backdrop" role="presentation" style:top="{top}px">
   <div class="panel" role="dialog" aria-modal="true">
     <div class="title">
       {rangeLabel(box.sourcePath, box.startLine, box.endLine)}
@@ -81,10 +83,12 @@
 </div>
 
 <style>
-  /* Below ConfirmModal (z-index 3), so a dialog raised from the box covers it. */
+  /* Below ConfirmModal (z-index 5), so a dialog raised from the box covers it. */
   .backdrop {
     position: absolute;
-    inset: 0;
+    right: 0;
+    bottom: 0;
+    left: 0;
     z-index: 2;
     display: flex;
     align-items: center;

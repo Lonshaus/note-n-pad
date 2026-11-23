@@ -25,8 +25,9 @@
   import { readCspNonce } from '../util/cspNonce';
   import { keymapExtension } from './keymap';
   import { dialogMarquee } from './dialogMarquee';
-  import { compositionCancel } from './composition';
-  import { isUndoKey } from './imeShortcuts';
+  import { gotoLine } from '@codemirror/search';
+  import { compositionCancel, compositionKey } from './composition';
+  import { isGotoLineKey, isUndoKey } from './imeShortcuts';
   import { cmPhraseExtension, cmPhraseSignature } from './cmPhrases';
   import { shortcutsState } from '../state/shortcuts.svelte';
   import { platform } from '../state/platform.svelte';
@@ -169,7 +170,14 @@
           // here breaks styling for the whole window. Do not deduplicate.
           EditorView.cspNonce.of(readCspNonce()),
           minimal
-            ? [minimalSetup, keymapCompartment.of(currentKeymap())]
+            ? [
+                minimalSetup,
+                keymapCompartment.of(currentKeymap()),
+                // Go to Line while composing, which the keymap skips.
+                platform.isMacOS
+                  ? compositionKey(isGotoLineKey, (v) => void gotoLine(v))
+                  : [],
+              ]
             : basicSetup,
           // Undo while composing cancels the composition, as TextEdit does.
           platform.isMacOS

@@ -112,19 +112,36 @@
   import {
     IDLE,
     dragStep,
+    dropSlot,
+    hoverAccepted,
+    hoverCall,
+    hoverGap,
+    hoverShift,
     slideOffset,
+    translateXOf,
     type CancelReason,
     type DragInput,
     type DragOutcome,
     type DragState,
     type TabBarGeometry,
   } from './lib/util/tabDrag';
+  import {
+    dragModalOpen,
+    keepsBoxFocus,
+    tabBarAllowed,
+  } from './lib/util/rangeBoxTabBar';
   import { closeDocumentWindow } from './lib/state/windowClose';
   import { IncomingTransfers } from './lib/state/incomingTransfer.svelte';
   import { menuActionAllowed } from './lib/util/menuActionGate';
   import {
+    composingGotoSurface,
+    gotoLineSurface,
+  } from './lib/util/gotoLineSurface';
+  import {
+    HOVER_EVENT,
     QUEUED_TRANSFER,
     TRANSFER_EVENT,
+    type HoverPayload,
     type TransferEventPayload,
   } from './lib/util/tabTransferWire';
   import type { PasteLock } from './lib/util/pasteLock';
@@ -132,6 +149,7 @@
   import type { EditorState } from '@codemirror/state';
   import { settleViewComposition } from './lib/editor/composition';
   import { isSaveKey } from './lib/editor/imeShortcuts';
+  import { dropFocusWhenInert } from './lib/util/inertFocus.svelte';
   import type { EditorView } from '@codemirror/view';
   import { undo, redo, selectAll } from '@codemirror/commands';
   import {
@@ -139,6 +157,7 @@
     closeSearchPanel,
     findNext,
     findPrevious,
+    gotoLine,
     searchPanelOpen,
   } from '@codemirror/search';
   import {
@@ -198,6 +217,11 @@
   // Whether the active tab renders through the ordinary editor.
   const activeOrdinary = $derived(
     documentWindow.ready && active !== null && isOrdinaryTab(active),
+  );
+  let editorSlot = $state<HTMLDivElement | null>(null);
+  dropFocusWhenInert(
+    () => editorSlot,
+    () => !activeOrdinary,
   );
   // The ordinary tab the editor holds: the active tab, or while a windowed or
   // large tab is active, the last active ordinary one (editor hidden).
@@ -343,6 +367,7 @@
     flushed: () => Promise<void>;
     openFind: () => void;
     openFindReplace: () => void;
+    openGotoBox: () => void;
     findNext: () => void;
     findPrevious: () => void;
     panelOpen: () => boolean;
@@ -886,6 +911,7 @@
       documentWindow.rangeBox !== null ||
       otherDialogs,
   );
+  const rangeBoxOpen = $derived(documentWindow.rangeBox !== null);
   // A dialog the tabs must not move under: the ones above and the conversion
   // and edit-box conflict dialogs. Not the close confirmation, the close gate or
   // the missing-file dialog (MissingFiles judges those itself), the error banner
@@ -1082,6 +1108,32 @@
       input?.focus();
     });
   }
+  // Go to Line on whichever surface the tab, or the open range edit box, shows.
+  function currentGotoSurface(): ReturnType<typeof gotoLineSurface> {
+    return gotoLineSurface({
+      boxOpen: documentWindow.rangeBox !== null,
+      windowed: active?.windowed !== undefined,
+      large: active?.large !== undefined,
+    });
+  }
+  function gotoLineAction(): void {
+    const surface = currentGotoSurface();
+    if (surface === 'box') {
+      if (boxView !== null) {
+        gotoLine(boxView);
+      }
+    } else if (surface === 'windowed') {
+      windowedRef?.openGotoBox();
+    } else if (surface === 'large') {
+      largeRef?.largeGotoOpen();
+    } else {
+      ensureSourceView();
+      const view = liveView();
+      if (view !== null) {
+        gotoLine(view);
+      }
+    }
+  }
 
   function findNextMatch(): void {
     if (active?.windowed !== undefined) {
@@ -1142,7 +1194,8 @@
     }
   }
   // The menu actions the open range edit box takes besides the edits: save
-  // writes it back, find drives its own editor. Everything else waits.
+  // writes it back, find and go to line drive its own editor. Everything else
+  // waits.
   function runBoxAction(action: string): void {
     const view = boxView;
     switch (action) {
@@ -1164,6 +1217,9 @@
         if (view !== null) {
           findPrevious(view);
         }
+        break;
+      case 'goto-line':
+        gotoLineAction();
         break;
     }
   }
@@ -1315,6 +1371,9 @@
       case 'find-prev':
         findPrevMatch();
         break;
+      case 'goto-line':
+        gotoLineAction();
+        break;
     }
   }
   // Close the current active tab; its store entry is removed and the window
@@ -1382,6 +1441,8 @@
   // Tab drag. The state machine in tabDrag.ts decides; this forwards the pointer
   // events to it and acts on what it decides.
   let tabbarEl = $state<HTMLElement | null>(null);
+  // The tab bar's height with its border: the range edit box starts below it.
+  let tabbarHeight = $state(0);
   let dragState = $state.raw<DragState>(IDLE);
   // How far the pressed tab follows the pointer, in CSS pixels.
   let dragDx = $state(0);
@@ -1391,13 +1452,14 @@
   // slide transform would otherwise move them under the pointer.
   let dragRects: { left: number; width: number }[] = [];
   // The tab boxes in the bar's content coordinates (the scroll offset not
-  // applied).
+  // applied), laid out: a tab's current translation is taken off.
   function tabRects(bar: HTMLElement): { left: number; width: number }[] {
     const box = bar.getBoundingClientRect();
     return [...bar.querySelectorAll<HTMLElement>(':scope > .tab')].map((el) => {
       const tabBox = el.getBoundingClientRect();
+      const shift = translateXOf(getComputedStyle(el).transform);
       return {
-        left: tabBox.left - box.left + bar.scrollLeft,
+        left: tabBox.left - shift - box.left + bar.scrollLeft,
         width: tabBox.width,
       };
     });
@@ -1440,6 +1502,10 @@
   }
   function onTabPointerDown(e: PointerEvent, index: number): void {
     const bar = tabbarEl;
+    if (keepsBoxFocus(rangeBoxOpen)) {
+      // No compatibility mousedown: the tab must not take focus from the box.
+      e.preventDefault();
+    }
     if (
       bar === null ||
       e.button !== 0 ||
@@ -1466,6 +1532,10 @@
       y: e.clientY,
       geometry: dragGeometry(bar),
     });
+    hoverPoint = { x: e.clientX, y: e.clientY };
+    if (dragState.phase === 'dragging' && hoverFrame === 0) {
+      hoverFrame = requestAnimationFrame(onHoverFrame);
+    }
     const mine = dragRects[dragState.index];
     const first = dragRects[0];
     const last = dragRects[dragRects.length - 1];
@@ -1493,6 +1563,11 @@
     const tab = dragTab;
     dragTab = null;
     dragPointer = -1;
+    hover = null;
+    endHover();
+    if (outcome !== null && rangeBoxOpen) {
+      focusActiveEditor();
+    }
     // Every release asks the core where it landed: the own window reorders the
     // tab or returns it to its slot, anything else moves it.
     if (outcome?.kind === 'release' && tab !== null) {
@@ -1506,19 +1581,86 @@
     }
   }
   function cancelDrag(reason: CancelReason): void {
-    feedDrag({ kind: 'cancel', reason });
+    const outcome = feedDrag({ kind: 'cancel', reason });
     dragTab = null;
     dragPointer = -1;
+    hover = null;
+    endHover();
+    if (outcome !== null && rangeBoxOpen) {
+      focusActiveEditor();
+    }
   }
   function onTabClick(index: number): void {
     const result = dragStep(dragState, { kind: 'click' });
     dragState = result.state;
-    if (!result.swallowed) {
+    if (!result.swallowed && tabBarAllowed('switch', rangeBoxOpen)) {
       void documentWindow.switchTo(index, false, true);
     }
   }
-  // The transform of the tab at `index` while a drag is over the own tab bar.
+  // The hover feedback this window sends while its dragged tab is over another
+  // window: at most one call per frame, and an end after the last hover.
+  let hovering = false;
+  let hoverFrame = 0;
+  let hoverPoint = { x: 0, y: 0 };
+  function onHoverFrame(): void {
+    hoverFrame = 0;
+    const call = hoverCall({
+      dragging: dragState.phase === 'dragging',
+      overBar: dragState.overBar,
+      hovering,
+      transferable:
+        dragTab !== null && documentWindow.transferBlockerOf(dragTab) === null,
+    });
+    if (call === 'hover') {
+      hovering = true;
+      invoke('tab_drag_hover', {
+        clientX: hoverPoint.x,
+        clientY: hoverPoint.y,
+        dpr: window.devicePixelRatio,
+        onlyTab: documentWindow.tabs.length === 1,
+        width: dragRects[dragState.index]?.width ?? 0,
+      }).catch((error: unknown) => {
+        console.error('tab_drag_hover failed', error);
+      });
+    } else if (call === 'end') {
+      endHover();
+    }
+  }
+  function endHover(): void {
+    cancelAnimationFrame(hoverFrame);
+    hoverFrame = 0;
+    if (hovering) {
+      hovering = false;
+      invoke('tab_drag_hover_end').catch((error: unknown) => {
+        console.error('tab_drag_hover_end failed', error);
+      });
+    }
+  }
+  // The gap a tab dragged from another window opens here.
+  let hover = $state.raw<{ slot: number; width: number } | null>(null);
+  function onHover(payload: HoverPayload): void {
+    if (
+      !hoverAccepted({
+        ready: documentWindow.ready,
+        locked: documentWindow.dragLocked(),
+      })
+    ) {
+      hover = null;
+      return;
+    }
+    const geometry = currentGeometry();
+    const gap = hoverGap(payload, platform.os, window.devicePixelRatio);
+    const slot = geometry === null ? null : dropSlot(gap.point, geometry);
+    hover = slot === null ? null : { slot, width: gap.width };
+  }
+  const hoverShown = $derived(hover !== null && dragState.phase !== 'dragging');
+  // The transform of the tab at `index` while a drag is over the own tab bar, or
+  // while another window's tab hovers over this one.
   function tabTransform(index: number): string | undefined {
+    if (hover !== null && hoverShown) {
+      const shift = hoverShift(index, hover.slot, hover.width);
+      return shift === 0 ? undefined : `translateX(${shift}px)`;
+    }
     if (dragState.phase !== 'dragging' || !dragState.overBar) {
       return undefined;
     }
@@ -1650,7 +1792,14 @@
     });
     const transferListeners = Promise.all([
       win.listen<TransferEventPayload>(TRANSFER_EVENT.in, (event) => {
+        hover = null;
         void incomingTransfers.take(event.payload.t);
+      }),
+      win.listen<HoverPayload>(HOVER_EVENT.hover, (event) => {
+        onHover(event.payload);
+      }),
+      win.listen(HOVER_EVENT.end, () => {
+        hover = null;
       }),
       win.listen<TransferEventPayload>(TRANSFER_EVENT.release, (event) => {
         documentWindow.onTransferRelease(event.payload.t);
@@ -1740,6 +1889,22 @@
           return;
         }
       }
+      // macOS: the menu does not fire while an IME composes, and the large-file
+      // editor and viewer have no key handler of their own for Go to Line.
+      const gotoKey = shortcutsState.accel('goto-line');
+      if (
+        composingGotoSurface({
+          mac: platform.isMacOS,
+          composing: e.isComposing,
+          matches:
+            gotoKey !== null && matchWindowShortcut(e, gotoKey, platform.os),
+          surface: currentGotoSurface(),
+        })
+      ) {
+        e.preventDefault();
+        gotoLineAction();
+        return;
+      }
       // The box covers the tab bar: the tabs stay as they are until it closes.
       if (missing.tabsLocked()) {
         return;
@@ -1771,6 +1936,8 @@
     const unlistenFocus = win.onFocusChanged(({ payload: focused }) => {
       if (focused) {
         focusActiveEditor();
+      } else {
+        hover = null;
       }
     });
     // Some window of the app came to the front: a file that was open here may
@@ -1899,7 +2066,15 @@
     documentWindow.dragHost = {
       navigationLocked: () => missing.navigationLocked(),
       gateVisible: () => gate.visible,
-      modalOpen: () => anyModalOpen,
+      modalOpen: () =>
+        dragModalOpen({
+          confirmClose: missing.confirmClose,
+          missingItem: missingItem !== null,
+          gateVisible: gate.visible,
+          windowedError: windowedError !== null,
+          otherDialogs,
+          boxConflict: documentWindow.rangeBox?.conflict === true,
+        }),
       closing: () => gate.closing,
       quitting: () => gate.quitting,
     };
@@ -2172,6 +2347,7 @@
     }
     return () => {
       window.removeEventListener('keydown', onKeydown);
+      endHover();
       uninstallPaste();
       convertController.attachDoc(null);
       documentWindow.endComposition = null;
@@ -2218,7 +2394,12 @@
   onblur={() => cancelDrag('blur')}
 />
 <div class="app">
-  <div class="tabbar" role="tablist" bind:this={tabbarEl}>
+  <div
+    class="tabbar"
+    role="tablist"
+    bind:this={tabbarEl}
+    bind:offsetHeight={tabbarHeight}
+  >
     {#each documentWindow.tabs as tab, i (tab.id)}
       {@const lock = largeLock(tab)}
       <div
@@ -2236,9 +2417,10 @@
           (dragState.phase === 'dragging' &&
             i === dragState.index &&
             !dragState.overBar)}
-        class:sliding={dragState.phase === 'dragging' &&
-          dragState.overBar &&
-          i !== dragState.index}
+        class:sliding={hoverShown ||
+          (dragState.phase === 'dragging' &&
+            dragState.overBar &&
+            i !== dragState.index)}
         onpointerdown={(e) => onTabPointerDown(e, i)}
         onpointermove={onTabPointerMove}
         onpointerup={onTabPointerUp}
@@ -2247,7 +2429,7 @@
         ondragstart={(e) => e.preventDefault()}
         onclick={() => onTabClick(i)}
         onkeydown={(e) => {
-          if (e.key === 'Enter') {
+          if (e.key === 'Enter' && tabBarAllowed('switch', rangeBoxOpen)) {
             void documentWindow.switchTo(i, false, true);
           }
         }}
@@ -2294,10 +2476,17 @@
             title={lock.title}
             aria-label={lock.title}
             disabled={lock.disabled}
-            onpointerdown={(e) => e.stopPropagation()}
+            onpointerdown={(e) => {
+              if (keepsBoxFocus(rangeBoxOpen)) {
+                e.preventDefault();
+              }
+              e.stopPropagation();
+            }}
             onclick={(e) => {
               e.stopPropagation();
-              void unlockTab(i);
+              if (tabBarAllowed('unlock', rangeBoxOpen)) {
+                void unlockTab(i);
+              }
             }}
           >
             <!-- Pencil = "start editing" (an action, matching the 編輯 tooltip);
@@ -2324,7 +2513,12 @@
           class="tab-close"
           title={t('doc.tab.close')}
           aria-label={t('doc.tab.close')}
-          onpointerdown={(e) => e.stopPropagation()}
+          onpointerdown={(e) => {
+            if (keepsBoxFocus(rangeBoxOpen)) {
+              e.preventDefault();
+            }
+            e.stopPropagation();
+          }}
           onclick={(e) => {
             e.stopPropagation();
             void requestCloseTab(i);
@@ -2348,7 +2542,16 @@
       class="tab-new"
       title={t('doc.tab.new')}
       aria-label={t('doc.tab.new')}
-      onclick={() => documentWindow.newTab()}
+      onpointerdown={(e) => {
+        if (keepsBoxFocus(rangeBoxOpen)) {
+          e.preventDefault();
+        }
+      }}
+      onclick={() => {
+        if (tabBarAllowed('new', rangeBoxOpen)) {
+          void documentWindow.newTab();
+        }
+      }}
     >
       <svg
         viewBox="0 0 24 24"
@@ -2469,6 +2672,7 @@
     {#if heldTab !== null}
       {@const held = heldTab}
       <div
+        bind:this={editorSlot}
         class="editor-slot"
         class:hidden={!activeOrdinary}
         inert={!activeOrdinary}
@@ -2592,6 +2796,7 @@
   {#if documentWindow.rangeBox !== null}
     <RangeEditBox
       box={documentWindow.rangeBox}
+      top={tabbarHeight}
       dark={settingsState.isDark}
       fontSize={settingsState.editorFontSize}
       fontFamily={settingsState.editorFontFamily}
@@ -2969,8 +3174,10 @@
     opacity: 1;
     background: rgba(127, 127, 127, 0.3);
   }
+  /* Keeps the editors' own layers under the window's dialogs. */
   .body {
     position: relative;
+    isolation: isolate;
     flex: 1 1 auto;
     min-height: 0;
   }

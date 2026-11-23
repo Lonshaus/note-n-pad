@@ -39,6 +39,7 @@
     onsearchkeydown: (e: KeyboardEvent) => void;
     onreplace?: () => void;
     onreplaceall?: () => void;
+    onsearchresize?: (first: boolean) => void;
   }
 
   let {
@@ -60,12 +61,31 @@
     onsearchkeydown,
     onreplace,
     onreplaceall,
+    onsearchresize,
   }: Props = $props();
 
   let gotoInput = $state<HTMLInputElement | null>(null);
   let queryInput = $state<HTMLInputElement | null>(null);
   let replaceInput = $state<HTMLInputElement | null>(null);
-
+  let searchPanel = $state<HTMLDivElement | null>(null);
+  $effect(() => {
+    const el = searchPanel;
+    if (el === null || onsearchresize === undefined) {
+      return;
+    }
+    const report = onsearchresize;
+    let first = true;
+    const observer = new ResizeObserver(() => {
+      report(first);
+      first = false;
+    });
+    observer.observe(el);
+    return () => observer.disconnect();
+  });
+  /** The find panel's height in pixels, 0 while it is not shown. */
+  export function searchPanelHeight(): number {
+    return searchPanel?.getBoundingClientRect().height ?? 0;
+  }
   export function focusGoto(): void {
     gotoInput?.focus();
   }
@@ -101,7 +121,7 @@
 {/if}
 
 {#if panel === 'search'}
-  <div class="cm-panel cm-search search-panel">
+  <div bind:this={searchPanel} class="cm-panel cm-search search-panel">
     <div class="cm-search-row">
       <input
         bind:this={queryInput}

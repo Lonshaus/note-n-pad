@@ -2,7 +2,12 @@
 // SPDX-License-Identifier: GPL-3.0-only
 
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { attachMarquee, marqueeStep, type MarqueeState } from './marquee';
+import {
+  attachMarquee,
+  marqueeStep,
+  type MarqueeHandle,
+  type MarqueeState,
+} from './marquee';
 
 const START: MarqueeState = { x: 0, held: false, holdLeftMs: 0 };
 // A 200 px text in a 100 px box: it reaches its end at x = -100, and its
@@ -132,37 +137,111 @@ describe('marqueeStep', () => {
 });
 
 describe('attachMarquee', () => {
-  afterEach(() => {
-    vi.unstubAllGlobals();
-  });
+  // Vitest runs without a DOM: plain fakes stand in for the elements.
+  class FakeElement {
+    closest(_selector: string): FakeElement | null {
+      return null;
+    }
+  }
+  type Listener = (event: unknown) => void;
+  class FakeDocument {
+    listeners: { type: string; fn: Listener }[] = [];
+    addEventListener(type: string, fn: Listener): void {
+      this.listeners.push({ type, fn });
+    }
+    removeEventListener(type: string, fn: Listener): void {
+      this.listeners = this.listeners.filter(
+        (l) => l.type !== type || l.fn !== fn,
+      );
+    }
+    emit(type: string, event: unknown): void {
+      for (const l of [...this.listeners]) {
+        if (l.type === type) {
+          l.fn(event);
+        }
+      }
+    }
+  }
+  class FakeButton extends FakeElement {
+    disabled = false;
+    hovered = false;
+    ownerDocument: FakeDocument | undefined;
+    listeners = new Map<string, () => void>();
+    constructor(doc: FakeDocument | undefined) {
+      super();
+      this.ownerDocument = doc;
+    }
+    matches(selector: string): boolean {
+      return selector === ':hover' && this.hovered;
+    }
+    closest(selector: string): FakeElement | null {
+      return selector === 'button' ? this : null;
+    }
+    addEventListener(type: string, fn: () => void): void {
+      this.listeners.set(type, fn);
+    }
+    removeEventListener(type: string): void {
+      this.listeners.delete(type);
+    }
+  }
+  // A target that sits inside `button`.
+  const inside = (button: FakeButton): FakeElement =>
+    Object.assign(new FakeElement(), { closest: () => button });
+  const TEXT_PX = 200;
+  let frames = new Map<number, (now: number) => void>();
+  let nextFrame = 1;
+  let resizeCallbacks: (() => void)[] = [];
 
-  it('keeps the position when the box width changes mid-run', () => {
-    // Vitest runs without a DOM: plain fakes stand in for the elements.
-    class FakeElement {}
-    let frame: ((now: number) => void) | null = null;
+  const setup = (): void => {
+    frames = new Map();
+    nextFrame = 1;
+    resizeCallbacks = [];
     vi.stubGlobal('HTMLElement', FakeElement);
+    vi.stubGlobal('Element', FakeElement);
     vi.stubGlobal('requestAnimationFrame', (cb: (now: number) => void) => {
-      frame = cb;
-      return 1;
+      frames.set(nextFrame, cb);
+      return nextFrame++;
     });
-    vi.stubGlobal('cancelAnimationFrame', () => {
-      frame = null;
+    vi.stubGlobal('cancelAnimationFrame', (id: number) => {
+      frames.delete(id);
     });
     vi.stubGlobal(
       'ResizeObserver',
       class {
+        constructor(cb: () => void) {
+          resizeCallbacks.push(cb);
+        }
         observe(): void {}
         disconnect(): void {}
       },
     );
     vi.stubGlobal('getComputedStyle', () => ({ fontSize: '16px' }));
-    const textPx = 200;
+  };
+  // Runs every pending frame callback once.
+  const run = (now: number): void => {
+    const pending = [...frames.values()];
+    frames.clear();
+    for (const cb of pending) {
+      cb(now);
+    }
+  };
+
+  interface Rig {
+    button: FakeButton;
+    inner: { style: { transform: string } };
+    handle: MarqueeHandle;
+    setBox(px: number): void;
+    resize(): void;
+    x(): number;
+  }
+  // `button` is shared when a test needs two marquees in one button.
+  const make = (doc: FakeDocument | undefined, existing?: FakeButton): Rig => {
     let boxPx = 100;
     const inner = Object.assign(new FakeElement(), {
       style: { transform: '' },
       offsetLeft: 0,
       offsetTop: 0,
-      getBoundingClientRect: () => ({ width: textPx }),
+      getBoundingClientRect: () => ({ width: TEXT_PX }),
       cloneNode: () => ({
         style: {},
         setAttribute: () => {},
@@ -175,34 +254,242 @@ describe('attachMarquee', () => {
       getBoundingClientRect: () => ({ width: boxPx }),
       appendChild: () => {},
     };
-    const listeners = new Map<string, () => void>();
-    const button = {
-      matches: () => false,
-      addEventListener: (type: string, fn: () => void) => {
-        listeners.set(type, fn);
-      },
-      removeEventListener: () => {},
-    };
-    const run = (now: number): void => {
-      const cb: ((now: number) => void) | null = frame;
-      expect(cb).not.toBeNull();
-      cb?.(now);
-    };
-    const x = (): number =>
-      Number(/translateX\((.*)px\)/.exec(inner.style.transform)?.[1]);
-    attachMarquee(
+    const button = existing ?? new FakeButton(doc);
+    const handle = attachMarquee(
       label as unknown as HTMLElement,
       button as unknown as HTMLElement,
     );
-    listeners.get('pointerenter')?.();
-    for (let now = 0; now <= 1000; now += 50) {
+    const onResize = resizeCallbacks[resizeCallbacks.length - 1];
+    return {
+      button,
+      inner,
+      handle,
+      setBox: (px) => {
+        boxPx = px;
+      },
+      resize: () => onResize?.(),
+      x: () => Number(/translateX\((.*)px\)/.exec(inner.style.transform)?.[1]),
+    };
+  };
+  // Pointer events as the document listeners see them.
+  const over = (doc: FakeDocument, target: FakeElement): void => {
+    doc.emit('pointerover', { target });
+  };
+  const out = (doc: FakeDocument, relatedTarget: FakeElement | null): void => {
+    doc.emit('pointerout', { relatedTarget });
+  };
+  const runFrames = (from: number, to: number): void => {
+    for (let now = from; now <= to; now += 50) {
       run(now);
     }
-    expect(x()).toBe(-30);
-    boxPx = 140;
+  };
+
+  afterEach(() => {
+    vi.unstubAllGlobals();
+  });
+
+  it('keeps the position when the box width changes mid-run', () => {
+    setup();
+    const rig = make(undefined);
+    rig.button.listeners.get('pointerenter')?.();
+    rig.button.hovered = true;
+    runFrames(0, 1000);
+    expect(rig.x()).toBe(-30);
+    rig.setBox(140);
     run(1050);
-    expect(x()).toBe(-31.5);
-    listeners.get('pointerleave')?.();
-    expect(inner.style.transform).toBe('');
+    expect(rig.x()).toBe(-31.5);
+    rig.button.hovered = false;
+    rig.button.listeners.get('pointerleave')?.();
+    expect(rig.inner.style.transform).toBe('');
+  });
+
+  it('(1) runs the label of a disabled button on a document pointerover', () => {
+    setup();
+    const doc = new FakeDocument();
+    const rig = make(doc);
+    rig.button.disabled = true;
+    rig.button.hovered = true;
+    over(doc, inside(rig.button));
+    runFrames(0, 1000);
+    expect(rig.inner.style.transform).toMatch(/^translateX\(-\d/);
+  });
+
+  it('(2) stops a disabled button once :hover is gone', () => {
+    setup();
+    const doc = new FakeDocument();
+    const rig = make(doc);
+    rig.button.disabled = true;
+    rig.button.hovered = true;
+    over(doc, inside(rig.button));
+    runFrames(0, 500);
+    expect(rig.inner.style.transform).not.toBe('');
+    rig.button.hovered = false;
+    run(550);
+    expect(rig.inner.style.transform).toBe('');
+  });
+
+  it('(3) starts on a document pointerout only for the button', () => {
+    setup();
+    const doc = new FakeDocument();
+    const rig = make(doc);
+    rig.button.disabled = true;
+    rig.button.hovered = true;
+    const other = new FakeButton(doc);
+    other.disabled = true;
+    expect(() => {
+      out(doc, other);
+      out(doc, inside(other));
+      out(doc, new FakeElement());
+      out(doc, null);
+    }).not.toThrow();
+    runFrames(0, 500);
+    expect(rig.inner.style.transform).toBe('');
+    out(doc, rig.button);
+    runFrames(0, 500);
+    expect(rig.inner.style.transform).toMatch(/^translateX\(-\d/);
+  });
+
+  it('(4) leaves an enabled button to pointerenter and pointerleave', () => {
+    setup();
+    const doc = new FakeDocument();
+    const rig = make(doc);
+    rig.button.hovered = true;
+    over(doc, inside(rig.button));
+    runFrames(0, 500);
+    expect(rig.inner.style.transform).toBe('');
+    rig.button.listeners.get('pointerenter')?.();
+    runFrames(0, 1000);
+    expect(rig.x()).toBe(-30);
+    rig.button.hovered = false;
+    rig.button.listeners.get('pointerleave')?.();
+    expect(rig.inner.style.transform).toBe('');
+  });
+
+  it('(5a) stops a running label when :hover is gone without an event', () => {
+    setup();
+    const rig = make(new FakeDocument());
+    rig.button.hovered = true;
+    rig.button.listeners.get('pointerenter')?.();
+    runFrames(0, 500);
+    expect(rig.inner.style.transform).not.toBe('');
+    rig.button.disabled = true;
+    rig.button.hovered = false;
+    run(550);
+    expect(rig.inner.style.transform).toBe('');
+  });
+
+  it('(5b) drops the hover left over from before a disabled period', () => {
+    setup();
+    const rig = make(new FakeDocument());
+    rig.button.hovered = true;
+    rig.button.listeners.get('pointerenter')?.();
+    run(0);
+    // The label fits, so the frame stops it and leaves hover set.
+    rig.setBox(300);
+    run(50);
+    expect(rig.inner.style.transform).toBe('');
+    rig.button.disabled = true;
+    rig.button.hovered = false;
+    rig.button.disabled = false;
+    rig.setBox(100);
+    rig.resize();
+    run(100);
+    expect(rig.inner.style.transform).toBe('');
+  });
+
+  it('(6) uses two document listeners however many marquees there are', () => {
+    setup();
+    const doc = new FakeDocument();
+    const rigs = Array.from({ length: 100 }, () => make(doc));
+    expect(doc.listeners).toHaveLength(2);
+    for (const rig of rigs) {
+      rig.handle.destroy();
+    }
+    expect(doc.listeners).toHaveLength(0);
+  });
+
+  it('(7) keeps the listeners until the last marquee is destroyed', () => {
+    setup();
+    const doc = new FakeDocument();
+    const rigs = Array.from({ length: 5 }, () => make(doc));
+    const last = rigs[4];
+    expect(last).toBeDefined();
+    if (last === undefined) {
+      return;
+    }
+    last.button.disabled = true;
+    for (const rig of rigs.slice(0, 4)) {
+      rig.handle.destroy();
+    }
+    expect(doc.listeners).toHaveLength(2);
+    last.button.hovered = true;
+    over(doc, inside(last.button));
+    runFrames(0, 500);
+    expect(last.inner.style.transform).not.toBe('');
+    last.handle.destroy();
+    expect(doc.listeners).toHaveLength(0);
+  });
+
+  it('(8) adds the listeners again after the last destroy', () => {
+    setup();
+    const doc = new FakeDocument();
+    make(doc).handle.destroy();
+    expect(doc.listeners).toHaveLength(0);
+    const rig = make(doc);
+    expect(doc.listeners).toHaveLength(2);
+    rig.button.disabled = true;
+    rig.button.hovered = true;
+    over(doc, inside(rig.button));
+    runFrames(0, 500);
+    expect(rig.inner.style.transform).not.toBe('');
+  });
+
+  it('(9) keeps one marquee when the other one in its button is destroyed', () => {
+    for (const destroyFirst of [true, false]) {
+      setup();
+      const doc = new FakeDocument();
+      const a = make(doc);
+      const b = make(doc, a.button);
+      a.button.disabled = true;
+      a.button.hovered = true;
+      over(doc, inside(a.button));
+      runFrames(0, 500);
+      expect(a.inner.style.transform).not.toBe('');
+      expect(b.inner.style.transform).not.toBe('');
+      const [gone, kept] = destroyFirst ? [a, b] : [b, a];
+      gone.handle.destroy();
+      a.button.hovered = false;
+      run(550);
+      expect(kept.inner.style.transform).toBe('');
+      a.button.hovered = true;
+      over(doc, inside(a.button));
+      runFrames(600, 1100);
+      expect(kept.inner.style.transform).not.toBe('');
+      kept.handle.destroy();
+    }
+  });
+
+  it('(10) ignores a second destroy of the same handle', () => {
+    setup();
+    const doc = new FakeDocument();
+    const x = make(doc);
+    const y = make(doc);
+    y.button.disabled = true;
+    x.handle.destroy();
+    x.handle.destroy();
+    expect(doc.listeners).toHaveLength(2);
+    y.button.hovered = true;
+    over(doc, inside(y.button));
+    runFrames(0, 500);
+    expect(y.inner.style.transform).not.toBe('');
+  });
+
+  it('(11) registers nothing for a button without an owner document', () => {
+    setup();
+    const rig = make(undefined);
+    rig.button.hovered = true;
+    rig.button.listeners.get('pointerenter')?.();
+    runFrames(0, 500);
+    expect(rig.inner.style.transform).not.toBe('');
   });
 });
