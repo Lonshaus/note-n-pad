@@ -128,6 +128,7 @@ export const zhTW = {
   'settings.general.openTargetWindow': '新視窗',
   'settings.general.showTrayIcon': '在狀態列顯示圖示',
   'settings.general.openWorkspaceOnStartup': '啟動時開啟工作區',
+  'settings.general.showHiddenFiles': '顯示隱藏檔',
   // Settings — language (list lives on the language tab)
   'settings.language.label': '語言',
   'settings.language.system': '跟隨系統',
@@ -232,6 +233,7 @@ export const zhTW = {
     '無法完成「{name}」的索引建立。這個檔案目前無法顯示行數，也無法前往指定行。',
   'large.read.failed':
     '無法讀取這個檔案的一部分。檔案可能已被移動，或變得無法讀取。',
+  'large.notLoaded': '尚有 {size} 未載入',
   // Status bar
   'status.view': '閱覽',
   'status.indexing': '索引中… {count} 行',
@@ -362,7 +364,10 @@ export const zhTW = {
   'edition.row.themes': '主題（選擇、編輯、匯入、匯出、刪除）',
   'edition.row.languageFiles': '刪除、匯入與匯出語言',
   'edition.row.workspace': '工作區',
-  'edition.row.stickies': '便利貼',
+  'edition.row.stickies': '便利貼基本功能',
+  'edition.row.stickiesNote': '顏色及透明度變更',
+  'edition.row.stickyPinTop': '便利貼釘選至最上層',
+  'edition.row.stickyPinApp': '便利貼釘選至應用程式',
   'edition.row.documents': '文件編輯',
   'edition.row.markdown': 'Markdown 預覽',
   'edition.row.table': 'CSV / TSV 表格模式',

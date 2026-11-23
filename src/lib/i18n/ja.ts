@@ -134,6 +134,7 @@ export const ja = {
   'settings.general.openTargetWindow': '新しいウィンドウ',
   'settings.general.showTrayIcon': 'ステータスバーにアイコンを表示',
   'settings.general.openWorkspaceOnStartup': '起動時にワークスペースを開く',
+  'settings.general.showHiddenFiles': '隠しファイルを表示',
   // Settings — language (list lives on the language tab)
   'settings.language.label': '言語',
   'settings.language.system': 'システムに合わせる',
@@ -249,6 +250,7 @@ export const ja = {
     '「{name}」のインデックス作成を完了できませんでした。このファイルでは行数の表示と指定行への移動は使用できません。',
   'large.read.failed':
     'このファイルの一部を読み込めません。ファイルが移動されたか、読み取れなくなった可能性があります。',
+  'large.notLoaded': '未読み込み {size}',
   // Status bar
   'status.view': '閲覧',
   'status.indexing': 'インデックス作成中… {count} 行',
@@ -391,7 +393,10 @@ export const ja = {
   'edition.row.themes': 'テーマ（選択・編集・読み込み・書き出し・削除）',
   'edition.row.languageFiles': '言語の削除・読み込み・書き出し',
   'edition.row.workspace': 'ワークスペース',
-  'edition.row.stickies': '付箋',
+  'edition.row.stickies': '付箋の基本機能',
+  'edition.row.stickiesNote': '色と不透明度の変更',
+  'edition.row.stickyPinTop': '付箋を最前面にピン留め',
+  'edition.row.stickyPinApp': '付箋をアプリにピン留め',
   'edition.row.documents': '文書の編集',
   'edition.row.markdown': 'Markdown プレビュー',
   'edition.row.table': 'CSV / TSV 表モード',

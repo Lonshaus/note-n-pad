@@ -13,6 +13,7 @@ import type { PasteFlowDeps } from './pasteFlow';
 import {
   RedispatchWaiter,
   type FieldDeps,
+  type SystemTextRead,
   type TextBegin,
 } from './pasteRouting';
 import { parkClipStatus } from '../dev/windowedHold';
@@ -27,6 +28,59 @@ export const redispatchWaiter = new RedispatchWaiter();
 const USER_INPUT = ['keydown', 'pointerdown', 'input'] as const;
 /** Who wants to know of a gate the core revokes. */
 const revocationListeners = new Set<(token: number) => void>();
+/** The error of `clip_text_read` and `clip_text_chunk` for a gate that is gone
+ *  or another window's. */
+const CLIP_GATE_REFUSED = 'clip-gate-refused';
+/** What `clip_text_read` answers. */
+type ClipTextRead =
+  | { kind: 'text'; bytes: number }
+  | { kind: 'other' }
+  | { kind: 'not_key' }
+  | { kind: 'none' };
+/** The clipboard's text read by the core behind the gate `token`, carried over
+ *  in chunks of raw bytes; 'other' whenever raw bytes cannot cross. */
+async function readSystemText(token: number): Promise<SystemTextRead> {
+  let probe: unknown;
+  try {
+    probe = await invoke('ipc_probe');
+  } catch {
+    probe = null;
+  }
+  if (!(probe instanceof ArrayBuffer)) {
+    return { kind: 'other' };
+  }
+  try {
+    const found = await invoke<ClipTextRead>('clip_text_read', { token });
+    if (found.kind !== 'text') {
+      return found;
+    }
+    // `ignoreBOM` keeps a U+FEFF that belongs to the text.
+    const decoder = new TextDecoder('utf-8', { fatal: true, ignoreBOM: true });
+    let text = '';
+    let received = 0;
+    while (received < found.bytes) {
+      const chunk = await invoke<unknown>('clip_text_chunk', {
+        token,
+        offset: received,
+      });
+      if (
+        !(chunk instanceof ArrayBuffer) ||
+        chunk.byteLength === 0 ||
+        chunk.byteLength > found.bytes - received
+      ) {
+        return { kind: 'other' };
+      }
+      text += decoder.decode(chunk, { stream: true });
+      received += chunk.byteLength;
+    }
+    text += decoder.decode();
+    return { kind: 'text', text };
+  } catch (e) {
+    return String(e) === CLIP_GATE_REFUSED
+      ? { kind: 'none' }
+      : { kind: 'other' };
+  }
+}
 
 export const pasteEnv: FieldDeps = {
   get platform(): string {
@@ -55,6 +109,7 @@ export const pasteEnv: FieldDeps = {
   unpin: (pin) => {
     invoke('clip_unpin', { pin }).catch(() => {});
   },
+  readSystemText,
   redispatchPaste: () =>
     invoke<'send' | 'not-key' | 'not-handled'>('clipboard_redispatch_paste'),
   readText: () => navigator.clipboard.readText(),

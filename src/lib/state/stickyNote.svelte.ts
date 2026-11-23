@@ -36,6 +36,9 @@ export interface NoteSnapshot {
   dirty: boolean;
   window_group: string | null;
   tab_index: number;
+  /** Sort key of the tab within its window; absent or null on a record from
+   *  before the field, which then sorts by `tab_index`. */
+  tab_order?: number | null;
   line_ending: 'LF' | 'CRLF';
   had_bom: boolean;
   encoding: string;

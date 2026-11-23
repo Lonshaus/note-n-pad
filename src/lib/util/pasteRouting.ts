@@ -38,6 +38,14 @@ export type Resolved =
   | { kind: 'text'; text: string }
   | { kind: 'system' }
   | { kind: 'none' };
+/** What the core's own read of the clipboard's text found (macOS): the text,
+ *  'other' when the page is handed the paste as before, 'not_key' or 'none'
+ *  when nothing may be read. */
+export type SystemTextRead =
+  | { kind: 'text'; text: string }
+  | { kind: 'other' }
+  | { kind: 'not_key' }
+  | { kind: 'none' };
 /** The mark the core numbered a paste with at the event, or null when the
  *  core could not (nothing to wait for then). */
 export type MarkInput = Promise<number | null> | number | null;
@@ -112,6 +120,8 @@ export interface ResolveDeps {
   pin: (clipId: string) => Promise<number>;
   /** `clip_unpin`. */
   unpin: (pin: number) => void;
+  /** macOS: the core reads plain text behind the gate `token` itself. */
+  readSystemText: (token: number) => Promise<SystemTextRead>;
   /** macOS: asks the core to send a paste to the focused element. */
   redispatchPaste: () => Promise<'send' | 'not-key' | 'not-handled'>;
   /** Windows: the web page's own clipboard read. */
@@ -246,7 +256,7 @@ async function readExternal(
     });
     const read =
       deps.platform === 'macos'
-        ? redispatched(deps, gate, (cancel) => {
+        ? systemText(deps, token, gate, (cancel) => {
             cancelWait = cancel;
           })
         : deps.readText().then(
@@ -267,6 +277,25 @@ async function readExternal(
     cancelWait?.();
     void end();
   }
+}
+// The core reads plain text itself; for anything else the page is handed the
+// paste as before.
+async function systemText(
+  deps: ResolveDeps,
+  token: number,
+  gate: GateState,
+  setCancel: (cancel: () => void) => void,
+): Promise<string | null> {
+  const found = await deps
+    .readSystemText(token)
+    .catch((): SystemTextRead => ({ kind: 'other' }));
+  if (found.kind === 'text') {
+    return found.text;
+  }
+  if (found.kind !== 'other' || !gate.open) {
+    return null;
+  }
+  return redispatched(deps, gate, setCancel);
 }
 
 async function redispatched(

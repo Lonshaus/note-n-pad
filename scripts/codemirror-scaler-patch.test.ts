@@ -77,6 +77,20 @@ describe('patchViewScaler', () => {
     expect(patched.split(refresh).length - 1).toBe(1);
   });
 
+  it('continues a widget only with the widget the new-tile branch would draw', () => {
+    const patched = patchViewScaler(VIEW_SOURCE);
+    expect(
+      patched.split(
+        'prevWidget.widget.compare(deco.widget || (deco.block ? NullWidget.block : NullWidget.inline))',
+      ).length - 1,
+    ).toBe(1);
+    expect(
+      patched.split(
+        'if (openStart > active.length) {\n                        b.continueWidget',
+      ).length - 1,
+    ).toBe(0);
+  });
+
   it('uses the fixed viewport constants', () => {
     const patched = patchViewScaler(VIEW_SOURCE);
     expect(patched).toContain('top <= visibleTop - 600');

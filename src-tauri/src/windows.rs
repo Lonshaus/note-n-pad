@@ -9,6 +9,8 @@ const DEFAULT_WIDTH: f64 = 280.0;
 const DEFAULT_HEIGHT: f64 = 230.0;
 /// Narrowest sticky that fits its toolbar with the color row open.
 pub const STICKY_MIN_WIDTH: f64 = 280.0;
+/// Shortest sticky that fits the save-before-close dialog in a 280 px width.
+pub const STICKY_MIN_HEIGHT: f64 = 160.0;
 const CASCADE_STEP: f64 = 28.0;
 /// The sticky card's corner radius, matching `border-radius` on `.card` in
 /// `StickyApp.svelte`. macOS clips the window's layer to it; a mismatch shows
@@ -519,6 +521,29 @@ fn cascade_position(app: &AppHandle) -> (f64, f64) {
 fn sticky_open_width(stored: Option<f64>) -> f64 {
   stored.unwrap_or(DEFAULT_WIDTH).max(STICKY_MIN_WIDTH)
 }
+/// A sticky saved under an older, shorter minimum opens at the current one.
+fn sticky_open_height(stored: Option<f64>) -> f64 {
+  stored.unwrap_or(DEFAULT_HEIGHT).max(STICKY_MIN_HEIGHT)
+}
+/// Whether a sticky floats always-on-top. A top pin floats in both editions;
+/// pin to app is full-only, so an app pin never floats while `lite`. Without
+/// foreground detection (e.g. Wayland) an app pin degrades to permanent
+/// on-top so the sticky stays visible.
+pub(crate) fn pin_on_top(
+  mode: &str,
+  pin_app: Option<&str>,
+  front: Option<&str>,
+  detection: bool,
+  lite: bool,
+) -> bool {
+  match mode {
+    "top" => true,
+    "app" if lite => false,
+    "app" if !detection => true,
+    "app" => pin_app.is_some() && pin_app == front,
+    _ => false,
+  }
+}
 /// Open a frameless sticky window for `note` at its saved bounds (or a cascade
 /// fallback), reflecting its pinned and opacity state.
 pub fn create_sticky_window(app: &AppHandle, note: &NoteSnapshot) -> Result<(), String> {
@@ -526,20 +551,13 @@ pub fn create_sticky_window(app: &AppHandle, note: &NoteSnapshot) -> Result<(), 
   let url = WebviewUrl::App(format!("index.html?mode=sticky&note={}", note.id).into());
   // Float on top for a "top" pin, or an "app" pin whose target app is frontmost
   // right now; app_watch keeps the "app" case in sync afterwards.
-  let on_top = match note.pin_mode.as_str() {
-    "top" => true,
-    "app" => {
-      if !crate::app_watch::detection_available() {
-        // Foreground detection is unavailable (e.g. Wayland): an app-pinned
-        // sticky degrades to permanent always-on-top so it stays visible.
-        true
-      } else {
-        note.pin_app.is_some()
-          && note.pin_app.as_deref() == crate::app_watch::frontmost_id().as_deref()
-      }
-    }
-    _ => false,
-  };
+  let on_top = pin_on_top(
+    note.pin_mode.as_str(),
+    note.pin_app.as_deref(),
+    crate::app_watch::frontmost_id().as_deref(),
+    crate::app_watch::detection_available(),
+    crate::edition::is_lite(),
+  );
   // Invisible in normal use (sticky windows have no decorations), but it
   // surfaces in the Windows taskbar/Alt-Tab and some Linux WM switchers, so it
   // must still be localized rather than a hardcoded English word. A dedicated
@@ -554,10 +572,10 @@ pub fn create_sticky_window(app: &AppHandle, note: &NoteSnapshot) -> Result<(), 
     .visible(false)
     .decorations(false)
     .always_on_top(on_top)
-    .min_inner_size(STICKY_MIN_WIDTH, 140.0)
+    .min_inner_size(STICKY_MIN_WIDTH, STICKY_MIN_HEIGHT)
     .inner_size(
       sticky_open_width(note.width),
-      note.height.unwrap_or(DEFAULT_HEIGHT),
+      sticky_open_height(note.height),
     );
   // Tauri's own way to clear the window layer. macOS is excluded because there
   // it is gated behind the `macos-private-api` feature, whose only private act
@@ -604,6 +622,23 @@ pub fn create_sticky_window(app: &AppHandle, note: &NoteSnapshot) -> Result<(), 
 
 const DOC_DEFAULT_WIDTH: f64 = 800.0;
 const DOC_DEFAULT_HEIGHT: f64 = 600.0;
+/// Narrowest document window that keeps the status bar on one line.
+const DOC_MIN_WIDTH: f64 = 480.0;
+/// Shortest document window that fits the tab bar, the status bar, the search
+/// panel and a few lines of text.
+const DOC_MIN_HEIGHT: f64 = 300.0;
+/// A document window saved under an older, smaller minimum opens at the current one.
+fn document_open_size(width: f64, height: f64) -> (f64, f64) {
+  (width.max(DOC_MIN_WIDTH), height.max(DOC_MIN_HEIGHT))
+}
+/// Size for a new document window: the size the user last gave one, else the
+/// fixed default.
+fn new_document_size(s: &crate::settings::AppSettings) -> (f64, f64) {
+  match (s.document_width, s.document_height) {
+    (Some(w), Some(h)) => (w, h),
+    _ => (DOC_DEFAULT_WIDTH, DOC_DEFAULT_HEIGHT),
+  }
+}
 /// The URL a document window loads, carrying the window group (and, for a fresh
 /// open, an initial file path and project root) so the frontend can load every
 /// tab in the group and restore it.
@@ -613,6 +648,7 @@ fn document_window_query(
   project: Option<&str>,
   tab: Option<i64>,
   blank: bool,
+  receive: bool,
 ) -> String {
   let mut query = format!("index.html?mode=document&group={}", percent_encode(group));
   if let Some(path) = initial_path {
@@ -632,9 +668,17 @@ fn document_window_query(
   if blank {
     query.push_str("&blank=1");
   }
+  // A window made for a tab dropped outside every window: it reveals itself
+  // only once the tab is in it.
+  if receive {
+    query.push_str("&receive=1");
+  }
   query
 }
-/// Build a normal-chrome document window labeled `doc-{group}`.
+/// Build a normal-chrome document window labeled `doc-{group}`. A `receive`
+/// window is made for a tab on its way: it is not forced into view after a
+/// grace, and it never joins the window tabs of macOS.
+#[allow(clippy::too_many_arguments)]
 fn build_document_window(
   app: &AppHandle,
   group: &str,
@@ -642,6 +686,7 @@ fn build_document_window(
   project: Option<&str>,
   tab: Option<i64>,
   blank: bool,
+  receive: bool,
   bounds: WindowBounds,
 ) -> Result<(), String> {
   let WindowBounds {
@@ -650,8 +695,9 @@ fn build_document_window(
     width,
     height,
   } = bounds;
+  let size = document_open_size(width, height);
   let label = format!("doc-{group}");
-  let query = document_window_query(group, initial_path, project, tab, blank);
+  let query = document_window_query(group, initial_path, project, tab, blank, receive);
   let url = WebviewUrl::App(query.into());
   // Set a real title at birth so macOS never shows its own empty-title
   // placeholder (e.g. "無題" on Japanese systems) before the frontend loads and
@@ -667,7 +713,8 @@ fn build_document_window(
     .title(title)
     .visible(false)
     .background_color(chrome_background(app))
-    .inner_size(width, height);
+    .min_inner_size(DOC_MIN_WIDTH, DOC_MIN_HEIGHT)
+    .inner_size(size.0, size.1);
   if let (Some(x), Some(y)) = (x, y) {
     builder = builder.position(x, y);
   }
@@ -675,10 +722,32 @@ fn build_document_window(
   #[cfg(windows)]
   let builder = builder.disable_drag_drop_handler();
   let window = builder.build().map_err(|e| e.to_string())?;
+  #[cfg(target_os = "macos")]
+  if receive {
+    disallow_tabbing(&window);
+  }
   crate::file_drop::attach(&window);
-  fix_inner_size(&window, (width, height));
-  show_after_grace(window);
+  fix_inner_size(&window, size);
+  if !receive {
+    show_after_grace(window);
+  }
   Ok(())
+}
+/// A window of a tab on its way is its own window, never a native tab of
+/// another. AppKit's calls belong to the main thread.
+#[cfg(target_os = "macos")]
+fn disallow_tabbing(window: &tauri::WebviewWindow) {
+  let Ok(ns_window) = window.ns_window() else {
+    return;
+  };
+  let ptr = ns_window as usize;
+  let _ = window.run_on_main_thread(move || {
+    use objc2_app_kit::{NSWindow, NSWindowTabbingMode};
+    // Safety: the pointer is the window's own NSWindow, which outlives this
+    // call on the main thread that runs it.
+    let ns_window = unsafe { &*(ptr as *const NSWindow) };
+    ns_window.setTabbingMode(NSWindowTabbingMode::Disallowed);
+  });
 }
 /// Open a fresh document window for a file on disk, minting a new window group.
 /// The frontend creates the first tab's store entry once the file is read (and
@@ -694,6 +763,7 @@ pub fn open_document_labeled(
   project: Option<&str>,
 ) -> Result<String, String> {
   let group = uuid::Uuid::new_v4().to_string();
+  let new_size = new_document_size(&crate::settings::app_settings(app));
   build_document_window(
     app,
     &group,
@@ -701,11 +771,12 @@ pub fn open_document_labeled(
     project,
     None,
     false,
+    false,
     WindowBounds {
       x: None,
       y: None,
-      width: DOC_DEFAULT_WIDTH,
-      height: DOC_DEFAULT_HEIGHT,
+      width: new_size.0,
+      height: new_size.1,
     },
   )?;
   Ok(format!("doc-{group}"))
@@ -714,6 +785,7 @@ pub fn open_document_labeled(
 /// group. The tab is created by the frontend, which stores it on first edit.
 pub fn new_blank_document(app: &AppHandle) -> Result<(), String> {
   let group = uuid::Uuid::new_v4().to_string();
+  let new_size = new_document_size(&crate::settings::app_settings(app));
   build_document_window(
     app,
     &group,
@@ -721,11 +793,12 @@ pub fn new_blank_document(app: &AppHandle) -> Result<(), String> {
     None,
     None,
     true,
+    false,
     WindowBounds {
       x: None,
       y: None,
-      width: DOC_DEFAULT_WIDTH,
-      height: DOC_DEFAULT_HEIGHT,
+      width: new_size.0,
+      height: new_size.1,
     },
   )
 }
@@ -734,6 +807,7 @@ pub fn new_blank_document(app: &AppHandle) -> Result<(), String> {
 /// its first tab (`convert_handoff`).
 pub fn open_empty_document(app: &AppHandle) -> Result<String, String> {
   let group = uuid::Uuid::new_v4().to_string();
+  let new_size = new_document_size(&crate::settings::app_settings(app));
   build_document_window(
     app,
     &group,
@@ -741,14 +815,42 @@ pub fn open_empty_document(app: &AppHandle) -> Result<String, String> {
     None,
     None,
     false,
+    false,
     WindowBounds {
       x: None,
       y: None,
-      width: DOC_DEFAULT_WIDTH,
-      height: DOC_DEFAULT_HEIGHT,
+      width: new_size.0,
+      height: new_size.1,
     },
   )?;
   Ok(format!("doc-{group}"))
+}
+/// Open the window that receives a tab dropped outside every window, labeled
+/// `doc-{group}`: `size` is its inner size and `at` its top left where the
+/// window system takes a position at build time (macOS). It is built hidden and
+/// not forced into view; it reveals itself once the tab is in it.
+pub fn open_receiving_document(
+  app: &AppHandle,
+  group: &str,
+  project: Option<&str>,
+  size: (f64, f64),
+  at: Option<(f64, f64)>,
+) -> Result<(), String> {
+  build_document_window(
+    app,
+    group,
+    None,
+    project,
+    None,
+    false,
+    true,
+    WindowBounds {
+      x: at.map(|(x, _)| x),
+      y: at.map(|(_, y)| y),
+      width: size.0,
+      height: size.1,
+    },
+  )
 }
 /// Recreate a stored document window (one per group) at the saved bounds of its
 /// lowest-tab_index tab on startup restore.
@@ -757,6 +859,7 @@ pub fn create_document_window(
   plan: &crate::note_store::DocWindowPlan,
   tab: Option<i64>,
 ) -> Result<(), String> {
+  let new_size = new_document_size(&crate::settings::app_settings(app));
   // Restored windows adopt their project from the group's stored notes, so no
   // project rides in the URL here.
   build_document_window(
@@ -766,11 +869,12 @@ pub fn create_document_window(
     None,
     tab,
     false,
+    false,
     WindowBounds {
       x: plan.x,
       y: plan.y,
-      width: plan.width.unwrap_or(DOC_DEFAULT_WIDTH),
-      height: plan.height.unwrap_or(DOC_DEFAULT_HEIGHT),
+      width: plan.width.unwrap_or(new_size.0),
+      height: plan.height.unwrap_or(new_size.1),
     },
   )
 }
@@ -808,6 +912,7 @@ fn blank_sticky(id: String, width: f64, height: f64, paper: String) -> NoteSnaps
     dirty: false,
     window_group: None,
     tab_index: 0,
+    tab_order: None,
     line_ending: "LF".to_string(),
     had_bom: false,
     encoding: "UTF-8".to_string(),
@@ -1423,6 +1528,63 @@ mod tests {
   }
 
   #[test]
+  fn a_sticky_opens_no_shorter_than_the_minimum() {
+    assert_eq!(super::sticky_open_height(None), 230.0);
+    assert_eq!(
+      super::sticky_open_height(Some(super::STICKY_MIN_HEIGHT - 1.0)),
+      super::STICKY_MIN_HEIGHT
+    );
+    assert_eq!(super::sticky_open_height(Some(400.0)), 400.0);
+  }
+
+  #[test]
+  fn a_document_window_opens_no_smaller_than_the_minimum() {
+    let (w, h) = (super::DOC_MIN_WIDTH, super::DOC_MIN_HEIGHT);
+    assert_eq!(super::document_open_size(w - 1.0, h - 1.0), (w, h));
+    assert_eq!(super::document_open_size(w, h), (w, h));
+    assert_eq!(
+      super::document_open_size(w + 1.0, h + 1.0),
+      (w + 1.0, h + 1.0)
+    );
+    assert_eq!(super::document_open_size(w - 1.0, h + 1.0), (w, h + 1.0));
+  }
+
+  #[test]
+  fn the_document_window_is_built_at_a_size_no_smaller_than_the_minimum() {
+    let source = include_str!("windows.rs");
+    let at = source.find("fn build_document_window(").unwrap();
+    let body = &source[at..];
+    let body = &body[..body.find("\n}\n").unwrap()];
+    assert!(body.contains(".min_inner_size(DOC_MIN_WIDTH, DOC_MIN_HEIGHT)"));
+    assert!(body.contains("let size = document_open_size(width, height);"));
+    assert!(body.contains(".inner_size(size.0, size.1)"));
+    assert!(body.contains("fix_inner_size(&window, size);"));
+  }
+
+  #[test]
+  fn the_sticky_window_is_built_at_a_size_no_smaller_than_the_minimum() {
+    let source = include_str!("windows.rs");
+    let at = source.find("pub fn create_sticky_window(").unwrap();
+    let body = &source[at..];
+    let body = &body[..body.find("\n}\n").unwrap()];
+    assert!(body.contains(".min_inner_size(STICKY_MIN_WIDTH, STICKY_MIN_HEIGHT)"));
+    assert!(body.contains("sticky_open_height(note.height)"));
+  }
+
+  #[test]
+  fn a_new_document_window_uses_the_remembered_size_only_when_complete() {
+    let mut s = crate::settings::AppSettings::default();
+    assert_eq!(super::new_document_size(&s), (800.0, 600.0));
+    s.document_width = Some(1000.0);
+    assert_eq!(super::new_document_size(&s), (800.0, 600.0));
+    s.document_width = None;
+    s.document_height = Some(700.0);
+    assert_eq!(super::new_document_size(&s), (800.0, 600.0));
+    s.document_width = Some(1000.0);
+    assert_eq!(super::new_document_size(&s), (1000.0, 700.0));
+  }
+
+  #[test]
   fn a_new_sticky_copies_the_focused_sticky_else_the_remembered_defaults() {
     let defaults = crate::settings::AppSettings {
       default_sticky_paper: "pink".into(),
@@ -1627,6 +1789,30 @@ mod window_command_threading_tests {
   ];
 
   #[test]
+  fn pin_on_top_decides_every_mode() {
+    use super::pin_on_top;
+    for detection in [true, false] {
+      assert!(pin_on_top("top", None, None, detection, true));
+      assert!(pin_on_top("top", None, None, detection, false));
+      for mode in ["none", "bogus"] {
+        assert!(!pin_on_top(mode, Some("a"), Some("a"), detection, true));
+        assert!(!pin_on_top(mode, Some("a"), Some("a"), detection, false));
+      }
+      // An app pin never floats while lite, whatever the frontmost app is.
+      assert!(!pin_on_top("app", Some("a"), Some("a"), detection, true));
+      assert!(!pin_on_top("app", Some("a"), Some("b"), detection, true));
+    }
+    // Full edition with detection: float only for the bound app.
+    assert!(pin_on_top("app", Some("a"), Some("a"), true, false));
+    assert!(!pin_on_top("app", Some("a"), Some("b"), true, false));
+    assert!(!pin_on_top("app", Some("a"), None, true, false));
+    assert!(!pin_on_top("app", None, None, true, false));
+    // Full edition without detection: permanent on-top.
+    assert!(pin_on_top("app", Some("a"), Some("b"), false, false));
+    assert!(pin_on_top("app", None, None, false, false));
+  }
+
+  #[test]
   fn building_a_sticky_never_propagates_an_opacity_failure() {
     // Guards the call site in `create_sticky_window` only; `set_window_opacity`
     // should propagate, the user asked for that change.
@@ -1703,13 +1889,50 @@ mod document_window_query_tests {
 
   #[test]
   fn a_blank_window_asks_for_one_blank_tab() {
-    let query = document_window_query("g1", None, None, None, true);
+    let query = document_window_query("g1", None, None, None, true, false);
     assert_eq!(query, "index.html?mode=document&group=g1&blank=1");
   }
 
   #[test]
   fn restored_and_file_windows_never_ask_for_a_blank_tab() {
-    assert!(!document_window_query("g1", None, None, Some(2), false).contains("blank"));
-    assert!(!document_window_query("g1", Some("/a b.txt"), None, None, false).contains("blank"));
+    assert!(!document_window_query("g1", None, None, Some(2), false, false).contains("blank"));
+    assert!(
+      !document_window_query("g1", Some("/a b.txt"), None, None, false, false).contains("blank")
+    );
+  }
+
+  #[test]
+  fn only_a_window_made_for_a_dropped_tab_asks_to_be_revealed_late() {
+    let receiving = document_window_query("g1", None, Some("/proj"), None, false, true);
+    assert_eq!(
+      receiving,
+      "index.html?mode=document&group=g1&project=%2Fproj&receive=1"
+    );
+    assert!(!document_window_query("g1", None, None, None, true, false).contains("receive"));
+  }
+
+  #[test]
+  fn a_receiving_window_is_built_without_the_forced_reveal_and_with_no_window_tabs() {
+    let source = include_str!("windows.rs");
+    let at = source.find("fn build_document_window(").unwrap();
+    let body = &source[at..];
+    let body = &body[..body.find("\n}\n").unwrap()];
+    assert!(body.contains("if !receive {\n    show_after_grace(window);"));
+    assert!(body.contains("disallow_tabbing(&window)"));
+    let at = source.find("fn disallow_tabbing(").unwrap();
+    let body = &source[at..];
+    let body = &body[..body.find("\n}\n").unwrap()];
+    assert!(body.contains("NSWindowTabbingMode::Disallowed"));
+    assert!(body.contains("run_on_main_thread"));
+  }
+
+  #[test]
+  fn the_receiving_window_is_built_by_the_one_document_builder() {
+    let source = include_str!("windows.rs");
+    let at = source.find("pub fn open_receiving_document(").unwrap();
+    let body = &source[at..];
+    let body = &body[..body.find("\n}\n").unwrap()];
+    assert!(body.contains("build_document_window("));
+    assert!(!body.contains("WebviewWindowBuilder"));
   }
 }

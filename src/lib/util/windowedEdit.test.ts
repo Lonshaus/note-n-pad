@@ -20,6 +20,8 @@ import {
   mapChangesToEdits,
   mapOffset,
   mapThrough,
+  MIRROR_LINE_MAX,
+  mirrorRefused,
   mirrorStep,
   nextWindow,
   rejectDuringSwap,
@@ -1760,6 +1762,82 @@ describe('globalFilters', () => {
     });
   });
 
+  describe('with an end of the selection in a part not loaded', () => {
+    it('asks whether the input is outside of the state the transaction starts from', () => {
+      const seen: EditorState[] = [];
+      const { state } = setup({
+        globalSel: () => SMALL,
+        outside: (from) => {
+          seen.push(from);
+          return false;
+        },
+      });
+      state.update({
+        changes: { from: 5, insert: 'X' },
+        userEvent: 'input.type',
+      });
+      expect(seen.length).toBeGreaterThan(0);
+      expect(seen.every((s) => s === state)).toBe(true);
+    });
+
+    it('asks the core-op value of that state too', () => {
+      const seen: EditorState[] = [];
+      const { state } = setup({
+        globalSel: () => SMALL,
+        outside: () => false,
+        coreOp: (from) => {
+          seen.push(from);
+          return false;
+        },
+      });
+      typed(state, 'input.type');
+      expect(seen.length).toBeGreaterThan(0);
+      expect(seen.every((s) => s === state)).toBe(true);
+    });
+
+    it('refuses a user edit under a core-op selection that is small', () => {
+      const core = setup({
+        globalSel: () => SMALL,
+        outside: () => false,
+        coreOp: () => true,
+      });
+      expect(typed(core.state, 'input.type').docChanged).toBe(false);
+      const plain = setup({
+        globalSel: () => SMALL,
+        outside: () => false,
+        coreOp: () => false,
+      });
+      expect(typed(plain.state, 'input.type').docChanged).toBe(true);
+    });
+
+    it('is the size test without a core-op value', () => {
+      const small = setup({ globalSel: () => SMALL, outside: () => false });
+      expect(typed(small.state, 'input.type').docChanged).toBe(true);
+      const large = setup({ outside: () => false });
+      expect(typed(large.state, 'input.type').docChanged).toBe(false);
+    });
+
+    it('queues the key of a bound key under a core-op selection, as under a selection too large', () => {
+      const e: Key = { chord: false, bound: true };
+      const core = setup({
+        globalSel: () => SMALL,
+        coreOp: () => true,
+        keyActive: () => true,
+        keydown: () => e,
+      });
+      core.state.update({ selection: { anchor: 3 }, userEvent: 'select' });
+      expect(core.keys).toEqual([e]);
+      const plain = setup({
+        globalSel: () => SMALL,
+        coreOp: () => false,
+        keyActive: () => true,
+        keydown: () => e,
+      });
+      plain.state.update({ selection: { anchor: 3 }, userEvent: 'select' });
+      expect(plain.keys).toEqual([]);
+    });
+  });
+
   it('takes a user edit during a swap to keep the composition apart', () => {
     const swapping = setup({ swapping: () => true, outside: () => false });
     expect(typed(swapping.state, 'input.type').docChanged).toBe(false);
@@ -1769,5 +1847,202 @@ describe('globalFilters', () => {
       capturing: () => true,
     });
     expect(typed(composing.state, 'input.type.compose').docChanged).toBe(true);
+  });
+});
+// A window whose lines hold only part of their text, against the same text
+// with every placeholder replaced by the text it stands for.
+describe('conversions with holes', () => {
+  const PLACEHOLDER = '\uFFFC';
+  // Hidden parts: 2-byte, 3-byte and 4-byte characters among them.
+  const HIDDEN = ['héllo', '日本語🙂', 'xyz', 'ñ'];
+  const holey = `ab${PLACEHOLDER}cd\nx\nye${PLACEHOLDER}\n${PLACEHOLDER}z${PLACEHOLDER}`;
+  const breaks = ['\n', '\r\n', '\n'];
+  function spansOf(doc: string): { from: number; bytes: number }[] {
+    const out: { from: number; bytes: number }[] = [];
+    let k = 0;
+    for (let i = 0; i < doc.length; i += 1) {
+      if (doc[i] === PLACEHOLDER) {
+        out.push({ from: i, bytes: byteLength(HIDDEN[k] as string) });
+        k += 1;
+      }
+    }
+    return out;
+  }
+  function expand(doc: string): string {
+    let k = 0;
+    return doc.replaceAll(PLACEHOLDER, () => HIDDEN[k++] as string);
+  }
+  const spans = spansOf(holey);
+  const expanded = expand(holey);
+  // The position in the expanded text of a position of the holey one.
+  function toExpanded(pos: number): number {
+    let out = pos;
+    spans.forEach((h, k) => {
+      if (h.from + 1 <= pos) {
+        out += (HIDDEN[k] as string).length - 1;
+      }
+    });
+    return out;
+  }
+  // Positions at the edge of a placeholder or a character, not inside one.
+  const positions = Array.from({ length: holey.length + 1 }, (_, i) => i);
+
+  it('counts a placeholder as the bytes it stands for', () => {
+    for (const pos of positions) {
+      expect(charToByte(holey, breaks, pos, spans)).toBe(
+        charToByte(expanded, breaks, toExpanded(pos)),
+      );
+    }
+  });
+
+  it('finds the position of every byte offset the expanded text has', () => {
+    const total = charToByte(expanded, breaks, expanded.length);
+    for (let off = 0; off <= total; off += 1) {
+      const want = byteToChar(expanded, breaks, off);
+      const got = byteToChar(holey, breaks, off, spans);
+      const inside = positions.some(
+        (pos) =>
+          holey[pos] === PLACEHOLDER &&
+          off > charToByte(holey, breaks, pos, spans) &&
+          off < charToByte(holey, breaks, pos + 1, spans),
+      );
+      if (inside || want === null) {
+        expect(got, `offset ${off}`).toBeNull();
+      } else {
+        expect(toExpanded(got as number), `offset ${off}`).toBe(want);
+      }
+    }
+  });
+
+  it('returns null strictly inside a hole, not at its edges', () => {
+    const left = charToByte(holey, breaks, 2, spans);
+    expect(byteToChar(holey, breaks, left, spans)).toBe(2);
+    expect(byteToChar(holey, breaks, left + 1, spans)).toBeNull();
+    expect(byteToChar(holey, breaks, left + 5, spans)).toBeNull();
+    expect(byteToChar(holey, breaks, left + 6, spans)).toBe(3);
+  });
+
+  it('without holes gives the result it gave before', () => {
+    expect(charToByte(holey, breaks, 4)).toBe(byteLength(holey.slice(0, 4)));
+    expect(byteToChar(holey, breaks, 3)).toBe(3);
+  });
+
+  it('rewrites the break bytes of a byte range as the expanded text does', () => {
+    const total = charToByte(expanded, breaks, expanded.length);
+    for (const [from, to] of [
+      [0, total],
+      [2, 20],
+      [14, 30],
+    ] as const) {
+      expect(fillBreaks(holey, breaks, from, to, '\r', spans)).toEqual(
+        fillBreaks(expanded, breaks, from, to, '\r'),
+      );
+    }
+  });
+
+  it('maps a change over a placeholder to the bytes of its hidden part', () => {
+    const changes: RawChange[] = [
+      { fromA: 1, toA: 4, inserted: 'Q' },
+      { fromA: 10, toA: 11, inserted: '' },
+    ];
+    const asExpanded = changes.map((c) => ({
+      ...c,
+      fromA: toExpanded(c.fromA),
+      toA: toExpanded(c.toA),
+    }));
+    expect(mapChangesToEdits(100, holey, breaks, '\n', changes, spans)).toEqual(
+      mapChangesToEdits(100, expanded, breaks, '\n', asExpanded),
+    );
+  });
+
+  it('puts the rewrite of a lone CR at the byte offset of the expanded text', () => {
+    const lone = `a${PLACEHOLDER}\nb\nc`;
+    const loneBreaks = ['\r', '\n'];
+    const hidden = lone.replace(PLACEHOLDER, 'héllo');
+    const got = junctionRewrites(
+      lone,
+      loneBreaks,
+      [{ fromA: 3, toA: 4, inserted: '' }],
+      '\n',
+      false,
+      false,
+      [{ from: 1, bytes: byteLength('héllo') }],
+    );
+    const want = junctionRewrites(
+      hidden,
+      loneBreaks,
+      [{ fromA: 7, toA: 8, inserted: '' }],
+      '\n',
+      false,
+      false,
+    );
+    expect(want.rewrites.length).toBeGreaterThan(0);
+    expect(got).toEqual(want);
+  });
+
+  it('mirrors an undo edit by bytes, and none that starts inside a hole', () => {
+    const at = charToByte(holey, breaks, 3, spans);
+    const edit = { start: at, end: at, text: 'Q' };
+    const got = mirrorStep(holey, breaks, 0, edit, spans);
+    const want = mirrorStep(expanded, breaks, 0, edit);
+    expect(got?.breaks).toEqual(want?.breaks);
+    expect(got?.change?.from).toBe(3);
+    expect(toExpanded(got?.change?.from as number)).toBe(want?.change?.from);
+    const inside = charToByte(holey, breaks, 2, spans) + 2;
+    expect(
+      mirrorStep(
+        holey,
+        breaks,
+        0,
+        { start: inside, end: inside, text: 'Q' },
+        spans,
+      ),
+    ).toBeNull();
+  });
+
+  it('replaces a placeholder exactly by the bytes of its hidden part', () => {
+    const from = charToByte(holey, breaks, 2, spans);
+    const step = mirrorStep(
+      holey,
+      breaks,
+      0,
+      { start: from, end: from + byteLength('héllo'), text: 'Z' },
+      spans,
+    );
+    expect(step?.change).toEqual({ from: 2, to: 3, insert: 'Z' });
+  });
+});
+
+describe('mirrorRefused', () => {
+  const edit = (text: string) => ({ text });
+  it('refuses an edit whose text holds a line over the limit', () => {
+    expect(mirrorRefused([edit('x'.repeat(MIRROR_LINE_MAX + 1))])).toBe(true);
+    expect(mirrorRefused([edit('a\n' + 'x'.repeat(MIRROR_LINE_MAX + 1))])).toBe(
+      true,
+    );
+    expect(
+      mirrorRefused([edit('x'.repeat(MIRROR_LINE_MAX + 1) + '\r\nb')]),
+    ).toBe(true);
+  });
+
+  it('takes a line of exactly the limit and many short lines', () => {
+    expect(mirrorRefused([edit('x'.repeat(MIRROR_LINE_MAX))])).toBe(false);
+    expect(mirrorRefused([edit('x'.repeat(MIRROR_LINE_MAX) + '\n')])).toBe(
+      false,
+    );
+    expect(mirrorRefused([edit('ab\n'.repeat(MIRROR_LINE_MAX))])).toBe(false);
+  });
+
+  it('does not count a line split across edits, nor an edit without text', () => {
+    const half = 'x'.repeat(MIRROR_LINE_MAX);
+    expect(mirrorRefused([edit(half), edit(half)])).toBe(false);
+    expect(mirrorRefused([edit('')])).toBe(false);
+    expect(mirrorRefused([])).toBe(false);
+  });
+
+  it('refuses when any one of the edits holds a long line', () => {
+    expect(
+      mirrorRefused([edit('a'), edit('y'.repeat(MIRROR_LINE_MAX + 1))]),
+    ).toBe(true);
   });
 });

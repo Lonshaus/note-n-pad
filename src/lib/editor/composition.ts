@@ -113,3 +113,40 @@ export function compositionCancel(
     };
   });
 }
+/** Whether a keydown runs a composing command: a composition is running, no
+ *  earlier handler has taken the key, and the key is the command's. */
+export function composingKeyRuns(input: {
+  composing: boolean;
+  handled: boolean;
+  matches: boolean;
+}): boolean {
+  return input.composing && !input.handled && input.matches;
+}
+/** macOS only: run a command whose key CodeMirror's keymap skips while an IME
+ *  composes. `isKey` says whether a keydown is that command's effective key. */
+export function compositionKey(
+  isKey: (event: KeyboardEvent) => boolean,
+  run: (view: EditorView) => void,
+): Extension {
+  return ViewPlugin.define((view) => {
+    const onKeydown = (event: KeyboardEvent): void => {
+      if (
+        !composingKeyRuns({
+          composing: view.compositionStarted,
+          handled: event.defaultPrevented,
+          matches: isKey(event),
+        })
+      ) {
+        return;
+      }
+      event.preventDefault();
+      run(view);
+    };
+    view.contentDOM.addEventListener('keydown', onKeydown);
+    return {
+      destroy: (): void => {
+        view.contentDOM.removeEventListener('keydown', onKeydown);
+      },
+    };
+  });
+}

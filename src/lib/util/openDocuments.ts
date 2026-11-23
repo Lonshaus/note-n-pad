@@ -4,6 +4,7 @@
 import type { NoteSnapshot } from '../state/stickyNote.svelte';
 import { t } from '../i18n';
 import { rangeLabel, sourceBaseName } from './rangeLabel';
+import { compareTabOrder } from './tabOrder';
 
 /** One document tab row in the workspace list. */
 export interface DocRow {
@@ -66,14 +67,14 @@ export function docLabel(note: NoteSnapshot): string {
 }
 
 /** Group document-kind notes into their windows (by window_group, falling back
- *  to the note id). Groups keep first-appearance order; rows sort by tab_index.
+ *  to the note id). Groups keep first-appearance order; rows sort by tab order.
  *  Stickies and other non-document notes are ignored. `label` names each row. */
 export function groupOpenDocuments(
   notes: NoteSnapshot[],
   label: (note: NoteSnapshot) => string,
 ): DocGroup[] {
   const order: string[] = [];
-  const byGroup = new Map<string, DocRow[]>();
+  const byGroup = new Map<string, { note: NoteSnapshot; row: DocRow }[]>();
   for (const note of notes) {
     if (note.kind !== 'document') {
       continue;
@@ -86,17 +87,23 @@ export function groupOpenDocuments(
       order.push(group);
     }
     rows.push({
-      id: note.id,
-      group,
-      tabIndex: note.tab_index,
-      name: label(note),
-      dirty: note.dirty,
-      filePath: note.file_path,
+      note,
+      row: {
+        id: note.id,
+        group,
+        tabIndex: note.tab_index,
+        name: label(note),
+        dirty: note.dirty,
+        filePath: note.file_path,
+      },
     });
   }
   return order.map((group) => ({
     group,
-    rows: byGroup.get(group)!.sort((a, b) => a.tabIndex - b.tabIndex),
+    rows: byGroup
+      .get(group)!
+      .sort((a, b) => compareTabOrder(a.note, b.note))
+      .map((entry) => entry.row),
   }));
 }
 

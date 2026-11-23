@@ -70,6 +70,10 @@ pub struct NoteSnapshot {
   /// Position of this tab within its window, ordering tabs on restore.
   #[serde(default)]
   pub tab_index: i64,
+  /// Sort key of this tab within its window; a record without one sorts by
+  /// `tab_index`. Changes only when its own tab is reordered or moved.
+  #[serde(default)]
+  pub tab_order: Option<f64>,
   /// Line ending the file is written with ("LF" or "CRLF"). The buffer is LF.
   #[serde(default = "default_line_ending")]
   pub line_ending: String,
@@ -379,7 +383,7 @@ pub fn delete(notes: &mut Vec<NoteSnapshot>, id: &str) -> bool {
   notes.len() != before
 }
 /// One document window to open on restore: its group id plus the bounds of the
-/// group's lowest-tab_index tab that is shown (all tabs share the one window).
+/// group's first tab in tab order that is shown (all tabs share the one window).
 #[derive(Debug, Clone, PartialEq)]
 pub struct DocWindowPlan {
   pub group: String,
@@ -393,12 +397,26 @@ pub struct DocWindowPlan {
 pub(crate) fn resolved_group(note: &NoteSnapshot) -> &str {
   note.window_group.as_deref().unwrap_or(&note.id)
 }
+/// A tab's place in its window: its `tab_order`, or its `tab_index` for a record
+/// without one, then its `tab_index`.
+pub(crate) fn order_key(note: &NoteSnapshot) -> (f64, i64) {
+  (
+    note.tab_order.unwrap_or(note.tab_index as f64),
+    note.tab_index,
+  )
+}
+/// Whether `a` comes before `b` in a window's tab order.
+fn order_before(a: &NoteSnapshot, b: &NoteSnapshot) -> bool {
+  let (ka, ia) = order_key(a);
+  let (kb, ib) = order_key(b);
+  ka.total_cmp(&kb).then(ia.cmp(&ib)).is_lt()
+}
 /// Plan one document window per group from stored notes. Stickies are ignored.
 /// Groups keep first-appearance order; each window inherits the bounds of its
-/// lowest-tab_index tab.
+/// first tab in tab order.
 pub fn plan_document_windows(notes: &[NoteSnapshot]) -> Vec<DocWindowPlan> {
   let mut order: Vec<String> = Vec::new();
-  let mut plans: std::collections::HashMap<String, (i64, DocWindowPlan)> =
+  let mut plans: std::collections::HashMap<String, (&NoteSnapshot, DocWindowPlan)> =
     std::collections::HashMap::new();
   for note in notes {
     if note.kind != "document" {
@@ -414,14 +432,14 @@ pub fn plan_document_windows(notes: &[NoteSnapshot]) -> Vec<DocWindowPlan> {
     };
     match plans.get_mut(&group) {
       Some((best, plan)) => {
-        if note.tab_index < *best {
-          *best = note.tab_index;
+        if order_before(note, best) {
+          *best = note;
           *plan = candidate;
         }
       }
       None => {
         order.push(group.clone());
-        plans.insert(group, (note.tab_index, candidate));
+        plans.insert(group, (note, candidate));
       }
     }
   }
@@ -492,16 +510,20 @@ pub fn take_startup_skips(state: State<StartupSkips>) -> Option<Vec<SkippedFile>
 /// The in-memory notes plus the directory their per-note files live in. Both are
 /// guarded together so a location switch stays consistent with the file layout.
 ///
-/// `seqs` is the last-applied sequence number per note id, used only by
-/// `upsert_ordered` (see its doc comment): `upsert_note` runs `(async)` off the
-/// UI thread, so two overlapping calls for the same id are no longer guaranteed
-/// to complete in call order, and the Mutex alone only prevents a torn write,
-/// not an older payload landing after a newer one. A missing entry means no
-/// ordered write has applied yet for that id.
+/// `seqs` is the last-applied sequence number per (note id, writer label), used
+/// only by `upsert_ordered` (see its doc comment): `upsert_note` runs `(async)`
+/// off the UI thread, so two overlapping calls for the same id are no longer
+/// guaranteed to complete in call order, and the Mutex alone only prevents a
+/// torn write, not an older payload landing after a newer one. The counter is
+/// per webview, so it is only comparable within one writer. A missing entry
+/// means no ordered write has applied yet for that id from that writer.
 struct Inner {
   notes: Vec<NoteSnapshot>,
   dir: PathBuf,
-  seqs: std::collections::HashMap<String, u64>,
+  seqs: std::collections::HashMap<(String, String), u64>,
+  /// The window label that alone may write or delete a note id, while that window
+  /// exists. An id without an entry is written by anyone.
+  owners: std::collections::HashMap<String, String>,
   /// Holds the exclusive lock on `dir` (see `snapshot_lock`) while the store
   /// lives. None when `dir` could not be locked and is used anyway.
   lock: Option<std::fs::File>,
@@ -512,6 +534,18 @@ struct Inner {
   /// Stickies whose text lives on in a document tab, by id (this run only). Their
   /// records stay, but they are not listed and have no window.
   handed_off: std::collections::HashMap<String, HandedLoc>,
+}
+/// Where a stored tab sits in its window, as a move between windows rewrites it.
+#[derive(Clone, Debug, PartialEq)]
+pub struct TabPlacement {
+  pub group: String,
+  pub tab_index: i64,
+  pub order: f64,
+  pub project: Option<String>,
+  pub x: Option<f64>,
+  pub y: Option<f64>,
+  pub width: Option<f64>,
+  pub height: Option<f64>,
 }
 /// Where the tab a sticky became is.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -534,6 +568,19 @@ fn rebound_project(
     }
   }
   Some(current)
+}
+/// Whether `writer` may write or delete `id`: nobody owns it, `writer` does, or
+/// the owner's window no longer exists.
+fn may_write(
+  owners: &std::collections::HashMap<String, String>,
+  id: &str,
+  writer: &str,
+  alive: impl Fn(&str) -> bool,
+) -> bool {
+  match owners.get(id) {
+    None => true,
+    Some(owner) => owner == writer || !alive(owner),
+  }
 }
 /// The single owner of note snapshots: an in-memory Vec guarded by a Mutex,
 /// loaded once at startup and persisted as one atomic file per note.
@@ -560,6 +607,7 @@ impl NoteStore {
           notes: loaded.items,
           dir,
           seqs: std::collections::HashMap::new(),
+          owners: std::collections::HashMap::new(),
           lock: None,
           rebinds: std::collections::HashMap::new(),
           handed_off: std::collections::HashMap::new(),
@@ -578,6 +626,7 @@ impl NoteStore {
         notes: Vec::new(),
         dir,
         seqs: std::collections::HashMap::new(),
+        owners: std::collections::HashMap::new(),
         lock: None,
         rebinds: std::collections::HashMap::new(),
         handed_off: std::collections::HashMap::new(),
@@ -649,26 +698,101 @@ impl NoteStore {
     Ok(())
   }
   /// Like `upsert`, but drops the write instead of applying it when `seq` is
-  /// older than the last `seq` this id was successfully written with. `seq` is
-  /// assigned by the frontend at the moment the write is issued (a single
-  /// incrementing counter, JS being single-threaded), not by whenever this
-  /// call happens to reach the lock, so it reflects true call order even
-  /// though `upsert_note` runs `(async)` and worker-pool scheduling gives no
-  /// such guarantee on its own. Returns whether the write was applied, so the
-  /// caller can skip broadcasting `store-changed` for a dropped write.
-  pub fn upsert_ordered(&self, mut note: NoteSnapshot, seq: u64) -> Result<bool, String> {
+  /// older than the last `seq` this id was successfully written with by the
+  /// same `writer`, or when the id has another owner whose window `alive` still
+  /// reports. `seq` is assigned by the frontend at the moment the write is
+  /// issued (a single incrementing counter per webview, JS being
+  /// single-threaded), not by whenever this call happens to reach the lock, so
+  /// it reflects true call order even though `upsert_note` runs `(async)` and
+  /// worker-pool scheduling gives no such guarantee on its own. Returns whether
+  /// the write was applied, so the caller can skip broadcasting `store-changed`
+  /// for a dropped write.
+  pub fn upsert_ordered(
+    &self,
+    mut note: NoteSnapshot,
+    seq: u64,
+    writer: &str,
+    alive: impl Fn(&str) -> bool,
+  ) -> Result<bool, String> {
     let mut inner = self.inner.lock().unwrap();
-    if let Some(&last) = inner.seqs.get(&note.id) {
+    if !may_write(&inner.owners, &note.id, writer, alive) {
+      return Ok(false);
+    }
+    let key = (note.id.clone(), writer.to_string());
+    if let Some(&last) = inner.seqs.get(&key) {
       if seq < last {
         return Ok(false);
       }
     }
     note.project = rebound_project(&inner.rebinds, note.project.take());
-    let id = note.id.clone();
     save_note(&inner.dir, &note)?;
-    inner.seqs.insert(id, seq);
+    inner.seqs.insert(key, seq);
     upsert(&mut inner.notes, note);
     Ok(true)
+  }
+  /// `delete`, unless the id has another owner whose window `alive` still
+  /// reports. Returns whether the delete was applied.
+  pub fn delete_as(
+    &self,
+    id: &str,
+    writer: &str,
+    alive: impl Fn(&str) -> bool,
+  ) -> Result<bool, String> {
+    let mut inner = self.inner.lock().unwrap();
+    if !may_write(&inner.owners, id, writer, alive) {
+      return Ok(false);
+    }
+    delete_note_file(&inner.dir, id)?;
+    delete(&mut inner.notes, id);
+    inner.owners.remove(id);
+    Ok(true)
+  }
+  /// From now on only window `label` may write or delete `id`, while it exists.
+  pub fn set_owner(&self, id: &str, label: &str) {
+    self
+      .inner
+      .lock()
+      .unwrap()
+      .owners
+      .insert(id.to_string(), label.to_string());
+  }
+  /// The window that owns `id`, if any.
+  #[cfg(test)]
+  pub fn owner(&self, id: &str) -> Option<String> {
+    self.inner.lock().unwrap().owners.get(id).cloned()
+  }
+  /// Rewrite where the stored tab `id` sits: its window group, index, order,
+  /// project and window bounds, with its content and everything else as it is.
+  /// False when no record exists for `id`, which is not an error: a tab made by
+  /// a paste has none until it is saved.
+  pub fn update_placement(&self, id: &str, placement: &TabPlacement) -> Result<bool, String> {
+    let mut inner = self.inner.lock().unwrap();
+    let Some(index) = inner.notes.iter().position(|n| n.id == id) else {
+      return Ok(false);
+    };
+    let mut note = inner.notes[index].clone();
+    note.window_group = Some(placement.group.clone());
+    note.tab_index = placement.tab_index;
+    note.tab_order = Some(placement.order);
+    note.project = rebound_project(&inner.rebinds, placement.project.clone());
+    note.x = placement.x;
+    note.y = placement.y;
+    note.width = placement.width;
+    note.height = placement.height;
+    save_note(&inner.dir, &note)?;
+    inner.notes[index] = note;
+    Ok(true)
+  }
+  /// The tab of the handed-off sticky `id` moved to document window `window`.
+  /// False if the sticky is not handed off.
+  pub fn retarget_handed_off(&self, id: &str, window: &str) -> bool {
+    match self.inner.lock().unwrap().handed_off.get_mut(id) {
+      Some(loc) => {
+        loc.window = window.to_string();
+        true
+      }
+      None => false,
+    }
   }
   /// Move every stored note tagged `from` (closed window groups included) to
   /// project `to`, and remember the rebind so a write still tagged `from` that
@@ -735,6 +859,7 @@ impl NoteStore {
     let mut inner = self.inner.lock().unwrap();
     delete_note_file(&inner.dir, id)?;
     delete(&mut inner.notes, id);
+    inner.owners.remove(id);
     Ok(())
   }
   /// The directory currently active for per-note files.
@@ -1424,6 +1549,7 @@ pub fn get_note(store: State<NoteStore>, id: String) -> Option<NoteSnapshot> {
 #[tauri::command(async)]
 pub fn upsert_note(
   app: AppHandle,
+  window: tauri::Window,
   store: State<NoteStore>,
   note: NoteSnapshot,
   seq: u64,
@@ -1434,7 +1560,7 @@ pub fn upsert_note(
     note.project.clone(),
     note.range_source.clone(),
   ];
-  if store.upsert_ordered(note, seq)? {
+  if store.upsert_ordered(note, seq, window.label(), window_exists(&app))? {
     emit_store_changed(&app, Some(&id));
     for path in paths.iter().flatten() {
       crate::grants::remember(path);
@@ -1444,17 +1570,28 @@ pub fn upsert_note(
 }
 
 #[tauri::command]
-pub fn delete_note(app: AppHandle, store: State<NoteStore>, id: String) -> Result<(), String> {
-  store.delete(&id)?;
-  emit_store_changed(&app, Some(&id));
+pub fn delete_note(
+  app: AppHandle,
+  window: tauri::Window,
+  store: State<NoteStore>,
+  id: String,
+) -> Result<(), String> {
+  if store.delete_as(&id, window.label(), window_exists(&app))? {
+    emit_store_changed(&app, Some(&id));
+  }
   Ok(())
 }
-/// Delete every note in `ids` from `store`, tolerating ids that don't exist
-/// (an unknown id is not an error — see `delete_note_file`) and logging any
-/// individual failure without aborting the rest of the batch.
-fn delete_notes(store: &NoteStore, ids: &[String]) {
+/// Liveness for the owner rule: whether the app still has a window `label`.
+fn window_exists(app: &AppHandle) -> impl Fn(&str) -> bool + '_ {
+  move |label| app.get_webview_window(label).is_some()
+}
+/// Delete every note in `ids` that `writer` may delete (see
+/// `NoteStore::delete_as`), tolerating ids that don't exist (an unknown id is
+/// not an error — see `delete_note_file`) and logging any individual failure
+/// without aborting the rest of the batch.
+fn delete_notes(store: &NoteStore, ids: &[String], writer: &str, alive: impl Fn(&str) -> bool) {
   for id in ids {
-    if let Err(e) = store.delete(id) {
+    if let Err(e) = store.delete_as(id, writer, &alive) {
       log::warn!("failed to drop closed tab {id}: {e}");
     }
   }
@@ -1506,7 +1643,7 @@ pub fn drop_closed_tabs(app: AppHandle, label: String, ids: Vec<String>) {
       return;
     }
     let store = app.state::<NoteStore>();
-    delete_notes(&store, &ids);
+    delete_notes(&store, &ids, &label, window_exists(&app));
     emit_store_changed(&app, None);
   });
 }
@@ -1951,6 +2088,7 @@ mod tests {
       dirty: false,
       window_group: None,
       tab_index: 0,
+      tab_order: None,
       line_ending: "LF".into(),
       had_bom: false,
       encoding: "UTF-8".into(),
@@ -2064,9 +2202,9 @@ mod tests {
     second.content = "two".into();
     let mut third = note("a");
     third.content = "three".into();
-    assert!(store.upsert_ordered(first, 1).unwrap());
-    assert!(store.upsert_ordered(second, 2).unwrap());
-    assert!(store.upsert_ordered(third, 3).unwrap());
+    assert!(store.upsert_ordered(first, 1, "w", |_| true).unwrap());
+    assert!(store.upsert_ordered(second, 2, "w", |_| true).unwrap());
+    assert!(store.upsert_ordered(third, 3, "w", |_| true).unwrap());
     assert_eq!(store.get("a").unwrap().content, "three");
     let reloaded = NoteStore::load(dir.path().to_path_buf()).unwrap();
     assert_eq!(reloaded.get("a").unwrap().content, "three");
@@ -2082,8 +2220,8 @@ mod tests {
     older.content = "older".into();
     // seq 5 (the newer payload) lands first, as if its write finished before
     // seq 2's write, which was issued earlier but took longer.
-    assert!(store.upsert_ordered(newer, 5).unwrap());
-    assert!(!store.upsert_ordered(older, 2).unwrap());
+    assert!(store.upsert_ordered(newer, 5, "w", |_| true).unwrap());
+    assert!(!store.upsert_ordered(older, 2, "w", |_| true).unwrap());
     // The stale write must not have overwritten the newer one, in memory or
     // on disk.
     assert_eq!(store.get("a").unwrap().content, "newer");
@@ -2101,10 +2239,151 @@ mod tests {
     b.content = "b-content".into();
     // "a" has already reached a high sequence; "b" starting fresh at a low
     // sequence must not be treated as stale just because "a" is ahead.
-    assert!(store.upsert_ordered(a, 100).unwrap());
-    assert!(store.upsert_ordered(b, 1).unwrap());
+    assert!(store.upsert_ordered(a, 100, "w", |_| true).unwrap());
+    assert!(store.upsert_ordered(b, 1, "w", |_| true).unwrap());
     assert_eq!(store.get("a").unwrap().content, "a-content");
     assert_eq!(store.get("b").unwrap().content, "b-content");
+  }
+
+  fn with_content(id: &str, content: &str) -> NoteSnapshot {
+    let mut n = note(id);
+    n.content = content.into();
+    n
+  }
+
+  #[test]
+  fn a_writers_stale_seq_is_dropped_whatever_other_writers_did() {
+    let dir = tempdir().unwrap();
+    let store = NoteStore::load(dir.path().to_path_buf()).unwrap();
+    assert!(store
+      .upsert_ordered(with_content("a", "newer"), 5, "doc-1", |_| true)
+      .unwrap());
+    assert!(store
+      .upsert_ordered(with_content("a", "other"), 9, "doc-2", |_| true)
+      .unwrap());
+    // doc-1 is still held to its own order, doc-2's higher seq notwithstanding.
+    assert!(!store
+      .upsert_ordered(with_content("a", "older"), 2, "doc-1", |_| true)
+      .unwrap());
+    assert_eq!(store.get("a").unwrap().content, "other");
+  }
+
+  #[test]
+  fn a_second_writers_lower_seq_is_not_dropped() {
+    let dir = tempdir().unwrap();
+    let store = NoteStore::load(dir.path().to_path_buf()).unwrap();
+    assert!(store
+      .upsert_ordered(with_content("a", "first"), 100, "doc-1", |_| true)
+      .unwrap());
+    assert!(store
+      .upsert_ordered(with_content("a", "second"), 1, "doc-2", |_| true)
+      .unwrap());
+    assert_eq!(store.get("a").unwrap().content, "second");
+  }
+
+  #[test]
+  fn the_sticky_to_document_sequence_applies_the_windows_write() {
+    let dir = tempdir().unwrap();
+    let store = NoteStore::load(dir.path().to_path_buf()).unwrap();
+    // The sticky has written many times; the document window starts at 1.
+    assert!(store
+      .upsert_ordered(with_content("a", "sticky text"), 57, "note-a", |_| true)
+      .unwrap());
+    assert!(store
+      .upsert_ordered(with_content("a", "tab text"), 1, "doc-g", |_| true)
+      .unwrap());
+    assert_eq!(store.get("a").unwrap().content, "tab text");
+  }
+
+  #[test]
+  fn the_adopt_orphan_sequence_applies_the_new_windows_write() {
+    let dir = tempdir().unwrap();
+    let store = NoteStore::load(dir.path().to_path_buf()).unwrap();
+    // A closed window wrote the record last; its label is gone.
+    assert!(store
+      .upsert_ordered(with_content("a", "orphan"), 40, "doc-old", |_| false)
+      .unwrap());
+    assert!(store
+      .upsert_ordered(with_content("a", "adopted"), 1, "doc-new", |l| l
+        == "doc-new")
+      .unwrap());
+    assert_eq!(store.get("a").unwrap().content, "adopted");
+  }
+
+  #[test]
+  fn an_owned_id_takes_writes_and_deletes_from_its_owner_only() {
+    let dir = tempdir().unwrap();
+    let store = NoteStore::load(dir.path().to_path_buf()).unwrap();
+    store.upsert(with_content("a", "kept")).unwrap();
+    store.set_owner("a", "doc-1");
+    let alive = |_: &str| true;
+    assert!(!store
+      .upsert_ordered(with_content("a", "intruder"), 1, "doc-2", alive)
+      .unwrap());
+    assert!(!store.delete_as("a", "doc-2", alive).unwrap());
+    assert_eq!(store.get("a").unwrap().content, "kept");
+    assert!(NoteStore::load(dir.path().to_path_buf())
+      .unwrap()
+      .get("a")
+      .is_some());
+    assert!(store
+      .upsert_ordered(with_content("a", "owner text"), 1, "doc-1", alive)
+      .unwrap());
+    assert_eq!(store.get("a").unwrap().content, "owner text");
+    assert!(store.delete_as("a", "doc-1", alive).unwrap());
+    assert!(store.get("a").is_none());
+  }
+
+  #[test]
+  fn an_owner_whose_window_is_gone_no_longer_blocks_other_writers() {
+    let dir = tempdir().unwrap();
+    let store = NoteStore::load(dir.path().to_path_buf()).unwrap();
+    store.set_owner("a", "doc-1");
+    // Only doc-2 exists.
+    let alive = |label: &str| label == "doc-2";
+    assert!(store
+      .upsert_ordered(with_content("a", "taken over"), 1, "doc-2", alive)
+      .unwrap());
+    assert_eq!(store.get("a").unwrap().content, "taken over");
+    assert!(store.delete_as("a", "doc-2", alive).unwrap());
+    assert!(store.get("a").is_none());
+  }
+
+  #[test]
+  fn the_owner_goes_with_the_record() {
+    let dir = tempdir().unwrap();
+    let store = NoteStore::load(dir.path().to_path_buf()).unwrap();
+    for id in ["a", "b"] {
+      store.upsert(note(id)).unwrap();
+      store.set_owner(id, "doc-1");
+    }
+    assert_eq!(store.owner("a").as_deref(), Some("doc-1"));
+    assert!(store.delete_as("a", "doc-1", |_| true).unwrap());
+    assert_eq!(store.owner("a"), None);
+    store.delete("b").unwrap();
+    assert_eq!(store.owner("b"), None);
+  }
+
+  #[test]
+  fn closing_a_window_skips_an_id_owned_by_another_live_window() {
+    let dir = tempdir().unwrap();
+    let store = NoteStore::load(dir.path().to_path_buf()).unwrap();
+    for id in ["mine", "moved", "left", "free"] {
+      store.upsert(note(id)).unwrap();
+    }
+    store.set_owner("mine", "doc-1");
+    store.set_owner("moved", "doc-2");
+    store.set_owner("left", "doc-3");
+    let ids: Vec<String> = ["mine", "moved", "left", "free"]
+      .iter()
+      .map(|s| s.to_string())
+      .collect();
+    // doc-1 closes; doc-2 is alive, doc-3 is gone.
+    delete_notes(&store, &ids, "doc-1", |l| l == "doc-2");
+    assert!(store.get("moved").is_some());
+    assert!(store.get("mine").is_none());
+    assert!(store.get("left").is_none());
+    assert!(store.get("free").is_none());
   }
 
   #[test]
@@ -2138,6 +2417,8 @@ mod tests {
     delete_notes(
       &store,
       &["a".to_string(), "b".to_string(), "unknown".to_string()],
+      "w",
+      |_| true,
     );
     assert_eq!(store.list(), vec![note("c")]);
   }
@@ -2798,6 +3079,100 @@ mod tests {
     assert!(store.take_back_in("doc-1").is_empty());
   }
 
+  fn placement() -> TabPlacement {
+    TabPlacement {
+      group: "g-new".to_string(),
+      tab_index: 7,
+      order: 2.5,
+      project: Some("/proj".to_string()),
+      x: Some(1.0),
+      y: Some(2.0),
+      width: None,
+      height: Some(4.0),
+    }
+  }
+
+  #[test]
+  fn a_placement_update_rewrites_where_the_tab_sits_and_leaves_its_content() {
+    let dir = tempdir().unwrap();
+    let store = NoteStore::load(dir.path().to_path_buf()).unwrap();
+    let mut stored = doc("a", Some("g-old"), 1);
+    stored.content = "unsaved text".to_string();
+    stored.dirty = true;
+    stored.width = Some(500.0);
+    store.upsert(stored.clone()).unwrap();
+    assert_eq!(store.update_placement("a", &placement()), Ok(true));
+    let moved = store.get("a").unwrap();
+    assert_eq!(moved.window_group.as_deref(), Some("g-new"));
+    assert_eq!(moved.tab_index, 7);
+    assert_eq!(moved.tab_order, Some(2.5));
+    assert_eq!(moved.project.as_deref(), Some("/proj"));
+    assert_eq!(
+      (moved.x, moved.y, moved.width, moved.height),
+      (Some(1.0), Some(2.0), None, Some(4.0))
+    );
+    // Everything else is as it was, on disk too.
+    let expected = NoteSnapshot {
+      window_group: moved.window_group.clone(),
+      tab_index: 7,
+      tab_order: Some(2.5),
+      project: moved.project.clone(),
+      x: moved.x,
+      y: moved.y,
+      width: None,
+      height: moved.height,
+      ..stored
+    };
+    assert_eq!(moved, expected);
+    let restarted = NoteStore::load(dir.path().to_path_buf()).unwrap();
+    assert_eq!(restarted.get("a"), Some(expected));
+  }
+
+  #[test]
+  fn a_placement_update_of_an_id_without_a_record_succeeds_and_creates_none() {
+    let dir = tempdir().unwrap();
+    let store = NoteStore::load(dir.path().to_path_buf()).unwrap();
+    assert_eq!(store.update_placement("nope", &placement()), Ok(false));
+    assert!(store.get("nope").is_none());
+    assert!(store.list().is_empty());
+  }
+
+  #[test]
+  fn a_placement_update_follows_this_runs_project_rebinds() {
+    let dir = tempdir().unwrap();
+    let store = NoteStore::load(dir.path().to_path_buf()).unwrap();
+    store.upsert(doc("a", Some("g"), 0)).unwrap();
+    store.rebind_project("/proj", "/outer").unwrap();
+    store.update_placement("a", &placement()).unwrap();
+    assert_eq!(store.get("a").unwrap().project.as_deref(), Some("/outer"));
+  }
+
+  #[test]
+  fn retargeting_a_handed_off_sticky_moves_it_to_the_new_window() {
+    let dir = tempdir().unwrap();
+    let store = NoteStore::load(dir.path().to_path_buf()).unwrap();
+    store.upsert(note("s")).unwrap();
+    store.hand_off(
+      "s",
+      HandedLoc {
+        window: "doc-1".to_string(),
+        tab_id: "t".to_string(),
+      },
+    );
+    assert!(store.retarget_handed_off("s", "doc-2"));
+    // `focus_handed_off` raises the window named here; the tab id stays.
+    assert_eq!(
+      store.handed_off("s"),
+      Some(HandedLoc {
+        window: "doc-2".to_string(),
+        tab_id: "t".to_string(),
+      })
+    );
+    assert!(store.take_back_in("doc-1").is_empty());
+    assert_eq!(store.take_back_in("doc-2"), vec!["s"]);
+    assert!(!store.retarget_handed_off("s", "doc-3"));
+  }
+
   #[test]
   fn the_dock_and_the_jump_list_read_the_stickies_through_list() {
     for source in [include_str!("dock.rs"), include_str!("jumplist.rs")] {
@@ -3157,12 +3532,12 @@ mod tests {
     let dir = tempdir().unwrap();
     let store = NoteStore::load(dir.path().to_path_buf()).unwrap();
     store
-      .upsert_ordered(doc_in("a", "g1", Some("/x/y")), 4)
+      .upsert_ordered(doc_in("a", "g1", Some("/x/y")), 4, "w", |_| true)
       .unwrap();
     store.rebind_project("/x/y", "/x").unwrap();
     // Sent before the rebind with the same seq, delivered after it.
     assert!(store
-      .upsert_ordered(doc_in("a", "g1", Some("/x/y")), 4)
+      .upsert_ordered(doc_in("a", "g1", Some("/x/y")), 4, "w", |_| true)
       .unwrap());
     assert_eq!(store.get("a").unwrap().project.as_deref(), Some("/x"));
     let reloaded = NoteStore::load(dir.path().to_path_buf()).unwrap();
@@ -3171,12 +3546,12 @@ mod tests {
     store.upsert(doc_in("a", "g1", Some("/x/y"))).unwrap();
     assert_eq!(store.get("a").unwrap().project.as_deref(), Some("/x"));
     store
-      .upsert_ordered(doc_in("new", "g1", Some("/x/y")), 1)
+      .upsert_ordered(doc_in("new", "g1", Some("/x/y")), 1, "w", |_| true)
       .unwrap();
     assert_eq!(store.get("new").unwrap().project.as_deref(), Some("/x"));
     // Other projects are left alone.
     store
-      .upsert_ordered(doc_in("c", "g3", Some("/x/other")), 1)
+      .upsert_ordered(doc_in("c", "g3", Some("/x/other")), 1, "w", |_| true)
       .unwrap();
     assert_eq!(store.get("c").unwrap().project.as_deref(), Some("/x/other"));
   }
@@ -3209,7 +3584,7 @@ mod tests {
     store.upsert(doc_in("a", "g1", Some("/x/y"))).unwrap();
     assert_eq!(store.get("a").unwrap().project.as_deref(), Some("/x/y"));
     store
-      .upsert_ordered(doc_in("b", "g2", Some("/x/y")), 1)
+      .upsert_ordered(doc_in("b", "g2", Some("/x/y")), 1, "w", |_| true)
       .unwrap();
     assert_eq!(store.get("b").unwrap().project.as_deref(), Some("/x/y"));
     // Forgetting a project that was never folded changes nothing.
@@ -3325,22 +3700,22 @@ mod tests {
     let old = || doc_at("a", "g1", Some("/x/f.txt"), None);
     let moved = || doc_at("a", "g1", Some("/x/g.txt"), None);
     // Sent before the rename and applied.
-    assert!(store.upsert_ordered(old(), 7).unwrap());
+    assert!(store.upsert_ordered(old(), 7, "w", |_| true).unwrap());
     store.retarget_paths("/x/f.txt", "/x/g.txt").unwrap();
     assert_eq!(
       store.get("a").unwrap().file_path.as_deref(),
       Some("/x/g.txt")
     );
     // The window writes the tab again with the new path and a newer seq.
-    assert!(store.upsert_ordered(moved(), 8).unwrap());
+    assert!(store.upsert_ordered(moved(), 8, "w", |_| true).unwrap());
     // The old write, sent before the rename with seq 7, arrives only now.
-    assert!(!store.upsert_ordered(old(), 7).unwrap());
+    assert!(!store.upsert_ordered(old(), 7, "w", |_| true).unwrap());
     assert_eq!(
       store.get("a").unwrap().file_path.as_deref(),
       Some("/x/g.txt")
     );
     // A write after the rename is applied as usual.
-    assert!(store.upsert_ordered(moved(), 9).unwrap());
+    assert!(store.upsert_ordered(moved(), 9, "w", |_| true).unwrap());
     let reloaded = NoteStore::load(dir.path().to_path_buf()).unwrap();
     assert_eq!(
       reloaded.get("a").unwrap().file_path.as_deref(),
@@ -3371,6 +3746,69 @@ mod tests {
     assert_eq!(plans.len(), 2);
     assert_eq!(plans[0].group, "solo1");
     assert_eq!(plans[1].group, "solo2");
+  }
+
+  fn ordered(id: &str, tab_index: i64, tab_order: Option<f64>, x: f64) -> NoteSnapshot {
+    NoteSnapshot {
+      tab_order,
+      x: Some(x),
+      ..doc(id, Some("g"), tab_index)
+    }
+  }
+
+  #[test]
+  fn order_key_prefers_tab_order_and_falls_back_to_tab_index() {
+    assert_eq!(order_key(&ordered("a", 7, Some(0.5), 0.0)), (0.5, 7));
+    assert_eq!(order_key(&ordered("a", 7, None, 0.0)), (7.0, 7));
+  }
+
+  #[test]
+  fn plan_takes_bounds_from_the_first_tab_in_tab_order() {
+    // The tab with the highest tab_index was moved to the front: its bounds win.
+    let notes = vec![
+      ordered("a", 0, Some(0.0), 10.0),
+      ordered("b", 1, Some(1.0), 20.0),
+      ordered("c", 2, Some(-1.0), 30.0),
+    ];
+    assert_eq!(plan_document_windows(&notes)[0].x, Some(30.0));
+    // Without the move the lowest tab_index wins, as before.
+    let unmoved = vec![
+      ordered("a", 0, Some(0.0), 10.0),
+      ordered("b", 1, Some(1.0), 20.0),
+    ];
+    assert_eq!(plan_document_windows(&unmoved)[0].x, Some(10.0));
+  }
+
+  #[test]
+  fn plan_orders_a_record_without_tab_order_by_tab_index() {
+    // Legacy tab_index 30 and 31, only the second rewritten with a key: 29.
+    let notes = vec![
+      ordered("a", 30, None, 10.0),
+      ordered("b", 31, Some(29.0), 20.0),
+    ];
+    assert_eq!(plan_document_windows(&notes)[0].x, Some(20.0));
+    // Both legacy: the lower tab_index wins whatever the list order.
+    let legacy = vec![ordered("b", 31, None, 20.0), ordered("a", 30, None, 10.0)];
+    assert_eq!(plan_document_windows(&legacy)[0].x, Some(10.0));
+  }
+
+  #[test]
+  fn plan_breaks_a_tab_order_tie_by_tab_index() {
+    let notes = vec![
+      ordered("b", 5, Some(2.0), 20.0),
+      ordered("a", 4, Some(2.0), 10.0),
+    ];
+    assert_eq!(plan_document_windows(&notes)[0].x, Some(10.0));
+  }
+
+  #[test]
+  fn tab_order_is_optional_on_read_and_kept_on_write() {
+    let legacy: NoteSnapshot =
+      serde_json::from_str(r#"{"id":"a","content":"","file_path":null}"#).unwrap();
+    assert_eq!(legacy.tab_order, None);
+    let keyed = ordered("a", 3, Some(-0.25), 0.0);
+    let back: NoteSnapshot = serde_json::from_str(&serde_json::to_string(&keyed).unwrap()).unwrap();
+    assert_eq!(back.tab_order, Some(-0.25));
   }
 
   #[test]

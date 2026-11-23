@@ -11,6 +11,7 @@
 // changes the viewport, not only in the ones that do not.
 // Upstream reads the scroll offset before the scroll target is applied, so the
 // next anchor is picked away from the target and a centered jump drifts.
+// Upstream merges a point that starts before the redraw into the previous widget whatever its widget; remove 'widget continuation only for the same widget' once @codemirror/view fixes that: its match then fails.
 const E1_OLD = `        if (viewportChange) {
             if (result & 2 /* UpdateFlag.Height */)
                 result |= this.updateScaler();
@@ -103,6 +104,17 @@ export const REPLACEMENTS: Replacement[] = [
                             this.viewState.scrollTarget = null;
                             scrollAnchorHeight = -1;
                             scrollOffset = this.viewState.getScrollOffset();
+`,
+  },
+  {
+    name: 'widget continuation only for the same widget',
+    old: `                    if (openStart > active.length) {
+                        b.continueWidget(to - from);
+`,
+    new: `                    let prevWidget = b.afterWidget || b.lastBlock;
+                    if (openStart > active.length && prevWidget && prevWidget.isWidget() &&
+                        prevWidget.widget.compare(deco.widget || (deco.block ? NullWidget.block : NullWidget.inline))) {
+                        b.continueWidget(to - from);
 `,
   },
 ];

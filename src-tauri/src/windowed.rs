@@ -504,8 +504,9 @@ pub struct OpenResult {
   pub fingerprint: Fingerprint,
 }
 /// A read-back window: its text plus the byte range it covers and the current
-/// global document statistics.
-#[derive(Serialize)]
+/// global document statistics. Where a line is cut, its text holds one U+FFFC
+/// per `holes` entry in place of the bytes not loaded.
+#[derive(Serialize, PartialEq, Debug)]
 pub struct WindowResult {
   pub text: String,
   pub start_offset: u64,
@@ -518,6 +519,24 @@ pub struct WindowResult {
   pub prev_lone_cr: bool,
   /// The window does not end the file and the byte at its end is a `\n`.
   pub next_is_lf: bool,
+  /// The parts of lines not loaded, in document order.
+  pub holes: Vec<Hole>,
+}
+/// A part of a line a window does not hold, drawn as one U+FFFC in its text.
+#[derive(Serialize, PartialEq, Debug, Clone)]
+pub struct Hole {
+  /// The line, counted from the window's first line.
+  pub line: u64,
+  /// UTF-16 index of the placeholder in that line's text.
+  pub at: u64,
+  /// UTF-8 bytes not loaded.
+  pub bytes: u64,
+  /// UTF-16 length of the bytes not loaded.
+  pub units: u64,
+  /// The line's share was cut by the window's budget, not only by the line cap.
+  pub budget: bool,
+  /// The line lay in the `view` of the request.
+  pub in_view: bool,
 }
 /// Current global document statistics after a mutating command.
 #[derive(Serialize, Debug)]
@@ -1680,26 +1699,527 @@ pub fn windowed_index(
   );
   Ok(snapshot)
 }
+/// What a session holds now, for a window that takes over a tab: whether it has
+/// unsaved changes and its size.
+#[derive(Serialize, Debug, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionStats {
+  pub dirty: bool,
+  pub total_bytes: u64,
+  pub total_lines: u64,
+}
+/// Core of `windowed_stats`.
+fn stats_core(state: &WindowedState, session_id: u64) -> Result<SessionStats, String> {
+  let map = state.lock_idle(session_id)?;
+  let session = map
+    .get(&session_id)
+    .ok_or_else(|| UNKNOWN_SESSION.to_string())?;
+  let stats = session.stats();
+  Ok(SessionStats {
+    dirty: !stats.clean,
+    total_bytes: stats.total_bytes,
+    total_lines: stats.total_lines,
+  })
+}
+/// A session's dirty flag and totals, waiting for a running replace-all as every
+/// read does.
+#[tauri::command(async)]
+pub fn windowed_stats(
+  state: State<WindowedState>,
+  session_id: u64,
+) -> Result<SessionStats, String> {
+  stats_core(&state, session_id)
+}
 /// Read the line window `[start_line, end_line)` (0-based, end exclusive) of a
 /// session, clamping to the current line range. Returns the window text plus the
 /// byte range it spans and the current global statistics. The content must be
 /// valid UTF-8 (the file was validated at open and inserts come from JS strings);
 /// a decode failure is a defensive error rather than a lossy substitution.
+/// `focus`, `also`, `lead` and `view` say which lines matter most when a line is
+/// cut, and `keep` which part of a line to show again (see `read_window_result`).
+#[allow(clippy::too_many_arguments)]
 #[tauri::command(async)]
 pub fn windowed_read(
   state: State<WindowedState>,
   session_id: u64,
   start_line: u64,
   end_line: u64,
+  focus: Option<Pos>,
+  also: Option<Pos>,
+  lead: Option<u64>,
+  view: Option<[u64; 2]>,
+  keep: Option<Vec<Keep>>,
 ) -> Result<WindowResult, String> {
   let map = state.lock_idle(session_id)?;
   let session = map
     .get(&session_id)
     .ok_or_else(|| UNKNOWN_SESSION.to_string())?;
-  read_window_result(&session.table, start_line, end_line)
+  let request = WindowRequest {
+    focus,
+    also,
+    lead,
+    view,
+    keep: keep.unwrap_or_default(),
+  };
+  read_window_result(&session.table, start_line, end_line, &request, SCAN_CHUNK)
+}
+/// The most of one line's content a window holds (1 MiB), plus up to 3 bytes
+/// where a cut is moved to a character boundary.
+const LINE_CAP_BYTES: u64 = 1024 * 1024;
+/// The most content the lines other than the focus line hold together (2 MiB).
+const WINDOW_BUDGET_BYTES: u64 = 2 * 1024 * 1024;
+/// The most one read of loaded content asks for: a capped line, its alignment
+/// bytes and its break.
+const READ_MAX: u64 = LINE_CAP_BYTES + 5;
+/// Protocol error string of a `keep` entry that does not set exactly one of
+/// `start` and `end`.
+const BAD_KEEP: &str = "bad-keep";
+/// Stands for the bytes of a line a window does not hold.
+const PLACEHOLDER: &str = "\u{FFFC}";
+/// A part of a line the next read shows again: from byte `start` of the line's
+/// content, or up to byte `end`. Exactly one is set.
+#[derive(Deserialize, Clone, Copy, Debug)]
+pub struct Keep {
+  /// The global line.
+  pub line: u64,
+  pub start: Option<u64>,
+  pub end: Option<u64>,
+}
+/// What a window read is made for: the lines whose text matters most.
+#[derive(Default, Debug)]
+struct WindowRequest {
+  focus: Option<Pos>,
+  also: Option<Pos>,
+  lead: Option<u64>,
+  view: Option<[u64; 2]>,
+  keep: Vec<Keep>,
+}
+/// The lines of a window a read is made for, counted from its first line.
+#[derive(Default, Debug)]
+struct Lines {
+  focus: Option<usize>,
+  /// A line other than the focus line.
+  also: Option<usize>,
+  /// A line other than the focus line; the line of `also` ranks before it.
+  lead: Option<usize>,
+  /// `[first, end)`, not empty.
+  view: Option<(usize, usize)>,
+}
+
+impl Lines {
+  /// The line the others are ranked by distance from.
+  fn centre(&self) -> usize {
+    self
+      .focus
+      .or(self.also)
+      .or(self.view.map(|(first, end)| first + (end - first - 1) / 2))
+      .unwrap_or(0)
+  }
+  fn group(&self, line: usize) -> u8 {
+    if self.focus == Some(line) {
+      0
+    } else if self.also == Some(line) {
+      1
+    } else if self.lead == Some(line) {
+      2
+    } else if self
+      .view
+      .is_some_and(|(first, end)| line >= first && line < end)
+    {
+      3
+    } else {
+      4
+    }
+  }
+}
+/// The lines of a window of `count` lines in the order they are given their
+/// share: the focus line, the line of `also`, the `lead` line, the lines of
+/// `view`, the others; within a group by distance from the centre, the later
+/// line first on a tie.
+fn priority_order(count: usize, lines: &Lines) -> Vec<usize> {
+  let centre = lines.centre();
+  let mut order: Vec<usize> = (0..count).collect();
+  order.sort_by_key(|&i| (lines.group(i), i.abs_diff(centre), std::cmp::Reverse(i)));
+  order
+}
+/// How many bytes of each line (of content length `lens`) a window holds. The
+/// focus line takes at most the line cap; every other line also takes only what
+/// is left of the budget.
+fn allocate(lens: &[u64], lines: &Lines) -> Vec<u64> {
+  let mut given = vec![0u64; lens.len()];
+  let mut left = WINDOW_BUDGET_BYTES;
+  for i in priority_order(lens.len(), lines) {
+    let want = lens[i].min(LINE_CAP_BYTES);
+    if lines.focus == Some(i) {
+      given[i] = want;
+    } else {
+      let share = want.min(left);
+      left -= share;
+      given[i] = share;
+    }
+  }
+  given
+}
+/// Where the segment of a cut line is put, in bytes of the line's content.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Place {
+  /// Around one byte.
+  Centre(u64),
+  /// Around two bytes that both stay inside: `lo <= hi`.
+  Span(u64, u64),
+  /// From a byte on.
+  Start(u64),
+  /// Up to a byte.
+  End(u64),
+}
+/// The left cut of a segment of `a` bytes (`0 < a < len`) of a line of `len`
+/// bytes, before it is moved to a character boundary, and the end it is
+/// anchored to: `Some` for a segment that reaches an end it was given or the end
+/// of the line, whose right cut is that end, `None` otherwise (its right cut is
+/// the left cut after alignment plus `a`).
+fn raw_cuts(len: u64, a: u64, place: Place) -> (u64, Option<u64>) {
+  let reach = |left: i64| -> (u64, Option<u64>) {
+    if left <= 0 {
+      (0, None)
+    } else if left as u64 + a >= len {
+      (len - a, Some(len))
+    } else {
+      (left as u64, None)
+    }
+  };
+  let half = (a / 2) as i64;
+  match place {
+    Place::Centre(c) => reach(c.min(len) as i64 - half),
+    Place::Span(lo, hi) => {
+      let (lo, hi) = (lo.min(len) as i64, hi.min(len) as i64);
+      // The left cut may move down by 3 bytes; the far end must still fit.
+      let centred = lo + (hi - lo) / 2 - half;
+      reach(centred.max(hi + 3 - a as i64))
+    }
+    Place::Start(start) => reach(start.min(len) as i64),
+    Place::End(end) => {
+      let end = end.min(len);
+      if end < a {
+        (0, None)
+      } else {
+        (end - a, Some(end))
+      }
+    }
+  }
+}
+/// One line of a window: where its content starts, and the lengths of its
+/// content and of its break (0 for the last line of the text).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct LineSpan {
+  start: u64,
+  len: u64,
+  brk: u64,
+}
+/// The lines of the text `[from, to)` by the line rule, found in reads of at
+/// most `chunk` bytes. The text ends at a line start, or, with `last_line`, is
+/// followed by a last line without a break (possibly an empty one).
+fn scan_lines(
+  table: &Table,
+  from: u64,
+  to: u64,
+  last_line: bool,
+  chunk: usize,
+) -> Result<Vec<LineSpan>, String> {
+  let chunk = chunk.max(1) as u64;
+  let mut spans = Vec::new();
+  let mut line_start = from;
+  // A `\r` whose next byte, which makes it a break of its own or not, is unseen.
+  let mut pending_cr: Option<u64> = None;
+  let mut at = from;
+  while at < to {
+    let upto = (at + chunk).min(to);
+    for (i, &b) in table.read(at, upto)?.iter().enumerate() {
+      let o = at + i as u64;
+      if let Some(cr) = pending_cr.take() {
+        if b == b'\n' {
+          spans.push(LineSpan {
+            start: line_start,
+            len: cr - line_start,
+            brk: 2,
+          });
+          line_start = o + 1;
+          continue;
+        }
+        spans.push(LineSpan {
+          start: line_start,
+          len: cr - line_start,
+          brk: 1,
+        });
+        line_start = cr + 1;
+      }
+      if b == b'\n' {
+        spans.push(LineSpan {
+          start: line_start,
+          len: o - line_start,
+          brk: 1,
+        });
+        line_start = o + 1;
+      } else if b == b'\r' {
+        pending_cr = Some(o);
+      }
+    }
+    at = upto;
+  }
+  // A window ends at a line start, so a `\r` that ends it is a break.
+  if let Some(cr) = pending_cr {
+    spans.push(LineSpan {
+      start: line_start,
+      len: cr - line_start,
+      brk: 1,
+    });
+    line_start = cr + 1;
+  }
+  if last_line {
+    spans.push(LineSpan {
+      start: line_start,
+      len: to - line_start,
+      brk: 0,
+    });
+  } else if line_start != to {
+    return Err(LINE_MISMATCH.to_string());
+  }
+  Ok(spans)
+}
+/// Protocol error string of a window whose bytes do not hold the lines the table
+/// counts.
+const LINE_MISMATCH: &str = "line-count-mismatch";
+/// UTF-16 units in `[from, to)`, counted in reads of at most `chunk` bytes.
+fn units_between(table: &Table, from: u64, to: u64, chunk: usize) -> Result<u64, String> {
+  let chunk = chunk.max(1) as u64;
+  let (mut at, mut units) = (from, 0u64);
+  while at < to {
+    let upto = (at + chunk).min(to);
+    units += utf16_units(&table.read(at, upto)?);
+    at = upto;
+  }
+  Ok(units)
+}
+/// `at`, moved down to the start of the character it lies in; `floor` and `end`
+/// bound the line's content.
+fn align_down(table: &Table, floor: u64, end: u64, at: u64) -> Result<u64, String> {
+  if at <= floor || at >= end {
+    return Ok(at.clamp(floor, end));
+  }
+  let lo = at.saturating_sub(3).max(floor);
+  let bytes = table.read(lo, at + 1)?;
+  let mut i = (at - lo) as usize;
+  while i > 0 && (0x80..0xC0).contains(&bytes[i]) {
+    i -= 1;
+  }
+  Ok(lo + i as u64)
+}
+/// The text and holes of a window being put together. Loaded bytes that follow
+/// each other are read together.
+struct Assembly {
+  bytes: Vec<u8>,
+  holes: Vec<Hole>,
+  run: Option<(u64, u64)>,
+}
+
+impl Assembly {
+  fn loaded(&mut self, table: &Table, from: u64, to: u64) -> Result<(), String> {
+    if from >= to {
+      return Ok(());
+    }
+    if let Some(run) = self.run.as_mut() {
+      if run.1 == from {
+        run.1 = to;
+        return Ok(());
+      }
+    }
+    self.flush(table)?;
+    self.run = Some((from, to));
+    Ok(())
+  }
+  fn flush(&mut self, table: &Table) -> Result<(), String> {
+    if let Some((mut at, to)) = self.run.take() {
+      while at < to {
+        let upto = (at + READ_MAX).min(to);
+        self.bytes.extend_from_slice(&table.read(at, upto)?);
+        at = upto;
+      }
+    }
+    Ok(())
+  }
+  fn placeholder(&mut self, hole: Hole) {
+    self.bytes.extend_from_slice(PLACEHOLDER.as_bytes());
+    self.holes.push(hole);
+  }
 }
 /// The window `[start_line, end_line)` of `table`, clamped to its line range.
+/// A line longer than its share is cut (see `allocate` and `raw_cuts`): its text
+/// holds a placeholder for each part left out, with a `Hole` to match. `chunk`
+/// bounds the reads that scan a line or count its units.
 fn read_window_result(
+  table: &Table,
+  start_line: u64,
+  end_line: u64,
+  req: &WindowRequest,
+  chunk: usize,
+) -> Result<WindowResult, String> {
+  if req
+    .keep
+    .iter()
+    .any(|k| k.start.is_some() == k.end.is_some())
+  {
+    return Err(BAD_KEEP.to_string());
+  }
+  let total_lines = table.line_count();
+  let total_bytes = table.len();
+  let start_line = start_line.min(total_lines);
+  let end_line = end_line.clamp(start_line, total_lines);
+  let start_offset = line_offset(table, start_line)?;
+  let end_offset = line_offset(table, end_line)?;
+  let prev_lone_cr = start_offset > 0 && table.read(start_offset - 1, start_offset)? == b"\r";
+  let next_is_lf = end_offset < total_bytes && table.read(end_offset, end_offset + 1)? == b"\n";
+  let result = |text: String, holes: Vec<Hole>| WindowResult {
+    text,
+    start_offset,
+    end_offset,
+    start_line,
+    total_lines,
+    total_bytes,
+    prev_lone_cr,
+    next_is_lf,
+    holes,
+  };
+  if start_line == end_line {
+    return Ok(result(String::new(), Vec::new()));
+  }
+  let spans = scan_lines(
+    table,
+    start_offset,
+    end_offset,
+    end_line == total_lines,
+    chunk,
+  )?;
+  if spans.len() as u64 != end_line - start_line {
+    return Err(LINE_MISMATCH.to_string());
+  }
+  let local =
+    |line: u64| (line >= start_line && line < end_line).then(|| (line - start_line) as usize);
+  let focus = req.focus.and_then(|p| local(p.line).map(|i| (i, p)));
+  let also = req.also.and_then(|p| local(p.line).map(|i| (i, p)));
+  let focus_line = focus.map(|f| f.0);
+  let also_line = also.map(|a| a.0).filter(|&i| Some(i) != focus_line);
+  let lines = Lines {
+    focus: focus_line,
+    also: also_line,
+    lead: req.lead.and_then(local).filter(|&i| Some(i) != focus_line),
+    view: req.view.and_then(|[first, end]| {
+      let (first, end) = (first.max(start_line), end.min(end_line));
+      (first < end).then(|| ((first - start_line) as usize, (end - start_line) as usize))
+    }),
+  };
+  let lens: Vec<u64> = spans.iter().map(|s| s.len).collect();
+  let shares = allocate(&lens, &lines);
+  let centre = lines.centre();
+  let mut keeps: HashMap<usize, &Keep> = HashMap::new();
+  for k in &req.keep {
+    if let Some(i) = local(k.line) {
+      keeps.insert(i, k);
+    }
+  }
+  let byte_of = |i: usize, pos: &Pos| -> Result<u64, String> {
+    let s = &spans[i];
+    let at = pos_to_offset_chunked(table, pos, chunk)?;
+    Ok(at.saturating_sub(s.start).min(s.len))
+  };
+  let mut asm = Assembly {
+    bytes: Vec::new(),
+    holes: Vec::new(),
+    run: None,
+  };
+  for (i, s) in spans.iter().enumerate() {
+    let share = shares[i];
+    let content_end = s.start + s.len;
+    if share >= s.len {
+      asm.loaded(table, s.start, content_end + s.brk)?;
+      continue;
+    }
+    let (left, right) = if share == 0 {
+      (s.start, s.start)
+    } else {
+      let place = if let Some((_, fp)) = focus.filter(|f| f.0 == i) {
+        let at = byte_of(i, &fp)?;
+        match also.filter(|a| a.0 == i) {
+          Some((_, ap)) => {
+            let other = byte_of(i, &ap)?;
+            let (lo, hi) = (at.min(other), at.max(other));
+            if share >= 3 && hi - lo <= share - 3 {
+              Place::Span(lo, hi)
+            } else {
+              Place::Centre(at)
+            }
+          }
+          None => Place::Centre(at),
+        }
+      } else if let Some((_, ap)) = also.filter(|a| a.0 == i) {
+        Place::Centre(byte_of(i, &ap)?)
+      } else if let Some(k) = keeps.get(&i) {
+        match k.start {
+          Some(start) => Place::Start(start),
+          None => Place::End(k.end.unwrap_or(s.len)),
+        }
+      } else if i < centre {
+        Place::End(s.len)
+      } else {
+        Place::Start(0)
+      };
+      let (cut, anchor) = raw_cuts(s.len, share, place);
+      let l = align_down(table, s.start, content_end, s.start + cut)?;
+      let r = match anchor {
+        Some(end) => align_down(table, s.start, content_end, s.start + end)?,
+        None => align_down(table, s.start, content_end, l + share)?,
+      };
+      if r > l {
+        (l, r)
+      } else {
+        (s.start, s.start)
+      }
+    };
+    let flags = (
+      share < s.len.min(LINE_CAP_BYTES),
+      lines.view.is_some_and(|(first, end)| i >= first && i < end),
+    );
+    let hole = |at: u64, bytes: u64, units: u64| Hole {
+      line: i as u64,
+      at,
+      bytes,
+      units,
+      budget: flags.0,
+      in_view: flags.1,
+    };
+    asm.flush(table)?;
+    if left > s.start {
+      let units = units_between(table, s.start, left, chunk)?;
+      asm.placeholder(hole(0, left - s.start, units));
+    }
+    let mut at = u64::from(left > s.start);
+    if right > left {
+      let segment = table.read(left, right)?;
+      at += utf16_units(&segment);
+      asm.bytes.extend_from_slice(&segment);
+    }
+    if right < content_end {
+      let units = units_between(table, right, content_end, chunk)?;
+      asm.placeholder(hole(at, content_end - right, units));
+    }
+    asm.loaded(table, content_end, content_end + s.brk)?;
+  }
+  asm.flush(table)?;
+  let text = String::from_utf8(asm.bytes).map_err(|_| NOT_UTF8.to_string())?;
+  Ok(result(text, asm.holes))
+}
+/// The window `[start_line, end_line)` of `table` as it was before lines were
+/// cut: every line whole.
+#[cfg(test)]
+fn read_window_whole(
   table: &Table,
   start_line: u64,
   end_line: u64,
@@ -1723,6 +2243,7 @@ fn read_window_result(
     total_bytes,
     prev_lone_cr,
     next_is_lf,
+    holes: Vec::new(),
   })
 }
 /// Core of `windowed_apply`: waits for a running replace-all, then applies.
@@ -2158,6 +2679,62 @@ fn end_pos_core(state: &WindowedState, session_id: u64) -> Result<Pos, String> {
 pub fn windowed_end_pos(state: State<WindowedState>, session_id: u64) -> Result<Pos, String> {
   end_pos_core(&state, session_id)
 }
+/// Core of `windowed_offset_pos`.
+fn offset_pos_core(
+  state: &WindowedState,
+  session_id: u64,
+  offset: u64,
+  chunk: usize,
+) -> Result<Pos, String> {
+  let map = state.lock_idle(session_id)?;
+  let session = map
+    .get(&session_id)
+    .ok_or_else(|| UNKNOWN_SESSION.to_string())?;
+  let table = &session.table;
+  let len = table.len();
+  if offset > len {
+    return Err(OFFSET_OUT_OF_RANGE.to_string());
+  }
+  // An offset inside a CRLF is the start of its break.
+  let inside_crlf = offset > 0 && offset < len && table.read(offset - 1, offset + 1)? == b"\r\n";
+  pos_chunked(table, offset - u64::from(inside_crlf), chunk)
+}
+/// Protocol error string of an offset past the end of the document.
+const OFFSET_OUT_OF_RANGE: &str = "offset-out-of-range";
+/// The line and UTF-16 column of global byte `offset`, read in chunks: a very
+/// long line is never read whole. An offset inside a CRLF gives the start of the
+/// break.
+#[tauri::command(async)]
+pub fn windowed_offset_pos(
+  state: State<WindowedState>,
+  session_id: u64,
+  offset: u64,
+) -> Result<Pos, String> {
+  offset_pos_core(&state, session_id, offset, SCAN_CHUNK)
+}
+/// Core of `windowed_pos_offset`.
+fn pos_offset_core(
+  state: &WindowedState,
+  session_id: u64,
+  pos: &Pos,
+  chunk: usize,
+) -> Result<u64, String> {
+  let map = state.lock_idle(session_id)?;
+  let session = map
+    .get(&session_id)
+    .ok_or_else(|| UNKNOWN_SESSION.to_string())?;
+  pos_to_offset_chunked(&session.table, pos, chunk)
+}
+/// The global byte offset of a line and UTF-16 column, read in chunks (see
+/// `locate_pos`).
+#[tauri::command(async)]
+pub fn windowed_pos_offset(
+  state: State<WindowedState>,
+  session_id: u64,
+  pos: Pos,
+) -> Result<u64, String> {
+  pos_offset_core(&state, session_id, &pos, SCAN_CHUNK)
+}
 /// Reads session content one chunk at a time. Each read takes the sessions lock
 /// for that chunk only and refuses once the content has changed since the scan
 /// began, so a hit with an older generation's offsets is never reported.
@@ -2199,6 +2776,7 @@ pub struct FindHit {
 }
 /// Byte offset of `line` / `col` (UTF-16 units, line break excluded). A column
 /// past the end of the line lands at its end.
+#[cfg(test)]
 fn pos_to_offset<O: OriginalSource>(
   table: &PieceTable<O>,
   line: u64,
@@ -2224,6 +2802,7 @@ fn pos_to_offset<O: OriginalSource>(
   Ok(start + text.len() as u64)
 }
 /// Line and UTF-16 column of byte `offset`.
+#[cfg(test)]
 fn offset_to_pos<O: OriginalSource>(table: &PieceTable<O>, offset: u64) -> Result<Pos, String> {
   if table.len() == 0 {
     return Ok(Pos { line: 0, col: 0 });
@@ -2272,7 +2851,8 @@ fn find_once(
     (
       session.generation,
       session.table.len(),
-      pos_to_offset(&session.table, line, col).map_err(FindFailure::Failed)?,
+      pos_to_offset_chunked(&session.table, &Pos { line, col }, chunk)
+        .map_err(FindFailure::Failed)?,
     )
   };
   let m = needle.len() as u64;
@@ -2334,8 +2914,8 @@ fn find_once(
     return Err(FindFailure::Stale);
   }
   Ok(Some(FindHit {
-    start: offset_to_pos(&session.table, offset).map_err(FindFailure::Failed)?,
-    end: offset_to_pos(&session.table, offset + m).map_err(FindFailure::Failed)?,
+    start: pos_chunked(&session.table, offset, chunk).map_err(FindFailure::Failed)?,
+    end: pos_chunked(&session.table, offset + m, chunk).map_err(FindFailure::Failed)?,
     start_offset: offset,
     end_offset: offset + m,
   }))
@@ -9258,7 +9838,8 @@ mod junction_tests {
     // Lines: `a\r`, `b\r\n`, `\n`, `c\n`, and a last one holding `d`.
     let s = open_at(&dir, b"a\rb\r\n\nc\nd", 4);
     let read = |from: u64, to: u64| {
-      let w = read_window_result(&s.table, from, to).unwrap();
+      let w =
+        read_window_result(&s.table, from, to, &WindowRequest::default(), SCAN_CHUNK).unwrap();
       (w.start_offset, w.end_offset, w.prev_lone_cr, w.next_is_lf)
     };
     // The start of the file has nothing before it; the end has nothing after.
@@ -9270,10 +9851,10 @@ mod junction_tests {
     assert_eq!(read(2, 3), (5, 6, false, false));
     assert_eq!(read(3, 5), (6, 9, false, false));
     let s = open_at(&dir, b"a\n\nb\r", 4);
-    let w = read_window_result(&s.table, 0, 1).unwrap();
+    let w = read_window_result(&s.table, 0, 1, &WindowRequest::default(), SCAN_CHUNK).unwrap();
     assert!(w.next_is_lf && !w.prev_lone_cr);
     // A file ending in a lone `\r`: the last window has nothing after it.
-    let w = read_window_result(&s.table, 2, 3).unwrap();
+    let w = read_window_result(&s.table, 2, 3, &WindowRequest::default(), SCAN_CHUNK).unwrap();
     assert_eq!((w.start_offset, w.end_offset), (3, 5));
     assert!(!w.next_is_lf && !w.prev_lone_cr);
   }
@@ -10299,6 +10880,8 @@ mod heavy_io_command_threading_tests {
     "windowed_release_replace",
     "windowed_offset_line",
     "windowed_end_pos",
+    "windowed_offset_pos",
+    "windowed_pos_offset",
     "windowed_replace_range",
     "windowed_enter",
     "windowed_indent_range",
@@ -10309,6 +10892,7 @@ mod heavy_io_command_threading_tests {
     "windowed_open_converted",
     "windowed_reopen_converted",
     "windowed_set_encoding",
+    "windowed_stats",
   ];
 
   #[test]
@@ -10354,6 +10938,8 @@ mod heavy_io_command_threading_tests {
       "fn release_replace_core",
       "fn offset_line_core",
       "fn end_pos_core",
+      "fn offset_pos_core",
+      "fn pos_offset_core",
       "fn find_once",
       "fn search_core",
       "fn replace_range_core",
@@ -11625,7 +12211,7 @@ mod range_tests {
   fn read_other(rig: &Rig) -> u64 {
     let map = rig.state.lock_idle(OTHER).unwrap();
     let session = map.get(&OTHER).unwrap();
-    read_window_result(&session.table, 0, 3)
+    read_window_result(&session.table, 0, 3, &WindowRequest::default(), SCAN_CHUNK)
       .unwrap()
       .total_bytes
   }
@@ -13344,6 +13930,1028 @@ mod range_tests {
       assert!(body.contains("reservation: Option<u64>"));
     }
   }
+  /// Windows that cut a long line: which line gets what, where the cuts fall,
+  /// and the two position commands.
+  mod line_cap {
+    use super::*;
+    const CAP: usize = LINE_CAP_BYTES as usize;
+    const BUDGET: usize = WINDOW_BUDGET_BYTES as usize;
+    const LONG: usize = CAP + CAP / 2;
+    /// Reads of the scan and of the unit count, and the checkpoint interval of
+    /// the opened file.
+    const READ_CHUNK: usize = 32 * 1024;
+    const BIG_INTERVAL: u64 = 64 * 1024;
+    fn at(line: u64, col: u64) -> Pos {
+      Pos { line, col }
+    }
+    /// Ascii text of `len` bytes that differs from line to line and from byte to
+    /// byte, so a misplaced cut shows.
+    fn filler(len: usize, seed: usize) -> Vec<u8> {
+      (0..len)
+        .map(|j| b'a' + ((j.wrapping_mul(2654435761) >> 7).wrapping_add(seed) % 26) as u8)
+        .collect()
+    }
+    /// Lines with their breaks, one after the other.
+    fn text_of(parts: &[(Vec<u8>, &str)]) -> Vec<u8> {
+      let mut out = Vec::new();
+      for (line, brk) in parts {
+        out.extend_from_slice(line);
+        out.extend_from_slice(brk.as_bytes());
+      }
+      out
+    }
+    /// `n` lines of `len` bytes, `\n` between them.
+    fn long_lines(n: usize, len: usize) -> Vec<u8> {
+      let parts: Vec<(Vec<u8>, &str)> = (0..n)
+        .map(|i| (filler(len, i), if i + 1 < n { "\n" } else { "" }))
+        .collect();
+      text_of(&parts)
+    }
+    /// A file and the session over it.
+    struct Big {
+      _dir: TempDir,
+      session: Session,
+      bytes: Vec<u8>,
+    }
+    impl Big {
+      fn new(bytes: Vec<u8>) -> Big {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("big.txt");
+        fs::write(&path, &bytes).unwrap();
+        let session = open_session(&path, BIG_INTERVAL);
+        Big {
+          _dir: dir,
+          session,
+          bytes,
+        }
+      }
+      /// The window, put back together and compared with the file.
+      fn read(&self, from: u64, to: u64, req: &WindowRequest) -> WindowResult {
+        let w = self.try_read(from, to, req).unwrap();
+        assert_window(&w, &self.bytes);
+        w
+      }
+      fn try_read(&self, from: u64, to: u64, req: &WindowRequest) -> Result<WindowResult, String> {
+        read_window_result(&self.session.table, from, to, req, READ_CHUNK)
+      }
+    }
+    /// Text and holes put back together give exactly the bytes of the window, and
+    /// every hole hides whole characters.
+    fn assert_window(w: &WindowResult, doc: &[u8]) {
+      let (start, end) = (w.start_offset as usize, w.end_offset as usize);
+      let hidden: usize = w.holes.iter().map(|h| h.bytes as usize).sum();
+      assert_eq!(
+        w.text.len() - 3 * w.holes.len() + hidden,
+        end - start,
+        "the invariant"
+      );
+      let text = w.text.as_bytes();
+      let next_line = |from: usize| {
+        let mut j = from;
+        while j < text.len() {
+          match text[j] {
+            b'\n' => return j + 1,
+            b'\r' if text.get(j + 1) == Some(&b'\n') => return j + 2,
+            b'\r' => return j + 1,
+            _ => j += 1,
+          }
+        }
+        j
+      };
+      let mut out: Vec<u8> = Vec::with_capacity(end - start);
+      let (mut copied, mut line, mut cursor, mut units) = (0usize, 0u64, 0usize, 0u64);
+      for h in &w.holes {
+        assert!(h.line >= line, "holes are in document order");
+        assert!(h.bytes > 0, "a hole hides at least one byte");
+        while line < h.line {
+          cursor = next_line(cursor);
+          line += 1;
+          units = 0;
+        }
+        while units < h.at {
+          let ch = w.text[cursor..].chars().next().unwrap();
+          cursor += ch.len_utf8();
+          units += ch.len_utf16() as u64;
+        }
+        assert_eq!(&text[cursor..cursor + 3], "\u{FFFC}".as_bytes());
+        out.extend_from_slice(&text[copied..cursor]);
+        let from = start + out.len();
+        let gone = &doc[from..from + h.bytes as usize];
+        let gone = std::str::from_utf8(gone).expect("a hole hides whole characters");
+        assert_eq!(gone.encode_utf16().count() as u64, h.units, "units");
+        out.extend_from_slice(gone.as_bytes());
+        cursor += 3;
+        units += 1;
+        copied = cursor;
+      }
+      out.extend_from_slice(&text[copied..]);
+      assert!(out == doc[start..end], "the window put back together");
+    }
+    /// The part of a line of `len` bytes a window holds, as byte offsets in its
+    /// content.
+    fn loaded(w: &WindowResult, line: u64, len: usize) -> (usize, usize) {
+      let holes: Vec<&Hole> = w.holes.iter().filter(|h| h.line == line).collect();
+      match holes[..] {
+        [] => (0, len),
+        [h] if h.bytes as usize == len => (0, 0),
+        [h] if h.at == 0 => (h.bytes as usize, len),
+        [h] => (0, len - h.bytes as usize),
+        [l, r] => (l.bytes as usize, len - r.bytes as usize),
+        _ => panic!("more than two holes on line {line}"),
+      }
+    }
+    fn all_loaded(w: &WindowResult, lens: &[usize]) -> Vec<(usize, usize)> {
+      (0..lens.len())
+        .map(|i| loaded(w, i as u64, lens[i]))
+        .collect()
+    }
+    fn holes_of(w: &WindowResult, line: u64) -> Vec<&Hole> {
+      w.holes.iter().filter(|h| h.line == line).collect()
+    }
+    fn lines_of(
+      focus: Option<usize>,
+      also: Option<usize>,
+      lead: Option<usize>,
+      view: Option<(usize, usize)>,
+    ) -> Lines {
+      Lines {
+        focus,
+        also,
+        lead,
+        view,
+      }
+    }
+    fn focused(line: u64, col: u64) -> WindowRequest {
+      WindowRequest {
+        focus: Some(at(line, col)),
+        ..Default::default()
+      }
+    }
+    fn viewing(first: u64, end: u64) -> WindowRequest {
+      WindowRequest {
+        view: Some([first, end]),
+        ..Default::default()
+      }
+    }
+    fn start_keep(line: u64, start: u64) -> Keep {
+      Keep {
+        line,
+        start: Some(start),
+        end: None,
+      }
+    }
+    fn end_keep(line: u64, end: u64) -> Keep {
+      Keep {
+        line,
+        start: None,
+        end: Some(end),
+      }
+    }
+    fn kept(keep: Vec<Keep>) -> WindowRequest {
+      WindowRequest {
+        keep,
+        ..Default::default()
+      }
+    }
+    /// The `keep` the frontend builds from a read: a line with only a right hole
+    /// is anchored at its start, with only a left hole at its end, with both at
+    /// the left hole's bytes.
+    fn keeps_from(w: &WindowResult, lens: &[usize]) -> Vec<Keep> {
+      let mut out = Vec::new();
+      for (i, &len) in lens.iter().enumerate() {
+        let holes = holes_of(w, i as u64);
+        let line = w.start_line + i as u64;
+        match holes[..] {
+          [] => {}
+          [h] if h.at == 0 && h.bytes as usize != len => out.push(end_keep(line, len as u64)),
+          [_] => out.push(start_keep(line, 0)),
+          [l, _] => out.push(start_keep(line, l.bytes)),
+          _ => {}
+        }
+      }
+      out
+    }
+    // --- priority and allocation (lengths only) ------------------------------
+    #[test]
+    fn lines_are_ranked_focus_also_lead_view_then_the_rest() {
+      let l = lines_of(Some(6), Some(2), Some(9), Some((4, 8)));
+      assert_eq!(
+        priority_order(12, &l),
+        vec![6, 2, 9, 7, 5, 4, 8, 3, 10, 11, 1, 0]
+      );
+    }
+    #[test]
+    fn the_centre_is_the_focus_line_else_also_else_the_middle_of_the_view_else_the_first() {
+      assert_eq!(lines_of(Some(3), Some(5), None, Some((0, 9))).centre(), 3);
+      assert_eq!(lines_of(None, Some(5), None, Some((0, 9))).centre(), 5);
+      assert_eq!(lines_of(None, None, Some(7), Some((2, 7))).centre(), 4);
+      assert_eq!(lines_of(None, None, None, Some((3, 5))).centre(), 3);
+      assert_eq!(lines_of(None, None, Some(7), None).centre(), 0);
+      let also = lines_of(None, Some(5), None, None);
+      assert_eq!(priority_order(8, &also), vec![5, 6, 4, 7, 3, 2, 1, 0]);
+      let view = lines_of(None, None, None, Some((2, 7)));
+      assert_eq!(priority_order(9, &view), vec![4, 5, 3, 6, 2, 7, 1, 8, 0]);
+      let lead = lines_of(None, None, Some(3), None);
+      assert_eq!(priority_order(5, &lead), vec![3, 0, 1, 2, 4]);
+      assert_eq!(priority_order(4, &Lines::default()), vec![0, 1, 2, 3]);
+    }
+    #[test]
+    fn a_line_gets_the_line_cap_and_the_rest_of_the_budget() {
+      let lens = vec![3 * CAP as u64; 4];
+      let got = allocate(&lens, &Lines::default());
+      assert_eq!(got, vec![LINE_CAP_BYTES, LINE_CAP_BYTES, 0, 0]);
+      assert_eq!(allocate(&[0, 7, 0], &Lines::default()), vec![0, 7, 0]);
+    }
+    #[test]
+    fn the_focus_line_does_not_draw_on_the_budget() {
+      let lens = vec![3 * CAP as u64; 4];
+      let got = allocate(&lens, &lines_of(Some(2), None, None, None));
+      assert_eq!(got, vec![0, LINE_CAP_BYTES, LINE_CAP_BYTES, LINE_CAP_BYTES]);
+    }
+    #[test]
+    fn also_is_given_its_share_before_view_lines_that_come_first_in_the_text() {
+      // Four view lines of 1 MiB, the focus line after them, `also` further on.
+      let lens = vec![LINE_CAP_BYTES; 9];
+      let l = lines_of(Some(4), Some(8), None, Some((0, 4)));
+      let got = allocate(&lens, &l);
+      let mut want = vec![0; 9];
+      want[4] = LINE_CAP_BYTES;
+      want[8] = LINE_CAP_BYTES;
+      want[3] = LINE_CAP_BYTES;
+      assert_eq!(got, want);
+    }
+    #[test]
+    fn focus_and_also_leave_the_short_lines_between_them_whole() {
+      let mut lens = vec![LONG as u64];
+      lens.extend([10, 10, 10, 10]);
+      lens.push(LONG as u64);
+      let got = allocate(&lens, &lines_of(Some(0), Some(5), None, None));
+      assert_eq!(got, vec![LINE_CAP_BYTES, 10, 10, 10, 10, LINE_CAP_BYTES]);
+    }
+    // --- where a segment lies (pure) -------------------------------------------
+    #[test]
+    fn a_segment_is_placed_around_a_byte_or_at_an_end_and_kept_inside_the_line() {
+      let (len, a) = (3 * LINE_CAP_BYTES, LINE_CAP_BYTES);
+      let cut = |p| raw_cuts(len, a, p);
+      assert_eq!(cut(Place::Centre(len / 2)), (len / 2 - a / 2, None));
+      assert_eq!(cut(Place::Centre(10)), (0, None));
+      assert_eq!(cut(Place::Centre(len - 10)), (len - a, Some(len)));
+      assert_eq!(cut(Place::Start(0)), (0, None));
+      assert_eq!(cut(Place::Start(1000)), (1000, None));
+      assert_eq!(cut(Place::Start(len - 10)), (len - a, Some(len)));
+      assert_eq!(cut(Place::Start(u64::MAX)), (len - a, Some(len)));
+      assert_eq!(cut(Place::End(5)), (0, None));
+      assert_eq!(cut(Place::End(a)), (0, Some(a)));
+      assert_eq!(cut(Place::End(2 * a)), (a, Some(2 * a)));
+      assert_eq!(cut(Place::End(u64::MAX)), (len - a, Some(len)));
+      // Two ends: around their middle, and never so far that the later one falls
+      // out when the left cut moves down by 3 bytes.
+      assert_eq!(cut(Place::Span(1000, 1010)), (0, None));
+      assert_eq!(cut(Place::Span(1_000_000, 1_000_010)), (475_717, None));
+      let (lo, hi) = (1_000_004, 1_000_004 + a - 3);
+      let (left, right) = cut(Place::Span(lo, hi));
+      assert!(left <= lo && right.is_none() && left + a - 3 >= hi);
+    }
+    // --- reads that cut -------------------------------------------------------
+    #[test]
+    fn the_focus_line_is_loaded_first_and_the_others_by_distance() {
+      let big = Big::new(long_lines(5, LONG));
+      let w = big.read(0, 5, &focused(3, 700_000));
+      let lens = [LONG; 5];
+      assert_eq!(
+        all_loaded(&w, &lens),
+        vec![
+          (0, 0),
+          (0, 0),
+          (LONG - CAP, LONG),
+          (700_000 - CAP / 2, 700_000 + CAP / 2),
+          (0, CAP),
+        ]
+      );
+      let budget: Vec<(u64, bool)> = w.holes.iter().map(|h| (h.line, h.budget)).collect();
+      assert_eq!(
+        budget,
+        vec![
+          (0, true),
+          (1, true),
+          (2, false),
+          (3, false),
+          (3, false),
+          (4, false)
+        ]
+      );
+      assert!(w.holes.iter().all(|h| !h.in_view));
+    }
+    #[test]
+    fn also_alone_leads_the_others_and_lead_follows_it() {
+      let big = Big::new(long_lines(5, LONG));
+      let lens = [LONG; 5];
+      let also = WindowRequest {
+        also: Some(at(1, 100)),
+        ..Default::default()
+      };
+      let w = big.read(0, 5, &also);
+      assert_eq!(
+        all_loaded(&w, &lens),
+        vec![(0, 0), (0, CAP), (0, CAP), (0, 0), (0, 0)]
+      );
+      let lead = WindowRequest {
+        lead: Some(4),
+        ..Default::default()
+      };
+      let w = big.read(0, 5, &lead);
+      assert_eq!(
+        all_loaded(&w, &lens),
+        vec![(0, CAP), (0, 0), (0, 0), (0, 0), (0, CAP)]
+      );
+    }
+    #[test]
+    fn view_only_and_no_request_rank_around_the_view_or_the_first_line() {
+      let big = Big::new(long_lines(5, LONG));
+      let lens = [LONG; 5];
+      let w = big.read(0, 5, &viewing(2, 4));
+      assert_eq!(
+        all_loaded(&w, &lens),
+        vec![(0, 0), (0, 0), (0, CAP), (0, CAP), (0, 0)]
+      );
+      let flags: Vec<(u64, bool, bool)> = w
+        .holes
+        .iter()
+        .map(|h| (h.line, h.budget, h.in_view))
+        .collect();
+      assert_eq!(
+        flags,
+        vec![
+          (0, true, false),
+          (1, true, false),
+          (2, false, true),
+          (3, false, true),
+          (4, true, false)
+        ]
+      );
+      let w = big.read(0, 5, &WindowRequest::default());
+      assert_eq!(
+        all_loaded(&w, &lens),
+        vec![(0, CAP), (0, CAP), (0, 0), (0, 0), (0, 0)]
+      );
+    }
+    #[test]
+    fn lines_outside_the_window_and_unusable_views_are_ignored() {
+      let big = Big::new(long_lines(5, LONG));
+      let plain = big.read(1, 3, &WindowRequest::default());
+      let outside = WindowRequest {
+        focus: Some(at(0, 5)),
+        also: Some(at(4, 5)),
+        lead: Some(9),
+        ..Default::default()
+      };
+      assert_eq!(big.read(1, 3, &outside), plain);
+      for view in [[0, 0], [5, 2], [10, 20], [0, 1], [3, 3]] {
+        assert_eq!(
+          big.read(1, 3, &viewing(view[0], view[1])),
+          plain,
+          "{view:?}"
+        );
+      }
+      // Partly outside: the part inside, and its middle line.
+      assert_eq!(
+        big.read(1, 3, &viewing(2, 10)),
+        big.read(1, 3, &viewing(2, 3))
+      );
+      assert_eq!(
+        big.read(1, 5, &viewing(0, 10)),
+        big.read(1, 5, &viewing(1, 5))
+      );
+      assert_eq!(
+        big.read(1, 5, &viewing(0, u64::MAX)),
+        big.read(1, 5, &viewing(1, 5))
+      );
+      let w = big.read(1, 5, &viewing(0, 10));
+      assert!(w.holes.iter().any(|h| h.in_view));
+    }
+    #[test]
+    fn the_budget_goes_to_focus_and_also_before_the_short_lines_between_them() {
+      let mut parts = vec![(filler(LONG, 1), "\n")];
+      for i in 0..4 {
+        parts.push((filler(10, i + 2), "\n"));
+      }
+      parts.push((filler(LONG, 7), ""));
+      let big = Big::new(text_of(&parts));
+      let req = WindowRequest {
+        focus: Some(at(0, 0)),
+        also: Some(at(5, 50)),
+        ..Default::default()
+      };
+      let w = big.read(0, 6, &req);
+      let lens = [LONG, 10, 10, 10, 10, LONG];
+      assert_eq!(
+        all_loaded(&w, &lens),
+        vec![(0, CAP), (0, 10), (0, 10), (0, 10), (0, 10), (0, CAP)]
+      );
+      assert!(w.holes.iter().all(|h| !h.budget));
+    }
+    // --- placement --------------------------------------------------------------
+    #[test]
+    fn the_focus_segment_is_centred_and_shifts_when_the_line_ends_sooner() {
+      let big = Big::new(filler(3_000_000, 1));
+      let loaded_at = |col| loaded(&big.read(0, 1, &focused(0, col)), 0, 3_000_000);
+      assert_eq!(
+        loaded_at(1_500_000),
+        (1_500_000 - CAP / 2, 1_500_000 + CAP / 2)
+      );
+      assert_eq!(loaded_at(10), (0, CAP));
+      assert_eq!(loaded_at(2_999_990), (3_000_000 - CAP, 3_000_000));
+      // A column past the line end is its end.
+      assert_eq!(loaded_at(u64::MAX), (3_000_000 - CAP, 3_000_000));
+    }
+    #[test]
+    fn also_on_the_focus_line_is_kept_inside_when_the_allocation_less_3_allows() {
+      let big = Big::new(filler(3_000_000, 1));
+      let read = |focus, also| {
+        let req = WindowRequest {
+          focus: Some(at(0, focus)),
+          also: Some(at(0, also)),
+          ..Default::default()
+        };
+        loaded(&big.read(0, 1, &req), 0, 3_000_000)
+      };
+      let span = (CAP - 3) as u64;
+      assert_eq!(read(1_000_000, 1_000_000 + span), (1_000_000, 2_048_576));
+      assert_eq!(read(1_000_000 + span, 1_000_000), (1_000_000, 2_048_576));
+      // One byte further apart: around the focus byte.
+      let far = read(1_000_000, 1_000_000 + span + 1);
+      assert_eq!(far, (1_000_000 - CAP / 2, 1_000_000 + CAP / 2));
+      // Close together: around their middle.
+      assert_eq!(
+        read(1_000_000, 1_000_010),
+        (1_000_005 - CAP / 2, 1_000_005 + CAP / 2)
+      );
+    }
+    #[test]
+    fn the_later_end_stays_inside_when_the_left_cut_moves_down_over_a_character() {
+      // A four-byte character ends at `lo`; the cut would land inside it.
+      let mut bytes = vec![b'x'; 1_000_000];
+      bytes.extend_from_slice("😀".as_bytes());
+      bytes.extend(vec![b'y'; 2_000_000]);
+      let big = Big::new(bytes);
+      let len = 3_000_004;
+      let (lo_col, hi_col) = (1_000_002u64, 1_000_002 + (CAP - 3) as u64);
+      let req = WindowRequest {
+        focus: Some(at(0, lo_col)),
+        also: Some(at(0, hi_col)),
+        ..Default::default()
+      };
+      let (from, to) = loaded(&big.read(0, 1, &req), 0, len);
+      assert!(
+        from <= 1_000_004 && to >= 1_000_004 + CAP - 3,
+        "{from} {to}"
+      );
+    }
+    #[test]
+    fn a_start_or_end_anchored_keep_places_the_segment_and_shifts_it_into_the_line() {
+      let len = 3_000_000;
+      let big = Big::new(filler(len, 1));
+      let read = |keep: Vec<Keep>| loaded(&big.read(0, 1, &kept(keep)), 0, len);
+      assert_eq!(read(vec![start_keep(0, 1000)]), (1000, 1000 + CAP));
+      assert_eq!(
+        read(vec![end_keep(0, 2_000_000)]),
+        (2_000_000 - CAP, 2_000_000)
+      );
+      assert_eq!(read(vec![start_keep(0, 2_999_990)]), (len - CAP, len));
+      assert_eq!(read(vec![end_keep(0, 5)]), (0, CAP));
+      assert_eq!(read(vec![start_keep(0, u64::MAX)]), (len - CAP, len));
+      assert_eq!(read(vec![end_keep(0, u64::MAX)]), (len - CAP, len));
+      // The last entry for a line wins.
+      assert_eq!(
+        read(vec![start_keep(0, 1000), end_keep(0, 2_000_000)]),
+        (2_000_000 - CAP, 2_000_000)
+      );
+      assert_eq!(
+        read(vec![end_keep(0, 2_000_000), start_keep(0, 1000)]),
+        (1000, 1000 + CAP)
+      );
+    }
+    #[test]
+    fn keep_is_not_applied_to_the_focus_line_or_the_line_of_also() {
+      let big = Big::new(long_lines(4, LONG));
+      let lens = [LONG; 4];
+      let (f, a) = (800_000u64, 700_000u64);
+      let focus_only = WindowRequest {
+        focus: Some(at(1, f)),
+        keep: vec![start_keep(1, 0), end_keep(1, LONG as u64)],
+        ..Default::default()
+      };
+      let w = big.read(0, 4, &focus_only);
+      let (from, to) = loaded(&w, 1, lens[1]);
+      let f = f as usize;
+      assert!(
+        f - from >= CAP / 2 - 3 && to - f >= CAP / 2 - 3,
+        "{from} {to}"
+      );
+      let plain = WindowRequest {
+        focus: Some(at(1, f as u64)),
+        ..Default::default()
+      };
+      assert_eq!(w, big.read(0, 4, &plain));
+      let with_also = WindowRequest {
+        focus: Some(at(0, 0)),
+        also: Some(at(3, a)),
+        keep: vec![end_keep(3, LONG as u64), start_keep(3, 0)],
+        ..Default::default()
+      };
+      let w = big.read(0, 4, &with_also);
+      let a = a as usize;
+      assert_eq!(loaded(&w, 3, lens[3]), (a - CAP / 2, a + CAP / 2));
+    }
+    #[test]
+    fn keep_for_a_line_outside_the_window_is_ignored() {
+      let big = Big::new(long_lines(5, LONG));
+      let plain = big.read(1, 3, &WindowRequest::default());
+      let outside = kept(vec![start_keep(0, 5), end_keep(4, 9), start_keep(1000, 0)]);
+      assert_eq!(big.read(1, 3, &outside), plain);
+    }
+    #[test]
+    fn a_keep_that_sets_neither_or_both_ends_is_refused_first() {
+      let big = Big::new(long_lines(3, LONG));
+      let neither = Keep {
+        line: 0,
+        start: None,
+        end: None,
+      };
+      let both = Keep {
+        line: 1,
+        start: Some(0),
+        end: Some(5),
+      };
+      for keep in [neither, both] {
+        let req = kept(vec![keep]);
+        for (from, to) in [(0, 3), (1, 2), (3, 3), (9, 9)] {
+          assert_eq!(
+            big.try_read(from, to, &req),
+            Err("bad-keep".to_string()),
+            "{from} {to}"
+          );
+        }
+      }
+      // An entry for a line outside the window counts too.
+      let outside = kept(vec![start_keep(0, 0), neither]);
+      assert_eq!(big.try_read(1, 2, &outside), Err("bad-keep".to_string()));
+    }
+    #[test]
+    fn a_read_with_the_keep_built_from_a_previous_result_is_the_same_text() {
+      let bytes = text_of(&[(filler(LONG, 1), "\n"), (filler(3_000_000, 2), "")]);
+      let big = Big::new(bytes);
+      let lens = [LONG, 3_000_000];
+      let first = big.read(0, 2, &focused(1, 1_500_000));
+      assert_eq!(holes_of(&first, 0).len(), 1);
+      assert_eq!(holes_of(&first, 1).len(), 2);
+      let keep = keeps_from(&first, &lens);
+      // Unfocused, the screen on the focus line: the budget holds both.
+      let again = WindowRequest {
+        view: Some([1, 2]),
+        keep: keep.clone(),
+        ..Default::default()
+      };
+      let second = big.read(0, 2, &again);
+      assert_eq!(second.text, first.text);
+      let shape = |w: &WindowResult| -> Vec<(u64, u64, u64, u64)> {
+        w.holes
+          .iter()
+          .map(|h| (h.line, h.at, h.bytes, h.units))
+          .collect()
+      };
+      assert_eq!(shape(&second), shape(&first));
+      // Focused again, the same keep for the other lines.
+      let same_focus = WindowRequest {
+        focus: Some(at(1, 1_500_000)),
+        keep,
+        ..Default::default()
+      };
+      assert_eq!(big.read(0, 2, &same_focus), first);
+    }
+    #[test]
+    fn a_keep_built_from_a_result_with_wide_characters_is_the_same_text() {
+      for (ch, per_col) in [("é", 1u64), ("日", 1), ("😀", 2)] {
+        let width = ch.len();
+        for k in 0..width {
+          let mut line = vec![b'x'; k];
+          line.extend(ch.repeat(2_000_000 / width).into_bytes());
+          let len = line.len();
+          let big = Big::new(text_of(&[(line, "\n"), (filler(LONG, 4), "")]));
+          let lens = [len, LONG];
+          let col = k as u64 + per_col * 400_000;
+          let first = big.read(0, 2, &focused(0, col));
+          let keep = keeps_from(&first, &lens);
+          let again = WindowRequest {
+            view: Some([0, 1]),
+            keep,
+            ..Default::default()
+          };
+          assert_eq!(big.read(0, 2, &again).text, first.text, "{ch} {k}");
+        }
+      }
+    }
+    // --- cut points and holes --------------------------------------------------
+    /// `at` moved down to the start of its character, written out plainly.
+    fn start_of_char(line: &[u8], mut at: usize) -> usize {
+      while at < line.len() && (0x80..0xC0).contains(&line[at]) {
+        at -= 1;
+      }
+      at
+    }
+    #[test]
+    fn cuts_land_on_character_boundaries_at_both_ends_for_two_three_and_four_bytes() {
+      for (ch, per_col) in [("é", 1u64), ("日", 1), ("😀", 2)] {
+        let width = ch.len();
+        for k in 0..width {
+          let mut line = vec![b'x'; k];
+          line.extend(ch.repeat(2_500_000 / width).into_bytes());
+          let len = line.len();
+          let tail = filler(20, 9);
+          let big = Big::new(text_of(&[(line.clone(), "\n"), (tail, "")]));
+          // The start part: the right cut is `CAP`, moved down.
+          let w = big.read(0, 2, &WindowRequest::default());
+          let right = start_of_char(&line, CAP);
+          assert_eq!(loaded(&w, 0, len), (0, right), "start part {ch} {k}");
+          // The end part (before the focus line): the left cut is `len - CAP`.
+          let w = big.read(0, 2, &focused(1, 0));
+          let left = start_of_char(&line, len - CAP);
+          assert_eq!(loaded(&w, 0, len), (left, len), "end part {ch} {k}");
+          // Around the focus: the left cut moved down, then `CAP` further.
+          let f = k + width * 300_000;
+          let col = k as u64 + per_col * 300_000;
+          let w = big.read(0, 2, &focused(0, col));
+          let from = start_of_char(&line, f - CAP / 2);
+          let to = start_of_char(&line, from + CAP);
+          assert_eq!(loaded(&w, 0, len), (from, to), "centred {ch} {k}");
+          // Near the end the segment reaches it, with no sliver hidden after it.
+          let col = k as u64 + per_col * (len - k) as u64 / width as u64 - 20;
+          let w = big.read(0, 2, &focused(0, col));
+          let left = start_of_char(&line, len - CAP);
+          assert_eq!(loaded(&w, 0, len), (left, len), "near the end {ch} {k}");
+        }
+      }
+    }
+    #[test]
+    fn a_line_of_exactly_the_line_cap_is_whole_and_one_byte_more_has_a_hole() {
+      for brk in ["\n", "\r\n"] {
+        let whole = text_of(&[(filler(CAP, 1), brk), (b"end".to_vec(), "")]);
+        let big = Big::new(whole);
+        let w = big.read(0, 2, &WindowRequest::default());
+        assert!(w.holes.is_empty(), "{brk:?}");
+        assert_eq!(w.text.len(), CAP + brk.len() + 3);
+        let more = text_of(&[(filler(CAP + 1, 1), brk), (b"end".to_vec(), "")]);
+        let big = Big::new(more);
+        let w = big.read(0, 2, &WindowRequest::default());
+        let hole = Hole {
+          line: 0,
+          at: CAP as u64,
+          bytes: 1,
+          units: 1,
+          budget: false,
+          in_view: false,
+        };
+        assert_eq!(w.holes, vec![hole], "{brk:?}");
+        assert!(w.text.ends_with(&format!("\u{FFFC}{brk}end")));
+      }
+    }
+    #[test]
+    fn no_hole_hides_zero_bytes() {
+      // An empty line past the budget stays whole.
+      let mut parts: Vec<(Vec<u8>, &str)> = (0..3).map(|i| (filler(LONG, i), "\n")).collect();
+      parts.push((Vec::new(), "\n"));
+      parts.push((b"tail".to_vec(), ""));
+      let big = Big::new(text_of(&parts));
+      let w = big.read(0, 5, &WindowRequest::default());
+      assert!(holes_of(&w, 3).is_empty());
+      assert_eq!(holes_of(&w, 4).len(), 1);
+      // A left cut inside the first character: nothing left to hide.
+      let mut first = "😀".as_bytes().to_vec();
+      first.extend(vec![b'x'; CAP - 3]);
+      let big = Big::new(text_of(&[(first, "\n"), (b"z".to_vec(), "")]));
+      let w = big.read(0, 2, &focused(1, 0));
+      assert!(w.holes.is_empty());
+      assert_eq!(w, read_window_whole(&big.session.table, 0, 2).unwrap());
+      // A remainder of the budget of 1 to 3 bytes that aligns away: the line is
+      // one hole.
+      for r in 1..=3usize {
+        let parts = [
+          (filler(CAP, 1), "\n"),
+          (filler(CAP - r, 2), "\n"),
+          ("😀".repeat(250).into_bytes(), ""),
+        ];
+        let big = Big::new(text_of(&parts));
+        let w = big.read(0, 3, &WindowRequest::default());
+        let holes = holes_of(&w, 2);
+        assert_eq!(holes.len(), 1, "{r}");
+        assert_eq!(
+          (holes[0].at, holes[0].bytes, holes[0].units),
+          (0, 1000, 500)
+        );
+        assert!(holes[0].budget);
+        // The same with a kept start inside the line: still one hole.
+        let w = big.read(0, 3, &kept(vec![start_keep(2, 400)]));
+        let holes = holes_of(&w, 2);
+        assert_eq!(holes.len(), 1, "{r} kept");
+        assert_eq!((holes[0].at, holes[0].bytes), (0, 1000));
+      }
+    }
+    #[test]
+    fn the_last_line_without_a_break_an_empty_last_line_and_lone_crs_are_read_right() {
+      let parts = [
+        (filler(1_100_000, 1), "\r"),
+        (filler(1_100_000, 2), "\r\n"),
+        (Vec::new(), "\n"),
+        (filler(1_100_000, 3), "\n"),
+        (filler(1_100_000, 4), ""),
+      ];
+      let big = Big::new(text_of(&parts));
+      let lens = [1_100_000, 1_100_000, 0, 1_100_000, 1_100_000];
+      let w = big.read(0, 5, &focused(4, 5));
+      assert_eq!(
+        all_loaded(&w, &lens),
+        vec![
+          (0, 0),
+          (1_100_000 - CAP, 1_100_000),
+          (0, 0),
+          (1_100_000 - CAP, 1_100_000),
+          (0, CAP)
+        ]
+      );
+      assert!(holes_of(&w, 2).is_empty());
+      // The neighbour flags and offsets are those of a whole read.
+      let requests = [WindowRequest::default(), focused(4, 5)];
+      for req in &requests {
+        for from in 0..=5u64 {
+          for to in from..=5 {
+            let w = big.read(from, to, req);
+            let whole = read_window_whole(&big.session.table, from, to).unwrap();
+            let flags = |w: &WindowResult| {
+              (
+                w.start_offset,
+                w.end_offset,
+                w.start_line,
+                w.total_lines,
+                w.total_bytes,
+                w.prev_lone_cr,
+                w.next_is_lf,
+              )
+            };
+            assert_eq!(flags(&w), flags(&whole), "{from} {to}");
+          }
+        }
+      }
+      let w = big.read(1, 2, &WindowRequest::default());
+      assert!(w.prev_lone_cr && w.next_is_lf);
+      // An empty last line, and the empty byte range that holds it.
+      for end in ["\n", "\r"] {
+        let big = Big::new(text_of(&[(filler(1_100_000, 1), end)]));
+        let w = big.read(0, 2, &WindowRequest::default());
+        assert_eq!(holes_of(&w, 0).len(), 1);
+        assert!(w.text.ends_with(&format!("\u{FFFC}{end}")));
+        let w = big.read(1, 2, &WindowRequest::default());
+        assert_eq!((w.text.as_str(), w.holes.len()), ("", 0));
+        assert_eq!(w.start_offset, w.end_offset);
+        assert_eq!(w.total_lines, 2);
+      }
+    }
+    #[test]
+    fn units_are_counted_in_small_reads_that_cut_characters() {
+      let mut line = "日😀é".repeat(300_000).into_bytes();
+      line.extend(filler(10, 1));
+      let big = Big::new(line);
+      let flat = std::str::from_utf8(&big.bytes)
+        .unwrap()
+        .encode_utf16()
+        .count() as u64;
+      for chunk in [4093usize, 65_537] {
+        let req = focused(0, 600_000);
+        let w = read_window_result(&big.session.table, 0, 1, &req, chunk).unwrap();
+        assert_window(&w, &big.bytes);
+        assert_eq!(w.holes.len(), 2);
+        let hidden: u64 = w.holes.iter().map(|h| h.units).sum();
+        let shown = w.text.encode_utf16().count() as u64 - 2;
+        assert_eq!(hidden + shown, flat, "{chunk}");
+      }
+    }
+    #[test]
+    fn a_window_that_cuts_stays_within_its_bounds() {
+      let parts = [
+        (filler(3 * CAP, 1), "\n"),
+        (filler(CAP, 2), "\n"),
+        (filler(5000, 3), "\r\n"),
+        (filler(3 * CAP, 4), "\n"),
+        (filler(CAP + 7, 5), ""),
+      ];
+      let big = Big::new(text_of(&parts));
+      for req in [focused(3, 700_000), WindowRequest::default(), viewing(1, 3)] {
+        let w = big.read(0, 5, &req);
+        let longest = w.text.split(['\n', '\r']).map(str::len).max().unwrap();
+        assert!(longest <= CAP + 3 + 6, "{longest}");
+        let most = BUDGET + CAP + 5 * 3 + 3 * w.holes.len() + 5 * 2;
+        assert!(w.text.len() <= most, "{}", w.text.len());
+      }
+    }
+    #[test]
+    fn reads_are_bounded_by_the_chunk_the_line_cap_and_the_checkpoint_interval() {
+      let parts = [
+        (filler(3 * CAP, 1), "\n"),
+        (filler(2 * CAP, 2), "\n"),
+        (filler(500, 3), "\n"),
+        (filler(3 * CAP, 4), ""),
+      ];
+      let big = Big::new(text_of(&parts));
+      let bound = READ_CHUNK.max(CAP + 3 + 2).max(BIG_INTERVAL as usize + 1);
+      // Whole lines that follow each other are read in pieces of the same bound.
+      let run = [
+        (filler(690_000, 1), "\n"),
+        (filler(690_000, 2), "\n"),
+        (filler(690_000, 3), "\n"),
+        (filler(100, 4), ""),
+      ];
+      let big_run = Big::new(text_of(&run));
+      stats::reset();
+      let w = big_run.read(0, 4, &WindowRequest::default());
+      assert!(w.holes.is_empty());
+      let seen = stats::get().max_read;
+      assert!(seen <= bound && seen > READ_CHUNK, "largest read {seen}");
+      for req in [
+        focused(3, 1_000_000),
+        WindowRequest::default(),
+        WindowRequest {
+          focus: Some(at(0, 1_700_000)),
+          also: Some(at(3, 1_000)),
+          view: Some([1, 3]),
+          keep: vec![start_keep(1, 7)],
+          ..Default::default()
+        },
+      ] {
+        stats::reset();
+        let w = big.read(0, 4, &req);
+        assert!(!w.holes.is_empty());
+        let seen = stats::get().max_read;
+        // `read` also checks the window against the file, which reads nothing.
+        assert!(seen <= bound, "largest read {seen}, bound {bound}");
+        assert!(seen > READ_CHUNK, "the cap is what the test exercises");
+      }
+    }
+    // --- nothing cut --------------------------------------------------------------
+    #[test]
+    fn a_window_that_cuts_nothing_equals_the_whole_read() {
+      let mut docs: Vec<Vec<u8>> = vec![MIXED.as_bytes().to_vec()];
+      let alphabet = ["a", "\r", "\n", "日"];
+      let mut level: Vec<String> = vec![String::new()];
+      for _ in 0..4 {
+        let mut next = Vec::new();
+        for s in &level {
+          for c in alphabet {
+            next.push(format!("{s}{c}"));
+          }
+        }
+        docs.extend(next.iter().map(|s| s.as_bytes().to_vec()));
+        level = next;
+      }
+      docs.push(Vec::new());
+      let dir = tempdir().unwrap();
+      for (n, bytes) in docs.iter().enumerate() {
+        let path = dir.path().join(format!("d{n}.txt"));
+        fs::write(&path, bytes).unwrap();
+        let s = open_session(&path, 4);
+        let lines = s.table.line_count();
+        for chunk in [1usize, 3, 64] {
+          for from in 0..lines + 2 {
+            for to in from..lines + 3 {
+              let whole = read_window_whole(&s.table, from, to).unwrap();
+              let busy = WindowRequest {
+                focus: Some(at(from + 1, 3)),
+                also: Some(at(to, 0)),
+                lead: Some(from),
+                view: Some([from, to + 1]),
+                keep: vec![start_keep(from, 2), end_keep(to, 9)],
+              };
+              for req in [&WindowRequest::default(), &busy] {
+                let got = read_window_result(&s.table, from, to, req, chunk).unwrap();
+                assert_eq!(got, whole, "doc {bytes:?} window {from} {to} chunk {chunk}");
+              }
+            }
+          }
+        }
+      }
+    }
+    #[test]
+    fn the_request_and_the_hole_use_the_names_the_frontend_sends_and_reads() {
+      let keep: Keep = serde_json::from_str(r#"{"line":3,"start":5}"#).unwrap();
+      assert_eq!((keep.line, keep.start, keep.end), (3, Some(5), None));
+      let keep: Keep = serde_json::from_str(r#"{"line":3,"end":9}"#).unwrap();
+      assert_eq!((keep.start, keep.end), (None, Some(9)));
+      let hole = Hole {
+        line: 1,
+        at: 2,
+        bytes: 3,
+        units: 4,
+        budget: true,
+        in_view: false,
+      };
+      assert_eq!(
+        serde_json::to_value(&hole).unwrap(),
+        serde_json::json!({
+          "line": 1, "at": 2, "bytes": 3, "units": 4, "budget": true, "in_view": false
+        })
+      );
+    }
+    #[test]
+    fn a_scan_that_does_not_end_at_a_line_start_is_an_error_not_a_panic() {
+      let big = Big::new(b"a\nb\nc".to_vec());
+      let spans = scan_lines(&big.session.table, 0, 4, false, 2).unwrap();
+      assert_eq!(spans.len(), 2);
+      assert_eq!(
+        scan_lines(&big.session.table, 0, 3, false, 2),
+        Err("line-count-mismatch".to_string())
+      );
+    }
+    // --- the position commands ------------------------------------------------------
+    #[test]
+    fn the_position_commands_agree_with_the_whole_line_conversions() {
+      let rig = Rig::new(MIXED.as_bytes(), 1 << 20);
+      let bytes = MIXED.as_bytes();
+      let (lines, want_end) = rig.with(|s| (s.table.line_count(), s.table.len()));
+      assert_eq!(want_end as usize, bytes.len());
+      for chunk in [1usize, 2, 5, 1000] {
+        for offset in 0..=bytes.len() {
+          let inside_char = bytes.get(offset).is_some_and(|b| (0x80..0xC0).contains(b));
+          if inside_char {
+            continue;
+          }
+          let inside_crlf =
+            offset > 0 && bytes[offset - 1] == b'\r' && bytes.get(offset) == Some(&b'\n');
+          let flat = rig.with(|s| {
+            let shown = offset - usize::from(inside_crlf);
+            offset_to_pos(&s.table, shown as u64).unwrap()
+          });
+          let got = offset_pos_core(&rig.state, ID, offset as u64, chunk).unwrap();
+          assert_eq!(got, flat, "chunk {chunk} offset {offset}");
+        }
+        for line in 0..lines + 2 {
+          for col in 0..14 {
+            let flat = rig.with(|s| pos_to_offset(&s.table, line, col).unwrap());
+            let got = pos_offset_core(&rig.state, ID, &at(line, col), chunk).unwrap();
+            assert_eq!(got, flat, "chunk {chunk} line {line} col {col}");
+          }
+        }
+      }
+    }
+    #[test]
+    fn an_offset_past_the_end_is_refused_and_an_empty_document_has_one_position() {
+      let rig = Rig::new(b"ab\r\ncd", 1 << 20);
+      assert_eq!(
+        offset_pos_core(&rig.state, ID, 7, 4),
+        Err("offset-out-of-range".to_string())
+      );
+      assert_eq!(offset_pos_core(&rig.state, ID, 6, 4).unwrap(), at(1, 2));
+      let empty = Rig::new(b"", 1 << 20);
+      assert_eq!(offset_pos_core(&empty.state, ID, 0, 4).unwrap(), at(0, 0));
+      assert_eq!(
+        offset_pos_core(&empty.state, ID, 1, 4),
+        Err("offset-out-of-range".to_string())
+      );
+      assert_eq!(pos_offset_core(&empty.state, ID, &at(3, 3), 4).unwrap(), 0);
+      assert_eq!(
+        offset_pos_core(&rig.state, OTHER, 0, 4),
+        Err("unknown-session".to_string())
+      );
+    }
+    #[test]
+    fn an_offset_inside_a_crlf_is_the_start_of_its_break() {
+      let rig = Rig::new(b"ab\r\ncd\r\n", 1 << 20);
+      assert_eq!(offset_pos_core(&rig.state, ID, 2, 4).unwrap(), at(0, 2));
+      assert_eq!(offset_pos_core(&rig.state, ID, 3, 4).unwrap(), at(0, 2));
+      assert_eq!(offset_pos_core(&rig.state, ID, 4, 4).unwrap(), at(1, 0));
+      assert_eq!(offset_pos_core(&rig.state, ID, 7, 4).unwrap(), at(1, 2));
+    }
+    #[test]
+    fn the_position_commands_and_find_never_read_a_line_whole() {
+      let content = format!("a\n{}日{}\r\nend", "x".repeat(5000), "y".repeat(5000));
+      let rig = Rig::new(content.as_bytes(), 1 << 20);
+      stats::reset();
+      let pos = offset_pos_core(&rig.state, ID, 2 + 5000 + 3 + 1999, 64).unwrap();
+      assert_eq!(pos, at(1, 7000));
+      assert!(stats::get().max_read <= 64, "{}", stats::get().max_read);
+      stats::reset();
+      let offset = pos_offset_core(&rig.state, ID, &at(1, 7000), 64).unwrap();
+      assert_eq!(offset, 2 + 5000 + 3 + 1999);
+      assert!(stats::get().max_read <= 64, "{}", stats::get().max_read);
+      stats::reset();
+      let hit = find_core(&rig.state, ID, "end", true, 1, 9000, false, 64, &mut |_| {})
+        .unwrap()
+        .unwrap();
+      assert_eq!(hit.start, at(2, 0));
+      let needle = find_core(&rig.state, ID, "yy", true, 1, 7000, false, 64, &mut |_| {})
+        .unwrap()
+        .unwrap();
+      assert_eq!(needle.start, at(1, 7000));
+      assert!(stats::get().max_read <= 64, "{}", stats::get().max_read);
+    }
+  }
 }
 /// Sessions over a conversion file: a paste that outgrew a document, or a file
 /// restored from one, saved in the encoding the document had.
@@ -13457,6 +15065,29 @@ mod converted_tests {
     rig.state.sessions.lock().unwrap().clear();
     rig.open(TEXT, Some(&target), "UTF-8", false, false);
     assert!(rig.with(|s| s.clean()));
+  }
+
+  #[test]
+  fn session_stats_say_whether_it_is_dirty_and_how_big_it_is() {
+    let rig = Rig::new();
+    let target = rig.target("a.txt");
+    rig.open(TEXT, Some(&target), "UTF-8", false, false);
+    let clean = stats_core(&rig.state, ID).unwrap();
+    assert!(!clean.dirty);
+    assert_eq!(clean.total_bytes, TEXT.len() as u64);
+    assert_eq!(clean.total_lines, 4);
+    rig.type_at_start("x");
+    let typed = stats_core(&rig.state, ID).unwrap();
+    assert!(typed.dirty);
+    assert_eq!(typed.total_bytes, TEXT.len() as u64 + 1);
+    assert_eq!(
+      serde_json::to_string(&typed).unwrap(),
+      format!(
+        r#"{{"dirty":true,"totalBytes":{},"totalLines":{}}}"#,
+        typed.total_bytes, typed.total_lines
+      )
+    );
+    assert_eq!(stats_core(&rig.state, 99), Err(UNKNOWN_SESSION.to_string()));
   }
 
   #[test]

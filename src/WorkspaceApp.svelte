@@ -5,8 +5,9 @@
   import { onMount, tick } from 'svelte';
   import { invoke } from '@tauri-apps/api/core';
   import { getCurrentWindow } from '@tauri-apps/api/window';
+  import { listen } from '@tauri-apps/api/event';
   import { open } from '@tauri-apps/plugin-dialog';
-  import { settingsState } from './lib/state/settings.svelte';
+  import { settingsState, type AppSettings } from './lib/state/settings.svelte';
   import { revealWhenThemed } from './lib/util/reveal';
   import { onFileDragOver, onFileDrop } from './lib/util/fileDrop';
   import { applyTheme, applyChrome } from './lib/theme/applyTheme';
@@ -14,6 +15,7 @@
   import { localeRegistry } from './lib/i18n/localeRegistry.svelte';
   import { t } from './lib/i18n';
   import { debounce } from './lib/util/debounce';
+  import { marquee } from './lib/util/marquee';
   import { nativeFieldHistory, nativeSelectAll } from './lib/util/menuBar';
   import { installPasteWindow, pasteEnv } from './lib/util/pasteEnv';
   import { fieldPaste } from './lib/util/pasteRouting';
@@ -47,7 +49,6 @@
     dropDecision,
     dropFolder,
     failureDialog,
-    folderEntries,
     hoverFeedback,
     modifierOp,
     outcomeDialogs,
@@ -741,9 +742,11 @@
       await loadRootVolume(root);
       let children: readonly { name: string }[];
       try {
-        children = await folderEntries(cache, root, folder, (dir) =>
-          invoke<TreeEntry[]>('list_project_dir', { dir }),
-        );
+        // Everything in the folder, hidden items included, whatever the setting.
+        children = await invoke<TreeEntry[]>('list_project_dir', {
+          dir: folder,
+          all: true,
+        });
       } catch (e) {
         showDialogs([
           failureDialog(
@@ -1034,6 +1037,18 @@
     const unlistenChanges = settingsState.listenChanges();
     const unlistenThemes = themeRegistry.listen();
     const unlistenLocales = localeRegistry.listen();
+    // The tree follows "Show hidden files": when the setting flips, every
+    // listing is read again.
+    // The loaded value only seeds it when no event has set it first.
+    let shownHidden = false;
+    let hiddenFromEvent = false;
+    const unlistenHidden = listen<AppSettings>('settings-changed', (event) => {
+      hiddenFromEvent = true;
+      if (event.payload.show_hidden_files !== shownHidden) {
+        shownHidden = event.payload.show_hidden_files;
+        refreshAll();
+      }
+    });
     const uninstallPaste = installPasteWindow();
     // Reveal the window only after the theme is loaded and applied, so a
     // dark-theme window never flashes its default white background.
@@ -1043,7 +1058,12 @@
     // the visible folders. A list an older version left with nested projects is
     // folded into the outer ones, and the result is saved back.
     void (async (): Promise<void> => {
-      const loaded = await invoke<LoadedProjectRoots>('load_settings');
+      const loaded = await invoke<
+        LoadedProjectRoots & { settings: { show_hidden_files?: boolean } }
+      >('load_settings');
+      if (!hiddenFromEvent) {
+        shownHidden = loaded.settings.show_hidden_files ?? false;
+      }
       const saved = projectRootsFrom(loaded);
       const merged = normalizeRoots(saved, caseInsensitive);
       await invoke('forget_project_rebinds', { roots: merged.roots });
@@ -1248,6 +1268,7 @@
       void unlistenChanges.then((u) => u());
       void unlistenThemes.then((u) => u());
       void unlistenLocales.then((u) => u());
+      void unlistenHidden.then((u) => u());
       void unlistenStore.then((u) => u());
       void unlistenFocus.then((u) => u());
       void unlistenCtx.then((u) => u());
@@ -1298,7 +1319,9 @@
               <path d="M9 6l6 6-6 6" />
             </svg>
           </span>
-          {t('workspace.section.stickies')}
+          <span class="marquee" use:marquee={t('workspace.section.stickies')}
+            ><span>{t('workspace.section.stickies')}</span></span
+          >
         </button>
       </h2>
       {#if !secOpen.stickies}
@@ -1322,9 +1345,15 @@
                   aria-hidden="true"
                 ></span>
                 {#if row.preview === ''}
-                  <span class="label muted">{t('workspace.sticky.blank')}</span>
+                  <span
+                    class="label marquee muted"
+                    use:marquee={t('workspace.sticky.blank')}
+                    ><span>{t('workspace.sticky.blank')}</span></span
+                  >
                 {:else}
-                  <span class="label">{row.preview}</span>
+                  <span class="label marquee" use:marquee={row.preview}
+                    ><span>{row.preview}</span></span
+                  >
                 {/if}
               </button>
               <button
@@ -1405,7 +1434,9 @@
               <path d="M9 6l6 6-6 6" />
             </svg>
           </span>
-          {t('workspace.section.docs')}
+          <span class="marquee" use:marquee={t('workspace.section.docs')}
+            ><span>{t('workspace.section.docs')}</span></span
+          >
         </button>
       </h2>
       {#if !secOpen.docs}
@@ -1430,7 +1461,9 @@
                   class="row"
                   onclick={() => void focusDoc(row.group, row.tabIndex)}
                 >
-                  <span class="label">{row.name}</span>
+                  <span class="label marquee" use:marquee={row.name}
+                    ><span>{row.name}</span></span
+                  >
                   {#if row.dirty}
                     <span class="dirty" aria-hidden="true">•</span>
                   {/if}
@@ -1468,7 +1501,9 @@
                 <path d="M9 6l6 6-6 6" />
               </svg>
             </span>
-            {t('workspace.section.project')}
+            <span class="marquee" use:marquee={t('workspace.section.project')}
+              ><span>{t('workspace.section.project')}</span></span
+            >
           </button>
         </h2>
         <div class="proj-actions">
@@ -1654,7 +1689,9 @@
                       />
                     </svg>
                   </span>
-                  <span class="label">{row.name}</span>
+                  <span class="label marquee" use:marquee={row.name}
+                    ><span>{row.name}</span></span
+                  >
                 </button>
                 <button
                   class="icon-btn row-add"
@@ -1760,7 +1797,9 @@
                       <path d="M13 3v6h6" />
                     </svg>
                   </span>
-                  <span class="label">{row.name}</span>
+                  <span class="label marquee" use:marquee={row.name}
+                    ><span>{row.name}</span></span
+                  >
                   {#if dirty}
                     <span class="open-dot" aria-hidden="true"></span>
                   {/if}
@@ -1837,6 +1876,9 @@
     text-transform: inherit;
     letter-spacing: inherit;
     cursor: default;
+    max-width: 100%;
+    overflow: hidden;
+    flex-shrink: 0;
   }
   .sec-chevron {
     display: flex;
@@ -1888,6 +1930,9 @@
     font: inherit;
     text-align: left;
     cursor: default;
+    max-width: 100%;
+    overflow: hidden;
+    flex-shrink: 0;
   }
   .row:hover {
     background: var(--topbar-border);
@@ -1958,7 +2003,6 @@
   .label {
     flex: 1 1 auto;
     overflow: hidden;
-    text-overflow: ellipsis;
     white-space: nowrap;
   }
   .label.muted {
@@ -2015,6 +2059,9 @@
     align-items: center;
     justify-content: space-between;
     gap: 0.5rem;
+  }
+  .proj-head .heading {
+    min-width: 0;
   }
   .proj-actions {
     display: flex;

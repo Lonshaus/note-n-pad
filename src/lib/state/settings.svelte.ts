@@ -37,7 +37,7 @@ export interface SnapshotMovePreview {
 }
 
 /** Full settings payload from the Rust core (load_settings / settings-changed). */
-interface AppSettings {
+export interface AppSettings {
   // Not typed as ThemeId: Rust stores this verbatim and never validates it (see
   // AppSettings::theme's doc comment on the Rust side), so a legacy/unknown
   // value can arrive here — `apply()` below is what actually enforces the type.
@@ -63,6 +63,7 @@ interface AppSettings {
   language: Language;
   show_tray_icon: boolean;
   open_workspace_on_startup: boolean;
+  show_hidden_files: boolean;
 }
 
 /** Payload of the `load_settings` command: the settings themselves, plus the
@@ -139,6 +140,7 @@ export class SettingsState {
   language = $state<Language>('system');
   showTrayIcon = $state(true);
   openWorkspaceOnStartup = $state(false);
+  showHiddenFiles = $state(false);
   /** Active UI locale id, resolved against the OS language and the set of loaded
    *  locales. Depends on `localeRegistry`, so it re-resolves when a locale is
    *  imported or deleted — a deleted active locale falls back automatically. */
@@ -204,6 +206,7 @@ export class SettingsState {
     this.language = s.language;
     this.showTrayIcon = s.show_tray_icon;
     this.openWorkspaceOnStartup = s.open_workspace_on_startup;
+    this.showHiddenFiles = s.show_hidden_files;
   }
 
   /** Resolves once `init()` has folded the stored settings in — or has failed
@@ -422,6 +425,11 @@ export class SettingsState {
   async setOpenWorkspaceOnStartup(on: boolean): Promise<void> {
     this.openWorkspaceOnStartup = on;
     await this.save({ open_workspace_on_startup: on });
+  }
+
+  async setShowHiddenFiles(on: boolean): Promise<void> {
+    this.showHiddenFiles = on;
+    await this.save({ show_hidden_files: on });
   }
 
   async setFontFamily(family: string): Promise<void> {

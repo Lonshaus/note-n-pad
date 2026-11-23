@@ -212,9 +212,20 @@ input[type='checkbox'] {
   padding: 5px 11px;
   margin: 2px 3px;
   font-size: 0.85rem;
+  white-space: nowrap;
+  max-width: 100%;
+  overflow: hidden;
+  flex-shrink: 0;
 }
 .cm-panel.cm-search .cm-button:hover {
   border-color: var(--accent);
+}
+/* The go-to-line submit button follows the same rule as every text button. */
+.cm-dialog .cm-button {
+  white-space: nowrap;
+  max-width: 100%;
+  overflow: hidden;
+  flex-shrink: 0;
 }
 /* Round close button in a reserved top-right slot, matching the tab close.
    CM's base theme pins it with higher-specificity top/right/font, so those
@@ -309,4 +320,15 @@ input[type='checkbox'] {
 }
 .cm-content .tok-strong {
   font-weight: bold;
+}
+/* Button text that does not fit runs as a marquee (see util/marquee.ts). */
+.marquee {
+  position: relative;
+  display: block;
+  overflow: hidden;
+  white-space: nowrap;
+  min-width: 0;
+}
+.marquee > :first-child {
+  display: inline-block;
 }

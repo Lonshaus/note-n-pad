@@ -17,6 +17,9 @@ import { scanBreaks, type LineBreak } from './windowedEdit';
 /** An open edit box. `fingerprint` is the source's identity when the slice was
  *  read, the baseline the write-back's conflict check compares against. */
 export interface RangeBox {
+  /** Identifies this opening of a box. A write-back only acts on the box that
+   *  is open when it finishes if that box carries the id it was sent from. */
+  session: number;
   /** The large-file tab the box belongs to. */
   tabId: string;
   sourcePath: string;
@@ -53,9 +56,13 @@ export interface RangeBoxInit {
   text: string;
 }
 
+let lastSession = 0;
+
 export function openRangeBox(init: RangeBoxInit): RangeBox {
   const content = textFromString(normalizeToLf(init.text));
+  lastSession += 1;
   return {
+    session: lastSession,
     tabId: init.tabId,
     sourcePath: init.sourcePath,
     startByte: init.startByte,
@@ -113,4 +120,33 @@ export function rangeBoxWriteText(box: RangeBox): string {
     box.trailingBreak,
     box.lineEnding,
   );
+}
+/** Where the source's write of the box's text landed, as the core reports it. */
+export interface RangeWriteOutcome {
+  fingerprint: Fingerprint;
+  writtenStart: number;
+  writtenEnd: number;
+}
+/** What to do once a write-back succeeded: `sent` is the buffer the write was
+ *  made from, `current` the buffer now. */
+export function nextWriteBack(sent: Text, current: Text): 'done' | 'rewrite' {
+  return textEq(sent, current) ? 'done' : 'rewrite';
+}
+/** The box after its text `written` replaced the span: the span, the
+ *  fingerprint and the slice as read are now what was just written, so the
+ *  next write-back diffs against it. `trailingBreak` stays as it was: it tells
+ *  whether the span ends at a line break of the file, not what was written. */
+export function rebaseRangeBox(
+  box: RangeBox,
+  written: string,
+  outcome: RangeWriteOutcome,
+): RangeBox {
+  return {
+    ...box,
+    fingerprint: outcome.fingerprint,
+    startByte: outcome.writtenStart,
+    endByte: outcome.writtenEnd,
+    saved: textFromString(normalizeToLf(written)),
+    breaks: scanBreaks(written),
+  };
 }

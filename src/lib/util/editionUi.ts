@@ -11,6 +11,7 @@
  *  The free edition cannot start editing a large file.
  *  The free edition cannot open a range of a large file for editing.
  *  The free edition has no workspace to open at startup.
+ *  The free edition has no project tree whose hidden files could be shown.
  *  The free edition cannot import, export or delete a language.
  *  Editing a language and restoring its default stay in the free edition. */
 export interface EditionUi {
@@ -20,6 +21,7 @@ export interface EditionUi {
   largeUnlock: boolean;
   rangeEdit: boolean;
   openWorkspaceOnStartup: boolean;
+  showHiddenFiles: boolean;
   localeImport: boolean;
   localeDelete: boolean;
   localeUpdateFromJson: boolean;
@@ -35,6 +37,7 @@ export function editionUi(lite: boolean): EditionUi {
     largeUnlock: full,
     rangeEdit: full,
     openWorkspaceOnStartup: full,
+    showHiddenFiles: full,
     localeImport: full,
     localeDelete: full,
     localeUpdateFromJson: full,

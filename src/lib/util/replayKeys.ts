@@ -14,6 +14,8 @@ import {
   cursorLineBoundaryBackward,
   cursorLineBoundaryForward,
   cursorLineDown,
+  cursorLineEnd,
+  cursorLineStart,
   cursorLineUp,
   cursorMatchingBracket,
   cursorPageDown,
@@ -28,6 +30,8 @@ import {
   selectLineBoundaryBackward,
   selectLineBoundaryForward,
   selectLineDown,
+  selectLineEnd,
+  selectLineStart,
   selectLineUp,
   selectMatchingBracket,
   transposeChars,
@@ -68,6 +72,17 @@ export function replayWanted(s: ReplayState): boolean {
     return false;
   }
   return s.replayPending || s.queueHold || s.outside;
+}
+/** Whether a keydown may be judged by the selection at all: not while the
+ *  editor is locked or focus is elsewhere, nor while a replace all drops input,
+ *  nor during a plain window swap (one that no replay or hold is behind). */
+export function keyGuardPasses(s: ReplayState): boolean {
+  return !(
+    s.locked ||
+    s.focusElsewhere ||
+    s.dropHold ||
+    (s.swapping && !s.replayPending && !s.queueHold)
+  );
 }
 /** What `startReplaySwap` does: 'drop' the queue when nothing can ever replay it
  *  (the editor is gone or locked), 'wait' while something else holds the view (a
@@ -264,6 +279,16 @@ export const EDGE_COMMANDS: ReadonlySet<Command> = new Set<Command>([
   indentMore,
   cursorMatchingBracket,
   selectMatchingBracket,
+]);
+/** The commands that move to a line edge. A caret drawn at such an edge on a
+ *  line with a part not loaded is where the real caret is not, so these are
+ *  replayed after a focused read; they are consulted only when the selection
+ *  has a hidden end. */
+export const HIDDEN_EDGE_COMMANDS: ReadonlySet<Command> = new Set<Command>([
+  cursorLineStart,
+  cursorLineEnd,
+  selectLineStart,
+  selectLineEnd,
 ]);
 /** Key names by key code, as the keys type unshifted and shifted. */
 const BASE_CODES: Record<number, string> = {
@@ -462,20 +487,27 @@ export function matchesBinding(
 /** Whether a chord that left no transaction at the window edge is replayed once
  *  the window is back: when any command it falls through is an edge command,
  *  or it is an editing key (arrows, Home, Backspace and the like) held with
- *  Ctrl or Meta. The commands in `never` (undo, the tab-focus toggle) are not
- *  replayed whatever key they are bound to. */
+ *  Ctrl or Meta. With `hiddenEnd` (the selection has an end in a part not
+ *  loaded) the commands that move to a line edge count too. The commands in
+ *  `never` (undo, the tab-focus toggle) are not replayed whatever key they are
+ *  bound to. */
 export function chordReplaysAtEdge(
   layers: KeyLayers,
   e: KeyLike,
   os: string,
   never: ReadonlySet<Command>,
+  hiddenEnd = false,
 ): boolean {
   const chain = commandChain(layers, e, os);
   if (chain.some((command) => never.has(command))) {
     return false;
   }
   return (
-    chain.some((command) => EDGE_COMMANDS.has(command)) || isEditingKey(e.key)
+    chain.some(
+      (command) =>
+        EDGE_COMMANDS.has(command) ||
+        (hiddenEnd && HIDDEN_EDGE_COMMANDS.has(command)),
+    ) || isEditingKey(e.key)
   );
 }
 /** The windowed editor's own keys, besides the shared keymap: Escape closes
@@ -492,6 +524,8 @@ export function coreKeyBindings(commands: {
     { key: 'Mod-a', preventDefault: true, run: commands.selectVisible },
     { key: 'Mod-z', preventDefault: true, run: commands.undo },
     { key: 'Mod-Shift-z', preventDefault: true, run: commands.redo },
+    // Windows' Edit > Redo is a native item that sends Ctrl+Y.
+    { win: 'Mod-y', preventDefault: true, run: commands.redo },
   ];
 }
 /** Whether the keydown is Select All (Cmd+A on macOS, Ctrl+A elsewhere), read

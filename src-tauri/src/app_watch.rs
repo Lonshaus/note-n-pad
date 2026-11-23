@@ -462,8 +462,9 @@ pub fn list_running_apps() -> Vec<RunningApp> {
 }
 
 /// Toggle always-on-top for every app-pinned sticky so each floats only while
-/// the application it is bound to is frontmost.
-fn apply_app_pins(app: &tauri::AppHandle, front: Option<&str>) {
+/// the application it is bound to is frontmost. Also the re-apply helper when
+/// the edition changes, since app pins float in the full edition only.
+pub(crate) fn apply_app_pins(app: &tauri::AppHandle, front: Option<&str>) {
   use crate::note_store::NoteStore;
   use tauri::Manager;
   let store = app.state::<NoteStore>();
@@ -473,7 +474,13 @@ fn apply_app_pins(app: &tauri::AppHandle, front: Option<&str>) {
     }
     let label = format!("note-{}", note.id);
     if let Some(win) = app.get_webview_window(&label) {
-      let on_top = front.is_some() && note.pin_app.as_deref() == front;
+      let on_top = crate::windows::pin_on_top(
+        "app",
+        note.pin_app.as_deref(),
+        front,
+        detection_available(),
+        crate::edition::is_lite(),
+      );
       let _ = win.set_always_on_top(on_top);
     }
   }

@@ -9,6 +9,7 @@
   import EditorShell from './lib/editor/EditorShell.svelte';
   import ConfirmModal, { isModalOpen } from './lib/ConfirmModal.svelte';
   import { popupClosesOnEscape } from './lib/util/popupEscape';
+  import { marquee } from './lib/util/marquee';
   import {
     stickyNote,
     type PinMode,
@@ -16,7 +17,9 @@
   } from './lib/state/stickyNote.svelte';
   import { settingsState } from './lib/state/settings.svelte';
   import { platform } from './lib/state/platform.svelte';
+  import { editionState, isLite } from './lib/state/edition.svelte';
   import { shouldFloatOnTop } from './lib/util/pinFloat';
+  import { effectivePinMode, pinMenuHasApps } from './lib/util/pinMenu';
   import { matchStickyShortcut } from './lib/util/stickyShortcut';
   import { revealWhenThemed } from './lib/util/reveal';
   import { onFileDragOver, onFileDrop } from './lib/util/fileDrop';
@@ -43,6 +46,7 @@
   } from './lib/util/editorClipboard';
   import type { EditorView } from '@codemirror/view';
   import { undo, redo, selectAll } from '@codemirror/commands';
+  import { gotoLine } from '@codemirror/search';
   import { installPasteWindow } from './lib/util/pasteEnv';
   import ConvertDialogs from './lib/ConvertDialogs.svelte';
   import { convertController } from './lib/state/convertController.svelte';
@@ -81,7 +85,9 @@
   let showPinMenu = $state(false);
   let runningApps = $state<RunningApp[]>([]);
 
-  const pinMode = $derived(stickyNote.note?.pin_mode ?? 'none');
+  const pinMode = $derived(
+    effectivePinMode(stickyNote.note?.pin_mode ?? 'none', isLite()),
+  );
   const pinApp = $derived(stickyNote.note?.pin_app ?? null);
   // Fixed paper palette; order is the swatch-row order. graphite is the only
   // dark surface (drives the oneDark editor theme).
@@ -146,10 +152,14 @@
     void applyPin(pinMode === 'top' ? 'none' : 'top');
   }
 
+  async function loadRunningApps(): Promise<void> {
+    runningApps = await invoke<RunningApp[]>('list_running_apps');
+  }
+
   async function openPinMenu(): Promise<void> {
     showPinMenu = !showPinMenu;
-    if (showPinMenu) {
-      runningApps = await invoke<RunningApp[]>('list_running_apps');
+    if (showPinMenu && pinMenuHasApps(isLite())) {
+      await loadRunningApps();
     }
   }
 
@@ -202,6 +212,9 @@
         pin_mode: 'none',
         pin_app: null,
         kind: 'document',
+        // A new document window takes the remembered document size, not the sticky's.
+        width: null,
+        height: null,
         dirty: false,
         window_group: note.id,
         tab_index: 0,
@@ -278,11 +291,13 @@
     stickyNote.updateContent(v);
   }
   // The sticky's CodeMirror view, supplied by EditorShell for the edit actions
-  // below. Stickies have no search at all (no Find, no Find and Replace).
+  // below. Stickies have no search at all (no Find, no Find and Replace) but do
+  // have Go to Line.
   let editorView: EditorView | null = null;
   // Menu accelerators arrive from the Rust menu as a string payload. Save routes
-  // to the sticky's save-and-convert flow. New Tab, Open, Find and Find and
-  // Replace never reach an enabled sticky menu item, so they are ignored here.
+  // to the sticky's save-and-convert flow and Go to Line opens CodeMirror's box.
+  // New Tab, Open, Find and Find and Replace never reach an enabled sticky
+  // menu item, so they are ignored here.
   function runMenuAction(action: string): void {
     // The find field keeps its own undo history.
     if (
@@ -333,6 +348,11 @@
       case 'save':
         void saveAndConvert();
         break;
+      case 'goto-line':
+        if (editorView !== null) {
+          gotoLine(editorView);
+        }
+        break;
     }
   }
   // Linux only: a sticky there has no menu (`detach_menu_unless_document`), so
@@ -368,6 +388,12 @@
     const unlistenChanges = settingsState.listenChanges();
     const unlistenThemes = themeRegistry.listen();
     const unlistenLocales = localeRegistry.listen();
+    // A menu left open across a switch to full gets its app list now.
+    const unlistenEdition = editionState.onChanged((lite) => {
+      if (showPinMenu && pinMenuHasApps(lite)) {
+        void loadRunningApps();
+      }
+    });
     // Reveal the window only after the theme is loaded and applied, so a
     // dark-theme window never flashes its default white background.
     void revealWhenThemed();
@@ -512,6 +538,7 @@
       void unlistenChanges.then((u) => u());
       void unlistenThemes.then((u) => u());
       void unlistenLocales.then((u) => u());
+      unlistenEdition();
       void unlistenClose.then((u) => u());
       void unlistenMoved.then((u) => u());
       void unlistenResized.then((u) => u());
@@ -591,28 +618,33 @@
             class="pin-item"
             class:current={pinMode === 'top'}
             onclick={() => applyPin('top')}
+            ><span class="marquee" use:marquee={t('sticky.pin.alwaysOnTop')}
+              ><span>{t('sticky.pin.alwaysOnTop')}</span></span
+            ></button
           >
-            {t('sticky.pin.alwaysOnTop')}
-          </button>
-          <div class="pin-sep"></div>
-          <div class="pin-heading">{t('sticky.pin.toApp')}</div>
-          {#each runningApps as app (app.id)}
-            <button
-              class="pin-item"
-              class:current={pinMode === 'app' && pinApp === app.id}
-              onclick={() => applyPin('app', app.id)}
-            >
-              {app.name}
-            </button>
-          {/each}
+          {#if pinMenuHasApps(isLite())}
+            <div class="pin-sep"></div>
+            <div class="pin-heading">{t('sticky.pin.toApp')}</div>
+            {#each runningApps as app (app.id)}
+              <button
+                class="pin-item"
+                class:current={pinMode === 'app' && pinApp === app.id}
+                onclick={() => applyPin('app', app.id)}
+                ><span class="marquee" use:marquee={app.name}
+                  ><span>{app.name}</span></span
+                ></button
+              >
+            {/each}
+          {/if}
           <div class="pin-sep"></div>
           <button
             class="pin-item"
             class:current={pinMode === 'none'}
             onclick={() => applyPin('none')}
+            ><span class="marquee" use:marquee={t('sticky.pin.unpin')}
+              ><span>{t('sticky.pin.unpin')}</span></span
+            ></button
           >
-            {t('sticky.pin.unpin')}
-          </button>
         </div>
       {/if}
     </span>
@@ -869,6 +901,7 @@
     min-width: 130px;
     /* Fits a short sticky: the list scrolls instead of being clipped. */
     max-height: min(220px, calc(100vh - 40px));
+    max-width: calc(100vw - 12px - 6px);
     overflow-y: auto;
     padding: 3px;
     border-radius: 6px;
@@ -889,6 +922,9 @@
     text-align: left;
     white-space: nowrap;
     cursor: default;
+    max-width: 100%;
+    overflow: hidden;
+    flex-shrink: 0;
   }
   .pin-item:hover {
     background: var(--sticky-scrim);

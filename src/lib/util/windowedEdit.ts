@@ -1,11 +1,6 @@
 // Copyright © 2026 Lonshaus
 // SPDX-License-Identifier: GPL-3.0-only
-import {
-  EditorState,
-  Transaction,
-  type Extension,
-  type Text,
-} from '@codemirror/state';
+import { EditorState, Transaction, type Extension } from '@codemirror/state';
 import { devTrace } from '../dev/devTrace';
 import { offscreenMove } from '../editor/offscreenArrow';
 import { capturedInput, outsideInputAction } from './imeCapture';
@@ -77,12 +72,34 @@ function countLf(doc: string, from: number, to: number): number {
   }
   return n;
 }
+/** A placeholder of a window's document: it sits at index `from` (one UTF-16
+ *  unit) and stands for `bytes` UTF-8 bytes of the file that are not loaded. */
+export interface HoleSpan {
+  from: number;
+  bytes: number;
+}
+/** The UTF-8 length of the placeholder character U+FFFC. */
+const PLACEHOLDER_BYTES = 3;
+/** The bytes the holes before `pos` hold beyond what their placeholder
+ *  characters count for. `holes` is in document order. */
+function holeExtra(holes: readonly HoleSpan[], pos: number): number {
+  let extra = 0;
+  for (const h of holes) {
+    if (h.from + 1 > pos) {
+      break;
+    }
+    extra += h.bytes - PLACEHOLDER_BYTES;
+  }
+  return extra;
+}
 /** Global-window byte offset of CodeMirror position `pos` in the normalized `doc`,
- *  whose k-th line break is the file's `breaks[k]` (a CRLF takes two bytes). */
+ *  whose k-th line break is the file's `breaks[k]` (a CRLF takes two bytes). A
+ *  placeholder of `holes` counts as the bytes it stands for. */
 export function charToByte(
   doc: string,
   breaks: readonly string[],
   pos: number,
+  holes?: readonly HoleSpan[],
 ): number {
   const started = performance.now();
   const lines = countLf(doc, 0, pos);
@@ -92,7 +109,10 @@ export function charToByte(
       extra += 1;
     }
   }
-  const bytes = byteLength(doc.slice(0, pos)) + extra;
+  const bytes =
+    byteLength(doc.slice(0, pos)) +
+    extra +
+    (holes === undefined ? 0 : holeExtra(holes, pos));
   traceSlow('charToByte', started, doc.length);
   return bytes;
 }
@@ -100,17 +120,30 @@ export function charToByte(
  *  `byteOffset` of the raw window whose normalized text is `doc` and whose line
  *  breaks are `breaks`. A byte offset landing mid character (never produced by
  *  boundary-respecting edits) rounds up to the next character boundary. Returns
- *  null for an offset strictly inside a two-byte `\r\n`: no document position
- *  matches it (a reload can merge a lone `\r` and a `\n` into one break).
+ *  null for an offset strictly inside a two-byte `\r\n` or a hole of `holes`: no
+ *  document position matches it (a reload can merge a lone `\r` and a `\n` into
+ *  one break).
  *  ponytail: re-encodes each code point (O(window)) but runs only per undo/redo,
  *  not per keystroke; add a per-line byte index if it ever shows on the profile. */
 export function byteToChar(
   doc: string,
   breaks: readonly string[],
   byteOffset: number,
+  holes?: readonly HoleSpan[],
 ): number | null {
+  const chars = byteToCharAt(doc, breaks, byteOffset, holes);
+  return typeof chars === 'number' ? chars : null;
+}
+/** As `byteToChar`, telling the two kinds of offset that have no position
+ *  apart: inside a `\r\n` and inside a hole. */
+export function byteToCharAt(
+  doc: string,
+  breaks: readonly string[],
+  byteOffset: number,
+  holes?: readonly HoleSpan[],
+): number | 'crlf' | 'hole' {
   const started = performance.now();
-  const chars = scanByteToChar(doc, breaks, byteOffset);
+  const chars = scanByteToChar(doc, breaks, byteOffset, holes);
   traceSlow('byteToChar', started, doc.length);
   return chars;
 }
@@ -118,23 +151,35 @@ function scanByteToChar(
   doc: string,
   breaks: readonly string[],
   byteOffset: number,
-): number | null {
+  holes: readonly HoleSpan[] | undefined,
+): number | 'crlf' | 'hole' {
   if (byteOffset <= 0) {
     return 0;
   }
   let bytes = 0;
   let chars = 0;
   let k = 0;
+  let h = 0;
   for (const ch of doc) {
     if (bytes >= byteOffset) {
       break;
     }
     let width: number;
-    if (ch === '\n') {
+    while (holes !== undefined && (holes[h]?.from ?? chars) < chars) {
+      h += 1;
+    }
+    const hole = holes?.[h];
+    if (hole !== undefined && hole.from === chars) {
+      width = hole.bytes;
+      h += 1;
+      if (bytes + width > byteOffset) {
+        return 'hole';
+      }
+    } else if (ch === '\n') {
       width = (breaks[k] ?? '\n').length;
       k += 1;
       if (width === 2 && bytes + 1 === byteOffset) {
-        return null;
+        return 'crlf';
       }
     } else {
       width = byteLength(ch);
@@ -268,6 +313,7 @@ export function junctionRewrites(
   insertSep: string,
   prevLoneCr: boolean,
   nextIsLf: boolean,
+  holes?: readonly HoleSpan[],
 ): JunctionResult {
   const breaksAfter = applyBreaks(docBefore, breaksBefore, changes, insertSep);
   if (!prevLoneCr && !breaksBefore.includes('\r')) {
@@ -310,7 +356,7 @@ export function junctionRewrites(
     for (const i of found) {
       const k = origins[i] as number;
       rewrites.push({
-        at: charToByte(docBefore, breaksBefore, lfBefore[k] as number),
+        at: charToByte(docBefore, breaksBefore, lfBefore[k] as number, holes),
         whereBefore: 'inside',
       });
       if (insertSep !== '\n') {
@@ -343,15 +389,25 @@ export function fillBreaks(
   from: number,
   to: number,
   byte: string,
+  holes?: readonly HoleSpan[],
 ): string[] {
   const out = [...breaks];
   let bytes = 0;
+  let chars = 0;
   let k = 0;
+  let h = 0;
   for (const ch of doc) {
     if (bytes >= to) {
       break;
     }
-    if (ch === '\n') {
+    while (holes !== undefined && (holes[h]?.from ?? chars) < chars) {
+      h += 1;
+    }
+    const hole = holes?.[h];
+    if (hole !== undefined && hole.from === chars) {
+      bytes += hole.bytes;
+      h += 1;
+    } else if (ch === '\n') {
       if (bytes >= from) {
         out[k] = byte;
       }
@@ -360,6 +416,7 @@ export function fillBreaks(
     } else {
       bytes += byteLength(ch);
     }
+    chars += ch.length;
   }
   return out;
 }
@@ -371,12 +428,13 @@ export type UndoEdit = Pick<ByteEdit, 'start' | 'end' | 'text'> &
  *  starts at byte `windowStart`: the document change to dispatch (none for a
  *  `fill` edit, which only turns break bytes into other break bytes) and the
  *  break list after it. Null when a boundary falls inside a `\r\n`, which has
- *  no document position. */
+ *  no document position, and when one falls inside a hole of `holes`. */
 export function mirrorStep(
   doc: string,
   breaks: readonly string[],
   windowStart: number,
   edit: UndoEdit,
+  holes?: readonly HoleSpan[],
 ): {
   change: { from: number; to: number; insert: string } | null;
   breaks: string[];
@@ -390,11 +448,12 @@ export function mirrorStep(
         edit.start - windowStart,
         edit.end - windowStart,
         edit.fill as string,
+        holes,
       ),
     };
   }
-  const from = byteToChar(doc, breaks, edit.start - windowStart);
-  const to = byteToChar(doc, breaks, edit.end - windowStart);
+  const from = byteToChar(doc, breaks, edit.start - windowStart, holes);
+  const to = byteToChar(doc, breaks, edit.end - windowStart, holes);
   if (from === null || to === null) {
     return null;
   }
@@ -506,6 +565,8 @@ export interface ByteEdit {
  *  is expressed against the same pre-change document, `fromA`/`toA` are naturally
  *  non-overlapping and ascending — exactly the "one shared pre-apply coordinate
  *  table" the Rust side requires — so the mapping is a direct 1:1.
+ *  A placeholder of `holes` (those of `docBefore`) counts as the bytes it
+ *  stands for, so a change over it removes them too.
  *  ponytail: prefix re-encoding is O(window) per keystroke, acceptable for a 2000-
  *  line window; upgrade path is a per-line byte-offset index if it ever shows. */
 export function mapChangesToEdits(
@@ -514,10 +575,11 @@ export function mapChangesToEdits(
   breaks: readonly string[],
   insertSep: string,
   changes: RawChange[],
+  holes?: readonly HoleSpan[],
 ): ByteEdit[] {
   return changes.map((c) => ({
-    start: windowStartOffset + charToByte(docBefore, breaks, c.fromA),
-    end: windowStartOffset + charToByte(docBefore, breaks, c.toA),
+    start: windowStartOffset + charToByte(docBefore, breaks, c.fromA, holes),
+    end: windowStartOffset + charToByte(docBefore, breaks, c.toA, holes),
     text:
       insertSep === '\n' ? c.inserted : c.inserted.replaceAll('\n', insertSep),
   }));
@@ -551,6 +613,30 @@ export function mapThrough(offset: number, edits: readonly ByteEdit[]): number {
     mapped = mapOffset(mapped, edit);
   }
   return mapped;
+}
+/** The longest line, in UTF-16 units, the window mirrors from an undo or redo:
+ *  one more is read again from the core, which caps it. */
+export const MIRROR_LINE_MAX = 1_048_576;
+/** Whether an undo or redo result puts back a line longer than
+ *  `MIRROR_LINE_MAX` in one edit's text: the window then reads the core again
+ *  instead of holding it. */
+export function mirrorRefused(edits: readonly { text: string }[]): boolean {
+  for (const { text } of edits) {
+    let start = 0;
+    for (let i = 0; i < text.length; i += 1) {
+      const c = text.charCodeAt(i);
+      if (c === 10 || c === 13) {
+        if (i - start > MIRROR_LINE_MAX) {
+          return true;
+        }
+        start = i + 1;
+      }
+    }
+    if (text.length - start > MIRROR_LINE_MAX) {
+      return true;
+    }
+  }
+  return false;
 }
 /** The edits of one forward apply in the order the core applies them: from the
  *  highest `(start, end)` down, so every edit still sits where its coordinates
@@ -723,9 +809,13 @@ export interface GlobalFilterDeps<E> {
   /** The keydown being handled, if any. */
   keydown: () => E | undefined;
   globalSel: () => LineSelection;
-  /** Whether the input acts outside the loaded window `doc` (see
-   *  `inputOutside`). */
-  outside: (doc: Text) => boolean;
+  /** Whether the input acts outside the loaded window the transaction starts
+   *  from (see `inputOutside`). */
+  outside: (state: EditorState) => boolean;
+  /** Whether an operation on the selection runs in the core, for the window
+   *  the transaction starts from (see `coreOp`). Absent, only a selection too
+   *  large for one window does. */
+  coreOp?: (state: EditorState) => boolean;
   /** Select All and the transactions that undo a capture are never refused. */
   exempt: (tr: Transaction) => boolean;
   captureMark: (tr: Transaction) => boolean;
@@ -758,6 +848,8 @@ function insertedText(tr: Transaction): string {
 export function globalFilters<E>(deps: GlobalFilterDeps<E>): Extension[] {
   const captured = (tr: Transaction): boolean =>
     capturedInput(deps.capturing(), tr.annotation(Transaction.userEvent));
+  const core = (state: EditorState): boolean =>
+    deps.coreOp?.(state) ?? globalOpPath(deps.globalSel());
   return [
     EditorState.transactionFilter.of((tr) =>
       rejectDuringSwap(
@@ -775,6 +867,7 @@ export function globalFilters<E>(deps: GlobalFilterDeps<E>): Extension[] {
           userEvent: tr.annotation(Transaction.userEvent),
         },
         deps.globalSel(),
+        core(tr.startState),
       ) && !captured(tr)
         ? []
         : tr,
@@ -812,7 +905,7 @@ export function globalFilters<E>(deps: GlobalFilterDeps<E>): Extension[] {
         deps.swapping() ||
         deps.locked() ||
         deps.exempt(tr) ||
-        !deps.outside(tr.startState.doc)
+        !deps.outside(tr.startState)
       ) {
         return tr;
       }
@@ -850,7 +943,7 @@ export function globalFilters<E>(deps: GlobalFilterDeps<E>): Extension[] {
       if (
         e !== undefined &&
         ((!deps.replayPending() && deps.chord(e)) ||
-          (globalOpPath(deps.globalSel()) && deps.bound(e)))
+          (core(tr.startState) && deps.bound(e)))
       ) {
         deps.queueKey(e);
       }

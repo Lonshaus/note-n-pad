@@ -135,6 +135,7 @@ export const en = {
   'settings.general.openTargetWindow': 'New window',
   'settings.general.showTrayIcon': 'Show icon in the status bar',
   'settings.general.openWorkspaceOnStartup': 'Open the workspace at startup',
+  'settings.general.showHiddenFiles': 'Show hidden files',
   // Settings — language (list lives on the language tab)
   'settings.language.label': 'Language',
   'settings.language.system': 'Follow system',
@@ -252,6 +253,7 @@ export const en = {
     'Couldn’t finish indexing “{name}”. Line count and jump-to-line are unavailable for this file.',
   'large.read.failed':
     'Couldn’t read part of this file. It may have been moved or become unreadable.',
+  'large.notLoaded': '{size} not loaded',
   // Status bar
   'status.view': 'View',
   'status.indexing': 'Indexing… {count} line(s)',
@@ -393,7 +395,10 @@ export const en = {
   'edition.row.themes': 'Themes (choose, edit, import, export, delete)',
   'edition.row.languageFiles': 'Deleting, importing and exporting languages',
   'edition.row.workspace': 'Workspace',
-  'edition.row.stickies': 'Sticky notes',
+  'edition.row.stickies': 'Sticky note basics',
+  'edition.row.stickiesNote': 'Change color and opacity',
+  'edition.row.stickyPinTop': 'Pin sticky notes on top',
+  'edition.row.stickyPinApp': 'Pin sticky notes to apps',
   'edition.row.documents': 'Document editing',
   'edition.row.markdown': 'Markdown preview',
   'edition.row.table': 'CSV / TSV table mode',

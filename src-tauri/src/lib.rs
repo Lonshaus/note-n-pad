@@ -57,12 +57,14 @@ mod spill;
 mod store_state;
 #[cfg(all(target_os = "macos", feature = "storekit"))]
 mod storekit;
+mod tab_transfer;
 #[cfg(test)]
 mod test_alloc;
 mod theme_store;
 mod transfer;
 mod webview2_runtime;
 mod win_menu_gray;
+mod window_at;
 mod windowed;
 mod windowed_scan;
 mod windows;
@@ -244,14 +246,19 @@ pub(crate) fn flush_then_exit(app: &tauri::AppHandle) {
   // handing over to an instance that is about to exit.
   #[cfg(target_os = "macos")]
   mac_single_instance::mark_quitting();
+  // A tab on its way is called off before anything waits: the windows this
+  // destroys (those made for it) will never ack.
+  let destroyed = tab_transfer::quit_call_off(app);
   // Every sticky and document window flushes its state and acks; the quit is
   // always silent now, and restore brings unsaved documents back afterward.
-  let labels: HashSet<String> = app
-    .webview_windows()
-    .keys()
-    .filter(|l| l.starts_with("note-") || l.starts_with("doc-"))
-    .cloned()
-    .collect();
+  let labels: HashSet<String> = tab_transfer::ack_set(
+    app
+      .webview_windows()
+      .keys()
+      .filter(|l| l.starts_with("note-") || l.starts_with("doc-"))
+      .cloned(),
+    &destroyed,
+  );
   if labels.is_empty() {
     // Guard is intentionally not released: we are exiting now.
     app.exit(0);
@@ -342,6 +349,7 @@ struct MenuItemRefs {
   find_replace: MenuItem<Wry>,
   find_next: MenuItem<Wry>,
   find_prev: MenuItem<Wry>,
+  goto_line: MenuItem<Wry>,
   format_menu: Submenu<Wry>,
   line_ending_lf: CheckMenuItem<Wry>,
   line_ending_crlf: CheckMenuItem<Wry>,
@@ -391,6 +399,7 @@ impl MenuItems {
     let _ = items.find_replace.set_enabled(f.find_replace);
     let _ = items.find_next.set_enabled(f.find_next);
     let _ = items.find_prev.set_enabled(f.find_prev);
+    let _ = items.goto_line.set_enabled(f.goto_line);
     // Document-only items: Save As, the Format submenu, and always-on-top.
     let is_doc = kind == FocusKind::Doc;
     let _ = items.save_as.set_enabled(is_doc);
@@ -545,7 +554,7 @@ fn minimize_focused(app: &tauri::AppHandle) {
     let _ = window.minimize();
   }
 }
-/// Enabled flags for the eight mode-dependent menu items.
+/// Enabled flags for the nine mode-dependent menu items.
 struct MenuFlags {
   new_tab: bool,
   open: bool,
@@ -555,22 +564,25 @@ struct MenuFlags {
   find_replace: bool,
   find_next: bool,
   find_prev: bool,
+  goto_line: bool,
 }
 /// Map a focused-window kind to which mode-dependent items are enabled. Document
-/// windows get everything; stickies have no search at all and cannot open or
-/// tab; the workspace closes (which hides it) and opens -- it holds no document
-/// of its own, but it is the one window a user can be left with when no document
-/// is up, and greying Open there leaves no way into a file from inside the app;
+/// windows get everything; stickies have no search at all (but do have go to
+/// line) and cannot open or tab; the workspace closes (which hides it) and
+/// opens -- it holds no document of its own, but it is the one window a user
+/// can be left with when no document is up, and greying Open there leaves no
+/// way into a file from inside the app;
 /// settings/about and the no-focus tray state disable every mode-dependent item.
 fn menu_flags(kind: FocusKind) -> MenuFlags {
-  // Order: new_tab, open, save, close, find, find_replace, find_next, find_prev.
-  let (nt, op, sv, cl, fd, fr, nx, pv) = match kind {
-    FocusKind::Doc => (true, true, true, true, true, true, true, true),
-    FocusKind::Sticky => (false, false, true, true, false, false, false, false),
-    FocusKind::Workspace => (false, true, false, true, false, false, false, false),
-    FocusKind::Settings | FocusKind::About | FocusKind::None => {
-      (false, false, false, false, false, false, false, false)
-    }
+  // Order: new_tab, open, save, close, find, find_replace, find_next, find_prev,
+  // goto_line.
+  let (nt, op, sv, cl, fd, fr, nx, pv, gl) = match kind {
+    FocusKind::Doc => (true, true, true, true, true, true, true, true, true),
+    FocusKind::Sticky => (false, false, true, true, false, false, false, false, true),
+    FocusKind::Workspace => (false, true, false, true, false, false, false, false, false),
+    FocusKind::Settings | FocusKind::About | FocusKind::None => (
+      false, false, false, false, false, false, false, false, false,
+    ),
   };
   MenuFlags {
     new_tab: nt,
@@ -581,6 +593,7 @@ fn menu_flags(kind: FocusKind) -> MenuFlags {
     find_replace: fr,
     find_next: nx,
     find_prev: pv,
+    goto_line: gl,
   }
 }
 /// Emit an event carrying `payload` to whichever window currently has focus.
@@ -843,6 +856,9 @@ pub(crate) fn apply_app_theme(app: &tauri::AppHandle, mode: &str) {
 fn handle_page_load(webview: &tauri::Webview, payload: &tauri::webview::PageLoadPayload<'_>) {
   if payload.event() == tauri::webview::PageLoadEvent::Started {
     clipboard_store::window_reset(webview.label());
+    encoding::window_gone(webview.app_handle(), webview.label());
+    // A page that loads again has lost what its tabs were doing.
+    tab_transfer::page_started(webview.app_handle(), webview.label());
   }
 }
 /// The app's single window-event handler: keeps the menu's focus-dependent
@@ -976,9 +992,16 @@ fn handle_window_event(window: &tauri::Window, event: &tauri::WindowEvent) {
       items.on_top.lock().unwrap().remove(window.label());
     }
     release_pending_opens(window.app_handle(), window.label());
+    tab_transfer::window_gone(window.app_handle(), window.label());
+    // The Jump List listed the window's tabs; `destroy()` sends no other word.
+    #[cfg(target_os = "windows")]
+    if window.label().starts_with("doc-") {
+      jumplist::rebuild(window.app_handle());
+    }
     convert_handoff::window_destroyed(window.app_handle(), window.label());
     convert::window_destroyed(window.app_handle(), window.label());
     clipboard_store::window_destroyed(window.label());
+    encoding::window_gone(window.app_handle(), window.label());
     // A destroyed window has nothing left to flush; ack it on its behalf so
     // a quit whose wait list still names it (it was already let through and
     // is mid-destroy when the quit starts) doesn't stall out the full
@@ -989,6 +1012,15 @@ fn handle_window_event(window: &tauri::Window, event: &tauri::WindowEvent) {
     // handshake.
     if let Some(gate) = window.app_handle().try_state::<FlushGate>() {
       gate.ack(window.label());
+    }
+    // Win32 destroys a window's menu with the window, and every window shares
+    // the app menu's one HMENU: windows built later get the dead handle and no
+    // bar. A fresh menu gives them, and the open windows, a live one.
+    #[cfg(target_os = "windows")]
+    {
+      let app = window.app_handle();
+      let locale = i18n::current_locale(&settings::app_settings(app).language);
+      rebuild_app_menu(app, locale);
     }
   }
 }
@@ -1168,7 +1200,7 @@ fn build_menu(
   )?;
   // Edit items: standard roles for native clipboard/undo/select behaviour (which
   // also enables Cmd+C/V in workspace and settings inputs), then our find family
-  // which emits `menu-action` to the focused window.
+  // and go to line, which emit `menu-action` to the focused window.
   let find = MenuItem::with_id(app, "find", tr(i18n::Key::Find), false, accel("find"))?;
   let find_replace = MenuItem::with_id(
     app,
@@ -1190,6 +1222,13 @@ fn build_menu(
     tr(i18n::Key::FindPrev),
     false,
     accel("find-prev"),
+  )?;
+  let goto_line = MenuItem::with_id(
+    app,
+    "goto-line",
+    tr(i18n::Key::GoToLine),
+    false,
+    accel("goto-line"),
   )?;
   // Undo/Redo/Cut/Copy/Paste/Select All: predefined items on macOS (needed for
   // the responder chain) and Windows (already dispatched natively through
@@ -1331,6 +1370,7 @@ fn build_menu(
       &find_replace,
       &find_next,
       &find_prev,
+      &goto_line,
     ],
   )?;
   // Format menu (document-focus only). Line-ending / encoding / syntax checks
@@ -1510,6 +1550,7 @@ fn build_menu(
       find_replace,
       find_next,
       find_prev,
+      goto_line,
       format_menu,
       line_ending_lf,
       line_ending_crlf,
@@ -1597,8 +1638,8 @@ fn handle_menu_id(app: &tauri::AppHandle, id: &str) {
     },
     "minimize" => minimize_focused(app),
     "new-tab" | "open" | "save" | "save-as" | "show-in-finder" | "copy-path" | "find"
-    | "find-replace" | "find-next" | "find-prev" | "undo" | "redo" | "cut" | "copy" | "paste"
-    | "select-all" => {
+    | "find-replace" | "find-next" | "find-prev" | "goto-line" | "undo" | "redo" | "cut"
+    | "copy" | "paste" | "select-all" => {
       #[cfg(target_os = "macos")]
       if edit_menu_route(id, any_webview_focused(app)) == EditMenuRoute::FirstResponder {
         send_to_first_responder(id);
@@ -1668,6 +1709,7 @@ fn accelerator_enabled(id: &str, kind: FocusKind) -> bool {
     "find-replace" => f.find_replace,
     "find-next" => f.find_next,
     "find-prev" => f.find_prev,
+    "goto-line" => f.goto_line,
     // Document-only, mirroring `save_as.set_enabled(is_doc)` in `MenuItems::apply`.
     "save-as" => kind == FocusKind::Doc,
     // The Format and Window items and the file-path items are document-only,
@@ -1721,7 +1763,7 @@ fn trigger_menu_accelerator(
 }
 /// Every canonical accelerator a native menu item currently carries, for the
 /// Windows frontend keydown listener to match against. Shortcuts that are not
-/// menu items (tab switching, go to line) are never in this list, so
+/// menu items (tab switching) are never in this list, so
 /// `trigger_menu_accelerator` can never intercept them.
 #[tauri::command]
 fn get_menu_accelerators(app: tauri::AppHandle) -> Vec<String> {
@@ -1816,8 +1858,19 @@ mod menu_accelerator_command_tests {
   fn non_menu_combos_resolve_to_none() {
     let keys = defaults(Platform::Other);
     assert_eq!(keys.menu_id_for_accelerator("Ctrl+Z"), None);
-    assert_eq!(keys.menu_id_for_accelerator("Ctrl+Alt+G"), None);
     assert_eq!(keys.menu_id_for_accelerator("Ctrl+Tab"), None);
+  }
+
+  #[test]
+  fn go_to_line_is_a_menu_key() {
+    assert_eq!(
+      defaults(Platform::Other).menu_id_for_accelerator("Ctrl+Alt+G"),
+      Some("goto-line")
+    );
+    assert_eq!(
+      defaults(Platform::MacOS).menu_id_for_accelerator("Alt+Cmd+G"),
+      Some("goto-line")
+    );
   }
 
   #[test]
@@ -1873,6 +1926,45 @@ mod menu_accelerator_command_tests {
       assert!(accelerator_enabled(id, FocusKind::Doc));
       assert!(!accelerator_enabled(id, FocusKind::Sticky));
     }
+  }
+
+  #[test]
+  fn go_to_line_is_enabled_for_doc_and_sticky_only() {
+    assert!(accelerator_enabled("goto-line", FocusKind::Doc));
+    assert!(accelerator_enabled("goto-line", FocusKind::Sticky));
+    for kind in [
+      FocusKind::Workspace,
+      FocusKind::Settings,
+      FocusKind::About,
+      FocusKind::None,
+    ] {
+      assert!(!accelerator_enabled("goto-line", kind), "{kind:?}");
+    }
+  }
+
+  #[test]
+  fn the_edit_menu_lists_go_to_line_right_after_find_previous() {
+    assert!(
+      SOURCE.contains("&find_prev,\n      &goto_line,\n    ],"),
+      "the Edit menu must end with find_prev, goto_line"
+    );
+  }
+
+  #[test]
+  fn go_to_line_is_routed_to_the_focused_window_like_find() {
+    let at = SOURCE
+      .find("fn handle_menu_id(")
+      .expect("handle_menu_id no longer exists in lib.rs");
+    let body = &SOURCE[at..];
+    let body = &body[..body.find("\n}\n").unwrap()];
+    let arm = body
+      .find("\"goto-line\"")
+      .expect("handle_menu_id does not name goto-line");
+    let emit = body
+      .find("emit_to_focused(app, \"menu-action\", id.to_string())")
+      .expect("the find-family arm no longer emits menu-action");
+    assert!(arm < emit);
+    assert_eq!(body[arm..emit].matches("=>").count(), 1);
   }
 
   #[test]
@@ -2259,6 +2351,24 @@ mod rebuild_app_menu_guard_tests {
        rather than returning, and the app never opens a window"
     );
   }
+
+  #[test]
+  fn a_destroyed_window_rebuilds_the_menu_on_windows() {
+    let at = SOURCE
+      .find("if let tauri::WindowEvent::Destroyed = event {")
+      .expect("the Destroyed branch no longer exists in lib.rs");
+    let rest = &SOURCE[at..];
+    let end = rest
+      .find("\n  }\n")
+      .expect("could not find the end of the Destroyed branch");
+    let body = &rest[..end];
+    assert!(
+      body.contains("#[cfg(target_os = \"windows\")]")
+        && body.contains("rebuild_app_menu(app, locale)"),
+      "the Destroyed branch must rebuild the app menu on Windows: the destroyed \
+       window took the shared HMENU with it"
+    );
+  }
 }
 /// Labels of the menu last handed to the tray icon, newest first in build order.
 /// Tauri has `set_menu` and no getter, so without this there is no way to read
@@ -2539,8 +2649,9 @@ fn apply_launch_action(app: &tauri::AppHandle, action: cmdline::Action) {
 /// parser does not recognize — including the common case of a plain
 /// double-launch with no flags at all.
 #[cfg(any(target_os = "windows", target_os = "linux"))]
-fn handle_second_launch(app: &tauri::AppHandle, argv: Vec<String>) {
-  match cmdline::for_edition(cmdline::parse_args(&argv), edition::is_lite()) {
+fn handle_second_launch(app: &tauri::AppHandle, argv: Vec<String>, cwd: &str) {
+  let action = cmdline::absolute_files(cmdline::parse_args(&argv), std::path::Path::new(cwd));
+  match cmdline::for_edition(action, edition::is_lite()) {
     cmdline::Action::None => activate_existing(app),
     action => apply_launch_action(app, action),
   }
@@ -2554,10 +2665,9 @@ fn handle_second_launch(app: &tauri::AppHandle, argv: Vec<String>) {
 #[cfg(any(target_os = "windows", target_os = "linux"))]
 fn handle_first_launch(app: &tauri::AppHandle) {
   let argv: Vec<String> = std::env::args().collect();
-  apply_launch_action(
-    app,
-    cmdline::for_edition(cmdline::parse_args(&argv), edition::is_lite()),
-  );
+  let cwd = std::env::current_dir().unwrap_or_default();
+  let action = cmdline::absolute_files(cmdline::parse_args(&argv), &cwd);
+  apply_launch_action(app, cmdline::for_edition(action, edition::is_lite()));
 }
 /// Whether the launch hands the app files to open. Windows and Linux read them
 /// off the command line; macOS has already received them as `RunEvent::Opened`
@@ -2682,8 +2792,8 @@ pub fn run() {
   // executable directly starts a second process.
   #[cfg(any(target_os = "windows", target_os = "linux"))]
   {
-    builder = builder.plugin(tauri_plugin_single_instance::init(|app, argv, _cwd| {
-      handle_second_launch(app, argv);
+    builder = builder.plugin(tauri_plugin_single_instance::init(|app, argv, cwd| {
+      handle_second_launch(app, argv, &cwd);
     }));
   }
   // The opener plugin is not a dependency on Windows; see `open_externally`.
@@ -2829,7 +2939,9 @@ pub fn run() {
         app.manage(windowed::WindowedState::new(windowed_tmp));
       }
       app.manage(windows::OpenDocTabs::default());
+      app.manage(encoding::DocIoState::new());
       app.manage(pending_opens::PendingOpens::default());
+      app.manage(tab_transfer::TransferState::default());
       app.manage(MenuLists::default());
       app.manage(preview_img::PreviewBases::default());
       let store = app.state::<NoteStore>();
@@ -2969,6 +3081,14 @@ pub fn run() {
       encoding::read_file_auto,
       encoding::read_file_as,
       encoding::write_file_encoded,
+      encoding::ipc_probe,
+      encoding::read_begin,
+      encoding::doc_read_chunk,
+      encoding::read_end,
+      encoding::write_begin,
+      encoding::write_chunk,
+      encoding::write_commit,
+      encoding::write_abort,
       note_store::list_notes,
       note_store::take_startup_skips,
       windows::show_load_problems_window,
@@ -3009,6 +3129,18 @@ pub fn run() {
       windows::set_window_opacity,
       windows::reveal_self,
       pending_opens::doc_window_ready,
+      tab_transfer::tab_drop_target,
+      tab_transfer::tab_drag_hover,
+      tab_transfer::tab_drag_hover_end,
+      tab_transfer::tab_move_window,
+      tab_transfer::tab_transfer_begin,
+      tab_transfer::tab_transfer_claim,
+      tab_transfer::tab_transfer_answer,
+      tab_transfer::tab_transfer_committed,
+      tab_transfer::tab_transfer_cancel,
+      tab_transfer::tab_transfer_released,
+      tab_transfer::tab_transfer_status,
+      tab_transfer::tab_transfer_settle_window,
       windows::show_workspace_window,
       windows::show_settings_window,
       windows::show_about_window,
@@ -3045,7 +3177,10 @@ pub fn run() {
       windowed::windowed_open,
       windowed::windowed_reopen,
       windowed::windowed_index,
+      windowed::windowed_stats,
       windowed::windowed_read,
+      windowed::windowed_offset_pos,
+      windowed::windowed_pos_offset,
       windowed::windowed_apply,
       windowed::windowed_undo,
       windowed::windowed_redo,
@@ -3095,6 +3230,10 @@ pub fn run() {
       clipboard_store::clip_unpin,
       #[cfg(target_os = "macos")]
       clipboard_store::clipboard_redispatch_paste,
+      #[cfg(target_os = "macos")]
+      clipboard_store::clip_text_read,
+      #[cfg(target_os = "macos")]
+      clipboard_store::clip_text_chunk,
       file_ops::create_file,
       file_ops::create_folder,
       file_ops::rename_path,
@@ -3263,6 +3402,7 @@ mod tests {
     let f = menu_flags(FocusKind::Doc);
     assert!(f.new_tab && f.open && f.save && f.close);
     assert!(f.find && f.find_replace && f.find_next && f.find_prev);
+    assert!(f.goto_line);
   }
 
   #[test]
@@ -3271,6 +3411,9 @@ mod tests {
     assert!(f.save && f.close);
     assert!(!f.new_tab && !f.open);
     assert!(!f.find && !f.find_replace && !f.find_next && !f.find_prev);
+    // A sticky has go to line through its editor, and on Windows a disabled
+    // item would swallow its key.
+    assert!(f.goto_line);
   }
 
   #[test]
@@ -3283,6 +3426,7 @@ mod tests {
     assert!(f.open);
     assert!(!f.new_tab && !f.save);
     assert!(!f.find && !f.find_replace && !f.find_next && !f.find_prev);
+    assert!(!f.goto_line);
   }
 
   #[test]
@@ -3291,6 +3435,7 @@ mod tests {
       let f = menu_flags(kind);
       assert!(!f.new_tab && !f.open && !f.save && !f.close);
       assert!(!f.find && !f.find_replace && !f.find_next && !f.find_prev);
+      assert!(!f.goto_line);
     }
   }
 
@@ -3782,6 +3927,36 @@ mod app_focus_tests {
 }
 
 #[cfg(test)]
+mod launch_working_directory_tests {
+  fn body_of<'a>(source: &'a str, signature: &str) -> &'a str {
+    let body = &source[source.find(signature).unwrap()..];
+    &body[..body.find("\n}\n").unwrap()]
+  }
+
+  #[test]
+  fn the_first_launch_resolves_files_against_its_own_directory() {
+    let body = body_of(include_str!("lib.rs"), "fn handle_first_launch(");
+    assert!(body.contains("let cwd = std::env::current_dir().unwrap_or_default();"));
+    assert!(body.contains("cmdline::absolute_files(cmdline::parse_args(&argv), &cwd)"));
+    assert!(body.contains("cmdline::for_edition(action, edition::is_lite())"));
+  }
+
+  #[test]
+  fn a_second_launch_resolves_files_against_the_directory_it_was_started_in() {
+    let source = include_str!("lib.rs");
+    let run = &source[source.find("pub fn run()").unwrap()..];
+    let run = &run[..run.find("\n#[cfg(test)]").unwrap()];
+    assert!(run.contains("single_instance::init(|app, argv, cwd| {"));
+    assert!(run.contains("handle_second_launch(app, argv, &cwd);"));
+    let body = body_of(source, "fn handle_second_launch(");
+    assert!(body
+      .contains("cmdline::absolute_files(cmdline::parse_args(&argv), std::path::Path::new(cwd))"));
+    assert!(body.contains("cmdline::for_edition(action, edition::is_lite())"));
+    assert!(!body.contains("current_dir"));
+  }
+}
+
+#[cfg(test)]
 mod page_load_tests {
   #[test]
   fn a_page_that_starts_loading_lets_go_of_what_the_old_one_held() {
@@ -3797,6 +3972,83 @@ mod page_load_tests {
       .find("clipboard_store::window_reset(webview.label())")
       .unwrap();
     assert!(started < reset);
+  }
+
+  #[test]
+  fn a_page_load_and_a_destroyed_window_release_chunked_io_sessions() {
+    let source = include_str!("lib.rs");
+    let load = &source[source.find("fn handle_page_load(").unwrap()..];
+    let load = &load[..load.find("\n}\n").unwrap()];
+    assert!(load.contains("encoding::window_gone(webview.app_handle(), webview.label())"));
+    let event = &source[source
+      .find("if let tauri::WindowEvent::Destroyed = event {")
+      .unwrap()..];
+    let event = &event[..event.find("\n  }\n").unwrap()];
+    assert!(event.contains("encoding::window_gone(window.app_handle(), window.label())"));
+  }
+}
+
+#[cfg(test)]
+mod tab_transfer_hook_tests {
+  /// The text of the function that starts with `head`, up to its closing brace.
+  fn body<'a>(source: &'a str, head: &str) -> &'a str {
+    let at = source.find(head).unwrap();
+    let rest = &source[at..];
+    &rest[..rest.find("\n}\n").unwrap()]
+  }
+
+  #[test]
+  fn a_page_that_loads_again_is_told_to_the_transfers() {
+    let source = include_str!("lib.rs");
+    let load = body(source, "fn handle_page_load(");
+    let started = load.find("PageLoadEvent::Started").unwrap();
+    let told = load
+      .find("tab_transfer::page_started(webview.app_handle(), webview.label())")
+      .unwrap();
+    assert!(started < told);
+  }
+
+  #[test]
+  fn a_destroyed_window_is_told_to_the_transfers_and_a_document_window_to_the_jump_list() {
+    let source = include_str!("lib.rs");
+    let event = body(source, "fn handle_window_event(");
+    let destroyed = &event[event.find("WindowEvent::Destroyed = event").unwrap()..];
+    assert!(destroyed.contains("tab_transfer::window_gone(window.app_handle(), window.label())"));
+    let rebuild = destroyed
+      .find("jumplist::rebuild(window.app_handle())")
+      .unwrap();
+    let guard = destroyed[..rebuild]
+      .rfind("window.label().starts_with(\"doc-\")")
+      .unwrap();
+    assert!(destroyed[..guard].contains("#[cfg(target_os = \"windows\")]"));
+  }
+
+  #[test]
+  fn the_transfers_are_managed_and_their_commands_registered() {
+    let source = include_str!("lib.rs");
+    let run = &source[source.find("pub fn run()").unwrap()..];
+    let run = &run[..run.find("\n#[cfg(test)]").unwrap()];
+    assert!(run.contains("app.manage(tab_transfer::TransferState::default())"));
+    for command in [
+      "tab_drop_target",
+      "tab_drag_hover",
+      "tab_drag_hover_end",
+      "tab_move_window",
+      "tab_transfer_begin",
+      "tab_transfer_claim",
+      "tab_transfer_answer",
+      "tab_transfer_committed",
+      "tab_transfer_cancel",
+      "tab_transfer_released",
+      "tab_transfer_status",
+      "tab_transfer_settle_window",
+    ] {
+      assert!(
+        run.contains(&format!("tab_transfer::{command},")),
+        "{command}"
+      );
+    }
+    assert!(run.contains("windowed::windowed_stats,"));
   }
 }
 

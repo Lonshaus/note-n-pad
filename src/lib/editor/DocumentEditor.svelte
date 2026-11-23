@@ -13,7 +13,6 @@
   } from '@codemirror/state';
   import {
     EditorView,
-    lineNumbers,
     highlightActiveLineGutter,
     highlightSpecialChars,
     drawSelection,
@@ -31,8 +30,9 @@
     bracketMatching,
   } from '@codemirror/language';
   import { history } from '@codemirror/commands';
-  import { highlightSelectionMatches } from '@codemirror/search';
+  import { gotoLine, highlightSelectionMatches } from '@codemirror/search';
   import { searchWithInSelection } from './searchPanel';
+  import { dialogMarquee } from './dialogMarquee';
   import { closeBrackets, autocompletion } from '@codemirror/autocomplete';
   import {
     loadLanguage,
@@ -49,8 +49,9 @@
   import { focusEditorIfIdle } from '../util/editorFocus';
   import { readCspNonce } from '../util/cspNonce';
   import { keymapExtension } from './keymap';
-  import { compositionCancel } from './composition';
-  import { isUndoKey } from './imeShortcuts';
+  import { compositionCancel, compositionKey } from './composition';
+  import { isGotoLineKey, isUndoKey } from './imeShortcuts';
+  import { stickyLineNumbers } from './stickyLineNumbers';
   import { cmPhraseExtension, cmPhraseSignature } from './cmPhrases';
   import { shortcutsState } from '../state/shortcuts.svelte';
   import { platform } from '../state/platform.svelte';
@@ -69,6 +70,13 @@
     type PasteLock,
   } from '../util/pasteLock';
   import { isModalOpen, whenNoModal } from '../ConfirmModal.svelte';
+  import {
+    applyScrollRecord,
+    scrollRecordOf,
+    seededState,
+    type ScrollRecord,
+  } from './editorSeed';
+  import type { Seed } from '../state/documentWindow.svelte';
 
   interface Props {
     activeId: string;
@@ -107,6 +115,12 @@
     convertible?: boolean;
     onselection: (line: number, col: number) => void;
     onview?: (view: EditorView | null) => void;
+    // What a tab that arrived from another window starts from besides its text:
+    // its selection and history, and where it was scrolled to. Taken once, when
+    // the tab's state is first built here.
+    takeSeed?: (tabId: string) => Seed | undefined;
+    // A tab's state was built from such a seed: its document is the tab's text.
+    onseeded?: (tabId: string, doc: Text) => void;
     // Fired when the long-line gate for the active tab flips: true while the
     // document holds a line past LONG_LINE_THRESHOLD (synchronous highlighting
     // is off, worker highlighting takes over), false otherwise.
@@ -134,6 +148,8 @@
     convertible = true,
     onselection,
     onview,
+    takeSeed,
+    onseeded,
     onlongline,
   }: Props = $props();
   // basicSetup minus the gutter/line-wrapping bits, which move into compartments
@@ -170,7 +186,9 @@
   // The whole gutter column (line numbers + fold + active-line gutter) toggles
   // together, so turning line numbers off removes the gutter entirely.
   function gutterExtension(on: boolean): Extension {
-    return on ? [lineNumbers(), highlightActiveLineGutter(), foldGutter()] : [];
+    return on
+      ? [stickyLineNumbers(), highlightActiveLineGutter(), foldGutter()]
+      : [];
   }
 
   let container: HTMLDivElement;
@@ -197,6 +215,9 @@
   // Per-tab scroll snapshot (scroll is not part of EditorState), saved with the
   // state on switch-out and dispatched after setState on switch-in.
   const scrolls = new Map<string, StateEffect<unknown>>();
+  // The same position as plain data, which is what a move to another window
+  // carries (the snapshot effect above has no accessor).
+  const scrollRecords = new Map<string, ScrollRecord>();
   // The last snapshot dispatched but not yet applied: CodeMirror applies a
   // scroll target only in its next measure pass, so until then the live view
   // does not show it and a capture must use this record instead.
@@ -234,34 +255,59 @@
       }
       applyToSavedState(states, id, spec, oncontentof);
     },
-    showLock: (id: string, lock: PasteLock | undefined) => {
-      const effects = editableCompartment.reconfigure(
-        editableWith(!hidden && !overlay, lock),
-      );
-      if (
-        lock !== undefined &&
-        id === mountedId &&
-        view !== undefined &&
-        document.activeElement === view.contentDOM
-      ) {
-        refocusIds.add(id);
-      }
-      if (id === mountedId) {
-        view?.dispatch({ effects });
-      } else {
-        const saved = states.get(id);
-        if (saved !== undefined) {
-          states.set(id, saved.update({ effects }).state);
-        }
-      }
-      if (lock === undefined && refocusIds.delete(id)) {
-        setTimeout(() => {
-          whenNoModal(() => refocusEditor(id));
-        }, 0);
-      }
-    },
+    showLock: (id: string, lock: PasteLock | undefined) =>
+      showTabLock(id, lock),
     eolOf: (id) => lineEndingOf(id),
   };
+  // Put a lock on the tab's editor, or take it off.
+  function showTabLock(id: string, lock: PasteLock | undefined): void {
+    const effects = editableCompartment.reconfigure(
+      editableWith(!hidden && !overlay, lock),
+    );
+    if (
+      lock !== undefined &&
+      id === mountedId &&
+      view !== undefined &&
+      document.activeElement === view.contentDOM
+    ) {
+      refocusIds.add(id);
+    }
+    if (id === mountedId) {
+      view?.dispatch({ effects });
+    } else {
+      const saved = states.get(id);
+      if (saved !== undefined) {
+        states.set(id, saved.update({ effects }).state);
+      }
+    }
+    if (lock === undefined && refocusIds.delete(id)) {
+      setTimeout(() => {
+        whenNoModal(() => refocusEditor(id));
+      }, 0);
+    }
+  }
+  // The window freezes a tab that is on its way to another window, and gives
+  // it back, through the same lock a paste puts on it.
+  export function showLock(id: string, lock: PasteLock | undefined): void {
+    showTabLock(id, lock);
+  }
+  // The state of the tab's editor: the live one while it is shown, else the one
+  // saved when it was switched away from. Null for a tab never held here.
+  export function editorStateOf(id: string): EditorState | null {
+    if (id === mountedId) {
+      return view?.state ?? null;
+    }
+    return states.get(id) ?? null;
+  }
+  // Where the tab's editor is scrolled to, as plain data: read from the view
+  // while it is shown, else from the record made when it was switched away
+  // from. Null for a tab never switched out.
+  export function scrollOf(id: string): ScrollRecord | null {
+    if (id === mountedId) {
+      return view === undefined ? null : scrollRecordOf(view);
+    }
+    return scrollRecords.get(id) ?? null;
+  }
   const paste = new PasteFlow(pasteHost, {
     ...pasteFlowDeps,
     isLite: () => !convertible || pasteFlowDeps.isLite(),
@@ -275,51 +321,79 @@
   let hasLongLine = $state(false);
   // Phrases baked into every state so far; a reconfigure is skipped when equal.
   let appliedPhrases = cmPhraseSignature();
-
+  // What every tab's state is built with.
+  function extensionsFor(id: string): Extension {
+    return [
+      // Required in every view, see the note in Editor.svelte.
+      EditorView.cspNonce.of(readCspNonce()),
+      coreSetup,
+      keymapCompartment.of(currentKeymap()),
+      // Undo while composing cancels the composition, as TextEdit does.
+      platform.isMacOS ? compositionCancel(isUndoKey, afterCancel) : [],
+      // Go to Line while composing, which the keymap skips.
+      platform.isMacOS
+        ? compositionKey(isGotoLineKey, (v) => void gotoLine(v))
+        : [],
+      phraseCompartment.of(cmPhraseExtension()),
+      dialogMarquee,
+      gutterCompartment.of(gutterExtension(showLineNumbers)),
+      wrapCompartment.of(wordWrap ? EditorView.lineWrapping : []),
+      languageCompartment.of([]),
+      workerCompartment.of([]),
+      themeCompartment.of(varEditorTheme(dark)),
+      editableCompartment.of(
+        editableWith(!hidden && !overlay, pasteLocks.get(id)),
+      ),
+      // CodeMirror's own paste reads the clipboard by itself; ours asks the
+      // core first, and reads it once.
+      EditorView.domEventHandlers({
+        paste: (e, v) => paste.onPaste(mountedId, v, e),
+        copy: (_e, v) => {
+          rememberCopy(v.state);
+          return false;
+        },
+        cut: (_e, v) => {
+          rememberCopy(v.state);
+          return false;
+        },
+      }),
+      EditorView.updateListener.of((update) => {
+        if (update.docChanged) {
+          // Zero-copy: hand the rope reference to state, no whole-buffer string.
+          onchange(update.state.doc);
+          updateLongLineOnEdit(update);
+        }
+        if (update.docChanged || update.selectionSet) {
+          reportSelection();
+        }
+      }),
+    ];
+  }
   function buildState(doc: Text, id: string): EditorState {
-    return EditorState.create({
-      doc,
-      extensions: [
-        // Required in every view, see the note in Editor.svelte.
-        EditorView.cspNonce.of(readCspNonce()),
-        coreSetup,
-        keymapCompartment.of(currentKeymap()),
-        // Undo while composing cancels the composition, as TextEdit does.
-        platform.isMacOS ? compositionCancel(isUndoKey, afterCancel) : [],
-        phraseCompartment.of(cmPhraseExtension()),
-        gutterCompartment.of(gutterExtension(showLineNumbers)),
-        wrapCompartment.of(wordWrap ? EditorView.lineWrapping : []),
-        languageCompartment.of([]),
-        workerCompartment.of([]),
-        themeCompartment.of(varEditorTheme(dark)),
-        editableCompartment.of(
-          editableWith(!hidden && !overlay, pasteLocks.get(id)),
-        ),
-        // CodeMirror's own paste reads the clipboard by itself; ours asks the
-        // core first, and reads it once.
-        EditorView.domEventHandlers({
-          paste: (e, v) => paste.onPaste(mountedId, v, e),
-          copy: (_e, v) => {
-            rememberCopy(v.state);
-            return false;
-          },
-          cut: (_e, v) => {
-            rememberCopy(v.state);
-            return false;
-          },
-        }),
-        EditorView.updateListener.of((update) => {
-          if (update.docChanged) {
-            // Zero-copy: hand the rope reference to state, no whole-buffer string.
-            onchange(update.state.doc);
-            updateLongLineOnEdit(update);
-          }
-          if (update.docChanged || update.selectionSet) {
-            reportSelection();
-          }
-        }),
-      ],
-    });
+    return EditorState.create({ doc, extensions: extensionsFor(id) });
+  }
+  // The state of a tab that arrived from another window with its selection and
+  // history, and the scroll it had; null when it came with neither.
+  function seeded(
+    id: string,
+    doc: Text,
+  ): { state: EditorState | null; scroll: ScrollRecord | null } | null {
+    const seed = takeSeed?.(id);
+    if (seed === undefined) {
+      return null;
+    }
+    let state: EditorState | null = null;
+    if (seed.editor !== null) {
+      try {
+        state = seededState(seed.editor, doc, extensionsFor(id));
+      } catch (error) {
+        console.error(
+          'the editor state of a moved tab was not restored',
+          error,
+        );
+      }
+    }
+    return { state, scroll: seed.scroll };
   }
   // Bring everything that mirrors the document back in line after a cancelled
   // composition replaced the state (setState runs no update listeners).
@@ -448,10 +522,17 @@
   }
 
   onMount(() => {
-    const state = buildState(content, activeId);
+    const seed = seeded(activeId, content);
+    const state = seed?.state ?? buildState(content, activeId);
     view = new EditorView({ parent: container, state });
     mountedId = activeId;
     const v = view;
+    if (seed?.state != null) {
+      onseeded?.(activeId, state.doc);
+    }
+    if (seed?.scroll != null) {
+      applyScrollRecord(view, seed.scroll);
+    }
     const forget = registerPasteTarget(v, (text) =>
       paste.pasteText(mountedId, v.state, text),
     );
@@ -494,9 +575,15 @@
       if (openIds.includes(mountedId)) {
         states.set(mountedId, view.state);
         scrolls.set(mountedId, captureScroll(view));
+        scrollRecords.set(mountedId, scrollRecordOf(view));
       }
-      const incoming = states.get(id) ?? buildState(content, id);
+      const saved = states.get(id);
+      const seed = saved === undefined ? seeded(id, content) : null;
+      const incoming = saved ?? seed?.state ?? buildState(content, id);
       view.setState(incoming);
+      if (seed?.state != null) {
+        onseeded?.(id, incoming.doc);
+      }
       mountedId = id;
       view.dispatch({
         effects: [
@@ -507,7 +594,9 @@
         ],
       });
       const snap = scrolls.get(id);
-      if (snap !== undefined) {
+      if (seed?.scroll != null) {
+        applyScrollRecord(view, seed.scroll);
+      } else if (snap !== undefined) {
         dispatchScroll(view, snap);
       }
       rescanLongLine(incoming.doc);
@@ -560,15 +649,20 @@
       }
     });
   });
+  // The reload count the editor mounted with: a bump from before it existed
+  // changed a document this editor never held, and replacing the one it was
+  // just built with (a moved tab's, history and all) would add an undo step.
+  let reloadsSeen = untrack(() => reloadSeq);
   // Replace the active tab's whole document when the buffer changed outside the
   // editor (e.g. re-decoded under a new encoding). Only reloadSeq is tracked;
   // content is read untracked so keystrokes never trigger this.
   $effect(() => {
     const seq = reloadSeq;
     untrack(() => {
-      if (view === undefined || seq === 0) {
+      if (view === undefined || seq === reloadsSeen) {
         return;
       }
+      reloadsSeen = seq;
       if (hidden && reloadTarget !== mountedId) {
         return;
       }
@@ -674,6 +768,7 @@
         if (!ids.has(key)) {
           states.delete(key);
           scrolls.delete(key);
+          scrollRecords.delete(key);
           pasteLocks.drop(key);
         }
       }
