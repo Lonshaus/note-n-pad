@@ -701,6 +701,7 @@ else
 fi
 windowed_start() {
   select_all
+  settle
   if [ "$1" = "a" ]; then
     press ArrowUp '{shiftKey:true}'
     settle
@@ -750,8 +751,14 @@ for start in a b; do
   got=$(norm_sel "$(gsel)" "$END_LINE")
   want=$(grep "^$start|start|" "$WORK/ref.txt" | cut -d'|' -f3)
   check "start $start: the selection is the same before any key" "$got" "$want"
+  start_want=$want
   while IFS='|' read -r id key mods; do
     windowed_start "$start"
+    start_got=$(norm_sel "$(gsel)" "$END_LINE")
+    if [ "$start_got" != "$start_want" ]; then
+      bad "start $start before $id: the start selection is wrong (got: [$(e2e_show "$start_got")], want: [$(e2e_show "$start_want")])"
+      e2e_read "$DL" "JSON.stringify(__auto.windowedGlobalInfo())"
+    fi
     press "$key" "$mods"
     settle
     got=$(norm_sel "$(gsel)" "$END_LINE")
