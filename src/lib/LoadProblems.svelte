@@ -4,6 +4,7 @@
   import { invoke } from '@tauri-apps/api/core';
   import { ask } from '@tauri-apps/plugin-dialog';
   import { t } from './i18n';
+  import { marquee } from './util/marquee';
   import { platform } from './state/platform.svelte';
   import type { DataKind, SkippedFile } from './util/protocol';
   import { revealKey, skipReasonKey } from './util/skipped';
@@ -99,9 +100,12 @@
       class="summary error"
       aria-expanded={open}
       onclick={() => (open = !open)}
+      ><span
+        class="marquee"
+        use:marquee={t('skipped.heading', { count: items.length })}
+        ><span>{t('skipped.heading', { count: items.length })}</span></span
+      ></button
     >
-      {t('skipped.heading', { count: items.length })}
-    </button>
     {#if open}
       <span class="arrow" aria-hidden="true"></span>
       <ul>
@@ -113,16 +117,19 @@
             </div>
             {#if actions}
               <div class="row-actions">
-                <button class="link" onclick={() => void reveal(file.name)}>
-                  {t(revealKey(platform))}
-                </button>
+                <button class="link" onclick={() => void reveal(file.name)}
+                  ><span class="marquee" use:marquee={t(revealKey(platform))}
+                    ><span>{t(revealKey(platform))}</span></span
+                  ></button
+                >
                 {#if deletable}
                   <button
                     class="link danger"
                     onclick={() => void remove(file.name)}
+                    ><span class="marquee" use:marquee={t('skipped.delete')}
+                      ><span>{t('skipped.delete')}</span></span
+                    ></button
                   >
-                    {t('skipped.delete')}
-                  </button>
                 {/if}
               </div>
             {/if}
@@ -152,6 +159,9 @@
     text-align: left;
     cursor: pointer;
     font: inherit;
+    max-width: 100%;
+    overflow: hidden;
+    flex-shrink: 0;
   }
   .error {
     color: var(--danger);
@@ -242,7 +252,9 @@
   }
   .row-actions {
     display: flex;
+    flex-wrap: wrap;
     flex-shrink: 0;
+    max-width: 100%;
     gap: 0.6rem;
   }
   /* Quiet chips rather than filled buttons: two solid buttons on every one of
@@ -258,6 +270,9 @@
     font-size: 0.72rem;
     line-height: 1.3;
     white-space: nowrap;
+    max-width: 100%;
+    overflow: hidden;
+    flex-shrink: 0;
     color: var(--accent);
     transition:
       background-color 120ms ease,

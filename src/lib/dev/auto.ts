@@ -182,6 +182,8 @@ export interface DocumentHooks {
   openTabSettled: (path: string) => Promise<void>;
   newTab: () => void;
   closeActiveTab: () => void;
+  /** Answer the close confirmation when it is up; false when it was not. */
+  answerCloseConfirm: (choice: 'save' | 'discard' | 'cancel') => boolean;
   /** `openNormal` swallows `loadTab`'s exception and only sets this, so a
    *  failed open is otherwise indistinguishable from no open at all. */
   openFailed: () => string | null;
@@ -693,6 +695,8 @@ export function installSettingsAuto(hooks: SettingsHooks): void {
       language: settingsState.language,
       resolvedLocale: settingsState.resolvedLocale,
     }),
+    // True once this window's stored settings are loaded and applied.
+    settingsReady: () => settingsState.ready.then(() => true),
     getLanguage: () => settingsState.language,
     setLanguage: (l: Language) => settingsState.setLanguage(l),
     setThemeId: (id: string) => settingsState.setThemeId(id),

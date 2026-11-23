@@ -97,6 +97,36 @@ describe('clipCopyRoute', () => {
     it('has nothing to copy without a selection', () => {
       expect(routeEdit({ globalSel: null })).toBe('text');
     });
+    it('copies the session when a part of a line is not loaded under the selection', () => {
+      // The loaded text of the line is not its text in the file: not even a
+      // caret's line can be copied by the browser.
+      expect(
+        routeEdit({ globalSel: sel(100, 3, 100, 3), hiddenText: true }),
+      ).toBe('session');
+      expect(
+        routeEdit({ globalSel: sel(100, 0, 110, 0), hiddenText: true }),
+      ).toBe('session');
+    });
+    it('copies the session for an operation that runs in the core, whatever the size', () => {
+      expect(routeEdit({ globalSel: sel(100, 0, 110, 4), coreOp: true })).toBe(
+        'session',
+      );
+      expect(routeEdit({ globalSel: sel(0, 0, 5000, 0), coreOp: false })).toBe(
+        'text',
+      );
+    });
+    it('leaves a text field to itself even when a part of a line is not loaded', () => {
+      expect(
+        routeEdit({
+          globalSel: sel(100, 3, 100, 3),
+          hiddenText: true,
+          focus: 'other',
+        }),
+      ).toBe('text');
+    });
+    it('does not let hidden text move the viewer', () => {
+      expect(route({ hiddenText: true })).toBe('text');
+    });
   });
 
   describe('viewing', () => {

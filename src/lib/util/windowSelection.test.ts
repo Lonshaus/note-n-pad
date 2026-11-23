@@ -5,6 +5,7 @@ import { describe, expect, it } from 'vitest';
 import {
   blockedWhileGlobal,
   clipboardBlocked,
+  coreOp,
   fitsWindow,
   gotoSelection,
   insideWindow,
@@ -14,11 +15,14 @@ import {
   isNativeSelectAll,
   movedEnds,
   movesSelection,
+  nothingSelectableBefore,
   needsGlobalOp,
   queuedClipboardAction,
   queuedSelectEnds,
   replayKind,
   replayReady,
+  replaceRoute,
+  sameSelection,
   selectAllTarget,
   selectionAfterChange,
   selectionAfterSwap,
@@ -31,6 +35,7 @@ import {
   type SelectAllEntry,
   type SelectAllMode,
   type WholeFileEvent,
+  type WindowHoles,
   type WindowShape,
 } from './windowSelection';
 // Every line is 10 characters long.
@@ -704,5 +709,308 @@ describe('isModifierKey', () => {
     }
     expect(isModifierKey('a')).toBe(false);
     expect(isModifierKey('ArrowLeft')).toBe(false);
+  });
+});
+
+describe('sameSelection', () => {
+  it('compares both ends by line and column and ignores undirectional', () => {
+    expect(
+      sameSelection(
+        { ...sel(1, 2, 3, 4), undirectional: true },
+        sel(1, 2, 3, 4),
+      ),
+    ).toBe(true);
+    expect(sameSelection(sel(1, 2, 3, 4), sel(1, 2, 3, 5))).toBe(false);
+    expect(sameSelection(sel(1, 2, 3, 4), sel(1, 3, 3, 4))).toBe(false);
+  });
+
+  it('never equals a missing selection', () => {
+    expect(sameSelection(null, sel(1, 2, 3, 4))).toBe(false);
+    expect(sameSelection(null, null)).toBe(false);
+  });
+});
+
+describe('selectionAfterChange with ends that count as moved', () => {
+  // The anchor is hidden in the window: its live position is the edge of its
+  // marker, which is where the view shows it and where the next selection of
+  // the pointer lands.
+  const global = sel(100, 55, 100, 70);
+  const live = sel(0, 5, 0, 20);
+  it('keeps a hidden end whose live position did not change', () => {
+    expect(selectionAfterChange(global, live, live, 100, false)).toEqual(
+      global,
+    );
+  });
+
+  it('replaces the head only when it counts as moved', () => {
+    expect(
+      selectionAfterChange(global, live, live, 100, false, {
+        anchor: false,
+        head: true,
+      }),
+    ).toEqual(sel(100, 55, 100, 20));
+  });
+
+  it('replaces both ends of a click that counts them as moved', () => {
+    expect(
+      selectionAfterChange(global, live, live, 100, false, {
+        anchor: true,
+        head: true,
+      }),
+    ).toEqual(sel(100, 5, 100, 20));
+  });
+
+  it('keeps an end outside the window that the click did not move', () => {
+    const outside = sel(40, 3, 100, 70);
+    expect(
+      selectionAfterChange(
+        outside,
+        sel(0, 0, 0, 20),
+        sel(0, 0, 0, 20),
+        100,
+        false,
+        {
+          anchor: false,
+          head: true,
+        },
+      ),
+    ).toEqual(sel(40, 3, 100, 20));
+  });
+});
+
+describe('queuedSelectEnds with the ends the caller says moved', () => {
+  it('converts the ends named in `moved` and keeps the caret for the others', () => {
+    expect(
+      queuedSelectEnds(
+        { anchor: 5, head: 5 },
+        { anchor: 5, head: 5 },
+        (pos) => 1000 + pos,
+        { anchor: 900, head: 905 },
+        { anchor: false, head: true },
+      ),
+    ).toEqual({ anchor: 900, head: 1005 });
+  });
+});
+
+describe('coreOp', () => {
+  const holes = (
+    hidden: boolean,
+    readFor: LineSelection | null,
+  ): WindowHoles => ({
+    hidden: () => hidden,
+    hiddenText: () => hidden,
+    readFor,
+  });
+  const small = sel(100, 0, 110, 0);
+  it('is the size test without holes', () => {
+    expect(coreOp(small)).toBe(false);
+    expect(coreOp(sel(0, 0, 5000, 0))).toBe(true);
+  });
+
+  it('is set for a selection with a hidden end the window was read for', () => {
+    expect(coreOp(small, holes(true, small))).toBe(true);
+  });
+
+  it('is not set for a hidden end without a read for that selection', () => {
+    expect(coreOp(small, holes(true, null))).toBe(false);
+    expect(coreOp(small, holes(true, sel(100, 0, 110, 1)))).toBe(false);
+  });
+
+  it('is not set for a hidden caret, nor for an end that is not hidden', () => {
+    const caret = sel(100, 5, 100, 5);
+    expect(coreOp(caret, holes(true, caret))).toBe(false);
+    expect(coreOp(small, holes(false, small))).toBe(false);
+  });
+});
+// A window from global line 100 with 50 lines whose position at line 120,
+// column 5 is hidden, read for `readFor`.
+describe('a window with a part of a line not loaded', () => {
+  const holes = (
+    readFor: LineSelection | null,
+    hidden = (pos: { line: number; col: number }) =>
+      pos.line === 120 && pos.col === 5,
+  ): WindowHoles => ({
+    hidden,
+    hiddenText: () => true,
+    readFor,
+  });
+  const hiddenHead = sel(110, 2, 120, 5);
+  const hiddenAnchor = sel(120, 5, 110, 2);
+  const plain = sel(110, 2, 130, 0);
+  const caretHere = sel(120, 5, 120, 5);
+
+  describe('insideWindow', () => {
+    it('treats an end in a part not loaded as outside', () => {
+      expect(insideWindow(hiddenHead, 100, 50)).toBe(true);
+      expect(insideWindow(hiddenHead, 100, 50, holes(null))).toBe(false);
+      expect(insideWindow(hiddenAnchor, 100, 50, holes(null))).toBe(false);
+      expect(insideWindow(caretHere, 100, 50, holes(null))).toBe(false);
+    });
+
+    it('is the line test for a selection whose ends are both loaded', () => {
+      expect(insideWindow(plain, 100, 50, holes(null))).toBe(true);
+      expect(insideWindow(sel(10, 0, 20, 0), 100, 50, holes(null))).toBe(false);
+    });
+  });
+
+  describe('replayReady', () => {
+    it('is the hole-aware inside test for a selection no read was made for', () => {
+      expect(replayReady(plain, 100, 50, holes(null))).toBe(true);
+      expect(replayReady(hiddenHead, 100, 50, holes(null))).toBe(false);
+      expect(replayReady(caretHere, 100, 50, holes(plain))).toBe(false);
+    });
+
+    it('is the head on a loaded line, not hidden, for a core-op selection', () => {
+      // A hidden anchor the window was read for: the head is loaded.
+      expect(replayReady(hiddenAnchor, 100, 50, holes(hiddenAnchor))).toBe(
+        true,
+      );
+      const head = sel(120, 5, 110, 2);
+      const headHidden = holes(head, (p) => p.line === 110);
+      expect(replayReady(head, 100, 50, headHidden)).toBe(false);
+      // A head on a line the window does not hold.
+      const far = sel(120, 5, 400, 0);
+      expect(
+        replayReady(
+          far,
+          100,
+          50,
+          holes(far, () => true),
+        ),
+      ).toBe(false);
+    });
+
+    it('is the head test for a selection too large for a window, as before', () => {
+      expect(replayReady(sel(0, 0, 1500, 0), 1000, 2000)).toBe(true);
+      expect(replayReady(sel(0, 0, 1500, 0), 0, 1000)).toBe(false);
+    });
+
+    it('is never ready for a head key that must read the window again first', () => {
+      expect(replayReady(plain, 100, 50, holes(null), 'reload')).toBe(false);
+      expect(replayReady(plain, 100, 50, undefined, 'reload')).toBe(false);
+      expect(replayReady(plain, 100, 50, holes(null), 'run')).toBe(true);
+    });
+
+    it('is ready for a head key that is refused, which the drain drops', () => {
+      expect(replayReady(plain, 100, 50, holes(null), 'refuse')).toBe(true);
+    });
+  });
+
+  describe('replaceRoute', () => {
+    const lines = { startLine: 100, lineCount: 50 };
+    const route = (
+      from: LineSelection,
+      readFor: LineSelection | null,
+      revealed = false,
+    ) => replaceRoute(from, { ...lines, holes: holes(readFor) }, revealed);
+
+    it('replaces in the window when the selection is inside it', () => {
+      expect(route(plain, null)).toBe('here');
+      expect(replaceRoute(plain, lines, false)).toBe('here');
+    });
+
+    it('reveals a selection outside the window, or with a hidden end that no read was made for', () => {
+      expect(route(sel(10, 0, 20, 0), null)).toBe('reveal');
+      expect(route(hiddenHead, null)).toBe('reveal');
+      expect(route(hiddenHead, sel(1, 1, 1, 1))).toBe('reveal');
+    });
+
+    it('acts as Find Next for a hidden end the window was read for', () => {
+      expect(route(hiddenHead, hiddenHead)).toBe('find');
+    });
+
+    it('acts as Find Next for a selection too large for a window', () => {
+      expect(route(sel(0, 0, 5000, 0), null)).toBe('find');
+    });
+
+    it('acts as Find Next for a selection a focused read did not bring in', () => {
+      expect(route(hiddenHead, null, true)).toBe('find');
+      expect(route(sel(10, 0, 20, 0), null, true)).toBe('find');
+      expect(route(plain, null, true)).toBe('here');
+    });
+
+    it("is today's choice without holes", () => {
+      expect(replaceRoute(sel(10, 0, 20, 0), lines, false)).toBe('reveal');
+      expect(replaceRoute(sel(0, 0, 5000, 0), lines, false)).toBe('find');
+    });
+  });
+
+  describe('blockedWhileGlobal', () => {
+    const edit = { docChanged: true, userEvent: 'input.type' };
+
+    it('refuses a user edit under the core-op value it is given', () => {
+      expect(blockedWhileGlobal(edit, hiddenHead, true)).toBe(true);
+      expect(blockedWhileGlobal(edit, sel(0, 0, 5000, 0), false)).toBe(false);
+    });
+
+    it('falls back to the size test without it', () => {
+      expect(blockedWhileGlobal(edit, sel(0, 0, 5000, 0))).toBe(true);
+      expect(blockedWhileGlobal(edit, hiddenHead)).toBe(false);
+    });
+  });
+
+  describe('what resolvePaste reads for fits', () => {
+    it('is not set for a hidden end the window was read for', () => {
+      // `fits` is not core-op.
+      expect(!coreOp(hiddenHead, holes(hiddenHead))).toBe(false);
+      expect(!coreOp(hiddenHead, holes(null))).toBe(true);
+      expect(!coreOp(sel(0, 0, 5000, 0), holes(null))).toBe(false);
+      expect(!coreOp(plain, holes(plain))).toBe(true);
+    });
+  });
+});
+
+describe('nothingSelectableBefore', () => {
+  // The span before row 0 of the viewer: body whitespace, the tab bar, the
+  // space between the tab bar and the body, row 0's gutter number, its space.
+  const before = [
+    { text: '\n    ', unselectable: false },
+    { text: 'a.log', unselectable: true },
+    { text: ' ', unselectable: false },
+    { text: '1', unselectable: true },
+    { text: ' ', unselectable: false },
+  ];
+
+  it('is true for a select-all starting at the start of row 0', () => {
+    expect(
+      nothingSelectableBefore(before, {
+        text: 'abc',
+        offset: 0,
+        unselectable: false,
+      }),
+    ).toBe(true);
+  });
+
+  it('is false when selectable text of the start node lies before the start', () => {
+    expect(
+      nothingSelectableBefore(before, {
+        text: 'abc',
+        offset: 2,
+        unselectable: false,
+      }),
+    ).toBe(false);
+  });
+
+  it('is false when a selectable node lies before an element start', () => {
+    expect(
+      nothingSelectableBefore(
+        [...before, { text: 'abc', unselectable: false }],
+        null,
+      ),
+    ).toBe(false);
+  });
+
+  it('is true when nothing but the span lies before an element start', () => {
+    expect(nothingSelectableBefore(before, null)).toBe(true);
+    expect(nothingSelectableBefore([], null)).toBe(true);
+  });
+
+  it('ignores a selectable whitespace-only node', () => {
+    expect(
+      nothingSelectableBefore(
+        [...before, { text: '\t\n', unselectable: false }],
+        null,
+      ),
+    ).toBe(true);
   });
 });

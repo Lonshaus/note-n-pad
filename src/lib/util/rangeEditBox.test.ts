@@ -6,8 +6,10 @@ import { Text } from '@codemirror/state';
 import {
   isRangeBoxDirty,
   nextRangeBox,
+  nextWriteBack,
   openRangeBox,
   rangeBoxWriteText,
+  rebaseRangeBox,
   type RangeBox,
   type RangeBoxInit,
 } from './rangeEditBox';
@@ -182,5 +184,100 @@ describe('the breaks of a mixed slice', () => {
       content: text('a\nb\nc\nXd\n'),
     })!;
     expect(rangeBoxWriteText(edited)).toBe('a\rb\nc\r\nXd\n');
+  });
+});
+
+describe('nextWriteBack', () => {
+  it('is done when the buffer is the one that was sent, even as another document', () => {
+    expect(nextWriteBack(text('a\nb'), text('a\nb'))).toBe('done');
+  });
+
+  it('is a rewrite when the buffer differs from the one that was sent', () => {
+    expect(nextWriteBack(text('a\nb'), text('a\nbc'))).toBe('rewrite');
+    expect(nextWriteBack(text('a\nb'), text(''))).toBe('rewrite');
+  });
+});
+
+describe('the session of a box', () => {
+  it('differs for every opening and survives edits, conflicts and a rebase', () => {
+    const one = openRangeBox(init());
+    const two = openRangeBox(init());
+    expect(two.session).not.toBe(one.session);
+    const edited = nextRangeBox(one, { kind: 'edit', content: text('x') })!;
+    expect(edited.session).toBe(one.session);
+    expect(nextRangeBox(edited, { kind: 'mismatch' })!.session).toBe(
+      one.session,
+    );
+    expect(
+      rebaseRangeBox(edited, 'x\n', {
+        fingerprint: { size: 1, mtime_ms: 1 },
+        writtenStart: 0,
+        writtenEnd: 2,
+      }).session,
+    ).toBe(one.session);
+  });
+});
+
+describe('rebaseRangeBox', () => {
+  const outcome = {
+    fingerprint: { size: 40, mtime_ms: 9 },
+    writtenStart: 7,
+    writtenEnd: 20,
+  };
+
+  it('moves the baseline to what was written and keeps what was typed since', () => {
+    const typed = nextRangeBox(openRangeBox(init({ text: 'a\rb\nc\r\n' })), {
+      kind: 'edit',
+      content: text('a\nB\nc\nmore\n'),
+    })!;
+    const rebased = rebaseRangeBox(typed, 'a\rB\nc\r\n', outcome);
+    expect(rebased).toMatchObject({
+      startByte: 7,
+      endByte: 20,
+      fingerprint: { size: 40, mtime_ms: 9 },
+      startLine: typed.startLine,
+      endLine: typed.endLine,
+      tabId: typed.tabId,
+      sourcePath: typed.sourcePath,
+      lineEnding: typed.lineEnding,
+    });
+    expect(rebased.saved.toString()).toBe('a\nB\nc\n');
+    expect(rebased.breaks).toEqual(['\r', '\n', '\r\n']);
+    expect(rebased.content).toBe(typed.content);
+  });
+
+  it('keeps trailingBreak as the box had it, even when what was written is empty', () => {
+    const emptied = nextRangeBox(openRangeBox(init()), {
+      kind: 'edit',
+      content: text(''),
+    })!;
+    expect(emptied.trailingBreak).toBe(true);
+    const rebased = rebaseRangeBox(emptied, '', {
+      ...outcome,
+      writtenEnd: outcome.writtenStart,
+    });
+    expect(rebased.trailingBreak).toBe(true);
+    expect(rebased.saved.toString()).toBe('');
+    expect(rebased.breaks).toEqual([]);
+    const typed = nextRangeBox(rebased, {
+      kind: 'edit',
+      content: text('abc'),
+    })!;
+    expect(rangeBoxWriteText(typed)).toBe('abc\n');
+  });
+
+  it('writes the lines it left alone with the breaks of what was written, not of the slice first read', () => {
+    const open = openRangeBox(init({ text: 'a\r\nb\rc\r\n' }));
+    const grown = nextRangeBox(open, {
+      kind: 'edit',
+      content: text('a\nNEW\nb\nc\n'),
+    })!;
+    const written = rangeBoxWriteText(grown);
+    expect(written).toBe('a\r\nNEW\r\nb\rc\r\n');
+    const typed = nextRangeBox(rebaseRangeBox(grown, written, outcome), {
+      kind: 'edit',
+      content: text('a\nNEW\nb\nc2\n'),
+    })!;
+    expect(rangeBoxWriteText(typed)).toBe('a\r\nNEW\r\nb\rc2\r\n');
   });
 });

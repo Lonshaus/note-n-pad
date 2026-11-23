@@ -7,6 +7,7 @@
   import { listen, type UnlistenFn } from '@tauri-apps/api/event';
   import { cssFontFamily } from '../util/font';
   import { Lru } from '../util/lru';
+  import { marquee } from '../util/marquee';
   import {
     computeVisibleWindow,
     fullyVisibleSpan,
@@ -36,9 +37,7 @@
   import { platform } from '../state/platform.svelte';
   import { isLite } from '../state/edition.svelte';
   import { editionUi } from '../util/editionUi';
-  import { shortcutsState } from '../state/shortcuts.svelte';
   import { settingsState } from '../state/settings.svelte';
-  import { matchWindowShortcut } from '../util/windowShortcut';
   import {
     clipCopyRoute,
     clipFileRange,
@@ -47,6 +46,7 @@
   } from '../util/clipRouting';
   import {
     movesSelection,
+    nothingSelectableBefore,
     wholeFileAfter,
     type SelectAllEntry,
     type WholeFileEvent,
@@ -737,6 +737,43 @@
     sel.addRange(next);
     updateWholeFile({ type: 'selectAll', entry });
   }
+  function notSelectable(node: Node): boolean {
+    const el = node.parentElement;
+    if (el === null) {
+      return true;
+    }
+    const style = getComputedStyle(el);
+    return style.userSelect === 'none' || style.webkitUserSelect === 'none';
+  }
+  // Whether nothing selectable lies between the start of the document and the
+  // range's start (the tab bar is not selectable, so a select-all starts inside
+  // the viewer).
+  function startsBeforeViewer(range: Range): boolean {
+    const before: { text: string; unselectable: boolean }[] = [];
+    const walker = document.createTreeWalker(
+      document.body,
+      NodeFilter.SHOW_TEXT,
+    );
+    for (let n = walker.nextNode(); n !== null; n = walker.nextNode()) {
+      const text = n.textContent ?? '';
+      if (range.comparePoint(n, text.length) >= 0) {
+        break;
+      }
+      before.push({ text, unselectable: notSelectable(n) });
+    }
+    const first = range.startContainer;
+    return nothingSelectableBefore(
+      before,
+      first.nodeType === Node.TEXT_NODE
+        ? {
+            text: first.textContent ?? '',
+            offset: range.startOffset,
+            unselectable: notSelectable(first),
+          }
+        : null,
+    );
+  }
+  let pointerSelection = false;
   // A native select-all (keyboard) starts before the viewer and ends at or
   // after the last rendered row; narrow it to the rows fully on screen.
   function onSelectionChange(): void {
@@ -762,7 +799,9 @@
         ? (endNode.textContent ?? '').length
         : endNode.childNodes.length;
     if (
-      range.compareBoundaryPoints(Range.START_TO_START, root) >= 0 ||
+      (range.compareBoundaryPoints(Range.START_TO_START, root) >= 0 &&
+        // A pointer selection keeps the start-before-the-viewer rule.
+        (pointerSelection || !startsBeforeViewer(range))) ||
       range.comparePoint(endNode, endOffset) !== 0
     ) {
       return;
@@ -845,26 +884,34 @@
     e.preventDefault();
     e.clipboardData.setData('text/plain', joinSelectedRows(rows));
   }
+  function onPointerDown(e: PointerEvent): void {
+    if (e.button === 0) {
+      pointerSelection = true;
+    }
+  }
+  function onContextMenu(): void {
+    pointerSelection = false;
+  }
   // A click in the viewer starts a new selection.
   function onMouseDown(e: MouseEvent): void {
     if (e.target instanceof Node && wrap?.contains(e.target) === true) {
       updateWholeFile({ type: 'click' });
     }
   }
-  // The shortcut registry's `goto-line` key opens goto. Cmd/Ctrl+F is a native
-  // menu accelerator (it never reaches this listener), so DocumentApp routes it
-  // to `openSearch` instead.
+  // Cmd/Ctrl+A ends a pointer selection; a selection-moving key updates the
+  // whole-file state.
   function onWindowKeydown(e: KeyboardEvent): void {
+    if (
+      (platform.isMacOS ? e.metaKey : e.ctrlKey) &&
+      (e.key === 'a' || e.key === 'A' || e.code === 'KeyA' || e.keyCode === 65)
+    ) {
+      pointerSelection = false;
+    }
     if (movesSelection(e.key)) {
       updateWholeFile({ type: 'key' });
     }
-    const accel = shortcutsState.accel('goto-line');
-    if (accel !== null && matchWindowShortcut(e, accel, platform.os)) {
-      e.preventDefault();
-      openGoto();
-    }
   }
-  // DEV/automation surface, driven by DocumentApp's hooks.
+  // Driven by DocumentApp: Edit > Go to Line and the DEV/automation hooks.
   export function largeGotoOpen(): void {
     openGoto();
   }
@@ -1038,6 +1085,8 @@
     // Only mounted while a large tab is active, so this shortcut never fires in
     // the normal editor (which has no LargeFileView).
     window.addEventListener('keydown', onWindowKeydown);
+    document.addEventListener('pointerdown', onPointerDown, true);
+    document.addEventListener('contextmenu', onContextMenu, true);
     document.addEventListener('mousedown', onMouseDown);
     document.addEventListener('selectionchange', onSelectionChange);
     document.addEventListener('copy', onCopy);
@@ -1140,6 +1189,8 @@
       destroyed = true;
       observer?.disconnect();
       window.removeEventListener('keydown', onWindowKeydown);
+      document.removeEventListener('pointerdown', onPointerDown, true);
+      document.removeEventListener('contextmenu', onContextMenu, true);
       document.removeEventListener('mousedown', onMouseDown);
       document.removeEventListener('selectionchange', onSelectionChange);
       document.removeEventListener('copy', onCopy);
@@ -1210,14 +1261,20 @@
       >
       {#if editionUi(isLite()).rangeEdit}
         <button class="cm-button" onclick={() => void triggerRangeEdit()}
-          >{t('large.range.edit')}</button
+          ><span class="marquee" use:marquee={t('large.range.edit')}
+            ><span>{t('large.range.edit')}</span></span
+          ></button
         >
       {/if}
       <button class="cm-button" onclick={() => void triggerRangeSaveAs()}
-        >{t('large.range.saveAs')}</button
+        ><span class="marquee" use:marquee={t('large.range.saveAs')}
+          ><span>{t('large.range.saveAs')}</span></span
+        ></button
       >
       <button class="cm-button" onclick={clearSelection}
-        >{t('common.cancel')}</button
+        ><span class="marquee" use:marquee={t('common.cancel')}
+          ><span>{t('common.cancel')}</span></span
+        ></button
       >
       {#if rangeError !== ''}
         <span class="range-error">{rangeError}</span>
@@ -1326,6 +1383,11 @@
     border: 1px solid var(--topbar-border);
     border-radius: 6px;
     box-shadow: 0 4px 16px rgba(0, 0, 0, 0.25);
+  }
+  .range-bar .cm-button {
+    max-width: 100%;
+    overflow: hidden;
+    flex-shrink: 0;
   }
   .range-info {
     font-size: 0.8rem;

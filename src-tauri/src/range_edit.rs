@@ -42,6 +42,17 @@ pub struct Fingerprint {
   pub size: u64,
   pub mtime_ms: u64,
 }
+/// What a splice reports: the rewritten file's fingerprint and where the
+/// replacement's own bytes ended up, `[written_start, written_end)` in the new
+/// file. The bytes the splice widened over (a lone `\r` of the line before) are
+/// not part of the range.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SpliceWritten {
+  pub fingerprint: Fingerprint,
+  pub written_start: u64,
+  pub written_end: u64,
+}
 
 /// Modification time in milliseconds since the Unix epoch. Filesystems that do not
 /// expose an mtime (or report one before the epoch) degrade to 0 rather than
@@ -180,6 +191,10 @@ struct SplicePlan<'a> {
   start: u64,
   lead_lf: u64,
   replacement: Cow<'a, [u8]>,
+  /// Where the caller's replacement begins in the new file.
+  written_start: u64,
+  /// Its length as written, after a trailing `\r` was rewritten.
+  written_len: u64,
 }
 /// The splice for `[start, end)` and `replacement`, widened where it would join
 /// a lone `\r` to a `\n` into one `\r\n`: the `\r` is rewritten to `insert_sep`
@@ -222,6 +237,8 @@ fn plan_splice<'a>(
   let mut plan = SplicePlan {
     start,
     lead_lf: 0,
+    written_start: start,
+    written_len: repl.len() as u64,
     replacement: repl,
   };
   if before == Some(b'\r') && byte_at(file, start, size)? != Some(b'\n') && next == Some(b'\n') {
@@ -231,6 +248,7 @@ fn plan_splice<'a>(
       plan.start = run;
     } else {
       plan.start = start - 1;
+      plan.written_start = start + 1;
       let mut joined = b"\r\n".to_vec();
       joined.extend_from_slice(&plan.replacement);
       plan.replacement = Cow::Owned(joined);
@@ -246,7 +264,8 @@ fn plan_splice<'a>(
 /// pure insertion; an empty `replacement` is a pure deletion. `insert_sep` (`\n`
 /// or `\r\n`) is what a lone `\r` that the splice would join to a `\n` is
 /// rewritten to (see `plan_splice`). Returns the fingerprint of the rewritten
-/// file so the caller can rebase its range view.
+/// file and the range the replacement occupies in it, so the caller can rebase
+/// its range view.
 fn splice_at(
   path: &Path,
   start: u64,
@@ -254,7 +273,7 @@ fn splice_at(
   replacement: &str,
   insert_sep: &str,
   expected: Option<Fingerprint>,
-) -> Result<Fingerprint, String> {
+) -> Result<SpliceWritten, String> {
   let meta = fs::metadata(path).map_err(|e| e.to_string())?;
   let size = meta.len();
   if start > end || end > size {
@@ -289,7 +308,11 @@ fn splice_at(
     plan.lead_lf,
     &plan.replacement,
   )?;
-  fingerprint_of(path)
+  Ok(SpliceWritten {
+    fingerprint: fingerprint_of(path)?,
+    written_start: plan.written_start,
+    written_end: plan.written_start + plan.written_len,
+  })
 }
 
 /// Read `[start, end)` of `path` as text, for seeding a range-edit view. Reports
@@ -382,7 +405,7 @@ pub fn splice_file(
   replacement: String,
   insert_sep: String,
   expected: Option<Fingerprint>,
-) -> Result<Fingerprint, String> {
+) -> Result<SpliceWritten, String> {
   splice_at(
     Path::new(&path),
     start,
@@ -935,6 +958,56 @@ mod tests {
     let path = write_file(dir.path(), "f.txt", b"q\r..\n");
     splice_at(&path, 2, 4, "\r\r", "\n", None).unwrap();
     assert_eq!(fs::read(&path).unwrap(), b"q\n\n\n\n");
+  }
+  /// Splice `[start, end)` of `file` with `repl`, assert the reported range is
+  /// `want` and the file is `after`, then splice that range with the same text
+  /// and separator again: the bytes must not change.
+  fn assert_written_range(
+    file: &[u8],
+    start: u64,
+    end: u64,
+    repl: &str,
+    sep: &str,
+    want: (u64, u64),
+    after: &[u8],
+  ) {
+    let dir = tempdir().unwrap();
+    let path = write_file(dir.path(), "w.txt", file);
+    let done = splice_at(&path, start, end, repl, sep, None).unwrap();
+    assert_eq!(fs::read(&path).unwrap(), after, "{file:?} sep {sep:?}");
+    assert_eq!(
+      (done.written_start, done.written_end),
+      want,
+      "{file:?} sep {sep:?}"
+    );
+    assert_eq!(done.fingerprint, fingerprint_of(&path).unwrap());
+    let again = splice_at(&path, want.0, want.1, repl, sep, Some(done.fingerprint)).unwrap();
+    assert_eq!(
+      fs::read(&path).unwrap(),
+      after,
+      "again {file:?} sep {sep:?}"
+    );
+    assert_eq!((again.written_start, again.written_end), want);
+  }
+
+  #[test]
+  fn a_splice_reports_the_range_when_a_cr_before_it_is_rewritten() {
+    // The widening writes the previous line's break; the range starts after it.
+    assert_written_range(b"P\rA\nB\n", 2, 6, "\nB\n", "\n", (2, 5), b"P\n\nB\n");
+    assert_written_range(b"P\rA\nB\n", 2, 6, "\nB\n", "\r\n", (3, 6), b"P\r\n\nB\n");
+  }
+
+  #[test]
+  fn a_splice_reports_the_range_when_its_trailing_cr_is_rewritten() {
+    assert_written_range(b"..a\rb\n\nz", 2, 6, "a\r", "\n", (2, 4), b"..a\n\nz");
+    // The CRLF rewrite is one byte longer than the text sent.
+    assert_written_range(b"..a\rb\n\nz", 2, 6, "a\r", "\r\n", (2, 5), b"..a\r\n\nz");
+  }
+
+  #[test]
+  fn a_splice_reports_the_range_when_nothing_is_rewritten() {
+    assert_written_range(b"abcdef", 1, 4, "XY", "\n", (1, 3), b"aXYef");
+    assert_written_range(b"abcdef", 1, 4, "", "\r\n", (1, 1), b"aef");
   }
 
   #[test]

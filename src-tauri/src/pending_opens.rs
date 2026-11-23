@@ -18,6 +18,8 @@ pub enum Pending {
   Path(String),
   /// A converted document to claim (`convert_claim`), by handoff id.
   Handoff(u64),
+  /// A tab moved here from another window (`tab_transfer`), by transfer id.
+  Transfer(u64),
 }
 /// One guard covers the queue and the ready set, so a path is either queued
 /// before the window's drain or delivered directly after it, never both or
@@ -49,6 +51,14 @@ impl PendingOpens {
   /// `route`, for the converted document of handoff `handoff_id`.
   pub fn route_handoff(&self, label: &str, handoff_id: u64) -> Route {
     self.route_item(label, Pending::Handoff(handoff_id))
+  }
+  /// `route`, for the tab of transfer `t`.
+  pub fn route_transfer(&self, label: &str, t: u64) -> Route {
+    self.route_item(label, Pending::Transfer(t))
+  }
+  /// Whether `label` has announced itself and so takes items directly.
+  pub fn is_ready(&self, label: &str) -> bool {
+    self.inner.lock().unwrap().ready.contains(label)
   }
   fn route_item(&self, label: &str, item: Pending) -> Route {
     let mut inner = self.inner.lock().unwrap();
@@ -126,19 +136,22 @@ pub fn open_converted_in_window(window: &tauri::WebviewWindow, handoff_id: u64) 
 }
 /// What a window that went away never received, as the paths to open elsewhere
 /// and the handoffs to give back: a converted document is never opened as a path.
+/// A queued transfer gives back nothing: the window's going calls it off.
 pub fn split_released(items: Vec<Pending>) -> (Vec<String>, Vec<u64>) {
   let (mut paths, mut handoffs) = (Vec::new(), Vec::new());
   for item in items {
     match item {
       Pending::Path(path) => paths.push(path),
       Pending::Handoff(id) => handoffs.push(id),
+      Pending::Transfer(_) => {}
     }
   }
   (paths, handoffs)
 }
 /// The window announced itself: hand over what was queued for it, paths as
-/// `{ kind: 'path', value: <path> }` and converted documents as
-/// `{ kind: 'handoff', value: <handoff id> }`.
+/// `{ kind: 'path', value: <path> }`, converted documents as
+/// `{ kind: 'handoff', value: <handoff id> }` and moved tabs as
+/// `{ kind: 'transfer', value: <transfer id> }`.
 #[tauri::command]
 pub fn doc_window_ready(app: tauri::AppHandle, label: String) -> Vec<Pending> {
   app.state::<PendingOpens>().mark_ready(&label)
@@ -342,10 +355,51 @@ mod tests {
 
   #[test]
   fn the_queue_is_sent_as_kind_and_value() {
-    let items = vec![Pending::Path("a.txt".to_string()), Pending::Handoff(3)];
+    let items = vec![
+      Pending::Path("a.txt".to_string()),
+      Pending::Handoff(3),
+      Pending::Transfer(9),
+    ];
     assert_eq!(
       serde_json::to_string(&items).unwrap(),
-      r#"[{"kind":"path","value":"a.txt"},{"kind":"handoff","value":3}]"#
+      r#"[{"kind":"path","value":"a.txt"},{"kind":"handoff","value":3},{"kind":"transfer","value":9}]"#
     );
+  }
+
+  #[test]
+  fn a_transfer_waits_in_the_queue_in_the_order_it_came() {
+    let pending = PendingOpens::default();
+    pending.route("doc-a", "one.txt");
+    assert_eq!(pending.route_transfer("doc-a", 4), Route::Queued);
+    pending.route_handoff("doc-a", 7);
+    assert_eq!(
+      pending.mark_ready("doc-a"),
+      vec![
+        Pending::Path("one.txt".to_string()),
+        Pending::Transfer(4),
+        Pending::Handoff(7),
+      ]
+    );
+    assert_eq!(pending.route_transfer("doc-a", 5), Route::Deliver);
+  }
+
+  #[test]
+  fn a_window_closed_before_ready_gives_back_nothing_for_a_transfer() {
+    let pending = PendingOpens::default();
+    pending.route_transfer("doc-a", 4);
+    assert_eq!(split_released(pending.forget("doc-a")), (vec![], vec![]));
+  }
+
+  #[test]
+  fn a_label_is_ready_from_its_announcement_until_it_is_forgotten() {
+    let pending = PendingOpens::default();
+    assert!(!pending.is_ready("doc-a"));
+    pending.route_transfer("doc-a", 1);
+    assert!(!pending.is_ready("doc-a"));
+    pending.mark_ready("doc-a");
+    assert!(pending.is_ready("doc-a"));
+    assert!(!pending.is_ready("doc-b"));
+    pending.forget("doc-a");
+    assert!(!pending.is_ready("doc-a"));
   }
 }

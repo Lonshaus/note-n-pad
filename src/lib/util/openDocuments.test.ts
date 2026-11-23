@@ -83,6 +83,20 @@ describe('groupOpenDocuments', () => {
     expect(groups[0]!.rows.map((r) => r.id)).toEqual(['b', 'c', 'a']);
   });
 
+  it('sorts rows by tab_order, a record without one counting as its tab_index', () => {
+    const groups = groupOpenDocuments(
+      [
+        note({ id: 'a', window_group: 'g', tab_index: 30 }),
+        note({ id: 'b', window_group: 'g', tab_index: 31, tab_order: 29 }),
+        note({ id: 'c', window_group: 'g', tab_index: 32, tab_order: 30.5 }),
+      ],
+      docLabel,
+    );
+    expect(groups[0]!.rows.map((r) => r.id)).toEqual(['b', 'a', 'c']);
+    // The identity of a row is still its tab_index.
+    expect(groups[0]!.rows.map((r) => r.tabIndex)).toEqual([31, 30, 32]);
+  });
+
   it('falls back to the note id when window_group is null', () => {
     const groups = groupOpenDocuments(
       [note({ id: 'solo', window_group: null, file_path: '/s.txt' })],

@@ -32,9 +32,12 @@ import {
 import {
   isRangeBoxDirty,
   nextRangeBox,
+  nextWriteBack,
   openRangeBox,
   rangeBoxWriteText,
+  rebaseRangeBox,
   type RangeBox,
+  type RangeWriteOutcome,
 } from '../util/rangeEditBox';
 import { detectBreakStyle } from '../util/windowedEdit';
 import { createOpGate, type OpGate } from '../util/windowedGate';
@@ -49,6 +52,36 @@ import { settingsState } from './settings.svelte';
 import { platform } from './platform.svelte';
 import { editionState, isLite } from './edition.svelte';
 import { nextTabIndex } from '../util/keptTabs';
+import { compareTabOrder, keyBetween, newKey, orderOf } from '../util/tabOrder';
+import { dropSlot, toClientPoint, type TabBarGeometry } from '../util/tabDrag';
+import { pasteLocks, type PasteLock } from '../util/pasteLock';
+import {
+  fromPayload,
+  toPayload,
+  type TabPayload,
+  type ViewPos,
+} from '../util/tabPayload';
+import {
+  BEGIN,
+  DROP,
+  SETTLE,
+  committedMeta,
+  type BeginResult,
+  type CancelResult,
+  type CommittedMeta,
+  type DropTarget,
+  type Point,
+  type SettleAction,
+  type TransferBounds,
+  type TransferTarget,
+} from '../util/tabTransferWire';
+import {
+  editorPayload,
+  type EditorJson,
+  type ScrollRecord,
+} from '../editor/editorSeed';
+import type { EditorState } from '@codemirror/state';
+import type { ViewMode } from '../util/viewModes';
 import { isCleanOldRange, needsRewrite } from '../util/restoreRecords';
 import { isOrdinaryTab, pickHeldTab, touchMru } from './heldTab';
 import type { LargeIndexRef } from '../util/largeIndex';
@@ -67,6 +100,7 @@ import {
   isLiteRefusal,
 } from '../util/protocol';
 import { appliedTarget } from '../util/windowedApplied';
+import { readDocument, writeDocument, type Decoded } from '../util/documentIo';
 /** Rust `splice_file` rejects an out-of-band-edited source with this exact error
  *  string; the write-back keys its conflict flow off it (protocol value). */
 const FINGERPRINT_MISMATCH = 'fingerprint-mismatch';
@@ -212,10 +246,11 @@ interface WindowedIndexSnapshot {
 /** Result of a range edit box write-back: written, refused for a conflict (the
  *  conflict modal is now up), or failed for another reason. */
 export type SpliceResult = 'ok' | 'mismatch' | 'error';
-/** What `spliceRange` found: the source rewritten (with its new fingerprint),
- *  changed since `expected` was taken, or refused for another reason. */
+/** What `spliceRange` found: the source rewritten (with its new fingerprint and
+ *  the span the replacement took), changed since `expected` was taken, or
+ *  refused for another reason. */
 export type SpliceOutcome =
-  | { status: 'ok'; fingerprint: Fingerprint }
+  | ({ status: 'ok' } & RangeWriteOutcome)
   | { status: 'mismatch' }
   | { status: 'error'; error: string };
 /** Replace `[startByte, endByte)` of `sourcePath` with `replacement`, and
@@ -232,9 +267,9 @@ export async function spliceRange(
   replacement: string,
   expected: Fingerprint | null,
 ): Promise<SpliceOutcome> {
-  let fingerprint: Fingerprint;
+  let written: RangeWriteOutcome;
   try {
-    fingerprint = await invoke<Fingerprint>('splice_file', {
+    written = await invoke<RangeWriteOutcome>('splice_file', {
       path: target.sourcePath,
       start: target.startByte,
       end: target.endByte,
@@ -251,7 +286,7 @@ export async function spliceRange(
   }
   // Every window, this one included.
   void emit(RANGE_SPLICED_EVENT, target.sourcePath);
-  return { status: 'ok', fingerprint };
+  return { status: 'ok', ...written };
 }
 /** A byte slice decoded as text plus whether the decode was lossy (invalid
  *  UTF-8 replaced), mirroring the Rust `ReadRange`. */
@@ -259,14 +294,6 @@ interface RangeRead {
   text: string;
   lossy: boolean;
 }
-/** Result of a Rust decode command; content is BOM-free, line endings intact. */
-interface Decoded {
-  content: string;
-  encoding: string;
-  had_bom: boolean;
-  lossy: boolean;
-}
-
 interface FileStat {
   size: number;
 }
@@ -288,6 +315,27 @@ export const LARGE_EDIT_MAX = 512 * 1024 * 1024;
  *  Lite edition has no viewer: every size opens in the ordinary editor. */
 export function opensInLargeViewer(size: number, lite: boolean): boolean {
   return !lite && size > LARGE_FILE_THRESHOLD;
+}
+/** What a tab close compares across its wait for the core. */
+export interface TabCloseState {
+  content: Text;
+  lineEnding: LineEnding;
+  /** A windowed tab's newest content generation, or undefined. */
+  generation: number | undefined;
+}
+/** Whether the tab was edited while its close waited: another document, another
+ *  line ending, a newer windowed generation, or windowed input not in the core
+ *  yet (`pending`). */
+export function editedWhileClosing(
+  before: TabCloseState,
+  now: TabCloseState & { pending: boolean },
+): boolean {
+  return (
+    now.pending ||
+    before.content !== now.content ||
+    before.lineEnding !== now.lineEnding ||
+    before.generation !== now.generation
+  );
 }
 /** One open document tab. The buffer (`content`) is always LF-normalized. It is a
  *  CodeMirror `Text` (rope), not a string, so a keystroke costs O(edit) instead of
@@ -318,7 +366,12 @@ export interface DocTab {
   encoding: string;
   /** Transient: set when the last decode produced replacement characters. */
   lossy: boolean;
+  /** Stable identity of the tab across windows and restarts; it does not follow
+   *  a reorder. */
   tabIndex: number;
+  /** Sort key of the tab within its window, stored as `tab_order`. The tabs are
+   *  in array order of this key. */
+  order: number;
   /** Present only on a read-only large-file tab: its content is never loaded,
    *  it is never dirty, and it does not participate in snapshots. `unlockRefused`
    *  is set (to the reason shown on the tab lock) once an in-place unlock is
@@ -380,6 +433,20 @@ export interface DocTab {
   /** Present on a large-file editing tab that a paste made out of a document or
    *  a sticky note, until it is a plain UTF-8 file. */
   converted?: ConvertedTab;
+  /** Work in flight on the tab that a move to another window must not interrupt
+   *  (a file write, a re-decode, an edit box opening); in memory only. */
+  inFlight?: number;
+  /** The tab is being closed: `deleteTab` began. In memory only. */
+  closing?: boolean;
+  /** The tab is frozen, on its way to another window: it cannot be edited or
+   *  written, and a close of it calls the move off first. In memory only. */
+  transferring?: boolean;
+  /** The tab has landed in another window and is leaving this one: nothing of
+   *  it is written or deleted any more. In memory only. */
+  released?: boolean;
+  /** A sticky note's text handed over as this tab, until the handoff is done.
+   *  In memory only. */
+  handingOver?: boolean;
 }
 /** What a tab made by a paste needs to know of where it came from and what it
  *  is written as. */
@@ -397,7 +464,7 @@ export interface ConvertedTab {
   saved: boolean;
 }
 /** How the host compares paths, for following a rename. */
-function pathRules(): PathRules {
+export function pathRules(): PathRules {
   return {
     caseInsensitive: platform.isMacOS || platform.isWindows,
     backslash: platform.isWindows,
@@ -427,6 +494,139 @@ interface Bounds {
   y: number | null;
   width: number | null;
   height: number | null;
+}
+/** What the window around the state says of a drag: a tab cannot be dragged
+ *  while one of these holds. */
+export interface DragHost {
+  /** A missing-file dialog holds the window on its tab. */
+  navigationLocked(): boolean;
+  /** The quit, close or oversized-tab gate is up. */
+  gateVisible(): boolean;
+  /** Any other dialog is up. */
+  modalOpen(): boolean;
+  /** The window is closing (the close gate holds it). */
+  closing(): boolean;
+  /** A quit has the window. */
+  quitting(): boolean;
+}
+/** What a tab on its way needs of the window around the state. */
+export interface TransferHost {
+  /** Lock (or, with undefined, unlock) the editor of the tab `id`. */
+  showLock(id: string, lock: PasteLock | undefined): void;
+  /** The ordinary editor's state for the tab, when it has one. */
+  editorStateOf(id: string): EditorState | null;
+  /** Where the tab's editor is scrolled to, when it has been. */
+  scrollOf(id: string): ScrollRecord | null;
+  viewModeOf(id: string): ViewMode | undefined;
+  setViewMode(id: string, mode: ViewMode): void;
+  /** Let go of what the window keeps for a tab that left it. */
+  forgetTab(id: string): void;
+  /** Where the tabs are drawn, or null before there is a bar. */
+  dropGeometry(): TabBarGeometry | null;
+  /** Whether any dialog is up. */
+  modalOpen(): boolean;
+  /** Close this window (the sender after its last tab left, or a window
+   *  left with nothing). */
+  closeWindow(): Promise<void>;
+}
+/** A tab that arrived, as it sits in the window. */
+export type ArrivedHandler = (tab: DocTab) => void;
+/** The editor's seed for a tab: what it keeps besides the text. */
+export interface Seed {
+  editor: EditorJson | null;
+  scroll: ScrollRecord | null;
+}
+/** A tab on its way in: claimed and answered, not yet one of the window's. */
+export interface IncomingCopy {
+  t: number;
+  tab: DocTab;
+  payload: TabPayload;
+  /** The keys around it left no number between them: every tab is renumbered
+   *  when it comes in. */
+  renumber: boolean;
+}
+/** Why a tab cannot be moved to another window now. */
+export type TransferBlock =
+  | 'released'
+  | 'transferring'
+  | 'op'
+  | 'in-flight'
+  | 'closing'
+  | 'convert'
+  | 'handing-over'
+  | 'range-box'
+  | 'windowed-op'
+  | 'paste'
+  | 'locked';
+/** What the window knows of a tab that its fields do not say. */
+export interface BlockFacts {
+  /** An operation in `runTabOp` (a restore, an unlock, a copy). */
+  op: boolean;
+  /** A paste conversion of the tab. */
+  convert: boolean;
+  /** The range edit box is open on the tab. */
+  rangeBox: boolean;
+  /** A whole-file operation of its windowed session is pending. */
+  windowedOp: boolean;
+  /** A paste holds the tab. */
+  paste: boolean;
+  /** Any drag-start lock. */
+  locked: boolean;
+}
+/** The reason a tab cannot be moved to another window, or null when it can:
+ *  anything that is still running on it, or that would be lost or doubled by
+ *  the move. */
+export function transferBlocker(
+  tab: DocTab,
+  facts: BlockFacts,
+): TransferBlock | null {
+  if (tab.released === true) {
+    return 'released';
+  }
+  if (tab.transferring === true) {
+    return 'transferring';
+  }
+  if (facts.op) {
+    return 'op';
+  }
+  if ((tab.inFlight ?? 0) > 0) {
+    return 'in-flight';
+  }
+  if (tab.closing === true) {
+    return 'closing';
+  }
+  if (facts.convert) {
+    return 'convert';
+  }
+  if (tab.handingOver === true) {
+    return 'handing-over';
+  }
+  if (facts.rangeBox) {
+    return 'range-box';
+  }
+  if (facts.windowedOp) {
+    return 'windowed-op';
+  }
+  if (facts.paste) {
+    return 'paste';
+  }
+  if (facts.locked) {
+    return 'locked';
+  }
+  return null;
+}
+/** A release of a dragged tab: where the pointer was, and what the tab bar made
+ *  of it. */
+export interface ReleaseAt {
+  /** The client point of the release. */
+  x: number;
+  y: number;
+  /** The sender's `devicePixelRatio`. */
+  dpr: number;
+  /** The slot the pointer was over on the own tab bar. */
+  slot: number;
+  /** The release was over the own tab bar. */
+  overBar: boolean;
 }
 /** Owns every tab living in one document window (grouped by window_group).
  *
@@ -496,6 +696,15 @@ export class DocumentWindowState {
   /** The newest content generation each windowed session has reported, by
    *  session id: a result with a lower one is stale and changes nothing. */
   private windowedGenerations = new Map<number, number>();
+  /** Tabs whose close is waiting for the core, so a repeated close of the same
+   *  tab does nothing. */
+  private closingTabs = new Set<DocTab>();
+  /** Ids of large tabs opened for editing while another tab was held in front:
+   *  they unlock once they are shown. */
+  private unlockWhenShown = new Set<string>();
+  /** Orphaned records of a file an open tab already shows, by tab id, merged
+   *  into the tab once it is shown. */
+  private adoptWhenShown = new Map<string, NoteSnapshot>();
   viewTopLine(id: string): number | undefined {
     return this.viewPos.get(id)?.top;
   }
@@ -659,10 +868,17 @@ export class DocumentWindowState {
   /** Settles once `init` knows the group's stored tab indices; a new tab asked
    *  for before then waits, or it would take an index a stored tab holds. */
   private settleIndex: () => void = () => {};
+  /** Whether `init` has told the window the group's stored tab indices. */
+  indexKnown = false;
   private indexSettled = new Promise<void>((resolve) => {
-    this.settleIndex = resolve;
+    this.settleIndex = () => {
+      this.indexKnown = true;
+      resolve();
+    };
   });
   private lastSave: Promise<void> = Promise.resolve();
+  /** The writes of each tab that have not settled, by tab id. */
+  private pendingWrites = new Map<string, Set<Promise<void>>>();
   /** Tab ids with a `beginWindowedRestore` in flight, so re-activating a tab
    *  mid-restore (switch away and back) never starts a second reopen. Plain
    *  (non-reactive) Set: it is a dedupe guard, not render state. */
@@ -827,6 +1043,7 @@ export class DocumentWindowState {
       dirty,
       window_group: this.group,
       tab_index: tab.tabIndex,
+      tab_order: tab.order,
       line_ending: tab.lineEnding,
       had_bom: tab.hadBom,
       encoding: tab.encoding,
@@ -882,6 +1099,10 @@ export class DocumentWindowState {
   // exits without it). Failure is recorded on `snapshotFailed` instead of
   // being silently dropped.
   private upsertTab(tab: DocTab): Promise<void> {
+    // A tab on its way is written by neither window until it has landed.
+    if (this.onItsWay(tab)) {
+      return Promise.resolve();
+    }
     // A tab a paste made is not written until it is saved: the record of the
     // document or the note it came from is what a restart restores.
     if (tab.converted !== undefined && !tab.converted.saved) {
@@ -905,7 +1126,42 @@ export class DocumentWindowState {
         console.error('upsert_note failed', error);
       });
     this.lastSave = promise;
+    this._writesPending += 1;
+    void promise.then(() => {
+      this._writesPending -= 1;
+      if (this._writesPending === 0) {
+        this._clicksInWait = 0;
+      }
+    });
+    this.trackWrite(tab.id, promise);
     return promise;
+  }
+  private trackWrite(id: string, write: Promise<void>): void {
+    const writes = this.pendingWrites.get(id) ?? new Set<Promise<void>>();
+    writes.add(write);
+    this.pendingWrites.set(id, writes);
+    void write.then(() => {
+      writes.delete(write);
+      if (writes.size === 0 && this.pendingWrites.get(id) === writes) {
+        this.pendingWrites.delete(id);
+      }
+    });
+  }
+  /** Whether the tab is frozen for a move to another window, or has left. */
+  private onItsWay(tab: DocTab): boolean {
+    return tab.transferring === true || tab.released === true;
+  }
+  /** Run `work` with the tab counted as busy, so it is not moved meanwhile. */
+  private async busy<T>(tab: DocTab, work: () => Promise<T>): Promise<T> {
+    tab.inFlight = (tab.inFlight ?? 0) + 1;
+    try {
+      return await work();
+    } finally {
+      tab.inFlight = (tab.inFlight ?? 1) - 1;
+      if (tab.inFlight === 0) {
+        delete tab.inFlight;
+      }
+    }
   }
   /** Read a file from disk and build a tab, honouring a restored snapshot when
    *  it carries unsaved edits (snapshot wins over disk, matching stickies). */
@@ -931,6 +1187,7 @@ export class DocumentWindowState {
         encoding: settingsState.defaultEncoding,
         lossy: false,
         tabIndex: snap.tab_index,
+        order: orderOf(snap),
       };
     }
     // Known up front so every branch below (windowed/large restore, or an
@@ -973,6 +1230,7 @@ export class DocumentWindowState {
         encoding: snap.windowed_encoding ?? settingsState.defaultEncoding,
         lossy: false,
         tabIndex: snap.tab_index,
+        order: orderOf(snap),
         windowedRestore: {
           index: snap.windowed_index,
           fingerprint: {
@@ -1007,6 +1265,7 @@ export class DocumentWindowState {
         encoding: settingsState.defaultEncoding,
         lossy: false,
         tabIndex: snap.tab_index,
+        order: orderOf(snap),
         large: { size: snap.large },
       };
     }
@@ -1037,6 +1296,7 @@ export class DocumentWindowState {
           encoding: settingsState.defaultEncoding,
           lossy: false,
           tabIndex: snap?.tab_index ?? this.allocIndex(),
+          order: snap === null ? this.newOrder() : orderOf(snap),
           large: { size },
         };
       }
@@ -1047,11 +1307,8 @@ export class DocumentWindowState {
     let readError: string | null = null;
     try {
       decoded = snap?.encoding
-        ? await invoke<Decoded>('read_file_as', {
-            path,
-            encoding: snap.encoding,
-          })
-        : await invoke<Decoded>('read_file_auto', { path });
+        ? await readDocument(path, snap.encoding)
+        : await readDocument(path);
     } catch (e) {
       decoded = null;
       readError = String(e);
@@ -1076,6 +1333,7 @@ export class DocumentWindowState {
     const diskEnding = detectLineEnding(diskRaw);
     const id = snap?.id ?? crypto.randomUUID();
     const tabIndex = snap?.tab_index ?? this.allocIndex();
+    const order = snap === null ? this.newOrder() : orderOf(snap);
     const detected = detectByFilename(path);
     // Existing files keep their detected/stored encoding; a file that never
     // existed on disk (no decode, no snapshot) falls back to the user default.
@@ -1098,6 +1356,7 @@ export class DocumentWindowState {
         encoding,
         lossy,
         tabIndex,
+        order,
       };
     }
     // A clean tab shares one rope between buffer and saved baseline, so its dirty
@@ -1126,6 +1385,7 @@ export class DocumentWindowState {
       encoding,
       lossy,
       tabIndex,
+      order,
     };
   }
   /** Load every tab for this window's group, or open a single fresh tab when a
@@ -1155,7 +1415,7 @@ export class DocumentWindowState {
       .filter(
         (n) => n.kind === 'document' && (n.window_group ?? n.id) === group,
       )
-      .sort((a, b) => a.tab_index - b.tab_index);
+      .sort(compareTabOrder);
     // Before the restore below, so a restore that throws midway still leaves
     // later tabs above every stored index.
     this.nextIndex = nextTabIndex(entries);
@@ -1243,25 +1503,137 @@ export class DocumentWindowState {
    *  windowed editor is in the core, leaving a composition open. A save waits
    *  for it, so it writes what was typed. */
   windowedFlushed: (() => Promise<void>) | null = null;
-  /** Switch tabs, flushing the outgoing tab's pending upsert first. */
-  async switchTo(index: number): Promise<void> {
-    if (index === this.activeIndex || index < 0 || index >= this.tabs.length) {
+  /** Set by the window: whether a tab that is opening must stay behind the
+   *  active one (a dialog or the edit box is up). */
+  holdActive: (() => boolean) | null = null;
+  /** The ticket of the newest switch of any kind: a switch that waited gives up
+   *  when it is no longer the newest. */
+  private _switchSeq = 0;
+  get switchSeq(): number {
+    return this._switchSeq;
+  }
+  /** How many user clicks on a tab there have been. */
+  private _clickSeq = 0;
+  get clickSeq(): number {
+    return this._clickSeq;
+  }
+  private _pendingSwitches = 0;
+  /** Switches that have not returned yet. */
+  get pendingSwitches(): number {
+    return this._pendingSwitches;
+  }
+  private _pendingClicks = 0;
+  /** Switches for a user's click that have not returned yet. */
+  get pendingClicks(): number {
+    return this._pendingClicks;
+  }
+  private _writesPending = 0;
+  /** Writes of tab records that are still out. */
+  get writesPending(): number {
+    return this._writesPending;
+  }
+  private _clicksInWait = 0;
+  /** Clicks made while a write was out, until no write is. */
+  get clicksInWait(): number {
+    return this._clicksInWait;
+  }
+  private switchIdle: (() => void)[] = [];
+  /** Switch tabs, flushing the outgoing tab's pending upsert first. The tabs
+   *  are held by identity: a reorder or a close while waiting neither redirects
+   *  the switch nor lets it land on another tab. The newest switch of any kind
+   *  wins the screen. `click` marks a user's click on a tab; an `opening`
+   *  switch does not take the screen while `holdActive` says so. */
+  async switchTo(index: number, opening = false, click = false): Promise<void> {
+    const tab = this.tabs[index];
+    if (tab === undefined) {
       return;
     }
-    const from = this.activeIndex;
-    await this.endComposition?.();
-    // Another switch or a close may have moved on while waiting.
-    if (this.activeIndex !== from || index >= this.tabs.length) {
+    if (opening && this.holdActive?.() === true) {
       return;
     }
-    this.persistActive.flush();
-    await this.lastSave;
-    this.activeIndex = index;
+    const ticket = ++this._switchSeq;
+    this._pendingSwitches += 1;
+    if (click) {
+      this._clickSeq += 1;
+      this._pendingClicks += 1;
+      if (this._writesPending > 0) {
+        this._clicksInWait += 1;
+      }
+    }
+    try {
+      if (tab === this.activeTab) {
+        return;
+      }
+      await this.endComposition?.();
+      if (this.switchGone(tab, ticket, opening)) {
+        return;
+      }
+      this.persistActive.flush();
+      await this.lastSave;
+      if (this.switchGone(tab, ticket, opening)) {
+        return;
+      }
+      this.activeIndex = this.tabs.indexOf(tab);
+      this.consumeUnlock();
+    } finally {
+      this._pendingSwitches -= 1;
+      if (click) {
+        this._pendingClicks -= 1;
+      }
+      if (this._pendingSwitches === 0) {
+        const waiting = this.switchIdle;
+        this.switchIdle = [];
+        for (const wake of waiting) {
+          wake();
+        }
+      }
+    }
+  }
+  /** Whether a switch that waited must give up: a newer switch took the screen,
+   *  its tab is gone, or an opening switch is now held behind a dialog. */
+  private switchGone(tab: DocTab, ticket: number, opening: boolean): boolean {
+    return (
+      ticket !== this._switchSeq ||
+      !this.tabs.includes(tab) ||
+      (opening && this.holdActive?.() === true)
+    );
+  }
+  /** Resolves once the last write has settled and no switch is waiting, which
+   *  includes the ones that started meanwhile. */
+  async settled(): Promise<void> {
+    for (;;) {
+      await this.lastSave;
+      if (this._pendingSwitches === 0) {
+        return;
+      }
+      await new Promise<void>((resolve) => {
+        this.switchIdle.push(resolve);
+      });
+    }
+  }
+  /** Do what a tab was waiting to be shown for: unlock a large tab opened for
+   *  editing, and merge the orphaned record of a file it already showed. */
+  private consumeUnlock(): void {
+    const tab = this.activeTab;
+    if (tab === null) {
+      return;
+    }
+    if (this.unlockWhenShown.delete(tab.id)) {
+      void this.unlockLargeTab(tab, 0);
+    }
+    const note = this.adoptWhenShown.get(tab.id);
+    if (note !== undefined) {
+      this.adoptWhenShown.delete(tab.id);
+      void this.adoptIntoExisting(tab, note);
+    }
   }
   /** Run `op` once every earlier operation on `tab` has settled, so a tab does
    *  one thing at a time: a restore, an unlock or a view-mode copy. Starts at
    *  once when the tab is idle. A failed earlier operation does not block it. */
   private runTabOp<T>(tab: DocTab, op: () => Promise<T>): Promise<T> {
+    if (this.onItsWay(tab)) {
+      return Promise.reject(new Error('the tab is on its way'));
+    }
     const prev = this.tabOps.get(tab.id);
     const run = prev === undefined ? op() : prev.then(op);
     const tail = run.then(
@@ -1284,7 +1656,8 @@ export class DocumentWindowState {
   private ensureWindowedRestore(tab: DocTab | null): void {
     if (
       tab?.windowedRestore === undefined ||
-      this.restoringWindowedIds.has(tab.id)
+      this.restoringWindowedIds.has(tab.id) ||
+      this.onItsWay(tab)
     ) {
       return;
     }
@@ -1414,23 +1787,556 @@ export class DocumentWindowState {
     tab.windowed.topLine = topLine;
     this.persistActive();
   }
-
+  /** Set by the window: what keeps a tab from being dragged. */
+  dragHost: DragHost | null = null;
+  /** Set by the window: what a tab on its way needs of it. */
+  transferHost: TransferHost | null = null;
+  /** The window has registered its transfer listeners: until then it neither
+   *  sends nor takes a tab, since it could miss what the core tells it. */
+  transferListening = false;
+  /** Whether a drag may not start, or end in a reorder, now: a dialog or gate
+   *  holds the window, it is closing or quitting, or a tab is on its way. */
+  dragLocked(ownPreparing = false): boolean {
+    const host = this.dragHost;
+    if (
+      host !== null &&
+      (host.navigationLocked() ||
+        host.gateVisible() ||
+        host.modalOpen() ||
+        host.closing() ||
+        host.quitting())
+    ) {
+      return true;
+    }
+    return (
+      (this.transferHost !== null && !this.transferListening) ||
+      this.incoming.size > 0 ||
+      this.committing !== null ||
+      this.outgoing.size > 0 ||
+      (!ownPreparing && this.preparing !== null)
+    );
+  }
+  /** The tab, if any, on its way out: set from the busy check until the core
+   *  has answered `begin`. */
+  preparing: Promise<void> | null = null;
+  preparingTab: DocTab | null = null;
+  /** The `tab_transfer_committed` call of a tab on its way in, while it runs. */
+  committing: Promise<unknown> | null = null;
+  /** Tabs on their way out, by transfer id: frozen, not yet let go. */
+  private outgoing = new Map<number, DocTab>();
+  /** What the core said of a transfer before `begin` had answered. */
+  private earlyEvents = new Map<number, 'release' | 'cancel'>();
+  /** Tabs on their way in, by transfer id: outside `tabs`, so not held by the
+   *  editor, not reported, not counted, not written and never active. */
+  incoming = new Map<number, IncomingCopy>();
+  /** Transfers whose incoming copy was dropped: a flow that finds its id here
+   *  stops. */
+  private droppedIncoming = new Set<number>();
+  /** What each tab's editor starts from when it is built, by tab id: set when a
+   *  tab arrives, taken by the editor, deleted with a tab that goes first. */
+  pendingSeeds = new Map<string, Seed>();
+  /** Whether the window has no tab and none on its way in. */
+  get isEmpty(): boolean {
+    return this.tabs.length === 0 && this.incoming.size === 0;
+  }
+  /** The editor built the state of tab `id` from a seed: its document is the
+   *  tab's text from now on. When the tab was clean it shares that one rope with
+   *  its saved baseline again, as every clean tab does. */
+  seededDoc(id: string, doc: Text): void {
+    const tab = this.tabs.find((t) => t.id === id);
+    if (tab === undefined || this.onItsWay(tab) || !textEq(tab.content, doc)) {
+      return;
+    }
+    const clean = textEq(tab.content, tab.savedContent);
+    tab.content = doc;
+    if (clean) {
+      tab.savedContent = doc;
+    }
+  }
+  /** The editor takes the seed of tab `id`: it starts from it, once. */
+  takeSeed(id: string): Seed | undefined {
+    const seed = this.pendingSeeds.get(id);
+    this.pendingSeeds.delete(id);
+    return seed;
+  }
+  /** Move `tab` to index `to` of the window's tabs. The active tab stays the
+   *  active one (`ordinaryMru` and the restore kick are left alone) and only the
+   *  moved tab is written, unless its neighbours leave no key between them and
+   *  every tab takes its position as key. Nothing changes under a drag lock,
+   *  for a tab that is gone, or when `to` is where the tab is. */
+  moveTab(tab: DocTab, to: number): Promise<void> {
+    const from = this.tabs.indexOf(tab);
+    if (
+      this.dragLocked() ||
+      from === -1 ||
+      to === from ||
+      to < 0 ||
+      to >= this.tabs.length
+    ) {
+      return Promise.resolve();
+    }
+    const others = this.tabs.slice();
+    others.splice(from, 1);
+    const key = keyBetween(
+      others[to - 1]?.order ?? null,
+      others[to]?.order ?? null,
+    );
+    const active = this.activeTab;
+    this.tabs.splice(from, 1);
+    this.tabs.splice(to, 0, tab);
+    // Written directly: the setter would touch the MRU and the restore.
+    this.#activeIndexState = active === null ? 0 : this.tabs.indexOf(active);
+    if (key !== null) {
+      this.tabs[to]!.order = key;
+      return this.upsertTab(tab);
+    }
+    this.tabs.forEach((t, i) => {
+      t.order = i;
+    });
+    return Promise.all(this.tabs.map((t) => this.upsertTab(t))).then(() => {});
+  }
+  /** The window's bounds, which a tab put here is stored with. */
+  get windowBounds(): TransferBounds {
+    return { ...this.bounds };
+  }
+  /** Take `tab` out of `tabs` at `at`. The active tab stays the active one when
+   *  it is another; when it is `tab` the next one takes over by `deleteTab`'s
+   *  rule, through the setter. */
+  private spliceOut(tab: DocTab, at: number): void {
+    const active = this.activeTab;
+    this.tabs.splice(at, 1);
+    if (active !== tab) {
+      // Written directly: the setter would touch the MRU and the restore.
+      this.#activeIndexState = active === null ? 0 : this.tabs.indexOf(active);
+      return;
+    }
+    let next = this.activeIndex;
+    if (next >= this.tabs.length) {
+      next = Math.max(0, this.tabs.length - 1);
+    }
+    this.activeIndex = next;
+  }
+  /** Put `tab` where its `order` says. The active tab stays the active one
+   *  (`ordinaryMru` and the restore kick are left alone); a window that had none
+   *  makes `tab` its active tab through the setter. */
+  private insertByOrder(tab: DocTab, renumber: boolean): void {
+    const active = this.activeTab;
+    const first = renumber
+      ? Math.min(Math.max(0, tab.order), this.tabs.length)
+      : this.tabs.findIndex((other) => other.order > tab.order);
+    const at = first === -1 ? this.tabs.length : first;
+    this.tabs.splice(at, 0, tab);
+    if (active === null) {
+      this.activeIndex = at;
+      return;
+    }
+    // Written directly: the setter would touch the MRU and the restore.
+    this.#activeIndexState = this.tabs.indexOf(active);
+  }
+  // ---- A tab on its way to another window: the sender.
+  /** What the window knows of `tab` besides its own fields. */
+  private blockFacts(tab: DocTab, ownPreparing: boolean): BlockFacts {
+    const sessionId = tab.windowed?.sessionId;
+    return {
+      op: this.tabOps.has(tab.id),
+      convert: convertController.busy(tab.id),
+      rangeBox: this.rangeBox?.tabId === tab.id,
+      windowedOp:
+        sessionId !== undefined &&
+        (this.windowedGates.get(sessionId)?.pending() ?? false),
+      paste: pasteLocks.has(tab.id),
+      locked: this.dragLocked(ownPreparing),
+    };
+  }
+  /** Why `tab` cannot be moved to another window now, or null. */
+  transferBlockerOf(tab: DocTab, ownPreparing = false): TransferBlock | null {
+    return transferBlocker(tab, this.blockFacts(tab, ownPreparing));
+  }
+  /** A dragged tab was released. Where it goes is for the core to say: the own
+   *  window reorders it or returns it to its slot, another window takes it, and
+   *  anywhere else it opens a window of its own, or moves the window when it was
+   *  the only tab. */
+  async releaseTab(tab: DocTab, release: ReleaseAt): Promise<void> {
+    let target: DropTarget;
+    try {
+      target = await invoke<DropTarget>('tab_drop_target', {
+        clientX: release.x,
+        clientY: release.y,
+        dpr: release.dpr,
+        onlyTab: this.tabs.length === 1,
+      });
+    } catch (error) {
+      console.error('tab_drop_target failed', error);
+      target = { kind: DROP.self };
+    }
+    switch (target.kind) {
+      case DROP.self:
+        if (release.overBar) {
+          await this.moveTab(tab, release.slot);
+        }
+        return;
+      case DROP.cancel:
+        return;
+      case DROP.moveWindow:
+        // The tab stays in its own window, busy or not.
+        await invoke('tab_move_window', { point: target.point }).catch(
+          (error: unknown) => {
+            console.error('tab_move_window failed', error);
+          },
+        );
+        return;
+      default:
+        await this.transferOut(tab, target);
+    }
+  }
+  private transferOut(tab: DocTab, target: TransferTarget): Promise<void> {
+    if (this.transferHost === null || this.transferBlockerOf(tab) !== null) {
+      return Promise.resolve();
+    }
+    const run = this.carryOut(tab, target);
+    this.preparing = run;
+    this.preparingTab = tab;
+    return run.finally(() => {
+      if (this.preparing === run) {
+        this.preparing = null;
+        this.preparingTab = null;
+      }
+    });
+  }
+  /** Flush and write `tab`, freeze it, pack it and begin the transfer. Any
+   *  failure before the core has started it leaves the tab as it was. */
+  private async carryOut(tab: DocTab, target: TransferTarget): Promise<void> {
+    const host = this.transferHost;
+    if (host === null) {
+      return;
+    }
+    if (tab === this.activeTab) {
+      await this.endComposition?.();
+      if (tab.windowed !== undefined) {
+        await this.windowedFlushed?.();
+      }
+    }
+    if (
+      !this.tabs.includes(tab) ||
+      this.transferBlockerOf(tab, true) !== null
+    ) {
+      return;
+    }
+    if (tab === this.activeTab) {
+      this.persistActive.flush();
+    }
+    await this.upsertTab(tab);
+    await this.settleWrites(tab);
+    if (
+      !this.tabs.includes(tab) ||
+      this.transferBlockerOf(tab, true) !== null
+    ) {
+      return;
+    }
+    // The stored record would be stale: the tab stays here.
+    if (tab.writeFailed === true) {
+      this.unfreeze(tab);
+      return;
+    }
+    this.freeze(tab);
+    const payload = toPayload(tab, {
+      editor: editorPayload(host.editorStateOf(tab.id), tab.content),
+      scroll: host.scrollOf(tab.id),
+      view: this.viewPos.get(tab.id) ?? null,
+      viewMode: host.viewModeOf(tab.id) ?? null,
+    });
+    let result: BeginResult;
+    try {
+      result = await invoke<BeginResult>('tab_transfer_begin', {
+        payload,
+        target,
+        project: this.project,
+      });
+    } catch (error) {
+      console.error('tab_transfer_begin failed', error);
+      this.cancelled(tab);
+      return;
+    }
+    if (result.kind !== BEGIN.started) {
+      this.cancelled(tab);
+      return;
+    }
+    this.outgoing.set(result.t, tab);
+    // The core may have been quicker than its own answer.
+    const early = this.earlyEvents.get(result.t);
+    this.earlyEvents.delete(result.t);
+    if (early === 'release') {
+      this.applyRelease(result.t);
+    } else if (early === 'cancel') {
+      this.onTransferCancel(result.t);
+    }
+  }
+  /** Wait until every write of `tab` has settled. */
+  private async settleWrites(tab: DocTab): Promise<void> {
+    for (;;) {
+      const writes = this.pendingWrites.get(tab.id);
+      if (writes === undefined || writes.size === 0) {
+        return;
+      }
+      await Promise.all([...writes]);
+    }
+  }
+  /** Freeze `tab`: nothing is typed, edited or written until it lands or comes
+   *  back. */
+  private freeze(tab: DocTab): void {
+    tab.transferring = true;
+    this.transferHost?.showLock(tab.id, pasteLocks.begin(tab.id, 'full'));
+  }
+  /** Give `tab` back to its window. The one way a freeze ends other than a
+   *  release. */
+  private unfreeze(tab: DocTab): void {
+    pasteLocks.drop(tab.id);
+    this.transferHost?.showLock(tab.id, undefined);
+    delete tab.transferring;
+  }
+  /** The transfer was called off or never started: the tab is the window's
+   *  again and its record is written from here. */
+  private cancelled(tab: DocTab): void {
+    this.unfreeze(tab);
+    void this.upsertTab(tab);
+  }
+  /** `tab-transfer-release`, a settle's `release` and a close of a tab that had
+   *  already landed: the tab is in another window, so it leaves this one without
+   *  its record, its session or its conversion being touched. Once per transfer. */
+  applyRelease(t: number): void {
+    const tab = this.outgoing.get(t);
+    if (tab === undefined) {
+      return;
+    }
+    this.outgoing.delete(t);
+    tab.released = true;
+    this.ordinaryMru = this.ordinaryMru.filter((id) => id !== tab.id);
+    const at = this.tabs.indexOf(tab);
+    if (at !== -1) {
+      this.spliceOut(tab, at);
+    }
+    // The editor prunes its states and scrolls for tabs that are gone; a lock,
+    // a view mode and a seed of a tab it never held are not its to know of. A
+    // mounted view cancels its own search when it goes.
+    pasteLocks.drop(tab.id);
+    this.transferHost?.forgetTab(tab.id);
+    this.pendingSeeds.delete(tab.id);
+    this.releaseTabView(tab.id);
+    if (tab.windowed !== undefined) {
+      this.windowedGates.delete(tab.windowed.sessionId);
+      this.windowedGenerations.delete(tab.windowed.sessionId);
+    }
+    void invoke('tab_transfer_released', { t });
+    if (this.isEmpty) {
+      void this.transferHost?.closeWindow();
+    }
+  }
+  /** `tab-transfer-release`. */
+  onTransferRelease(t: number): void {
+    if (this.outgoing.has(t)) {
+      this.applyRelease(t);
+    } else {
+      this.earlyEvents.set(t, 'release');
+    }
+  }
+  /** `tab-transfer-cancel`. */
+  onTransferCancel(t: number): void {
+    const tab = this.outgoing.get(t);
+    if (tab === undefined) {
+      this.earlyEvents.set(t, 'cancel');
+      return;
+    }
+    this.outgoing.delete(t);
+    this.cancelled(tab);
+  }
+  /** Call off the move of `tab`, or let it go when it has landed already: a
+   *  close of the dimmed tab. Waits for a move that is still being set up. */
+  async settleTab(tab: DocTab): Promise<void> {
+    await this.preparing?.catch(() => {});
+    const entry = [...this.outgoing].find(([, held]) => held === tab);
+    if (entry === undefined) {
+      return;
+    }
+    const t = entry[0];
+    let result: CancelResult;
+    try {
+      result = await invoke<CancelResult>('tab_transfer_cancel', { t });
+    } catch (error) {
+      console.error('tab_transfer_cancel failed', error);
+      return;
+    }
+    if (result === 'accepted') {
+      this.applyRelease(t);
+    } else if (this.outgoing.delete(t)) {
+      this.cancelled(tab);
+    }
+  }
+  /** Settle every transfer of this window before it closes or quits: wait for
+   *  what is being set up or put in, then let the core call off what is not
+   *  accepted and do what it says about each. */
+  async settleTransfers(): Promise<void> {
+    await this.preparing?.catch(() => {});
+    await this.committing?.catch(() => {});
+    let actions: SettleAction[];
+    try {
+      actions = await invoke<SettleAction[]>('tab_transfer_settle_window');
+    } catch (error) {
+      console.error('tab_transfer_settle_window failed', error);
+      return;
+    }
+    for (const action of actions) {
+      if (action.kind === SETTLE.unfreeze) {
+        const tab =
+          this.outgoing.get(action.t) ??
+          this.tabs.find((t) => t.id === action.noteId);
+        this.outgoing.delete(action.t);
+        if (tab !== undefined) {
+          this.cancelled(tab);
+        }
+      } else if (action.kind === SETTLE.dropIncoming) {
+        this.dropIncoming(action.t);
+      } else {
+        this.applyRelease(action.t);
+      }
+    }
+  }
+  // ---- A tab on its way to this window: the receiver.
+  /** Wait for what the active tab is doing, as a switch away from it does. */
+  async settleForInsert(): Promise<void> {
+    await this.endComposition?.();
+    this.persistActive.flush();
+    await this.lastSave;
+  }
+  /** The order key for a tab that goes to slot `slot` of the tabs, or last. */
+  private planOrder(slot: number | null): { order: number; renumber: boolean } {
+    if (slot === null || slot >= this.tabs.length) {
+      return { order: this.newOrder(), renumber: false };
+    }
+    const key = keyBetween(
+      this.tabs[slot - 1]?.order ?? null,
+      this.tabs[slot]?.order ?? null,
+    );
+    return key === null
+      ? { order: slot, renumber: true }
+      : { order: key, renumber: false };
+  }
+  /** Keep the claimed tab as an incoming copy: it gets its index and its place
+   *  (where `client`, the drop point in this window's viewport, falls on the tab
+   *  bar, else last) but is not one of the window's tabs yet. */
+  holdIncoming(
+    t: number,
+    payload: TabPayload,
+    client: Point | null,
+  ): IncomingCopy {
+    const geometry = this.transferHost?.dropGeometry() ?? null;
+    const slot =
+      client === null || geometry === null ? null : dropSlot(client, geometry);
+    const plan = this.planOrder(slot);
+    const tab: DocTab = {
+      ...fromPayload(payload),
+      tabIndex: this.allocIndex(),
+      order: plan.order,
+    };
+    const copy: IncomingCopy = { t, tab, payload, renumber: plan.renumber };
+    this.incoming.set(t, copy);
+    return copy;
+  }
+  /** What the receiver reports of a copy it holds. */
+  committedMetaOf(copy: IncomingCopy): CommittedMeta {
+    return committedMeta(
+      copy.tab.tabIndex,
+      copy.tab.order,
+      this.group,
+      this.project,
+      this.windowBounds,
+    );
+  }
+  /** The transfer of `t` is over for this window as a receiver: its copy, if it
+   *  held one, is dropped. A window left with nothing closes. */
+  dropIncoming(t: number): void {
+    this.droppedIncoming.add(t);
+    const had = this.incoming.delete(t);
+    if (had && this.isEmpty) {
+      void this.transferHost?.closeWindow();
+    }
+  }
+  /** Whether the copy of transfer `t` was dropped. */
+  wasDropped(t: number): boolean {
+    return this.droppedIncoming.has(t);
+  }
+  /** Put a dropped copy back: the core had accepted it after all. */
+  restoreIncoming(copy: IncomingCopy): void {
+    this.droppedIncoming.delete(copy.t);
+    this.incoming.set(copy.t, copy);
+  }
+  /** The core accepted the transfer `t`: the copy is a tab of this window. In
+   *  one step: the editor's seed is stored, the tab's view is applied, the copy
+   *  leaves `incoming` and the tab is inserted at its place, and made the active
+   *  tab (`activate`: unless a dialog is up). Its record is written from here. */
+  acceptIncoming(t: number, activate: boolean): DocTab | null {
+    const copy = this.incoming.get(t);
+    if (copy === undefined) {
+      return null;
+    }
+    const { tab, payload } = copy;
+    if (payload.editor !== null || payload.scroll !== null) {
+      this.pendingSeeds.set(tab.id, {
+        editor: payload.editor,
+        scroll: payload.scroll,
+      });
+    }
+    if (payload.view !== null) {
+      this.viewPos.set(tab.id, { ...payload.view });
+    }
+    if (payload.viewMode !== null) {
+      this.transferHost?.setViewMode(tab.id, payload.viewMode);
+    }
+    this.incoming.delete(t);
+    const empty = this.activeTab === null;
+    this.insertByOrder(tab, copy.renumber);
+    // The $state array stores a proxy of `tab`: identity checks need the stored one.
+    const stored = this.tabs.find((t) => t.id === tab.id) ?? tab;
+    if (activate && !empty) {
+      void this.switchTo(this.tabs.indexOf(stored));
+    }
+    if (copy.renumber) {
+      this.tabs.forEach((other, i) => {
+        other.order = i;
+      });
+      void Promise.all(this.tabs.map((other) => this.upsertTab(other)));
+    } else {
+      void this.upsertTab(stored);
+    }
+    return stored;
+  }
   cycle(delta: number): void {
     const count = this.tabs.length;
     if (count < 2) {
       return;
     }
-    void this.switchTo((this.activeIndex + delta + count) % count);
+    void this.switchTo((this.activeIndex + delta + count) % count, false, true);
   }
   /** The next free tab index: above both the counter and every open tab, so an
    *  index is never handed out twice even if the counter fell behind. */
   private allocIndex(): number {
-    const index = this.tabs.reduce(
+    const held = [
+      ...this.tabs,
+      ...[...this.incoming.values()].map((c) => c.tab),
+    ];
+    const index = held.reduce(
       (max, t) => Math.max(max, t.tabIndex + 1),
       this.nextIndex,
     );
     this.nextIndex = index + 1;
     return index;
+  }
+  /** The order key of a tab added after every tab of the window. */
+  private newOrder(): number {
+    const held = [
+      ...this.tabs,
+      ...[...this.incoming.values()].map((c) => c.tab),
+    ];
+    return newKey(held.map((t) => t.order));
   }
   /** Open a fresh untitled tab (no path, empty buffer) and switch to it. */
   async newTab(): Promise<void> {
@@ -1450,9 +2356,10 @@ export class DocumentWindowState {
       encoding: settingsState.defaultEncoding,
       lossy: false,
       tabIndex: this.allocIndex(),
+      order: this.newOrder(),
     };
     this.tabs.push(tab);
-    await this.switchTo(this.tabs.length - 1);
+    await this.switchTo(this.tabs.length - 1, true);
     await this.upsertTab(tab);
   }
   /** Open `path` as a new tab, or activate its existing tab (dedupe by path).
@@ -1490,14 +2397,24 @@ export class DocumentWindowState {
     const route: OpenRoute =
       path === '' ? { kind: 'fresh' } : await this.routeFor(path);
     const existing =
-      path === '' ? -1 : this.tabs.findIndex((t) => t.path === path);
-    if (existing !== -1) {
-      await this.switchTo(existing);
+      path === '' ? undefined : this.tabs.find((t) => t.path === path);
+    if (existing !== undefined) {
+      // A tab on its way is neither switched to nor merged into.
+      if (this.onItsWay(existing)) {
+        return;
+      }
+      await this.switchTo(this.tabs.indexOf(existing), true);
       // A dirty orphan of a file this window already shows clean: pull its
       // unsaved edits in (snapshot wins over disk) and retire the orphan record.
       // A dirty local tab is left untouched — two-sided edits are not merged.
+      // The tab takes them once it is shown: only the active tab's editor
+      // refreshes, and the record stays until then.
       if (route.kind === 'adopt' && route.note.dirty) {
-        await this.adoptIntoExisting(existing, route.note);
+        if (this.activeTab === existing) {
+          await this.adoptIntoExisting(existing, route.note);
+        } else {
+          this.adoptWhenShown.set(existing.id, route.note);
+        }
       }
       return;
     }
@@ -1561,7 +2478,7 @@ export class DocumentWindowState {
       return;
     }
     this.tabs.push(tab);
-    await this.switchTo(this.tabs.length - 1);
+    await this.switchTo(this.tabs.length - 1, true);
     await this.upsertTab(tab);
   }
   /** Open-dialog choice. 'asis' commits the buffer unchanged (it opens in the
@@ -1584,9 +2501,11 @@ export class DocumentWindowState {
     } else if (mode === 'softwrap') {
       tab.content = textFromString(softWrapLongLines(tab.content.toString()));
     }
+    // The tab was staged while others may have opened; it goes last.
+    tab.order = this.newOrder();
     this.tabs.push(tab);
     void (async (): Promise<void> => {
-      await this.switchTo(this.tabs.length - 1);
+      await this.switchTo(this.tabs.length - 1, true);
       await this.upsertTab(tab);
     })();
   }
@@ -1647,8 +2566,9 @@ export class DocumentWindowState {
       return;
     }
     tab.tabIndex = this.allocIndex();
+    tab.order = this.newOrder();
     this.tabs.push(tab);
-    await this.switchTo(this.tabs.length - 1);
+    await this.switchTo(this.tabs.length - 1, true);
     await this.upsertTab(tab);
   }
   /** Bring a dirty orphan's unsaved edits into an existing clean tab for the same
@@ -1656,11 +2576,10 @@ export class DocumentWindowState {
    *  haunting the store. No-op when the local tab is itself dirty — a genuine
    *  two-sided edit is left for the user and the orphan is preserved. */
   private async adoptIntoExisting(
-    index: number,
+    tab: DocTab,
     note: NoteSnapshot,
   ): Promise<void> {
-    const tab = this.tabs[index];
-    if (tab === undefined || this.isDirty(tab)) {
+    if (!this.tabs.includes(tab) || this.onItsWay(tab) || this.isDirty(tab)) {
       return;
     }
     // savedContent stays the on-disk baseline, so forking content marks the tab
@@ -1703,39 +2622,50 @@ export class DocumentWindowState {
       encoding: settingsState.defaultEncoding,
       lossy: false,
       tabIndex: this.allocIndex(),
+      order: this.newOrder(),
       large: { size: pending.size },
     };
     this.tabs.push(tab);
     const index = this.tabs.length - 1;
+    // The $state array stores a proxy of `tab`: identity checks need the stored one.
+    const shown = this.tabs[index]!;
     void (async (): Promise<void> => {
-      await this.switchTo(index);
+      await this.switchTo(index, true);
       try {
-        tab.readOnlyFile = !(await invoke<boolean>('path_writable', {
-          path: tab.path,
+        shown.readOnlyFile = !(await invoke<boolean>('path_writable', {
+          path: shown.path,
         }));
       } catch {
-        tab.readOnlyFile = false;
+        shown.readOnlyFile = false;
       }
-      await this.upsertTab(tab);
+      await this.upsertTab(shown);
       // Edit choice: unlock straight into in-place editing right after the tab
       // opens, so an editable large file lands the user directly in edit mode. A
       // non-UTF-8 or oversized file silently stays in the read-only view (the tab
       // lock explains why). ponytail: reuses the in-place unlock path, no second
       // open route.
-      if (edit && tab.large !== undefined && tab.large.size < LARGE_EDIT_MAX) {
-        await this.unlockLargeTab(0);
+      if (
+        edit &&
+        shown.large !== undefined &&
+        shown.large.size < LARGE_EDIT_MAX
+      ) {
+        // Only the active tab can be unlocked; a tab held back unlocks once shown.
+        if (this.activeTab === shown) {
+          await this.unlockLargeTab(shown, 0);
+        } else {
+          this.unlockWhenShown.add(shown.id);
+        }
       }
     })();
   }
-  /** Unlock the active read-only large-file tab into an editable one, in place:
+  /** Unlock the read-only large-file tab `tab` into an editable one, in place:
    *  attach a Rust windowed session and swap the tab's `large` field for a
    *  `windowed` field (same tab id, so the view swaps from LargeFileView to
    *  WindowedEditor without a new tab). `topLine` is the 0-based line the user was
    *  viewing, so editing continues from there. Returns null on success, or a short
    *  reason when the file cannot be edited (non-UTF-8); the tab stays read-only. */
-  async unlockLargeTab(topLine: number): Promise<string | null> {
-    const tab = this.activeTab;
-    if (tab?.large === undefined) {
+  async unlockLargeTab(tab: DocTab, topLine: number): Promise<string | null> {
+    if (tab.large === undefined || this.onItsWay(tab)) {
       return null;
     }
     // Lite has no editing session to start. Nothing is asked of the core, and
@@ -1926,6 +2856,8 @@ export class DocumentWindowState {
       encoding,
       lossy: false,
       tabIndex: this.allocIndex(),
+      order: this.newOrder(),
+      handingOver: true,
       windowed: {
         sessionId: open.session_id,
         totalBytes: open.total_bytes,
@@ -1944,8 +2876,15 @@ export class DocumentWindowState {
       },
     };
     this.tabs.push(tab);
-    await this.switchTo(this.tabs.length - 1);
+    await this.switchTo(this.tabs.length - 1, true);
     return tab.id;
+  }
+  /** The handoff of the tab `tabId` is over, however it ended: it may be moved. */
+  endHandingOver(tabId: string): void {
+    const tab = this.tabs.find((t) => t.id === tabId);
+    if (tab !== undefined) {
+      delete tab.handingOver;
+    }
   }
   /** A paste that was too big to edit was saved to `path`: the tab shows that
    *  file in the read-only view. */
@@ -1982,7 +2921,7 @@ export class DocumentWindowState {
 
   updateActiveContent(content: Text): void {
     const tab = this.activeTab;
-    if (tab === null) {
+    if (tab === null || this.onItsWay(tab)) {
       return;
     }
     // Zero-copy: store the editor's own rope reference, not a string snapshot.
@@ -1993,7 +2932,7 @@ export class DocumentWindowState {
    *  active: a hidden editor must never write into the active tab. */
   updateContentById(id: string, content: Text): void {
     const tab = this.tabs.find((t) => t.id === id);
-    if (tab === undefined) {
+    if (tab === undefined || this.onItsWay(tab)) {
       return;
     }
     tab.content = content;
@@ -2006,7 +2945,7 @@ export class DocumentWindowState {
 
   setActiveLanguage(name: string | null): void {
     const tab = this.activeTab;
-    if (tab === null) {
+    if (tab === null || this.onItsWay(tab)) {
       return;
     }
     tab.language = name;
@@ -2019,7 +2958,12 @@ export class DocumentWindowState {
     const tab = this.activeTab;
     // A large tab's ending is the file's own (read by detection) and saving
     // never rewrites it, so there is nothing to choose.
-    if (tab === null || isLargeKind(tab) || tab.lineEnding === ending) {
+    if (
+      tab === null ||
+      this.onItsWay(tab) ||
+      isLargeKind(tab) ||
+      tab.lineEnding === ending
+    ) {
       return;
     }
     tab.lineEnding = ending;
@@ -2039,13 +2983,18 @@ export class DocumentWindowState {
    *  large-file viewer, which has nothing to write. */
   async saveActive(pathOverride?: string): Promise<boolean> {
     const tab = this.activeTab;
-    if (tab === null) {
+    return tab === null ? false : this.saveTab(tab, pathOverride);
+  }
+  /** `saveActive` for `tab`: a dialog that asked about a tab acts on that tab,
+   *  whichever is active by the time it is answered. */
+  async saveTab(tab: DocTab, pathOverride?: string): Promise<boolean> {
+    if (this.onItsWay(tab)) {
       return false;
     }
     // The file is gone: a write to the old path would quietly make a new file
     // there, so the user picks where it goes instead.
     if (tab.missing === true) {
-      return this.saveAs(pathOverride);
+      return this.saveAsTab(tab, pathOverride);
     }
     // A windowed tab saves its Rust-side buffer through windowed_save; only a
     // clean write counts as saved (a conflict raises the modal).
@@ -2053,7 +3002,7 @@ export class DocumentWindowState {
       // A tab a paste made has no file yet when it came from an untitled
       // document or a note: a save there asks where it goes.
       if (tab.converted !== undefined && tab.converted.target === null) {
-        return this.saveAs(pathOverride);
+        return this.saveAsTab(tab, pathOverride);
       }
       return (await this.saveWindowed(tab, false)) === 'ok';
     }
@@ -2077,15 +3026,21 @@ export class DocumentWindowState {
     }
     // Apply the line ending on the LF buffer, then let Rust encode (BOM handled
     // there: UTF-8 honours hadBom, UTF-16 always writes one, legacy ignores it).
+    // The baseline below is what was written, not what the tab holds by then:
+    // typing during the write must stay unsaved.
+    const written = tab.content;
+    const writtenEnding = tab.lineEnding;
     // Flush point: materialize the rope to a string for the write.
-    const out = applyLineEnding(tab.content.toString(), tab.lineEnding);
+    const out = applyLineEnding(written.toString(), writtenEnding);
     try {
-      await invoke('write_file_encoded', {
-        path: tab.path,
-        content: out,
-        encoding: tab.encoding,
-        withBom: tab.hadBom,
-      });
+      await this.busy(tab, () =>
+        writeDocument({
+          path: tab.path,
+          content: out,
+          encoding: tab.encoding,
+          withBom: tab.hadBom,
+        }),
+      );
     } catch (e) {
       // Left dirty (the assignments below never run) and reported, rather than
       // silently doing nothing. A file can turn read-only while open, so the
@@ -2096,8 +3051,8 @@ export class DocumentWindowState {
       this.saveFailed = { path: tab.path, error: String(e) };
       return false;
     }
-    tab.savedContent = tab.content;
-    tab.savedLineEnding = tab.lineEnding;
+    tab.savedContent = written;
+    tab.savedLineEnding = writtenEnding;
     await this.upsertTab(tab);
     return true;
   }
@@ -2108,7 +3063,11 @@ export class DocumentWindowState {
    *  `pathOverride` skips the dialog (automation/E2E). Returns false on cancel. */
   async saveAs(pathOverride?: string): Promise<boolean> {
     const tab = this.activeTab;
-    if (tab === null) {
+    return tab === null ? false : this.saveAsTab(tab, pathOverride);
+  }
+  /** `saveAs` for `tab`. */
+  async saveAsTab(tab: DocTab, pathOverride?: string): Promise<boolean> {
+    if (this.onItsWay(tab)) {
       return false;
     }
     const chosen =
@@ -2137,10 +3096,13 @@ export class DocumentWindowState {
     if (isLargeKind(tab)) {
       return false;
     }
+    // As in `saveActive`: the baseline is what was written.
+    const written = tab.content;
+    const writtenEnding = tab.lineEnding;
     // Flush point: materialize the rope for the save-as write.
-    const out = applyLineEnding(tab.content.toString(), tab.lineEnding);
+    const out = applyLineEnding(written.toString(), writtenEnding);
     try {
-      await invoke('write_file_encoded', {
+      await writeDocument({
         path: chosen,
         content: out,
         encoding: tab.encoding,
@@ -2157,8 +3119,8 @@ export class DocumentWindowState {
     if (!tab.explicit) {
       tab.language = detectByFilename(chosen);
     }
-    tab.savedContent = tab.content;
-    tab.savedLineEnding = tab.lineEnding;
+    tab.savedContent = written;
+    tab.savedLineEnding = writtenEnding;
     await this.upsertTab(tab);
     void invoke('add_recent_file', { path: chosen });
     return true;
@@ -2227,6 +3189,15 @@ export class DocumentWindowState {
       }
       moved.push(tab);
     }
+    for (const copy of this.incoming.values()) {
+      const next = retargetPath(copy.tab.path, from, to, rules);
+      if (next !== copy.tab.path) {
+        copy.tab.path = next;
+        if (!copy.tab.explicit) {
+          copy.tab.language = detectByFilename(next);
+        }
+      }
+    }
     const box = this.rangeBox;
     if (box !== null) {
       const source = retargetPath(box.sourcePath, from, to, rules);
@@ -2257,6 +3228,20 @@ export class DocumentWindowState {
       endLine: number;
     },
   ): Promise<string | null> {
+    if (this.onItsWay(tab)) {
+      return null;
+    }
+    return this.busy(tab, () => this.openRangeBoxNow(tab, info));
+  }
+  private async openRangeBoxNow(
+    tab: DocTab,
+    info: {
+      startByte: number;
+      endByte: number;
+      startLine: number;
+      endLine: number;
+    },
+  ): Promise<string | null> {
     const read = await invoke<RangeRead>('read_range', {
       path: tab.path,
       start: info.startByte,
@@ -2275,6 +3260,11 @@ export class DocumentWindowState {
       });
     } catch {
       fingerprint = null;
+    }
+    // Closed while the file was read, or on its way to another window: there is
+    // nothing to open the box over.
+    if (!this.tabs.includes(tab) || this.onItsWay(tab)) {
+      return null;
     }
     this.rangeBox = openRangeBox({
       tabId: tab.id,
@@ -2296,45 +3286,89 @@ export class DocumentWindowState {
   rangeBoxDirty(): boolean {
     return this.rangeBox !== null && isRangeBoxDirty(this.rangeBox);
   }
+  /** The write-back of the open box that is out now, with the id of the box it
+   *  was sent from. */
+  #rangeWrite: { session: number; done: Promise<SpliceResult> } | null = null;
   /** Write the open box back into its source. `force` skips the conflict check.
    *  Success closes the box; a changed source raises the conflict modal and
-   *  keeps it; any other failure is reported and keeps it too. */
-  private async writeBack(force: boolean): Promise<SpliceResult> {
+   *  keeps it; any other failure is reported and keeps it too. A save while a
+   *  write of the same box is out sends nothing and answers with that write. */
+  private writeBack(force: boolean): Promise<SpliceResult> {
     const box = this.rangeBox;
     if (box === null) {
-      return 'error';
+      return Promise.resolve('error');
     }
-    // Flush point: materialize the rope for the write-back.
-    const outcome = await spliceRange(
+    const running = this.#rangeWrite;
+    if (running !== null && running.session === box.session) {
+      return running.done;
+    }
+    const done: Promise<SpliceResult> = this.writeBackUntilSettled(
       box,
-      rangeBoxWriteText(box),
-      force ? null : box.fingerprint,
-    );
-    if (outcome.status === 'mismatch') {
-      this.rangeBox = nextRangeBox(this.rangeBox, { kind: 'mismatch' });
-      return 'mismatch';
-    }
-    if (outcome.status === 'error') {
-      // Every failure past the conflict check is reported: the write-back is a
-      // save, and a save that did not happen has to say so or the box is left
-      // dirty with nothing on screen to explain it. A read-only source also
-      // marks the viewer tab, so its padlock catches up without a reopen.
-      if (outcome.error === READ_ONLY_DESTINATION) {
-        const tab = this.tabs.find((t) => t.id === box.tabId);
-        if (tab !== undefined) {
-          tab.readOnlyFile = true;
-        }
+      force,
+    ).finally(() => {
+      if (this.#rangeWrite?.done === done) {
+        this.#rangeWrite = null;
       }
-      this.saveFailed = { path: box.sourcePath, error: outcome.error };
-      return 'error';
+    });
+    this.#rangeWrite = { session: box.session, done };
+    return done;
+  }
+  /** Write `first`, then again for what was typed while the write was out, until
+   *  a write finds the buffer as it sent it. Only the box with the id it started
+   *  from is changed; a box cancelled or replaced meanwhile is left alone. */
+  private async writeBackUntilSettled(
+    first: RangeBox,
+    force: boolean,
+  ): Promise<SpliceResult> {
+    let box = first;
+    let unchecked = force;
+    for (;;) {
+      const sentContent = box.content;
+      // Flush point: materialize the rope for the write-back.
+      const written = rangeBoxWriteText(box);
+      const outcome = await spliceRange(
+        box,
+        written,
+        unchecked ? null : box.fingerprint,
+      );
+      const open = this.rangeBox;
+      const current = open?.session === box.session ? open : null;
+      if (outcome.status === 'mismatch') {
+        if (current !== null) {
+          this.rangeBox = nextRangeBox(current, { kind: 'mismatch' });
+        }
+        return 'mismatch';
+      }
+      if (outcome.status === 'error') {
+        // Every failure past the conflict check is reported: the write-back is a
+        // save, and a save that did not happen has to say so or the box is left
+        // dirty with nothing on screen to explain it. A read-only source also
+        // marks the viewer tab, so its padlock catches up without a reopen.
+        if (outcome.error === READ_ONLY_DESTINATION) {
+          const tab = this.tabs.find((t) => t.id === box.tabId);
+          if (tab !== undefined) {
+            tab.readOnlyFile = true;
+          }
+        }
+        this.saveFailed = { path: box.sourcePath, error: outcome.error };
+        return 'error';
+      }
+      // The viewer's size stands for the rewritten file now.
+      const viewer = this.tabs.find((t) => t.id === box.tabId);
+      if (viewer?.large !== undefined) {
+        viewer.large.size = outcome.fingerprint.size;
+      }
+      if (current === null) {
+        return 'ok';
+      }
+      if (nextWriteBack(sentContent, current.content) === 'done') {
+        this.rangeBox = nextRangeBox(current, { kind: 'saved' });
+        return 'ok';
+      }
+      box = rebaseRangeBox(current, written, outcome);
+      this.rangeBox = box;
+      unchecked = false;
     }
-    this.rangeBox = nextRangeBox(this.rangeBox, { kind: 'saved' });
-    // The viewer's size stands for the rewritten file now.
-    const viewer = this.tabs.find((t) => t.id === box.tabId);
-    if (viewer?.large !== undefined) {
-      viewer.large.size = outcome.fingerprint.size;
-    }
-    return 'ok';
   }
   /** Box 儲存: write back with the conflict check. */
   rangeBoxSave(): Promise<SpliceResult> {
@@ -2364,7 +3398,7 @@ export class DocumentWindowState {
     // Flush point: materialize the rope for the save-as write.
     const out = applyLineEnding(box.content.toString(), box.lineEnding);
     try {
-      await invoke('write_file_encoded', {
+      await writeDocument({
         path: chosen,
         content: out,
         encoding: settingsState.defaultEncoding,
@@ -2378,6 +3412,12 @@ export class DocumentWindowState {
     }
     this.rangeBox = nextRangeBox(this.rangeBox, { kind: 'cancel' });
     await this.openTab(chosen);
+    // An answer of the dialog itself: the new file is shown even where other
+    // opens are held back.
+    const index = this.tabs.findIndex((t) => t.path === chosen);
+    if (index !== -1) {
+      await this.switchTo(index);
+    }
     return true;
   }
   /** Conflict choice: dismiss the modal, back to the box with its text. */
@@ -2489,6 +3529,7 @@ export class DocumentWindowState {
       encoding: settingsState.defaultEncoding,
       lossy: false,
       tabIndex: this.allocIndex(),
+      order: this.newOrder(),
       windowed: {
         sessionId: open.session_id,
         totalBytes: open.total_bytes,
@@ -2499,7 +3540,7 @@ export class DocumentWindowState {
       },
     };
     this.tabs.push(tab);
-    await this.switchTo(this.tabs.length - 1);
+    await this.switchTo(this.tabs.length - 1, true);
     await this.upsertTab(tab);
     return null;
   }
@@ -2640,6 +3681,15 @@ export class DocumentWindowState {
    *  conflict raises the conflict modal instead of writing. On success the
    *  fingerprint refreshes, totals update, and the tab goes clean. */
   async saveWindowed(tab: DocTab, force: boolean): Promise<WindowedSaveResult> {
+    if (this.onItsWay(tab)) {
+      return 'error';
+    }
+    return this.busy(tab, () => this.saveWindowedNow(tab, force));
+  }
+  private async saveWindowedNow(
+    tab: DocTab,
+    force: boolean,
+  ): Promise<WindowedSaveResult> {
     const w = tab.windowed;
     if (w === undefined) {
       return 'error';
@@ -2701,7 +3751,7 @@ export class DocumentWindowState {
    *  tab keeps its session and the failure is in `discardFailed`. */
   async discardWindowed(tab: DocTab): Promise<boolean> {
     const w = tab.windowed;
-    if (w === undefined) {
+    if (w === undefined || this.onItsWay(tab)) {
       return true;
     }
     if (tab.converted !== undefined) {
@@ -2812,18 +3862,19 @@ export class DocumentWindowState {
         encoding: tab.encoding,
         lossy: false,
         tabIndex: tab.tabIndex,
+        order: tab.order,
       };
     }
     void invoke('windowed_close', { sessionId: w.sessionId });
     this.windowedGates.delete(w.sessionId);
     this.windowedGenerations.delete(w.sessionId);
     this.releaseTabView(tab.id);
-    const { id, tabIndex } = tab;
+    const { id, tabIndex, order } = tab;
     const bare: Partial<DocTab> = tab;
     for (const key of Object.keys(bare) as (keyof DocTab)[]) {
       delete bare[key];
     }
-    Object.assign(tab, fresh, { id, tabIndex });
+    Object.assign(tab, fresh, { id, tabIndex, order });
     this.windowedConflict = null;
     await this.upsertTab(tab);
     return true;
@@ -2851,6 +3902,7 @@ export class DocumentWindowState {
             encoding: settingsState.defaultEncoding,
             lossy: false,
             tabIndex: tab.tabIndex,
+            order: tab.order,
             large: { size },
           };
         }
@@ -2879,6 +3931,7 @@ export class DocumentWindowState {
         encoding: tab.encoding,
         lossy: false,
         tabIndex: tab.tabIndex,
+        order: tab.order,
         missing: true,
       };
     }
@@ -3005,6 +4058,15 @@ export class DocumentWindowState {
    *  with `chosen`; it never raises the conflict modal, whose Force button
    *  writes the old path. */
   private async windowedSaveTo(tab: DocTab, chosen: string): Promise<boolean> {
+    if (this.onItsWay(tab)) {
+      return false;
+    }
+    return this.busy(tab, () => this.windowedSaveToNow(tab, chosen));
+  }
+  private async windowedSaveToNow(
+    tab: DocTab,
+    chosen: string,
+  ): Promise<boolean> {
     const w = tab.windowed;
     if (w === undefined) {
       return false;
@@ -3148,7 +4210,12 @@ export class DocumentWindowState {
     // A large tab's bytes are never re-decoded (the editor takes UTF-8 only
     // and the viewer decodes lossily), and the re-decode below would read the
     // whole file into memory.
-    if (tab === null || isLargeKind(tab) || tab.encoding === label) {
+    if (
+      tab === null ||
+      this.onItsWay(tab) ||
+      isLargeKind(tab) ||
+      tab.encoding === label
+    ) {
       return;
     }
     if (this.isDirty(tab)) {
@@ -3156,14 +4223,29 @@ export class DocumentWindowState {
       this.persistActive();
       return;
     }
+    const readContent = tab.content;
+    const readEnding = tab.lineEnding;
     let decoded: Decoded;
     try {
-      decoded = await invoke<Decoded>('read_file_as', {
-        path: tab.path,
-        encoding: label,
-      });
+      decoded = await this.busy(tab, () => readDocument(tab.path, label));
     } catch {
       this.encodingFailed = tab.path;
+      return;
+    }
+    // On its way to another window while the file was read: left as it was.
+    if (this.onItsWay(tab)) {
+      return;
+    }
+    // Closed during the read: writing its record now would bring the tab back.
+    if (!this.tabs.includes(tab)) {
+      return;
+    }
+    // Edited during the read: the tab is changed now, so it takes the rule above
+    // and only the save-time encoding changes. Not `persistActive`, the user
+    // may have switched tabs meanwhile.
+    if (tab.content !== readContent || tab.lineEnding !== readEnding) {
+      tab.encoding = label;
+      await this.upsertTab(tab);
       return;
     }
     // Re-decode replaces the buffer wholesale; one shared rope keeps the fresh
@@ -3179,7 +4261,7 @@ export class DocumentWindowState {
     // The editor doc for this tab is already mounted, so push the new buffer in.
     this.reloadTargetId = tab.id;
     this.reloadSeq += 1;
-    this.persistActive();
+    await this.upsertTab(tab);
   }
   /** Persist all logical bounds onto every tab so the lowest-index one (used on
    *  restore) always carries fresh bounds. */
@@ -3271,7 +4353,7 @@ export class DocumentWindowState {
    *  persisted, and the active tab's editor is refreshed. */
   discardChanges(index: number): void {
     const tab = this.tabs[index];
-    if (tab === undefined) {
+    if (tab === undefined || this.onItsWay(tab)) {
       return;
     }
     tab.content = tab.savedContent;
@@ -3282,56 +4364,110 @@ export class DocumentWindowState {
     }
     void this.upsertTab(tab);
   }
-  /** Remove a tab's store entry and drop it from the window. */
-  async deleteTab(index: number): Promise<void> {
+  /** Remove a tab's store entry and drop it from the window. True when this call
+   *  closed the tab; false when it stays (it was edited while the record went,
+   *  and the record is written back), was closed by another call, or is being
+   *  closed already. */
+  async deleteTab(index: number): Promise<boolean> {
     const tab = this.tabs[index];
-    if (tab === undefined) {
-      return;
+    if (tab === undefined || this.onItsWay(tab) || this.closingTabs.has(tab)) {
+      return false;
     }
-    if (index === this.activeIndex) {
-      this.persistActive.cancel();
-    }
-    // Release the Rust windowed session before dropping the tab.
-    if (tab.windowed !== undefined) {
-      void invoke('windowed_close', { sessionId: tab.windowed.sessionId });
-      this.windowedGates.delete(tab.windowed.sessionId);
-      this.windowedGenerations.delete(tab.windowed.sessionId);
-    }
-    // A paste still turning the tab into a large file is given up.
-    convertController.cancelTab(tab.id);
-    // A sticky note whose text was handed over and never saved comes back.
-    const conv = tab.converted;
-    if (conv?.saved === false && conv.origin === 'sticky') {
-      if (conv.noteId !== undefined) {
+    this.closingTabs.add(tab);
+    // From here the tab is not moved to another window: it is going.
+    tab.closing = true;
+    try {
+      if (index === this.activeIndex) {
+        this.persistActive.cancel();
+      }
+      if (tab === this.windowedConflict) {
+        this.windowedConflict = null;
+      }
+      if (this.rangeBox?.tabId === tab.id) {
+        this.rangeBox = null;
+      }
+      const before: TabCloseState = {
+        content: tab.content,
+        lineEnding: tab.lineEnding,
+        generation: this.generationOf(tab),
+      };
+      try {
+        await invoke('delete_note', { id: tab.id });
+      } catch (error) {
+        // Still open, and so a tab that may be moved again.
+        delete tab.closing;
+        throw error;
+      }
+      const pending =
+        tab === this.activeTab && this.windowedPending?.() === true;
+      if (
+        editedWhileClosing(before, {
+          content: tab.content,
+          lineEnding: tab.lineEnding,
+          generation: this.generationOf(tab),
+          pending,
+        })
+      ) {
+        delete tab.closing;
+        await this.upsertTab(tab);
+        return false;
+      }
+      const at = this.tabs.indexOf(tab);
+      if (at === -1) {
+        return false;
+      }
+      // Nothing below waits: the tab leaves `tabs` in the same step as its
+      // session, so nothing can be typed into it in between.
+      if (tab.windowed !== undefined) {
+        void invoke('windowed_close', { sessionId: tab.windowed.sessionId });
+        this.windowedGates.delete(tab.windowed.sessionId);
+        this.windowedGenerations.delete(tab.windowed.sessionId);
+      }
+      // A paste still turning the tab into a large file is given up.
+      convertController.cancelTab(tab.id);
+      const conv = tab.converted;
+      this.releaseTabView(tab.id);
+      // The editor never took its seed: it never will.
+      this.pendingSeeds.delete(tab.id);
+      this.unlockWhenShown.delete(tab.id);
+      this.adoptWhenShown.delete(tab.id);
+      this.tabs.splice(at, 1);
+      // Always write `activeIndex`, even when the computed value equals the
+      // current one: closing the active tab can leave the numeric index
+      // unchanged while the tab now living at that index is a different tab
+      // (e.g. closing tab 0 while a pending windowed-restore tab sits at index
+      // 1 shifts it down to index 0). The setter is what notices that and
+      // kicks off its restore — see the `activeIndex` accessor.
+      let newActive = this.activeIndex;
+      if (newActive > at) {
+        newActive -= 1;
+      } else if (newActive >= this.tabs.length) {
+        newActive = Math.max(0, this.tabs.length - 1);
+      }
+      this.activeIndex = newActive;
+      this.consumeUnlock();
+      // A sticky note whose text was handed over and never saved comes back.
+      if (
+        conv?.saved === false &&
+        conv.origin === 'sticky' &&
+        conv.noteId !== undefined
+      ) {
         try {
           await invoke('convert_release', { noteId: conv.noteId });
         } catch (e) {
           console.error('convert_release failed', e);
         }
       }
+      return true;
+    } finally {
+      this.closingTabs.delete(tab);
     }
-    if (tab === this.windowedConflict) {
-      this.windowedConflict = null;
-    }
-    if (this.rangeBox?.tabId === tab.id) {
-      this.rangeBox = null;
-    }
-    await invoke('delete_note', { id: tab.id });
-    this.releaseTabView(tab.id);
-    this.tabs.splice(index, 1);
-    // Always write `activeIndex`, even when the computed value equals the
-    // current one: closing the active tab can leave the numeric index
-    // unchanged while the tab now living at that index is a different tab
-    // (e.g. closing tab 0 while a pending windowed-restore tab sits at index
-    // 1 shifts it down to index 0). The setter is what notices that and
-    // kicks off its restore — see the `activeIndex` accessor.
-    let newActive = this.activeIndex;
-    if (newActive > index) {
-      newActive -= 1;
-    } else if (newActive >= this.tabs.length) {
-      newActive = Math.max(0, this.tabs.length - 1);
-    }
-    this.activeIndex = newActive;
+  }
+  /** The newest content generation of a windowed tab's session, if it has one. */
+  private generationOf(tab: DocTab): number | undefined {
+    return tab.windowed === undefined
+      ? undefined
+      : this.windowedGenerations.get(tab.windowed.sessionId);
   }
   /** Drop the store entry of every clean tab as this window closes, so the next
    *  launch does not reopen a document the user had already closed. Without it
@@ -3368,6 +4504,9 @@ export class DocumentWindowState {
   }
   /** Push every dirty tab to disk-store before a quit ack (not just the active). */
   async flushAll(): Promise<void> {
+    // A tab being put into this window is written by the core's own update; the
+    // flush follows it.
+    await this.committing?.catch(() => {});
     this.persistActive.flush();
     await this.lastSave;
     await Promise.all(

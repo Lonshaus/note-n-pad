@@ -127,6 +127,7 @@ pub(crate) fn follow_move(app: &AppHandle, store: &NoteStore, from: &str, to: &s
   }
   crate::retarget_recent(app, from, to);
   crate::grants::rekey(from, to);
+  crate::tab_transfer::follow_move(app, from, to);
   crate::note_store::emit_store_changed(app, None);
   let _ = app.emit(
     "paths-moved",
@@ -302,6 +303,15 @@ fn reveal_command(path: &str) -> Result<(&'static str, Vec<String>), String> {
 mod tests {
   use super::*;
   use tempfile::tempdir;
+
+  #[test]
+  fn a_rename_reaches_the_tabs_in_flight_between_windows_too() {
+    let source = include_str!("file_ops.rs");
+    let at = source.find("pub(crate) fn follow_move(").unwrap();
+    let body = &source[at..];
+    let body = &body[..body.find("\n}\n").unwrap()];
+    assert!(body.contains("crate::tab_transfer::follow_move(app, from, to)"));
+  }
 
   #[test]
   fn reveal_refuses_a_path_that_is_gone() {

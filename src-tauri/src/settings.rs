@@ -122,6 +122,12 @@ pub struct AppSettings {
   pub workspace_width: f64,
   #[serde(default = "default_workspace_height")]
   pub workspace_height: f64,
+  /// Size the user last gave a document window, used for new document windows.
+  /// None until one has been resized. Not shown on the settings page.
+  #[serde(default)]
+  pub document_width: Option<f64>,
+  #[serde(default)]
+  pub document_height: Option<f64>,
   /// Root folders of the project trees shown in the workspace sidebar. Empty
   /// until the user adds one; each entry is a sibling top-level node.
   #[serde(default)]
@@ -140,6 +146,10 @@ pub struct AppSettings {
   /// restored sticky/document windows. Off by default (unchanged behavior).
   #[serde(default = "default_open_workspace_on_startup")]
   pub open_workspace_on_startup: bool,
+  /// Whether the workspace's project tree lists hidden files (what the system
+  /// file browser hides by default). Off by default.
+  #[serde(default)]
+  pub show_hidden_files: bool,
   /// Recently opened file paths for the File > Open Recent menu, newest first,
   /// de-duplicated and capped at `RECENT_FILES_MAX`. Empty until the first open.
   #[serde(default)]
@@ -291,10 +301,13 @@ impl Default for AppSettings {
       workspace_y: None,
       workspace_width: default_workspace_width(),
       workspace_height: default_workspace_height(),
+      document_width: None,
+      document_height: None,
       project_roots: Vec::new(),
       project_expanded: BTreeMap::new(),
       show_tray_icon: default_show_tray_icon(),
       open_workspace_on_startup: default_open_workspace_on_startup(),
+      show_hidden_files: false,
       recent_files: Vec::new(),
     }
   }
@@ -485,6 +498,9 @@ fn repair(settings: &mut AppSettings) -> Vec<String> {
   if !(140.0..=4000.0).contains(&settings.default_sticky_height) {
     settings.default_sticky_height = default_sticky_height();
     repaired.push("default_sticky_height".to_string());
+  } else if settings.default_sticky_height < crate::windows::STICKY_MIN_HEIGHT {
+    // Valid under the old 140 minimum: raise it, nothing to report.
+    settings.default_sticky_height = crate::windows::STICKY_MIN_HEIGHT;
   }
   if !STICKY_PAPERS.contains(&settings.default_sticky_paper.as_str()) {
     settings.default_sticky_paper = default_sticky_paper();
@@ -497,6 +513,14 @@ fn repair(settings: &mut AppSettings) -> Vec<String> {
   if !(320.0..=4000.0).contains(&settings.workspace_height) {
     settings.workspace_height = default_workspace_height();
     repaired.push("workspace_height".to_string());
+  }
+  if !valid_document_size(settings.document_width) {
+    settings.document_width = None;
+    repaired.push("document_width".to_string());
+  }
+  if !valid_document_size(settings.document_height) {
+    settings.document_height = None;
+    repaired.push("document_height".to_string());
   }
   if !(9.0..=32.0).contains(&settings.editor_font_size) {
     settings.editor_font_size = default_editor_font_size();
@@ -524,6 +548,13 @@ fn repair(settings: &mut AppSettings) -> Vec<String> {
   }
   repaired
 }
+/// A remembered document-window dimension: unset, or any finite number above 0.
+fn valid_document_size(v: Option<f64>) -> bool {
+  match v {
+    None => true,
+    Some(n) => n.is_finite() && n > 0.0,
+  }
+}
 
 fn validate(settings: &AppSettings) -> Result<(), String> {
   let keys = crate::shortcuts::resolve_current(settings);
@@ -535,7 +566,7 @@ fn validate(settings: &AppSettings) -> Result<(), String> {
   }
   // Matches the sticky window's min size and a sane upper bound.
   if !(crate::windows::STICKY_MIN_WIDTH..=4000.0).contains(&settings.default_sticky_width)
-    || !(140.0..=4000.0).contains(&settings.default_sticky_height)
+    || !(crate::windows::STICKY_MIN_HEIGHT..=4000.0).contains(&settings.default_sticky_height)
   {
     return Err("default sticky size out of range".to_string());
   }
@@ -550,6 +581,10 @@ fn validate(settings: &AppSettings) -> Result<(), String> {
     || !(320.0..=4000.0).contains(&settings.workspace_height)
   {
     return Err("workspace size out of range".to_string());
+  }
+  if !valid_document_size(settings.document_width) || !valid_document_size(settings.document_height)
+  {
+    return Err("document size out of range".to_string());
   }
   if !(9.0..=32.0).contains(&settings.editor_font_size) {
     return Err("editor font size out of range".to_string());
@@ -790,6 +825,8 @@ fn tolerant_settings(
       default_workspace_height,
       &mut dropped,
     ),
+    document_width: field_or_default(obj, "document_width", || None, &mut dropped),
+    document_height: field_or_default(obj, "document_height", || None, &mut dropped),
     project_roots: field_or_default(obj, "project_roots", Vec::new, &mut dropped),
     project_expanded: field_or_default(obj, "project_expanded", BTreeMap::new, &mut dropped),
     show_tray_icon: field_or_default(obj, "show_tray_icon", default_show_tray_icon, &mut dropped),
@@ -799,6 +836,7 @@ fn tolerant_settings(
       default_open_workspace_on_startup,
       &mut dropped,
     ),
+    show_hidden_files: field_or_default(obj, "show_hidden_files", || false, &mut dropped),
     recent_files: field_or_default(obj, "recent_files", Vec::new, &mut dropped),
   };
   if !dropped.is_empty() {
@@ -1345,6 +1383,40 @@ mod tests {
   }
 
   #[test]
+  fn a_stored_sticky_height_below_the_minimum_is_raised_quietly() {
+    let (settings, repaired) = load_report(r#"{"default_sticky_height": 150}"#);
+    assert_eq!(settings.default_sticky_height, 160.0);
+    assert!(repaired.is_empty());
+  }
+
+  #[test]
+  fn a_stored_sticky_height_out_of_range_is_reset_and_reported() {
+    for bad in ["100", "5000"] {
+      let (settings, repaired) = load_report(&format!(r#"{{"default_sticky_height": {bad}}}"#));
+      assert_eq!(settings.default_sticky_height, 230.0, "{bad}");
+      assert_eq!(repaired, vec!["default_sticky_height".to_string()], "{bad}");
+    }
+  }
+
+  #[test]
+  fn a_stored_sticky_height_in_range_is_left_alone() {
+    let (settings, repaired) = load_report(r#"{"default_sticky_height": 200}"#);
+    assert_eq!(settings.default_sticky_height, 200.0);
+    assert!(repaired.is_empty());
+  }
+
+  #[test]
+  fn validate_checks_the_sticky_height_against_the_minimum() {
+    assert!(validate(&AppSettings::default()).is_ok());
+    let with_height = |h: f64| AppSettings {
+      default_sticky_height: h,
+      ..AppSettings::default()
+    };
+    assert!(validate(&with_height(159.0)).is_err());
+    assert!(validate(&with_height(160.0)).is_ok());
+  }
+
+  #[test]
   fn validate_rejects_an_unknown_sticky_paper() {
     let patched = merge_settings(
       &AppSettings::default(),
@@ -1407,6 +1479,8 @@ mod tests {
       workspace_y: Some(60.0),
       workspace_width: 320.0,
       workspace_height: 600.0,
+      document_width: Some(1000.0),
+      document_height: Some(700.0),
       project_roots: vec!["/tmp/project".into(), "/tmp/other".into()],
       project_expanded: BTreeMap::from([(
         "/tmp/project".to_string(),
@@ -1414,6 +1488,7 @@ mod tests {
       )]),
       show_tray_icon: false,
       open_workspace_on_startup: true,
+      show_hidden_files: true,
       recent_files: vec!["/tmp/a.txt".into(), "/tmp/b.txt".into()],
     };
     save_to(&path, &settings).unwrap();
@@ -1428,6 +1503,51 @@ mod tests {
     assert_eq!(settings.workspace_y, None);
     assert_eq!(settings.workspace_width, 300.0);
     assert_eq!(settings.workspace_height, 560.0);
+  }
+
+  #[test]
+  fn legacy_json_defaults_document_size_to_none() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("settings.json");
+    std::fs::write(&path, r#"{"theme":"dark"}"#).unwrap();
+    let (loaded, repaired) = load_from_with_report(&path).unwrap();
+    assert_eq!(loaded.document_width, None);
+    assert_eq!(loaded.document_height, None);
+    assert!(repaired.is_empty());
+  }
+
+  #[test]
+  fn invalid_document_size_is_repaired_and_rejected() {
+    for bad in [0.0, -5.0, f64::NAN, f64::INFINITY] {
+      let mut settings = AppSettings {
+        document_width: Some(bad),
+        document_height: Some(bad),
+        ..AppSettings::default()
+      };
+      let dir = tempdir().unwrap();
+      let path = dir.path().join("settings.json");
+      assert!(save_to(&path, &settings).is_err());
+      let repaired = repair(&mut settings);
+      assert!(repaired.contains(&"document_width".to_string()));
+      assert!(repaired.contains(&"document_height".to_string()));
+      assert_eq!(settings.document_width, None);
+      assert_eq!(settings.document_height, None);
+    }
+  }
+
+  #[test]
+  fn valid_document_sizes_round_trip() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("settings.json");
+    for (w, h) in [(1.0, 1.0), (150.0, 90.0), (12000.0, 8000.0)] {
+      let settings = AppSettings {
+        document_width: Some(w),
+        document_height: Some(h),
+        ..AppSettings::default()
+      };
+      save_to(&path, &settings).unwrap();
+      assert_eq!(load_from(&path).unwrap(), settings);
+    }
   }
 
   #[test]
@@ -1719,6 +1839,30 @@ mod tests {
     let settings = load_json(legacy);
     assert!(settings.show_tray_icon);
     assert!(!settings.open_workspace_on_startup);
+  }
+
+  #[test]
+  fn legacy_json_defaults_show_hidden_files_to_false() {
+    assert!(!load_json(r#"{"theme":"dark"}"#).show_hidden_files);
+  }
+
+  #[test]
+  fn tolerant_reader_defaults_show_hidden_files_to_false() {
+    // A wrong-typed field sends the load through the field-by-field reader.
+    let settings = load_json(r#"{"show_tray_icon":"yes"}"#);
+    assert!(!settings.show_hidden_files);
+  }
+
+  #[test]
+  fn show_hidden_files_round_trips() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("settings.json");
+    let on = AppSettings {
+      show_hidden_files: true,
+      ..AppSettings::default()
+    };
+    save_to(&path, &on).unwrap();
+    assert!(load_from(&path).unwrap().show_hidden_files);
   }
 
   #[test]

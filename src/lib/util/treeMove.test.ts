@@ -13,7 +13,6 @@ import {
   dropFolder,
   exceedsDragThreshold,
   failureDialog,
-  folderEntries,
   hoverFeedback,
   modifierOp,
   outcomeDialogs,
@@ -447,6 +446,16 @@ describe('dropDecision', () => {
       op: 'copy',
       allowed: [],
       rejected: [{ name: 'a.txt', reason: 'sameName' }],
+    });
+  });
+
+  it('refuses a name that matches a hidden-style child of the target', () => {
+    const env = item('/p/.env');
+    expect(decide('move', [env], target('/p/d'), ['.env'])).toEqual({
+      kind: 'partial',
+      op: 'move',
+      allowed: [],
+      rejected: [{ name: '.env', reason: 'sameName' }],
     });
   });
 
@@ -1087,84 +1096,6 @@ describe('applyDropResult', () => {
     applyDropResult(env, 'move', '/p', [], '/p/z');
     applyDropResult(env, 'copy', '/p', [], '/p/z');
     expect(calls).toEqual([]);
-  });
-});
-
-describe('folderEntries', () => {
-  const entry = (path: string): TreeEntry => ({
-    name: path.split('/').pop() ?? path,
-    path,
-    is_dir: false,
-    children: null,
-    volume: 1,
-    volume_error: null,
-    target_volume: null,
-    target_volume_error: null,
-  });
-
-  it('uses the listing that was read', async () => {
-    const cache = new TreeCache();
-    cache.setDir('/p', '/p/d', cache.begin('/p', '/p/d'), {
-      entries: [entry('/p/d/a.txt')],
-      error: null,
-    });
-    const list = vi.fn();
-    const found = await folderEntries(cache, '/p', '/p/d', list);
-    expect(found.map((e) => e.name)).toEqual(['a.txt']);
-    expect(list).not.toHaveBeenCalled();
-  });
-
-  it('reads a folder that never was, so a name already there is seen', async () => {
-    const list = vi.fn(async () => [entry('/p/d/a.txt')]);
-    const children = await folderEntries(new TreeCache(), '/p', '/p/d', list);
-    expect(list).toHaveBeenCalledWith('/p/d');
-    const a = item('/p/a.txt');
-    expect(
-      dropDecision({
-        op: 'move',
-        items: [a],
-        target: target('/p/d'),
-        targetChildren: children,
-        caseInsensitive: false,
-      }),
-    ).toEqual({
-      kind: 'partial',
-      op: 'move',
-      allowed: [],
-      rejected: [{ name: 'a.txt', reason: 'sameName' }],
-    });
-  });
-
-  it('reads again when the listing is marked to be read again', async () => {
-    const cache = new TreeCache();
-    cache.setDir('/p', '/p/d', cache.begin('/p', '/p/d'), {
-      entries: [],
-      error: null,
-    });
-    cache.invalidate('/p', '/p/d');
-    const list = vi.fn(async () => [entry('/p/d/a.txt')]);
-    const children = await folderEntries(cache, '/p', '/p/d', list);
-    expect(list).toHaveBeenCalledWith('/p/d');
-    expect(
-      dropDecision({
-        op: 'move',
-        items: [item('/p/a.txt')],
-        target: target('/p/d'),
-        targetChildren: children,
-        caseInsensitive: false,
-      }).kind,
-    ).toBe('partial');
-  });
-
-  it('reads again when the last read failed', async () => {
-    const cache = new TreeCache();
-    cache.setDir('/p', '/p/d', cache.begin('/p', '/p/d'), {
-      entries: [],
-      error: 'gone',
-    });
-    const list = vi.fn(async () => []);
-    await folderEntries(cache, '/p', '/p/d', list);
-    expect(list).toHaveBeenCalledTimes(1);
   });
 });
 

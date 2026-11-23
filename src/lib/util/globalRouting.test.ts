@@ -43,11 +43,14 @@ import {
   selectionOutside,
   shadowStep,
   trackOf,
+  trackReason,
+  undoJump,
   undoSelection,
   type GlobalAction,
   type OwnCommands,
   type RoutedItem,
   type SelectSpec,
+  type WindowLines,
 } from './globalRouting';
 import {
   commandChain,
@@ -55,7 +58,13 @@ import {
   coreKeyBindings,
   type KeyLayers,
 } from './replayKeys';
-import type { LinePos, LineSelection } from './windowSelection';
+import {
+  replayReady,
+  type LinePos,
+  type LineSelection,
+  type ReachDecision,
+  type WindowHoles,
+} from './windowSelection';
 interface At {
   line: number;
   col: number;
@@ -575,6 +584,80 @@ describe('trackOf', () => {
   it('hands over both ends of a selection too large for a window only', () => {
     expect(trackOf(LARGE)).toEqual([LARGE.anchor, LARGE.head]);
     expect(trackOf(SMALL)).toBeUndefined();
+  });
+});
+
+describe('trackOf with holes', () => {
+  const holes = (
+    hiddenAt: (pos: LinePos) => boolean,
+    readFor: LineSelection | null,
+  ): WindowHoles => ({
+    hidden: hiddenAt,
+    hiddenText: () => false,
+    readFor,
+  });
+  const hiddenHead = (pos: LinePos) => pos.line === 110;
+  const caret = sel(110, 7, 110, 7);
+  it('tracks a hidden caret for its hidden end', () => {
+    expect(trackReason(caret, holes(hiddenHead, null))).toBe('hidden');
+    expect(trackOf(caret, holes(hiddenHead, null))).toEqual([
+      caret.anchor,
+      caret.head,
+    ]);
+  });
+
+  it('tracks a hidden end the window was read for as a core operation', () => {
+    expect(trackReason(SMALL, holes(hiddenHead, SMALL))).toBe('core-op');
+  });
+
+  it('tracks a hidden end of a selection no read was made for as hidden', () => {
+    expect(trackReason(SMALL, holes(hiddenHead, null))).toBe('hidden');
+  });
+
+  it('tracks a selection too large for a window as a core operation', () => {
+    expect(
+      trackReason(
+        LARGE,
+        holes(() => false, null),
+      ),
+    ).toBe('core-op');
+  });
+
+  it('does not track a selection with no hidden end, nor without holes', () => {
+    expect(
+      trackReason(
+        SMALL,
+        holes(() => false, SMALL),
+      ),
+    ).toBeNull();
+    expect(
+      trackOf(
+        SMALL,
+        holes(() => false, SMALL),
+      ),
+    ).toBeUndefined();
+    expect(trackReason(SMALL)).toBeNull();
+  });
+});
+
+describe('undoJump', () => {
+  const tracked: [LinePos, LinePos] = [
+    { line: 50, col: 1 },
+    { line: 60, col: 2 },
+  ];
+  it('reveals the tracked selection of a core operation', () => {
+    expect(undoJump(tracked, 'core-op')).toEqual({
+      sel: { anchor: tracked[0], head: tracked[1] },
+      mode: 'reveal',
+    });
+  });
+
+  it('jumps to the change when the selection was tracked for a hidden end', () => {
+    expect(undoJump(tracked, 'hidden')).toEqual({ sel: null, mode: 'goto' });
+  });
+
+  it('jumps to the change for a selection that was not tracked', () => {
+    expect(undoJump(undefined, null)).toEqual({ sel: null, mode: 'goto' });
   });
 });
 
@@ -2022,5 +2105,241 @@ describe('a queued clip paste', () => {
 
   it('has the read loop read the window again once it has run', () => {
     expect(afterShadowStop({ type: 'clipPaste' })).toBe('reread');
+  });
+});
+// A window from global line 1000 with 2000 lines, where the position at line
+// 1510, column 5 lies in a part not loaded.
+describe('a selection with an end in a part not loaded', () => {
+  const HIDDEN = sel(1500, 0, 1510, 5);
+  const hole = (pos: LinePos): boolean => pos.line === 1510 && pos.col === 5;
+  const holesFor = (
+    readFor: LineSelection | null,
+    hiddenText = true,
+  ): WindowHoles => ({ hidden: hole, hiddenText: () => hiddenText, readFor });
+  const lines = { startLine: 1000, lineCount: 2000 };
+  const readHere: WindowLines = { ...lines, holes: holesFor(HIDDEN) };
+  const readElsewhere: WindowLines = { ...lines, holes: holesFor(null) };
+  interface Over {
+    sel?: LineSelection;
+    win?: WindowLines;
+  }
+  const item = (i: RoutedItem, over: Over = {}) =>
+    globalItemAction({
+      item: i,
+      sel: HIDDEN,
+      commands: [],
+      panelOpen: false,
+      own,
+      totalLines: TOTAL,
+      win: readHere,
+      ...over,
+    });
+  const key = (e: Ev, over: Over = {}): GlobalAction =>
+    globalItemAction({
+      item: { kind: 'key' },
+      sel: HIDDEN,
+      commands: commandChain(layersFor('macos'), e, 'macos'),
+      panelOpen: false,
+      own,
+      totalLines: TOTAL,
+      win: readHere,
+      ...over,
+    });
+
+  describe('selectionOutside and inputOutside', () => {
+    it("are today's without holes", () => {
+      expect(selectionOutside(HIDDEN, lines)).toBe(false);
+      expect(inputOutside(HIDDEN, lines)).toBe(false);
+    });
+
+    it('count a hidden caret as outside the window', () => {
+      const here = caret(1510, 5);
+      expect(selectionOutside(here, readElsewhere)).toBe(true);
+      expect(inputOutside(here, readElsewhere)).toBe(true);
+      // It is never core-op, so it stays outside after a read for it too.
+      expect(selectionOutside(here, { ...lines, holes: holesFor(here) })).toBe(
+        true,
+      );
+    });
+
+    it('send a hidden end no read was made for to a focused read', () => {
+      expect(selectionOutside(HIDDEN, readElsewhere)).toBe(true);
+      expect(inputOutside(HIDDEN, readElsewhere)).toBe(true);
+    });
+
+    it('act through the replay, as a core operation, for a hidden end the window was read for', () => {
+      expect(selectionOutside(HIDDEN, readHere)).toBe(false);
+      expect(inputOutside(HIDDEN, readHere)).toBe(true);
+    });
+
+    it('leave a selection with no hidden end inside the window', () => {
+      expect(inputOutside(sel(1500, 0, 1510, 4), readHere)).toBe(false);
+    });
+  });
+
+  describe('globalItemAction for a core-op selection made by a hidden end', () => {
+    it('deletes first for typed text and replaces the selection with pasted text', () => {
+      expect(item({ kind: 'text', userEvent: 'input.type' })).toEqual({
+        type: 'deleteFirst',
+      });
+      expect(item({ kind: 'text', userEvent: 'input.paste' })).toEqual(
+        op('replace'),
+      );
+    });
+
+    it('deletes the selection for a delete key, indents for Tab and breaks the line for Enter', () => {
+      expect(key(keyEv('Delete'))).toEqual(op('delete'));
+      expect(key(keyEv('Backspace'))).toEqual(op('delete'));
+      expect(key(keyEv('Tab'))).toEqual(op('indent'));
+      expect(key(keyEv('Enter'))).toEqual(op('enter'));
+    });
+
+    it('collapses the selection for an arrow key', () => {
+      expect(key(keyEv('ArrowRight'))).toEqual(
+        select({ type: 'collapse', forward: true }),
+      );
+    });
+
+    it('runs on the window as it is for a hidden end no read was made for', () => {
+      expect(
+        item({ kind: 'text', userEvent: 'input.type' }, { win: readElsewhere }),
+      ).toEqual({ type: 'normal' });
+      expect(key(keyEv('Delete'), { win: readElsewhere })).toEqual({
+        type: 'normal',
+      });
+    });
+
+    it("is today's answer without holes", () => {
+      expect(
+        item({ kind: 'text', userEvent: 'input.type' }, { win: lines }),
+      ).toEqual({ type: 'normal' });
+    });
+  });
+
+  describe('a copy or cut whose text in the window is not the text in the file', () => {
+    const supply = { kind: 'copy' } as const;
+    const supplyCut = { kind: 'cut' } as const;
+    const range = sel(1500, 0, 1500, 4);
+
+    it('goes through a clip, refusing the supply, once the selection has hidden text', () => {
+      const win = { ...lines, holes: holesFor(range) };
+      expect(item(supply, { sel: range, win })).toEqual({
+        type: 'clipCopy',
+        copy: { anchor: range.anchor, head: range.head },
+        linewise: false,
+        refuseSupply: true,
+      });
+      expect(item(supplyCut, { sel: range, win }).type).toBe('op');
+    });
+
+    it('copies the whole line of a caret on a line with a hole, as a linewise clip', () => {
+      const here = caret(1500, 2);
+      const r = item(supply, {
+        sel: here,
+        win: { ...lines, holes: holesFor(null) },
+      });
+      expect(r).toEqual({
+        type: 'clipCopy',
+        copy: {
+          anchor: { line: 1500, col: 0 },
+          head: { line: 1500, col: Number.MAX_SAFE_INTEGER },
+        },
+        linewise: true,
+        refuseSupply: true,
+      });
+    });
+
+    it('stays on the window for a selection with no hidden text', () => {
+      const win = { ...lines, holes: holesFor(null, false) };
+      expect(item(supply, { sel: range, win })).toEqual({ type: 'normal' });
+      expect(item(supplyCut, { sel: range, win })).toEqual({ type: 'normal' });
+    });
+
+    it('goes through a clip for a core-op selection from a hidden end, whatever the item', () => {
+      expect(item(supply).type).toBe('clipCopy');
+    });
+  });
+});
+
+describe('the drain and the shadow for a head key that reaches a part not loaded', () => {
+  const lines = { startLine: 1000, lineCount: 2000 };
+  const here = caret(1500, 3);
+  const backspace: Command[] = commandChain(
+    layersFor('macos'),
+    keyEv('Backspace'),
+    'macos',
+  );
+  const base = {
+    sel: here,
+    commands: backspace,
+    panelOpen: false,
+    own,
+    headMapping: false,
+    totalLines: TOTAL,
+    win: lines,
+    item: { kind: 'key' } as RoutedItem,
+  };
+  const drain = {
+    ...base,
+    swapping: false,
+    holds: 0,
+  };
+  const ready = (decision: ReachDecision): boolean =>
+    replayReady(here, lines.startLine, lines.lineCount, undefined, decision);
+
+  it('swaps to read the window around the caret for a reload', () => {
+    expect(
+      dequeueStep({ ...drain, ready: ready('reload'), decision: 'reload' })
+        .step,
+    ).toBe('swap');
+    expect(
+      shadowStep({ ...base, ready: ready('reload'), decision: 'reload' }).step,
+    ).toBe('swap');
+  });
+
+  it('drops a refused key, in the drain and in the shadow', () => {
+    expect(
+      dequeueStep({ ...drain, ready: ready('refuse'), decision: 'refuse' })
+        .step,
+    ).toBe('drop');
+    expect(
+      shadowStep({ ...base, ready: ready('refuse'), decision: 'refuse' }).step,
+    ).toBe('drop');
+  });
+
+  it('runs a key that does not reach', () => {
+    expect(
+      dequeueStep({ ...drain, ready: ready('run'), decision: 'run' }).step,
+    ).toBe('run');
+    expect(dequeueStep({ ...drain, ready: ready('run') }).step).toBe('run');
+    expect(
+      shadowStep({ ...base, ready: ready('run'), decision: 'run' }).step,
+    ).toBe('run');
+  });
+
+  it('waits behind a swap or a hold, a refused key too', () => {
+    expect(
+      dequeueStep({
+        ...drain,
+        holds: 1,
+        ready: ready('refuse'),
+        decision: 'refuse',
+      }).step,
+    ).toBe('wait');
+    expect(
+      dequeueStep({
+        ...drain,
+        swapping: true,
+        ready: ready('refuse'),
+        decision: 'refuse',
+      }).step,
+    ).toBe('wait');
+  });
+
+  it('drops a refused key only when the step would have run it', () => {
+    // Not ready: the window is swapped first.
+    expect(
+      dequeueStep({ ...drain, ready: false, decision: 'refuse' }).step,
+    ).toBe('swap');
   });
 });
