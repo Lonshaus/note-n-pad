@@ -186,6 +186,10 @@ until [ -n "$DL" ] && [ "$(evl "$DL" "typeof __auto!=='undefined' && typeof __au
   fi
   DL=$(doc_label)
 done
+if ! e2e_wait_eval "$DL" "String(__auto.getEditorState()!==null)" "true"; then
+  echo "FATAL: the editor state never appeared"
+  exit 1
+fi
 ORIG_WRAP=$(e2e_read "$DL" "String(__auto.getEditorState().wordWrap)")
 echo "original editor_word_wrap: $ORIG_WRAP"
 

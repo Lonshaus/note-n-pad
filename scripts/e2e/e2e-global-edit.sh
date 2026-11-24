@@ -26,7 +26,19 @@
 # interrupted at once. The trap restores the language and the Select All
 # setting, patching settings.json directly once the app is dead, and wipes this
 # suite's own document snapshots (matched by the fixture path).
+# GLOBAL_EDIT_PART picks what runs: main (default) is everything but the selection
+# keys, keys is section 4 alone (e2e-global-edit-keys.sh); the logs of keys carry
+# a -keys suffix.
 set -u
+GLOBAL_EDIT_PART="${GLOBAL_EDIT_PART:-main}"
+case "$GLOBAL_EDIT_PART" in
+  main) PART_SUFFIX="" ;;
+  keys) PART_SUFFIX="-keys" ;;
+  *)
+    echo "usage: GLOBAL_EDIT_PART=main|keys bash $0" >&2
+    exit 1
+    ;;
+esac
 source "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
 WORK="$OUT/global-edit-fixture"
 PASS=0
@@ -37,14 +49,14 @@ LINE_BYTES=48
 BASE_SIZE=$((N_LINES * LINE_BYTES - 1))
 END_LINE=$((N_LINES - 1))
 END_COL=47
-# The big file: 2,400,000 such lines.
+# The big file of the main part: 2,400,000 such lines.
 BIG_LINES=2400000
 BIG_SIZE=$((BIG_LINES * LINE_BYTES - 1))
 # The most a main process's resident set may grow during one step over the big file.
 RSS_LIMIT_KB=65536
 mkdir -p "$OUT"
-: >"$OUT/dev-global-edit.log"
-DIAG_LOG="$OUT/dev-diag-global-edit.log"
+: >"$OUT/dev-global-edit$PART_SUFFIX.log"
+DIAG_LOG="$OUT/dev-diag-global-edit$PART_SUFFIX.log"
 : >"$DIAG_LOG"
 
 ok() {
@@ -104,7 +116,7 @@ evl() {
 }
 launch() {
   e2e_require_clean_slate
-  NOTE_N_PAD_AUTOMATION=1 npm run tauri dev >>"$OUT/dev-global-edit.log" 2>&1 &
+  NOTE_N_PAD_AUTOMATION=1 npm run tauri dev >>"$OUT/dev-global-edit$PART_SUFFIX.log" 2>&1 &
   e2e_report_port_holders
   local tries=0
   until e2e_automation_up; do
@@ -116,7 +128,7 @@ launch() {
       exit 1
     fi
   done
-  e2e_require_automation_listener "$OUT/dev-global-edit.log"
+  e2e_require_automation_listener "$OUT/dev-global-edit$PART_SUFFIX.log"
   # The dev server binds 1420 while the app is coming up, so this is the
   # first moment a leftover holding it is visible; the app answering on
   # the automation port does not mean vite got its port.
@@ -141,6 +153,14 @@ case "$(uname -s)" in
   Darwin) MODPROP="metaKey" ;;
   *) MODPROP="ctrlKey" ;;
 esac
+# Shift+document start: the key and its modifiers (sections 4 and 7).
+if [ "$(uname -s)" = "Darwin" ]; then
+  DOC_START_KEY="ArrowUp"
+  DOC_START_MODS="{metaKey:true,shiftKey:true}"
+else
+  DOC_START_KEY="Home"
+  DOC_START_MODS="{ctrlKey:true,shiftKey:true}"
+fi
 # The page-side helpers every step below calls as __t.*.
 read -r -d '' HELPERS <<'JS'
 window.__errs = [];
@@ -316,10 +336,15 @@ fi
 echo "=== fixtures ==="
 rm -rf "$WORK"
 mkdir -p "$WORK"
+BIG_WRITE=""
+if [ "$GLOBAL_EDIT_PART" = main ]; then
+  BIG_WRITE="write('$WORK/big.log', $BIG_LINES)"
+fi
 # Every line is '0000000001 ' and 36 'x' (47 characters) and an LF, the last line
-# without one. base.log has 20,000 lines, big.log 2,400,000 (about 110 MB),
-# small.log the first 4,000 of them (the ordinary tab the selection keys are
-# compared with). cr.log has 3,000 lines of which every fifth ends in a lone CR.
+# without one. base.log has 20,000 lines, big.log (main part only) 2,400,000
+# (about 110 MB), small.log the first 4,000 of them (the ordinary tab the
+# selection keys are compared with). cr.log has 3,000 lines of which every fifth
+# ends in a lone CR.
 python3 - <<PYEOF
 def write(path, n, tail_newline=False):
     with open(path, 'w', newline='') as f:
@@ -334,7 +359,7 @@ def write(path, n, tail_newline=False):
                 first = False
                 buf = []
 write('$WORK/base.log', $N_LINES)
-write('$WORK/big.log', $BIG_LINES)
+$BIG_WRITE
 write('$WORK/small.log', 4000)
 with open('$WORK/cr.log', 'w', newline='') as f:
     for i in range(1, 3001):
@@ -344,8 +369,10 @@ with open('$WORK/cr.log', 'w', newline='') as f:
 PYEOF
 echo "base.log bytes: $(file_size "$WORK/base.log")"
 check "base.log has the size of $N_LINES lines" "$(file_size "$WORK/base.log")" "$BASE_SIZE"
-check "big.log has the size of $BIG_LINES lines" "$(file_size "$WORK/big.log")" "$BIG_SIZE"
-BIG_SHA=$(file_sha256 "$WORK/big.log")
+if [ "$GLOBAL_EDIT_PART" = main ]; then
+  check "big.log has the size of $BIG_LINES lines" "$(file_size "$WORK/big.log")" "$BIG_SIZE"
+  BIG_SHA=$(file_sha256 "$WORK/big.log")
+fi
 printf 'seed\n' >"$WORK/seed.txt"
 # What the file checks below read: modes of one script.
 cat >"$WORK/chk.py" <<'PYEOF'
@@ -459,6 +486,7 @@ check "setup: the window has OS focus" "$(e2e_read "$DL" "String(document.hasFoc
 evl "$DL" "$HELPERS" >/dev/null
 check "helpers installed" "$(e2e_read "$DL" "typeof __t")" "object"
 
+if [ "$GLOBAL_EDIT_PART" = main ]; then
 echo "=== 1. the whole of a 110 MB file: delete, type, Tab, Shift+Tab, paste, Enter ==="
 # The tab ends in the fixture's selection of the whole file at the end of the
 # line count, which the Select All below needs: END_LINE and END_COL of the big file.
@@ -608,7 +636,8 @@ e2e_wait_until 60 _e2e_eval_equals "$DL" "$(js_total)" "1"
 close_windowed
 check "the file holds the typed text and nothing else" "$(cat "$DOC")" "Q"
 check "no exception thrown" "$(e2e_read "$DL" "$(js_errors)")" "0"
-
+fi
+if [ "$GLOBAL_EDIT_PART" = keys ]; then
 echo "=== 4. the selection keys, against CodeMirror in a small ordinary tab ==="
 # The same keys on the same selection (set from the start of the file, or from
 # its end) in a 4,000 line ordinary tab, where CodeMirror alone acts, and in the
@@ -692,13 +721,6 @@ SMALL_A_TO=$(((SMALL_END_LINE - 2) * LINE_BYTES + END_COL))
 SMALL_B_FROM=$((SMALL_END_LINE * LINE_BYTES + END_COL))
 SMALL_B_TO=$((1 * LINE_BYTES))
 # Select All and the keys of a start $1 (a or b) in the windowed tab.
-if [ "$(uname -s)" = "Darwin" ]; then
-  DOC_START_KEY="ArrowUp"
-  DOC_START_MODS="{metaKey:true,shiftKey:true}"
-else
-  DOC_START_KEY="Home"
-  DOC_START_MODS="{ctrlKey:true,shiftKey:true}"
-fi
 windowed_start() {
   select_all
   settle
@@ -837,7 +859,8 @@ e2e_wait_eval "$DL" "String(__auto.getTabs().length)" "2"
 evl "$DL" "__auto.switchTab($((WIN_TAB - 1)))" >/dev/null
 e2e_wait_eval "$DL" "String(__auto.getTabs()[$((WIN_TAB - 1))].active && __auto.isWindowedTab())" "true"
 close_windowed
-
+fi
+if [ "$GLOBAL_EDIT_PART" = main ]; then
 echo "=== 5. the delete keys remove the whole selection ==="
 begin_doc
 S5_SIZE=$(total)
@@ -1180,6 +1203,7 @@ PLAIN_SHA=$QUEUED_SHA
 queued_run held
 check "Shift+End and then the composition: the same file as one after another" "$QUEUED_SHA" "$PLAIN_SHA"
 check "no exception thrown in the whole run" "$(e2e_read "$DL" "$(js_errors)")" "0"
+fi
 
 echo "=== teardown ==="
 evl "$DL" "__auto.setLanguage('$ORIG_LANG')" >/dev/null

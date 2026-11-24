@@ -499,6 +499,28 @@ e2e_app_running() {
 e2e_app_gone() {
   ! e2e_app_running
 }
+# PID of the app's own process, empty when there is none.
+e2e_app_pid() {
+  case "$(uname -s)" in
+    MINGW64_NT* | MSYS_NT*)
+      tasklist //FI "IMAGENAME eq note-n-pad.exe" //FO CSV //NH 2>/dev/null | tr -d '\r' | awk -F'","' 'NF > 1 {print $2; exit}'
+      ;;
+    *)
+      pgrep -x note-n-pad | head -1
+      ;;
+  esac
+}
+# Whether process <pid> is alive.
+e2e_pid_alive() {
+  case "$(uname -s)" in
+    MINGW64_NT* | MSYS_NT*)
+      tasklist //FI "PID eq $1" //FO CSV //NH 2>/dev/null | tr -d '\r' | awk -F'","' -v p="$1" '$2 == p {found = 1} END {exit !found}'
+      ;;
+    *)
+      kill -0 "$1" 2>/dev/null
+      ;;
+  esac
+}
 
 # Whether the dev binary (cargo run's debug build, matched by path) is
 # running. Narrower than e2e_app_running on purpose: the RSS attribution and

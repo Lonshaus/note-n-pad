@@ -9,11 +9,11 @@ dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 group() {
   case "$1" in
-    1) echo e2e-global-edit ;;
-    2) printf '%s\n' e2e-paste e2e-close-flush e2e-highlight e2e-goto e2e-i18n ;;
-    3) printf '%s\n' e2e-select-all e2e-view-mode e2e-table e2e-spill ;;
-    4) printf '%s\n' e2e-windowed e2e-clip e2e-longline e2e-file-drop e2e-windowed-two-tabs ;;
-    5) printf '%s\n' e2e-editor-focus e2e-range e2e-large ;;
+    1) printf '%s\n' e2e-global-edit-keys e2e-windowed-two-tabs ;;
+    2) printf '%s\n' e2e-highlight e2e-select-all e2e-view-mode e2e-clip e2e-longline ;;
+    3) printf '%s\n' e2e-paste e2e-goto e2e-i18n e2e-spill e2e-windowed ;;
+    4) printf '%s\n' e2e-paste-clip e2e-close-flush e2e-table e2e-editor-focus ;;
+    5) printf '%s\n' e2e-global-edit e2e-file-drop e2e-range e2e-large ;;
     *) return 1 ;;
   esac
 }

@@ -31,7 +31,18 @@
 # The trap restores the language, the open target and the two large-file
 # settings (patching settings.json once the app is dead) and wipes this suite's
 # own snapshots (matched by the fixture path).
+# PASTE_PART picks what runs: main (default) is sections 1a-6, clip is sections
+# 7-15 (e2e-paste-clip.sh); the logs of clip carry a -clip suffix.
 set -u
+PASTE_PART="${PASTE_PART:-main}"
+case "$PASTE_PART" in
+  main) PART_SUFFIX="" ;;
+  clip) PART_SUFFIX="-clip" ;;
+  *)
+    echo "usage: PASTE_PART=main|clip bash $0" >&2
+    exit 1
+    ;;
+esac
 source "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
 WORK="$OUT/paste-fixture"
 PASS=0
@@ -59,8 +70,8 @@ MID_LINES=2195000
 MID_SIZE=$((MID_LINES * LINE_BYTES - 1))
 MID_END_LINE=$((MID_LINES - 1))
 mkdir -p "$OUT"
-: >"$OUT/dev-paste.log"
-DIAG_LOG="$OUT/dev-diag-paste.log"
+: >"$OUT/dev-paste$PART_SUFFIX.log"
+DIAG_LOG="$OUT/dev-diag-paste$PART_SUFFIX.log"
 : >"$DIAG_LOG"
 
 case "$(uname -s)" in
@@ -248,7 +259,7 @@ evl() {
 }
 launch() {
   e2e_require_clean_slate
-  NOTENPAD_LARGE_EDIT_MAX="$LARGE_EDIT_MAX_BYTES" NOTE_N_PAD_AUTOMATION=1 npm run tauri dev >>"$OUT/dev-paste.log" 2>&1 &
+  NOTENPAD_LARGE_EDIT_MAX="$LARGE_EDIT_MAX_BYTES" NOTE_N_PAD_AUTOMATION=1 npm run tauri dev >>"$OUT/dev-paste$PART_SUFFIX.log" 2>&1 &
   e2e_report_port_holders
   local tries=0
   until e2e_automation_up; do
@@ -260,7 +271,7 @@ launch() {
       exit 1
     fi
   done
-  e2e_require_automation_listener "$OUT/dev-paste.log"
+  e2e_require_automation_listener "$OUT/dev-paste$PART_SUFFIX.log"
   e2e_report_port_holders
   sleep 4
 }
@@ -625,6 +636,12 @@ echo "=== fixtures ==="
 rm -rf "$WORK"
 mkdir -p "$WORK"
 DEFAULT_EOL="$(default_eol)"
+CLIP_WRITES=""
+if [ "$PASTE_PART" = clip ]; then
+  CLIP_WRITES="write(os.path.join(w, 'base.log'), $N_LINES)
+write(os.path.join(w, 'mid.log'), $MID_LINES)
+write(os.path.join(w, 'big.log'), $BIG_LINES)"
+fi
 python3 - <<PYEOF
 import os
 w = '$WORK'
@@ -667,15 +684,15 @@ def write(path, n):
                 f.write('\n'.join(buf))
                 first = False
                 buf = []
-write(os.path.join(w, 'base.log'), $N_LINES)
-write(os.path.join(w, 'mid.log'), $MID_LINES)
-write(os.path.join(w, 'big.log'), $BIG_LINES)
+$CLIP_WRITES
 PYEOF
-BASE_SHA=$(file_sha256 "$WORK/base.log")
-BIG_SHA=$(file_sha256 "$WORK/big.log")
-check "base.log has the size of $N_LINES lines" "$(file_size "$WORK/base.log")" "$BASE_SIZE"
-check "mid.log has the size of $MID_LINES lines" "$(file_size "$WORK/mid.log")" "$MID_SIZE"
-check "big.log has the size of $BIG_LINES lines" "$(file_size "$WORK/big.log")" "$BIG_SIZE"
+if [ "$PASTE_PART" = clip ]; then
+  BASE_SHA=$(file_sha256 "$WORK/base.log")
+  BIG_SHA=$(file_sha256 "$WORK/big.log")
+  check "base.log has the size of $N_LINES lines" "$(file_size "$WORK/base.log")" "$BASE_SIZE"
+  check "mid.log has the size of $MID_LINES lines" "$(file_size "$WORK/mid.log")" "$MID_SIZE"
+  check "big.log has the size of $BIG_LINES lines" "$(file_size "$WORK/big.log")" "$BIG_SIZE"
+fi
 
 CREATED_STICKY=""
 restore_state() {
@@ -753,6 +770,7 @@ evl "$DL" "$HELPERS" >/dev/null
 check "helpers installed" "$(e2e_read "$DL" "typeof __t")" "object"
 start_beat "$DL"
 
+if [ "$PASTE_PART" = main ]; then
 echo "=== 1a. [all] a sticky note pasted too much asks first; cancel gives the focus back to the note ==="
 # The note stays open: section 6 pastes into it too, and delete_note does not
 # close its window.
@@ -1006,7 +1024,8 @@ done
 # The note and the window it opened took the OS focus; the clip pastes below need it.
 focus_window "$BASE_DL"
 check "after 6: the document window has the OS focus" "$(e2e_read "$BASE_DL" "String(document.hasFocus())")" "true"
-
+fi
+if [ "$PASTE_PART" = clip ]; then
 echo "=== 7. [macOS, Windows] a clip of 110 MB is pasted from its file, never read by the page ==="
 if has_clipboard; then
   evl "$DL" "__auto.setOpenTarget('tab')" >/dev/null
@@ -1349,6 +1368,7 @@ if has_clipboard; then
   back_to_seed
 else
   skip "15. a whole line pasted above the caret line (macOS and Windows)"
+fi
 fi
 
 echo "=== teardown ==="

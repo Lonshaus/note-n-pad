@@ -20,12 +20,14 @@ on:
           - e2e-editor-focus
           - e2e-file-drop
           - e2e-global-edit
+          - e2e-global-edit-keys
           - e2e-goto
           - e2e-highlight
           - e2e-i18n
           - e2e-large
           - e2e-longline
           - e2e-paste
+          - e2e-paste-clip
           - e2e-range
           - e2e-select-all
           - e2e-spill
@@ -72,18 +74,31 @@ jobs:
         # combination without `os`.
         shard: >-
           ${{ fromJSON((inputs.suites == null || inputs.suites == '' || inputs.suites == 'all')
-          && '[{"n":1,"limit":66},{"n":2,"limit":110},{"n":3,"limit":99},{"n":4,"limit":85},{"n":5,"limit":53}]'
+          && '[{"n":1,"limit":62},{"n":2,"limit":105},{"n":3,"limit":105},{"n":4,"limit":89},{"n":5,"limit":84}]'
           || '[{"n":0,"limit":340}]') }}
     steps:
       - uses: actions/checkout@v7
-
+      # ImageOS and ImageVersion are runner variables, not in the env context.
+      - name: Name the runner image (Linux)
+        id: image
+        if: startsWith(matrix.os, 'ubuntu')
+        run: echo "image=$ImageOS-$ImageVersion" >> "$GITHUB_OUTPUT"
+      # Saved by ci.yml only; this job never saves a cache.
+      - name: Restore the apt archives (Linux)
+        id: apt-archives
+        if: startsWith(matrix.os, 'ubuntu')
+        uses: actions/cache/restore@v6
+        with:
+          path: ~/apt-archives/*.deb
+          key: apt-archives-${{ steps.image.outputs.image }}-${{ hashFiles('scripts/linux-check/apt-packages.txt') }}
       - name: Install Tauri system dependencies (Linux)
         if: startsWith(matrix.os, 'ubuntu')
         run: |
           sudo apt-get update
+          mkdir -p "$HOME/apt-archives/partial"
           grep -vE '^[[:space:]]*(#|$)' scripts/linux-check/apt-packages.txt \
-            | xargs sudo apt-get install -y
-          sudo apt-get install -y xvfb lsof jq
+            | xargs sudo apt-get install -y -o Dir::Cache::archives="$HOME/apt-archives"
+          sudo apt-get install -y -o Dir::Cache::archives="$HOME/apt-archives" xvfb lsof jq
 
       - name: Setup Node.js
         uses: actions/setup-node@v7
@@ -102,27 +117,11 @@ jobs:
         with:
           workspaces: src-tauri
           cache-on-failure: true
-          save-if: ${{ matrix.shard.n <= 1 }}
-      - name: Restore the licence tool
-        id: licence-tool
-        uses: actions/cache/restore@v6
-        with:
-          path: |
-            ~/.cargo/bin/cargo-bundle-licenses
-            ~/.cargo/bin/cargo-bundle-licenses.exe
-          key: licence-tool-${{ runner.os }}-4.2.0
+          shared-key: test
+          save-if: false
+      # Skipped by cargo when the restored ~/.cargo/bin already has it.
       - name: Install the licence tool
-        if: steps.licence-tool.outputs.cache-hit != 'true'
         run: cargo install cargo-bundle-licenses --version 4.2.0 --locked
-      # Saved at once, so a later failure does not lose it; one group saves for its platform.
-      - name: Save the licence tool
-        if: steps.licence-tool.outputs.cache-hit != 'true' && matrix.shard.n <= 1
-        uses: actions/cache/save@v6
-        with:
-          path: |
-            ~/.cargo/bin/cargo-bundle-licenses
-            ~/.cargo/bin/cargo-bundle-licenses.exe
-          key: licence-tool-${{ runner.os }}-4.2.0
       # tauri-build refuses to compile without the index.
       - name: Generate third-party licence index
         run: npm run licenses
@@ -180,8 +179,7 @@ jobs:
             case "$1" in
               e2e-close-flush | e2e-editor-focus | e2e-file-drop | e2e-goto | e2e-highlight | e2e-i18n | e2e-large | e2e-longline | e2e-range | e2e-windowed-two-tabs) echo 10 ;;
               e2e-table | e2e-view-mode | e2e-windowed | e2e-clip | e2e-spill) echo 15 ;;
-              e2e-select-all) echo 30 ;;
-              e2e-global-edit | e2e-paste) echo 45 ;;
+              e2e-select-all | e2e-global-edit | e2e-global-edit-keys | e2e-paste | e2e-paste-clip) echo 30 ;;
               *) return 1 ;;
             esac
           }
