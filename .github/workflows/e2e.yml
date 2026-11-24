@@ -1,9 +1,9 @@
 name: E2E
-# Automatic on pull requests into master only, where a merge means a version
-# is being released. Everywhere else it stays on demand.
+# Automatic on pull requests into develop and master, so a failure shows on the
+# pull request that causes it. Everywhere else it stays on demand.
 on:
   pull_request:
-    branches: [master]
+    branches: [develop, master]
   workflow_dispatch:
     inputs:
       suites:
