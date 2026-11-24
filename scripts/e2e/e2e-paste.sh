@@ -517,8 +517,9 @@ open_fresh() {
   DOC="$WORK/run$NEXT.${1##*.}"
   cp "$WORK/$1" "$DOC"
   if [ "${2:-}" = "windowed" ]; then
-    evl "$DL" "__auto.windowedOpen('$DOC').then((r)=>{window.__ow=r;});1" >/dev/null
+    evl "$DL" "window.__ow=undefined;__auto.windowedOpen('$DOC').then((r)=>{window.__ow=r;});1" >/dev/null
     e2e_wait_eval "$DL" "String(__auto.getTabs().some((t)=>t.path==='$DOC' && t.active) && __auto.isWindowedTab() && __auto.windowedInfo().windowStartLine===0)" "true"
+    e2e_wait_eval "$DL" "String(window.__ow!==undefined)" "true"
     check "$1 opened without refusal" "$(e2e_read "$DL" "String(window.__ow===null)")" "true"
   else
     evl "$DL" "__auto.openTab('$DOC')" >/dev/null

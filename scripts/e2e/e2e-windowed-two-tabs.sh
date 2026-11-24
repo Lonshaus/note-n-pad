@@ -165,10 +165,12 @@ if [ -z "$DL" ]; then
   exit 1
 fi
 e2e_wait_eval "$DL" "String(typeof __auto!=='undefined' && typeof __auto.windowedOpen==='function' && __auto.getTabs().length===1)" "true"
-evl "$DL" "__auto.windowedOpen('$WORK/a.log').then((r)=>{window.__oa=r;})" >/dev/null
+evl "$DL" "window.__oa=undefined;__auto.windowedOpen('$WORK/a.log').then((r)=>{window.__oa=r;})" >/dev/null
 e2e_wait_eval "$DL" "String(__auto.getTabs().length===2 && __auto.isWindowedTab())" "true"
-evl "$DL" "__auto.windowedOpen('$WORK/b.log').then((r)=>{window.__ob=r;})" >/dev/null
+evl "$DL" "window.__ob=undefined;__auto.windowedOpen('$WORK/b.log').then((r)=>{window.__ob=r;})" >/dev/null
 e2e_wait_eval "$DL" "String(__auto.getTabs().length===3 && __auto.isWindowedTab())" "true"
+e2e_wait_eval "$DL" "String(window.__oa!==undefined)" "true"
+e2e_wait_eval "$DL" "String(window.__ob!==undefined)" "true"
 # A refused open answers with a message, an accepted one with null; `e2e_read`
 # takes a literal null for a failed read, so the comparison happens in the page.
 check "a.log opened without refusal" "$(e2e_read "$DL" "String(window.__oa===null)")" "true"

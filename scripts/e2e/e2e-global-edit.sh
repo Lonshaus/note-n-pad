@@ -266,8 +266,9 @@ fresh_doc() {
 # Open $1 for windowed editing as tab number $2 (1-based) and give the editor
 # focus.
 open_windowed() {
-  evl "$DL" "__auto.windowedOpen('$1').then((r)=>{window.__ow=r;});1" >/dev/null
+  evl "$DL" "window.__ow=undefined;__auto.windowedOpen('$1').then((r)=>{window.__ow=r;});1" >/dev/null
   e2e_wait_eval "$DL" "String(__auto.getTabs().length===$2 && __auto.getTabs()[$2-1].active && __auto.isWindowedTab() && __auto.windowedInfo().windowStartLine===0)" "true"
+  e2e_wait_eval "$DL" "String(window.__ow!==undefined)" "true"
   check "$1 opened without refusal" "$(e2e_read "$DL" "String(window.__ow===null)")" "true"
   evl "$DL" "__t.focus()" >/dev/null
   e2e_wait_eval "$DL" "String(document.activeElement===__t.content())" "true"
