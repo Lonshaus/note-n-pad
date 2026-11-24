@@ -1,9 +1,12 @@
 name: CI
-# Pull requests rather than pushes: a branch is pushed many times while it is
-# being worked on, and only the state that is about to be merged has to be
-# green.
+# Pull requests rather than pushes to work branches: a branch is pushed many
+# times while it is being worked on, and only the state that is about to be
+# merged has to be green. Pushes to develop and master run too, so the state
+# that several merges leave behind is checked as a whole.
 on:
   pull_request:
+  push:
+    branches: [develop, master]
   workflow_dispatch:
 # Cancel superseded runs on the same ref to save CI minutes.
 concurrency:
@@ -24,12 +27,35 @@ jobs:
       # the local Linux container (scripts/linux-check/check.sh) install exactly
       # the same packages; two hand-copied lists had already drifted apart once,
       # which quietly makes the container stop standing in for this job.
+      # ImageOS and ImageVersion are runner variables, not in the env context.
+      - name: Name the runner image (Linux)
+        id: image
+        if: startsWith(matrix.os, 'ubuntu')
+        run: echo "image=$ImageOS-$ImageVersion" >> "$GITHUB_OUTPUT"
+      - name: Restore the apt archives (Linux)
+        id: apt-archives
+        if: startsWith(matrix.os, 'ubuntu')
+        uses: actions/cache/restore@v6
+        with:
+          path: ~/apt-archives/*.deb
+          key: apt-archives-${{ steps.image.outputs.image }}-${{ hashFiles('scripts/linux-check/apt-packages.txt') }}
       - name: Install Tauri system dependencies (Linux)
         if: startsWith(matrix.os, 'ubuntu')
         run: |
+          cat /etc/apt/apt-mirrors.txt
+          sudo sed -i -E 's#https?://[A-Za-z0-9.-]+\.ec2\.archive\.ubuntu\.com/#http://archive.ubuntu.com/#g' /etc/apt/apt-mirrors.txt
+          cat /etc/apt/apt-mirrors.txt
           sudo apt-get update
+          mkdir -p "$HOME/apt-archives/partial"
           grep -vE '^[[:space:]]*(#|$)' scripts/linux-check/apt-packages.txt \
-            | xargs sudo apt-get install -y
+            | xargs sudo apt-get install -y -o Dir::Cache::archives="$HOME/apt-archives"
+      # The e2e workflow only restores this; pull requests never save it.
+      - name: Save the apt archives (Linux)
+        if: startsWith(matrix.os, 'ubuntu') && steps.apt-archives.outputs.cache-hit != 'true' && github.event_name != 'pull_request'
+        uses: actions/cache/save@v6
+        with:
+          path: ~/apt-archives/*.deb
+          key: apt-archives-${{ steps.image.outputs.image }}-${{ hashFiles('scripts/linux-check/apt-packages.txt') }}
 
       - name: Setup Node.js
         uses: actions/setup-node@v7
@@ -39,6 +65,9 @@ jobs:
 
       - name: Install npm dependencies
         run: npm ci
+      # The Tauri CLI refuses to build on an npm/crate major.minor mismatch and no CI step runs it.
+      - name: Tauri npm/crate versions
+        run: node scripts/check-tauri-versions.mjs
       # rustfmt and clippy are not in the minimal profile this action installs
       # by default, so both are requested explicitly.
       - name: Setup Rust toolchain
@@ -54,6 +83,7 @@ jobs:
         uses: Swatinem/rust-cache@v2
         with:
           workspaces: src-tauri
+          save-if: ${{ github.event_name != 'pull_request' }}
       # tauri-build refuses to compile without the index, and the vitest and
       # cargo tests read it.
       - name: Generate third-party licence index
@@ -74,6 +104,10 @@ jobs:
       # crate. A target that is not Windows needs none and the script returns.
       - name: Build the clipboard helper
         run: node scripts/build-cliphelper.mjs
+      # The same debug build the E2E prebuild needs, so the saved cache holds it.
+      - name: Build the app (debug)
+        working-directory: src-tauri
+        run: cargo build
 
       - name: Rust tests (cargo test)
         working-directory: src-tauri

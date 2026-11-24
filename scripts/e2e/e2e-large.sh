@@ -341,11 +341,11 @@ check "confirm visible for 600MB" "$(e2e_read "$DL2" "String(__auto.largeConfirm
 # socket simply stops answering. Record the app's own pid and the window list
 # first, then say whether that pid survived — the socket cannot answer that
 # question once it is refused.
-APP_PID=$(pgrep -x note-n-pad | head -1)
+APP_PID=$(e2e_app_pid)
 echo "before cancel: app pid=${APP_PID:-none} windows=$(auto '{"id":15,"cmd":"list_windows"}' 2>/dev/null | jq -c '[.data[]|select(.label|startswith("doc-"))|.label]' 2>/dev/null)"
 evl "$DL2" "__auto.largeConfirmCancel()" >/dev/null
 sleep 2
-if [ -n "$APP_PID" ] && kill -0 "$APP_PID" 2>/dev/null; then
+if [ -n "$APP_PID" ] && e2e_pid_alive "$APP_PID"; then
   echo "after cancel: app pid $APP_PID alive"
 else
   echo "after cancel: app pid ${APP_PID:-none} GONE"
