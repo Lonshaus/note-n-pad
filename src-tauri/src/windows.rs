@@ -675,6 +675,34 @@ fn document_window_query(
   }
   query
 }
+/// What a window made for a torn-off tab is built with.
+#[cfg_attr(not(any(target_os = "macos", windows)), allow(dead_code))]
+pub struct TearBuild {
+  /// Whether the interface is dark, resolved: the page paints it before any
+  /// setting is read.
+  pub dark: bool,
+  /// The editor theme id, which the page stamps on its root before it mounts.
+  pub theme: String,
+  /// Where the builder puts the window, in logical pixels, where the window
+  /// system takes a position at build time and the window is shown at once.
+  pub position: Option<(f64, f64)>,
+}
+/// `query` for a torn-off window.
+fn tearoff_query(mut query: String, tear: &TearBuild) -> String {
+  query.push_str(&format!(
+    "&tearoff=1&tearoffMode={}&tearoffTheme={}",
+    if tear.dark { "dark" } else { "light" },
+    percent_encode(&tear.theme)
+  ));
+  query
+}
+/// The content size a document window restores to: the size the user last gave
+/// one, never smaller than the minimum.
+#[cfg(target_os = "macos")]
+pub(crate) fn remembered_content_size(app: &AppHandle) -> (f64, f64) {
+  let (width, height) = new_document_size(&crate::settings::app_settings(app));
+  document_open_size(width, height)
+}
 /// Build a normal-chrome document window labeled `doc-{group}`. A `receive`
 /// window is made for a tab on its way: it is not forced into view after a
 /// grace, and it never joins the window tabs of macOS.
@@ -688,6 +716,7 @@ fn build_document_window(
   blank: bool,
   receive: bool,
   bounds: WindowBounds,
+  tearoff: Option<&TearBuild>,
 ) -> Result<(), String> {
   let WindowBounds {
     x,
@@ -697,7 +726,10 @@ fn build_document_window(
   } = bounds;
   let size = document_open_size(width, height);
   let label = format!("doc-{group}");
-  let query = document_window_query(group, initial_path, project, tab, blank, receive);
+  let mut query = document_window_query(group, initial_path, project, tab, blank, receive);
+  if let Some(tear) = tearoff {
+    query = tearoff_query(query, tear);
+  }
   let url = WebviewUrl::App(query.into());
   // Set a real title at birth so macOS never shows its own empty-title
   // placeholder (e.g. "無題" on Japanese systems) before the frontend loads and
@@ -715,6 +747,16 @@ fn build_document_window(
     .background_color(chrome_background(app))
     .min_inner_size(DOC_MIN_WIDTH, DOC_MIN_HEIGHT)
     .inner_size(size.0, size.1);
+  if tearoff.is_some() {
+    // Never focused: the window is shown under the pointer while the drag goes
+    // on in the sender. Windows shows it at once without activating it; macOS
+    // orders it front once it is placed.
+    builder = builder.focused(false);
+    #[cfg(windows)]
+    {
+      builder = builder.visible(true);
+    }
+  }
   if let (Some(x), Some(y)) = (x, y) {
     builder = builder.position(x, y);
   }
@@ -722,8 +764,9 @@ fn build_document_window(
   #[cfg(windows)]
   let builder = builder.disable_drag_drop_handler();
   let window = builder.build().map_err(|e| e.to_string())?;
+  // A torn-off window is made untabbed in the block that places it.
   #[cfg(target_os = "macos")]
-  if receive {
+  if receive && tearoff.is_none() {
     disallow_tabbing(&window);
   }
   crate::file_drop::attach(&window);
@@ -778,6 +821,7 @@ pub fn open_document_labeled(
       width: new_size.0,
       height: new_size.1,
     },
+    None,
   )?;
   Ok(format!("doc-{group}"))
 }
@@ -800,6 +844,7 @@ pub fn new_blank_document(app: &AppHandle) -> Result<(), String> {
       width: new_size.0,
       height: new_size.1,
     },
+    None,
   )
 }
 /// Open a fresh document window with no tab at all, minting a new window group; its
@@ -822,6 +867,7 @@ pub fn open_empty_document(app: &AppHandle) -> Result<String, String> {
       width: new_size.0,
       height: new_size.1,
     },
+    None,
   )?;
   Ok(format!("doc-{group}"))
 }
@@ -850,6 +896,35 @@ pub fn open_receiving_document(
       width: size.0,
       height: size.1,
     },
+    None,
+  )
+}
+/// Open the window of a tab torn off its bar, labeled `doc-{group}`, with the
+/// inner `size`. Like a receiving window it shows nothing of the app until the
+/// tab is in it, but it is on screen under the pointer from the start.
+#[cfg_attr(not(any(target_os = "macos", windows)), allow(dead_code))]
+pub fn open_tearoff_document(
+  app: &AppHandle,
+  group: &str,
+  project: Option<&str>,
+  size: (f64, f64),
+  tear: &TearBuild,
+) -> Result<(), String> {
+  build_document_window(
+    app,
+    group,
+    None,
+    project,
+    None,
+    false,
+    true,
+    WindowBounds {
+      x: tear.position.map(|(x, _)| x),
+      y: tear.position.map(|(_, y)| y),
+      width: size.0,
+      height: size.1,
+    },
+    Some(tear),
   )
 }
 /// Recreate a stored document window (one per group) at the saved bounds of its
@@ -876,6 +951,7 @@ pub fn create_document_window(
       width: plan.width.unwrap_or(new_size.0),
       height: plan.height.unwrap_or(new_size.1),
     },
+    None,
   )
 }
 /// Size and paper for a new sticky: the focused sticky's, else the last-resized
@@ -1016,6 +1092,7 @@ pub fn set_window_opacity(window: tauri::WebviewWindow, value: f64) -> Result<()
 /// focused its editor. Called by `revealWhenThemed` in place of a raw show().
 #[tauri::command]
 pub fn reveal_self(window: tauri::WebviewWindow) -> Result<(), String> {
+  crate::tab_follow::restore(window.app_handle(), window.label());
   window.show().map_err(|e| e.to_string())?;
   window.set_focus().map_err(|e| e.to_string())?;
   detach_menu_unless_document(&window);
@@ -1043,6 +1120,7 @@ const WORKSPACE_MIN_WIDTH: f64 = 260.0;
 const WORKSPACE_MIN_HEIGHT: f64 = 320.0;
 /// Raise the existing helper, or reveal a focused window.
 pub(crate) fn reveal(win: &tauri::WebviewWindow) {
+  crate::tab_follow::restore(win.app_handle(), win.label());
   let _ = win.unminimize();
   let _ = win.show();
   let _ = win.set_focus();

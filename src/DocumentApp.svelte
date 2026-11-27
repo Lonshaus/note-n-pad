@@ -32,7 +32,7 @@
     type LargeSelectAll,
     type OpenTarget,
   } from './lib/state/settings.svelte';
-  import { revealWhenThemed } from './lib/util/reveal';
+  import { loadChrome, revealWhenThemed } from './lib/util/reveal';
   import { onFileDragOver, onFileDrop } from './lib/util/fileDrop';
   import { applyTheme, applyChrome } from './lib/theme/applyTheme';
   import { themeRegistry } from './lib/theme/themeRegistry.svelte';
@@ -111,19 +111,27 @@
   import { matchWindowShortcut } from './lib/util/windowShortcut';
   import {
     IDLE,
+    GHOST_CLASS,
+    TAB_SELECTOR,
+    canTearOff,
     dragStep,
     dropSlot,
+    ghostLeft,
     hoverAccepted,
+    hoverAck,
     hoverCall,
     hoverGap,
     hoverShift,
+    isFollowing,
     slideOffset,
+    tearOffStart,
     translateXOf,
     type CancelReason,
     type DragInput,
     type DragOutcome,
     type DragState,
     type TabBarGeometry,
+    type TearOffInput,
   } from './lib/util/tabDrag';
   import {
     dragModalOpen,
@@ -132,6 +140,7 @@
   } from './lib/util/rangeBoxTabBar';
   import { closeDocumentWindow } from './lib/state/windowClose';
   import { IncomingTransfers } from './lib/state/incomingTransfer.svelte';
+  import { tearOffCloseCalledOff } from './lib/util/tearOff';
   import { menuActionAllowed } from './lib/util/menuActionGate';
   import {
     composingGotoSurface,
@@ -140,9 +149,15 @@
   import {
     HOVER_EVENT,
     QUEUED_TRANSFER,
+    TEAROFF_EVENT,
     TRANSFER_EVENT,
     type HoverPayload,
+    type SendPayload,
+    type StartResult,
+    type TearOffEndPayload,
+    type TearOffTarget,
     type TransferEventPayload,
+    type WindowReady,
   } from './lib/util/tabTransferWire';
   import type { PasteLock } from './lib/util/pasteLock';
   import type { ScrollRecord } from './lib/editor/editorSeed';
@@ -178,6 +193,9 @@
   // A window made for a tab dropped outside every window: it shows itself once
   // the tab is in it, and closes if it never gets it.
   const receive = params.get('receive') === '1';
+  // A window made for a tab torn off its bar: on screen under the pointer from
+  // the start, and shown by the core once the drag is over.
+  const tearOff = params.get('tearoff') === '1';
   // The gate before a quit, a window close or a tab close that would lose what no
   // snapshot can carry; see CloseGate. Its host callbacks are function
   // declarations below, so they are ready by the time a handshake runs.
@@ -185,10 +203,30 @@
     label: win.label,
     finishWindowClose: () => finishWindowClose(),
     finishTabClose: (tab, keepWindow) => finishTabClose(tab, keepWindow),
-    focusWindow: () => win.setFocus(),
+    // The window may be invisible, hidden by a tab that follows the pointer: it is
+    // shown before it is asked to take focus, key window or not.
+    focusWindow: async () => {
+      await invoke('tab_window_restore').catch((error: unknown) => {
+        console.error('tab_window_restore failed', error);
+      });
+      await win.setFocus();
+    },
     promptBlocked: () => missing.current() !== null,
     promptRefused: () => missing.otherDialogUp(),
   });
+  // A tear-off whose close or quit was called off is still waiting in its role:
+  // the core shows it.
+  gate.onCallOff = () => {
+    // Any window a follow made invisible is shown again, in its role or not.
+    invoke('tab_window_restore').catch((error: unknown) => {
+      console.error('tab_window_restore failed', error);
+    });
+    tearOffCloseCalledOff(documentWindow.tearOffRole, () => {
+      invoke('tab_tearoff_close_vetoed').catch((error: unknown) => {
+        console.error('tab_tearoff_close_vetoed failed', error);
+      });
+    });
+  };
   // The tabs whose file is gone, and the close confirmation they share a rule
   // with; see MissingFiles.
   const missing: MissingFiles = new MissingFiles(documentWindow, gate, {
@@ -1443,11 +1481,43 @@
   let tabbarEl = $state<HTMLElement | null>(null);
   // The tab bar's height with its border: the range edit box starts below it.
   let tabbarHeight = $state(0);
+  // Tell the core where this window's tab bar is, in client CSS pixels: a tab
+  // that follows the pointer over it is over a bar.
+  function reportTabBar(): void {
+    const bar = tabbarEl;
+    if (bar === null) {
+      return;
+    }
+    const box = bar.getBoundingClientRect();
+    invoke('report_tab_bar', {
+      top: box.top,
+      bottom: box.bottom,
+      left: box.left,
+      right: box.right,
+      dpr: window.devicePixelRatio,
+    }).catch((error: unknown) => {
+      console.error('report_tab_bar failed', error);
+    });
+  }
+  // On mount, and whenever the bar's height changes; the size and the pixel
+  // ratio are watched where the window listeners are.
+  $effect(() => {
+    void tabbarEl;
+    void tabbarHeight;
+    reportTabBar();
+  });
   let dragState = $state.raw<DragState>(IDLE);
   // How far the pressed tab follows the pointer, in CSS pixels.
   let dragDx = $state(0);
   let dragPointer = -1;
+  // The kind of pointer that pressed the tab: only a mouse tears a tab off.
+  let dragPointerType = 'mouse';
   let dragTab: DocTab | null = null;
+  // Whether the window is full screen, kept current on every resize.
+  let fullscreen = false;
+  // Esc came before the core answered the start of a tear-off, and whether it has.
+  let pendingTearOffCancel = false;
+  let tearOffStarted = false;
   // The tab boxes in the bar's content coordinates, measured at the press: a
   // slide transform would otherwise move them under the pointer.
   let dragRects: { left: number; width: number }[] = [];
@@ -1455,7 +1525,7 @@
   // applied), laid out: a tab's current translation is taken off.
   function tabRects(bar: HTMLElement): { left: number; width: number }[] {
     const box = bar.getBoundingClientRect();
-    return [...bar.querySelectorAll<HTMLElement>(':scope > .tab')].map((el) => {
+    return [...bar.querySelectorAll<HTMLElement>(TAB_SELECTOR)].map((el) => {
       const tabBox = el.getBoundingClientRect();
       const shift = translateXOf(getComputedStyle(el).transform);
       return {
@@ -1502,6 +1572,11 @@
   }
   function onTabPointerDown(e: PointerEvent, index: number): void {
     const bar = tabbarEl;
+    // The compatibility mousedown would extend a text selection from the press
+    // into the editor; a press on a tab never selects.
+    if (e.button === 0) {
+      e.preventDefault();
+    }
     if (keepsBoxFocus(rangeBoxOpen)) {
       // No compatibility mousedown: the tab must not take focus from the box.
       e.preventDefault();
@@ -1516,22 +1591,42 @@
     }
     dragRects = tabRects(bar);
     dragPointer = e.pointerId;
+    dragPointerType = e.pointerType;
     dragTab = documentWindow.tabs[index] ?? null;
     dragDx = 0;
     feedDrag({ kind: 'down', x: e.clientX, y: e.clientY, index });
     (e.currentTarget as HTMLElement).setPointerCapture(e.pointerId);
+  }
+  // Whether a drag may take its tab out of the bar, and what it needs for that.
+  function tearOffInput(): TearOffInput {
+    const tab = dragTab;
+    return {
+      canTearOff: canTearOff(dragPointerType, platform.os, fullscreen),
+      onlyTab: documentWindow.tabs.length === 1,
+      blocked: tab === null || documentWindow.transferBlockerOf(tab) !== null,
+      mintId: () => crypto.randomUUID(),
+    };
   }
   function onTabPointerMove(e: PointerEvent): void {
     const bar = tabbarEl;
     if (bar === null || e.pointerId !== dragPointer) {
       return;
     }
-    feedDrag({
+    // The pointer is the core's while it follows.
+    if (isFollowing(dragState)) {
+      return;
+    }
+    const outcome = feedDrag({
       kind: 'move',
       x: e.clientX,
       y: e.clientY,
       geometry: dragGeometry(bar),
+      tearOff: tearOffInput(),
     });
+    if (outcome?.kind === 'detach' || outcome?.kind === 'moveWindow') {
+      void startTearOff(outcome.kind, outcome.id);
+      return;
+    }
     hoverPoint = { x: e.clientX, y: e.clientY };
     if (dragState.phase === 'dragging' && hoverFrame === 0) {
       hoverFrame = requestAnimationFrame(onHoverFrame);
@@ -1549,11 +1644,109 @@
       );
     }
   }
+  // The tab left its bar: the core is asked to follow the pointer with a window
+  // of its own, or with this one. Esc before it answers is held until it has.
+  async function startTearOff(
+    kind: 'detach' | 'moveWindow',
+    id: string,
+  ): Promise<void> {
+    const tab = dragTab;
+    const bar = tabbarEl;
+    if (tab === null || bar === null) {
+      return;
+    }
+    pendingTearOffCancel = false;
+    tearOffStarted = false;
+    hover = null;
+    const start = tearOffStart({
+      id,
+      pressed: { x: dragState.startX, y: dragState.startY },
+      geometry: dragGeometry(bar),
+      index: dragState.index,
+      dpr: window.devicePixelRatio,
+      title: tabName(tab.path),
+    });
+    // No page hover is in flight when the core takes the pointer.
+    await endHover();
+    let result: StartResult;
+    try {
+      result =
+        kind === 'detach'
+          ? await documentWindow.detachTab(
+              tab,
+              start,
+              () => pendingTearOffCancel,
+            )
+          : await followWindow(tab, start);
+    } catch (error) {
+      console.error('starting a tear-off failed', error);
+      result = 'notStarted';
+    }
+    if (result === 'started') {
+      tearOffStarted = true;
+      if (pendingTearOffCancel) {
+        pendingTearOffCancel = false;
+        sendTearOffCancel(id);
+      }
+      return;
+    }
+    // The button is still down: the release behaves as it always did.
+    feedDrag({ kind: 'notStarted' });
+  }
+  // The only tab moves its window with the pointer.
+  async function followWindow(
+    tab: DocTab,
+    start: TearOffTarget,
+  ): Promise<StartResult> {
+    try {
+      const started = await invoke<boolean>('tab_window_follow_start', {
+        id: start.id,
+        pressed: { x: dragState.startX, y: dragState.startY },
+        escOffset: start.escOffset,
+        dpr: start.dpr,
+        width: start.width,
+        note: tab.id,
+        title: start.title,
+        // The press point within the tab, as for a tab that is torn off.
+        tabGrabX: start.grab.x,
+      });
+      return started ? 'started' : 'notStarted';
+    } catch (error) {
+      console.error('tab_window_follow_start failed', error);
+      return 'notStarted';
+    }
+  }
+  function sendTearOffCancel(id: string): void {
+    invoke('tab_tearoff_cancel', { id }).catch((error: unknown) => {
+      console.error('tab_tearoff_cancel failed', error);
+    });
+  }
+  // Esc has one road: before the core has answered the start it is held, after
+  // it the core is told.
+  function dispatchTearOffCancel(id: string): void {
+    if (tearOffStarted) {
+      sendTearOffCancel(id);
+    } else {
+      pendingTearOffCancel = true;
+    }
+  }
+  // What a drag leaves behind when it ends: the range edit box gets its focus
+  // back, as for every other exit.
+  function afterDragExit(): void {
+    dragTab = null;
+    dragPointer = -1;
+    hover = null;
+    void endHover();
+    if (rangeBoxOpen) {
+      focusActiveEditor();
+    }
+  }
   function onTabPointerUp(e: PointerEvent): void {
     const bar = tabbarEl;
     if (bar === null || e.pointerId !== dragPointer) {
       return;
     }
+    const following = isFollowing(dragState);
     const outcome = feedDrag({
       kind: 'up',
       x: e.clientX,
@@ -1564,9 +1757,16 @@
     dragTab = null;
     dragPointer = -1;
     hover = null;
-    endHover();
-    if (outcome !== null && rangeBoxOpen) {
+    void endHover();
+    if ((outcome !== null || following) && rangeBoxOpen) {
       focusActiveEditor();
+    }
+    if (outcome?.kind === 'releaseSeen') {
+      invoke('tab_tearoff_release_seen', { id: outcome.id }).catch(
+        (error: unknown) => {
+          console.error('tab_tearoff_release_seen failed', error);
+        },
+      );
     }
     // Every release asks the core where it landed: the own window reorders the
     // tab or returns it to its slot, anything else moves it.
@@ -1581,13 +1781,25 @@
     }
   }
   function cancelDrag(reason: CancelReason): void {
+    const following = isFollowing(dragState);
     const outcome = feedDrag({ kind: 'cancel', reason });
     dragTab = null;
     dragPointer = -1;
     hover = null;
-    endHover();
-    if (outcome !== null && rangeBoxOpen) {
+    void endHover();
+    if (outcome?.kind === 'tearOffCancel') {
+      dispatchTearOffCancel(outcome.id);
+    }
+    if ((outcome !== null || following) && rangeBoxOpen) {
       focusActiveEditor();
+    }
+  }
+  // `tab-tearoff-end`: the core is done with the follow of this drag.
+  function onTearOffEnd(id: string): void {
+    const following = isFollowing(dragState);
+    feedDrag({ kind: 'end', id });
+    if (following && !isFollowing(dragState)) {
+      afterDragExit();
     }
   }
   function onTabClick(index: number): void {
@@ -1626,32 +1838,60 @@
       endHover();
     }
   }
-  function endHover(): void {
+  function endHover(): Promise<void> {
     cancelAnimationFrame(hoverFrame);
     hoverFrame = 0;
-    if (hovering) {
-      hovering = false;
-      invoke('tab_drag_hover_end').catch((error: unknown) => {
-        console.error('tab_drag_hover_end failed', error);
+    if (!hovering) {
+      return Promise.resolve();
+    }
+    hovering = false;
+    return invoke<void>('tab_drag_hover_end').catch((error: unknown) => {
+      console.error('tab_drag_hover_end failed', error);
+    });
+  }
+  // The gap a tab dragged from another window opens here, and for a tab that a
+  // follow of the core carries, the tab drawn in it under the pointer.
+  let hover = $state.raw<{
+    slot: number;
+    width: number;
+    ghost: { title: string; left: number; top: number; height: number } | null;
+  } | null>(null);
+  function onHover(payload: HoverPayload): void {
+    const ready = documentWindow.ready;
+    const locked = documentWindow.dragLocked();
+    // The core hides its follower while this window takes the tab, so it asks on
+    // every hover, as things are now.
+    const ack = hoverAck(payload, ready, locked);
+    if (ack !== null) {
+      invoke('tab_hover_ack', { ...ack }).catch((error: unknown) => {
+        console.error('tab_hover_ack failed', error);
       });
     }
-  }
-  // The gap a tab dragged from another window opens here.
-  let hover = $state.raw<{ slot: number; width: number } | null>(null);
-  function onHover(payload: HoverPayload): void {
-    if (
-      !hoverAccepted({
-        ready: documentWindow.ready,
-        locked: documentWindow.dragLocked(),
-      })
-    ) {
+    if (!hoverAccepted({ ready, locked })) {
       hover = null;
       return;
     }
     const geometry = currentGeometry();
     const gap = hoverGap(payload, platform.os, window.devicePixelRatio);
     const slot = geometry === null ? null : dropSlot(gap.point, geometry);
-    hover = slot === null ? null : { slot, width: gap.width };
+    if (geometry === null || slot === null) {
+      hover = null;
+      return;
+    }
+    const follow = payload.follow;
+    hover = {
+      slot,
+      width: gap.width,
+      ghost:
+        follow === undefined
+          ? null
+          : {
+              title: follow.title,
+              left: ghostLeft(gap.point, follow.grabX, gap.width, geometry.bar),
+              top: geometry.bar.top,
+              height: geometry.bar.bottom - geometry.bar.top,
+            },
+    };
   }
   const hoverShown = $derived(hover !== null && dragState.phase !== 'dragging');
   // The transform of the tab at `index` while a drag is over the own tab bar, or
@@ -1707,36 +1947,48 @@
     // Reveal the window only after the theme is loaded and applied, so a
     // dark-theme window never flashes its default white background. File
     // content is loaded separately below and paints onto the themed surface.
-    // A window made for a tab on its way waits for the tab.
+    // A window made for a tab on its way waits for the tab. A tear-off is on
+    // screen already and loads what the first paint of its chrome waits for; the
+    // core shows it, never this page, while its role lasts.
+    documentWindow.tearOffRole = tearOff;
+    documentWindow.revealSelf = () => invoke('reveal_self').then(() => {});
     if (!receive) {
       void revealWhenThemed();
+    } else if (tearOff) {
+      void loadChrome();
     }
     // Settles once the `open-file-here` listener below is registered.
     let openFileListening: Promise<unknown> = Promise.resolve();
     // Announce the window to the core and open the files it queued meanwhile.
     // Each path opens on its own, so one failure leaves the rest.
     const announceReady = async (): Promise<void> => {
-      const queued = await invoke<
-        (
-          | { kind: 'path'; value: string }
-          | { kind: 'handoff'; value: number }
-          | { kind: typeof QUEUED_TRANSFER; value: number }
-        )[]
-      >('doc_window_ready', {
+      const ready = await invoke<WindowReady>('doc_window_ready', {
         label: win.label,
       });
-      for (const item of queued) {
+      for (const item of ready.queued) {
         if (item.kind === 'handoff') {
           await openHandoff(item.value);
           continue;
         }
         if (item.kind === QUEUED_TRANSFER) {
+          // The tab a tear-off was made for is the one the role lets through.
+          if (tearOff && documentWindow.tearOffFirst === null) {
+            documentWindow.tearOffFirst = item.value;
+          }
           await incomingTransfers.take(item.value);
           continue;
         }
         await documentWindow.openTab(item.value).catch((err: unknown) => {
           console.error('opening a queued file failed', err);
         });
+      }
+      // The role ended before this page could hear of it: it ends now, with the
+      // tab in, and the window is shown as the core decided.
+      if (tearOff && ready.tearOffRoleEnded) {
+        documentWindow.endTearOffRole();
+        if (ready.revealed) {
+          await invoke('reveal_self');
+        }
       }
     };
     // The size the window last had; null until the mount-time read resolves, so
@@ -1809,6 +2061,16 @@
       }),
       win.listen<TransferEventPayload>(TRANSFER_EVENT.abort, (event) => {
         incomingTransfers.onAbort(event.payload.t);
+      }),
+      win.listen<SendPayload>(TEAROFF_EVENT.send, (event) => {
+        void documentWindow.onTransferSend(event.payload);
+      }),
+      win.listen<TearOffEndPayload>(TEAROFF_EVENT.end, (event) => {
+        if (event.payload.id === null) {
+          documentWindow.endTearOffRole();
+        } else {
+          onTearOffEnd(event.payload.id);
+        }
       }),
     ]).then((unlisten) => {
       documentWindow.transferListening = true;
@@ -1930,6 +2192,35 @@
     );
     const unlistenMoved = win.onMoved(() => captureBounds());
     const unlistenResized = win.onResized(() => captureBounds());
+    // The core needs the tab bar's box wherever it is, and the drag needs to know
+    // whether the window is full screen: both follow the size and the pixel ratio.
+    const refreshFullscreen = (): void => {
+      void win
+        .isFullscreen()
+        .then((on) => {
+          fullscreen = on;
+        })
+        .catch(() => {});
+    };
+    const onWindowResize = (): void => {
+      refreshFullscreen();
+      reportTabBar();
+    };
+    let ratioQuery: MediaQueryList | null = null;
+    const onRatioChange = (): void => {
+      reportTabBar();
+      watchRatio();
+    };
+    const watchRatio = (): void => {
+      ratioQuery?.removeEventListener('change', onRatioChange);
+      ratioQuery = window.matchMedia(
+        `(resolution: ${window.devicePixelRatio}dppx)`,
+      );
+      ratioQuery.addEventListener('change', onRatioChange);
+    };
+    window.addEventListener('resize', onWindowResize);
+    refreshFullscreen();
+    watchRatio();
     // When the window regains OS focus, keyboard focus can be left on BODY (the
     // WebView then silently drops keystrokes); hand it back to the active editor
     // unless a dialog or an input field is holding it.
@@ -2347,7 +2638,10 @@
     }
     return () => {
       window.removeEventListener('keydown', onKeydown);
-      endHover();
+      window.removeEventListener('resize', onWindowResize);
+      ratioQuery?.removeEventListener('change', onRatioChange);
+      void endHover();
+      documentWindow.revealSelf = null;
       uninstallPaste();
       convertController.attachDoc(null);
       documentWindow.endComposition = null;
@@ -2393,7 +2687,7 @@
   onkeydown={onWindowKeydown}
   onblur={() => cancelDrag('blur')}
 />
-<div class="app">
+<div class="app" class:tab-held={dragState.phase !== 'idle'}>
   <div
     class="tabbar"
     role="tablist"
@@ -2566,6 +2860,20 @@
       </svg>
     </button>
   </div>
+  {#if hover !== null && hover.ghost !== null && hoverShown}
+    <!-- The tab of another window's follow, drawn in the gap under the pointer. It
+         is outside the bar, and not a tab for its geometry. -->
+    <div
+      class="tab-ghost"
+      aria-hidden="true"
+      style:left="{hover.ghost.left}px"
+      style:top="{hover.ghost.top}px"
+      style:width="{hover.width}px"
+      style:height="{hover.ghost.height}px"
+    >
+      <span class="tab-name">{hover.ghost.title}</span>
+    </div>
+  {/if}
 
   <main class="body">
     {#if documentWindow.ready && active !== null && active.windowed !== undefined}
@@ -3054,6 +3362,11 @@
     --modal-border: var(--topbar-border);
     --modal-hover: var(--topbar-border);
   }
+  /* A held tab owns the pointer: nothing under it shows its own cursor. */
+  .app.tab-held,
+  .app.tab-held :global(*) {
+    cursor: default !important;
+  }
   .tabbar {
     display: flex;
     align-items: stretch;
@@ -3066,7 +3379,8 @@
     user-select: none;
     -webkit-user-select: none;
   }
-  .tab {
+  .tab,
+  .tab-ghost {
     display: flex;
     align-items: center;
     gap: 0.3rem;
@@ -3077,6 +3391,16 @@
     white-space: nowrap;
     cursor: default;
     opacity: 0.7;
+  }
+  /* The tab of another window's follow, over the gap it opened. */
+  .tab-ghost {
+    position: absolute;
+    z-index: 2;
+    box-sizing: border-box;
+    max-width: none;
+    background: var(--topbar-border);
+    opacity: 1;
+    pointer-events: none;
   }
   .tab:hover {
     opacity: 0.9;

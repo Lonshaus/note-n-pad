@@ -18,6 +18,7 @@ import { platform } from './lib/state/platform.svelte';
 import { shortcutsState } from './lib/state/shortcuts.svelte';
 import { editionState } from './lib/state/edition.svelte';
 import { matchMenuAccelerator } from './lib/util/menuAccelerator';
+import { stampTearOff } from './lib/util/tearOff';
 
 const mode = new URLSearchParams(window.location.search).get('mode');
 const Component =
@@ -44,6 +45,8 @@ const Component =
 if (Component === StickyApp) {
   document.documentElement.classList.add('transparent-window');
 }
+// A tab torn off its bar is on screen before its settings load.
+stampTearOff(document.documentElement, window.location.search);
 
 const app = mount(Component, {
   target: document.getElementById('app')!,

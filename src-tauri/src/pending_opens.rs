@@ -148,13 +148,36 @@ pub fn split_released(items: Vec<Pending>) -> (Vec<String>, Vec<u64>) {
   }
   (paths, handoffs)
 }
+/// What a document window gets when it announces itself.
+#[derive(Debug, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WindowReady {
+  /// What was queued for it, in arrival order.
+  pub queued: Vec<Pending>,
+  /// The tear-off role of the window ended before it could hear of it.
+  pub tear_off_role_ended: bool,
+  /// The core showed the window itself when the role ended.
+  pub revealed: bool,
+}
+/// The answer of `doc_window_ready` for what was queued and what became of the
+/// window's tear-off role.
+pub fn window_ready(queued: Vec<Pending>, role: crate::tab_tearoff::RoleState) -> WindowReady {
+  WindowReady {
+    queued,
+    tear_off_role_ended: role.ended,
+    revealed: role.revealed,
+  }
+}
 /// The window announced itself: hand over what was queued for it, paths as
 /// `{ kind: 'path', value: <path> }`, converted documents as
 /// `{ kind: 'handoff', value: <handoff id> }` and moved tabs as
-/// `{ kind: 'transfer', value: <transfer id> }`.
+/// `{ kind: 'transfer', value: <transfer id> }`, and say whether its tear-off
+/// role is over already (an event sent before the page listens is dropped).
 #[tauri::command]
-pub fn doc_window_ready(app: tauri::AppHandle, label: String) -> Vec<Pending> {
-  app.state::<PendingOpens>().mark_ready(&label)
+pub fn doc_window_ready(app: tauri::AppHandle, label: String) -> WindowReady {
+  let queued = app.state::<PendingOpens>().mark_ready(&label);
+  let role = crate::tab_transfer::role_state(&app, &label);
+  window_ready(queued, role)
 }
 /// The document window a file joins as a tab when the open target is "tab":
 /// the window the user was in most recently, else the last window the startup
@@ -217,6 +240,35 @@ mod tests {
     }
     seen.extend(strings(pending.mark_ready("doc-a")));
     assert_eq!(seen, vec!["p1", "p2", "p3", "p4"]);
+  }
+
+  #[test]
+  fn the_ready_answer_hands_over_the_queue_unchanged_with_the_role_of_the_window() {
+    use crate::tab_tearoff::RoleState;
+    let queued = vec![
+      Pending::Path("a.txt".to_string()),
+      Pending::Transfer(4),
+      Pending::Handoff(9),
+    ];
+    let ready = window_ready(
+      queued.clone(),
+      RoleState {
+        ended: true,
+        revealed: false,
+      },
+    );
+    assert_eq!(ready.queued, queued);
+    assert!(ready.tear_off_role_ended);
+    assert!(!ready.revealed);
+    assert_eq!(
+      serde_json::to_string(&ready).unwrap(),
+      r#"{"queued":[{"kind":"path","value":"a.txt"},{"kind":"transfer","value":4},{"kind":"handoff","value":9}],"tearOffRoleEnded":true,"revealed":false}"#
+    );
+    let plain = window_ready(Vec::new(), RoleState::default());
+    assert_eq!(
+      serde_json::to_string(&plain).unwrap(),
+      r#"{"queued":[],"tearOffRoleEnded":false,"revealed":false}"#
+    );
   }
 
   #[test]

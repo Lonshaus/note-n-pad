@@ -269,6 +269,29 @@ describe('closing the window with an edit box that has changes', () => {
     expect(host.finishWindowClose).not.toHaveBeenCalled();
   });
 
+  it('reports the close called off on a failed save, and not on one that closes', async () => {
+    let calledOff = 0;
+    gate.onCallOff = () => {
+      calledOff += 1;
+    };
+    await withBox(true);
+    await gate.onCloseFlushRequest();
+    splice = 'No space left on device (os error 28)';
+    await gate.save();
+    expect(host.finishWindowClose).not.toHaveBeenCalled();
+    expect(calledOff).toBe(1);
+
+    splice = {
+      fingerprint: { size: 101, mtime_ms: 2 },
+      writtenStart: 0,
+      writtenEnd: 14,
+    };
+    await gate.onCloseFlushRequest();
+    await gate.save();
+    expect(host.finishWindowClose).toHaveBeenCalledTimes(1);
+    expect(calledOff).toBe(1);
+  });
+
   it('closes at once when the box has no changes', async () => {
     await withBox(false);
     await gate.onCloseFlushRequest();
@@ -289,6 +312,20 @@ describe('closing the window with an edit box that has changes', () => {
 });
 
 describe('closing the tab an edit box with changes belongs to', () => {
+  it('does not report the window close called off when the tab close is', async () => {
+    let calledOff = 0;
+    gate.onCallOff = () => {
+      calledOff += 1;
+    };
+    await withBox(true);
+    await gate.promptTabClose(win.tabs[0]!);
+    gate.cancel();
+    splice = 'No space left on device (os error 28)';
+    await gate.promptTabClose(win.tabs[0]!);
+    await gate.save();
+    expect(calledOff).toBe(0);
+  });
+
   it('shows the box prompt and keeps the tab', async () => {
     await withBox(true);
     await gate.promptTabClose(win.tabs[0]!);

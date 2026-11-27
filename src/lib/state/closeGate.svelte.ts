@@ -92,6 +92,7 @@ export class CloseGate {
   /** The close failed to finish (`closeDocumentWindow`): it is not under way. */
   abandonClose(): void {
     this.closingNow = false;
+    this.onCallOff?.();
   }
   /** The tab the dialog is about: the one the scan that raised it found. Save,
    *  Discard and a tab close act on it, whichever tab is active by then. */
@@ -112,6 +113,10 @@ export class CloseGate {
   /** Called when the quit this gate guards was vetoed (by any window), or the
    *  gate dialog was cancelled: the quit or close will not go through. */
   onVetoed: (() => void) | null = null;
+  /** Called when a close or quit the window had begun is called off: the gate
+   *  dialog was cancelled or its save failed, the quit was vetoed or the close
+   *  failed. Not for a tab close. */
+  onCallOff: (() => void) | null = null;
   /** Called with the tab of a pending tab close when that close has ended: the
    *  tab was closed, the dialog was left or the close was taken over. */
   onTabCloseEnded: ((tab: DocTab) => void) | null = null;
@@ -285,6 +290,9 @@ export class CloseGate {
     // quit is already vetoed, so the app simply stays open).
     if (!saved) {
       this.hide();
+      if (this.continuation !== 'tab') {
+        this.onCallOff?.();
+      }
       return;
     }
     await this.prompt();
@@ -313,8 +321,13 @@ export class CloseGate {
   }
 
   cancel(): void {
+    const continuation = this.continuation;
     this.hide();
     this.onVetoed?.();
+    // A tab close called off leaves the window's own close untouched.
+    if (continuation !== 'tab') {
+      this.onCallOff?.();
+    }
   }
   /** `flush-request`: the quit handshake starts. Quit stays silent otherwise;
    *  restore reopens unsaved tabs afterward. */
@@ -369,6 +382,7 @@ export class CloseGate {
       wake();
     }
     this.onVetoed?.();
+    this.onCallOff?.();
   }
   /** Resolves at the next `flush-cancelled`. */
   private nextCancelled(): Promise<void> {
