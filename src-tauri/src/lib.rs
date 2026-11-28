@@ -57,6 +57,8 @@ mod spill;
 mod store_state;
 #[cfg(all(target_os = "macos", feature = "storekit"))]
 mod storekit;
+mod tab_follow;
+mod tab_tearoff;
 mod tab_transfer;
 #[cfg(test)]
 mod test_alloc;
@@ -291,6 +293,7 @@ pub(crate) fn flush_then_exit(app: &tauri::AppHandle) {
         // it can undo whatever it did on the assumption the app was exiting
         // (StickyApp's `quitting` latch, in particular).
         let _ = app.emit("flush-cancelled", ());
+        tab_transfer::quit_cancelled(&app);
         log::info!("quit cancelled by a window");
       }
     }
@@ -878,6 +881,15 @@ fn handle_window_event(window: &tauri::Window, event: &tauri::WindowEvent) {
   sync_menu_focus(window, event);
   track_last_doc_window(window, event);
   announce_app_focus(window, event);
+  // A document window that takes focus is visible: the native ways to it (the
+  // Window menu, Cmd+`, the Dock, Mission Control, Alt+Tab, the taskbar) pass no
+  // code of ours.
+  #[cfg(any(target_os = "macos", windows))]
+  if let tauri::WindowEvent::Focused(true) = event {
+    if window.label().starts_with("doc-") {
+      tab_follow::restore(window.app_handle(), window.label());
+    }
+  }
   // muda caches a menu's light/dark colours per-HWND when the menu is attached
   // and never re-reads them, so a live app-mode switch leaves the native menu
   // bar stale while the title bar follows. `set_theme` re-pushes muda's Auto
@@ -3141,6 +3153,13 @@ pub fn run() {
       tab_transfer::tab_transfer_released,
       tab_transfer::tab_transfer_status,
       tab_transfer::tab_transfer_settle_window,
+      tab_transfer::report_tab_bar,
+      tab_transfer::tab_window_follow_start,
+      tab_transfer::tab_tearoff_cancel,
+      tab_transfer::tab_tearoff_release_seen,
+      tab_transfer::tab_tearoff_close_vetoed,
+      tab_transfer::tab_hover_ack,
+      tab_transfer::tab_window_restore,
       windows::show_workspace_window,
       windows::show_settings_window,
       windows::show_about_window,
@@ -4042,6 +4061,13 @@ mod tab_transfer_hook_tests {
       "tab_transfer_released",
       "tab_transfer_status",
       "tab_transfer_settle_window",
+      "report_tab_bar",
+      "tab_window_follow_start",
+      "tab_tearoff_cancel",
+      "tab_tearoff_release_seen",
+      "tab_tearoff_close_vetoed",
+      "tab_hover_ack",
+      "tab_window_restore",
     ] {
       assert!(
         run.contains(&format!("tab_transfer::{command},")),

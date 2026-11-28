@@ -103,14 +103,38 @@ pub fn screen_point(origin: Point, client: Point, scale: f64) -> Point {
     y: origin.y + client.y * scale,
   }
 }
-/// The AppKit point (bottom-left origin) of a screen point, for the hit test
-/// only; `primary_height` is the primary screen's frame height.
+/// A point moved between the AppKit frame (bottom-left origin) and the screen
+/// frame (top-left origin) of the primary screen, whose frame height is
+/// `primary_height`: the flip is its own inverse. Displays above or left of the
+/// primary one have a negative y or x in the screen frame and still map one to
+/// one.
 #[cfg(any(target_os = "macos", test))]
-pub fn appkit_point(point: Point, primary_height: f64) -> Point {
+pub fn flip_y(point: Point, primary_height: f64) -> Point {
   Point {
     x: point.x,
     y: primary_height - point.y,
   }
+}
+/// The AppKit point (bottom-left origin) of a screen point, for the hit test
+/// only; `primary_height` is the primary screen's frame height.
+#[cfg(any(target_os = "macos", test))]
+pub fn appkit_point(point: Point, primary_height: f64) -> Point {
+  flip_y(point, primary_height)
+}
+/// The screen point (top-left origin) of an AppKit point, such as the mouse
+/// location.
+#[cfg(any(target_os = "macos", test))]
+pub fn screen_of_appkit(point: Point, primary_height: f64) -> Point {
+  flip_y(point, primary_height)
+}
+/// The primary screen's frame height, which every flip between the AppKit frame
+/// and the screen frame uses.
+#[cfg(target_os = "macos")]
+pub fn primary_height(mtm: objc2::MainThreadMarker) -> f64 {
+  use objc2_app_kit::NSScreen;
+  NSScreen::screens(mtm)
+    .firstObject()
+    .map_or(0.0, |screen| screen.frame().size.height)
 }
 /// A screen point relative to a window's inner origin, in native units. The
 /// receiver turns it into its own CSS pixels.
@@ -175,6 +199,34 @@ pub fn pick_window_at(point: Point, stack: &[StackWindow], sender: &str) -> Hit 
       )
     })
 }
+/// `pick_window_at` for a window that follows the pointer: that window is never
+/// what is under the pointer, so it is left out of the stack, and the original
+/// sender is an ordinary document window.
+#[cfg(any(windows, test))]
+pub fn pick_window_skipping(point: Point, stack: &[StackWindow], following: &str) -> Hit {
+  let rest: Vec<StackWindow> = stack
+    .iter()
+    .filter(|window| {
+      window
+        .owner
+        .as_ref()
+        .map_or(true, |(label, _)| label != following)
+    })
+    .cloned()
+    .collect();
+  pick_window_at(point, &rest, following)
+}
+/// What is under the pointer for a window that follows it: the topmost window,
+/// and only when that is the following window itself, the one below it. A window
+/// above the following one (pinned on top) wins.
+#[cfg(any(target_os = "macos", test))]
+pub fn skip_following(first: Hit, below: impl FnOnce() -> Hit) -> Hit {
+  if first == Hit::SelfWindow {
+    below()
+  } else {
+    first
+  }
+}
 /// A display: its whole area and the part windows may use.
 #[cfg(any(target_os = "macos", windows, test))]
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -234,31 +286,41 @@ pub fn outer_for_visible(visible: Point, window_origin: Point, frame_origin: Poi
     y: visible.y + (window_origin.y - frame_origin.y),
   }
 }
+/// The label and inner origin of the window of this app that has window number
+/// `number`, if any.
+#[cfg(target_os = "macos")]
+fn owner_of_number(
+  app: &tauri::AppHandle,
+  mtm: objc2::MainThreadMarker,
+  number: isize,
+) -> Option<(String, Point)> {
+  use objc2_app_kit::NSApplication;
+  use tauri::Manager;
+  let ns_window = NSApplication::sharedApplication(mtm).windowWithWindowNumber(number)?;
+  let wanted = objc2::rc::Retained::as_ptr(&ns_window) as usize;
+  app.webview_windows().into_iter().find_map(|(label, w)| {
+    let ptr = w.ns_window().ok()? as usize;
+    (ptr == wanted).then(|| (label, inner_origin(&w)))
+  })
+}
+/// The window number under an AppKit point, below the window numbered `below`
+/// (0 for none).
+#[cfg(target_os = "macos")]
+fn number_at(mtm: objc2::MainThreadMarker, at: Point, below: isize) -> isize {
+  use objc2_app_kit::NSWindow;
+  use objc2_foundation::NSPoint;
+  NSWindow::windowNumberAtPoint_belowWindowWithWindowNumber(NSPoint::new(at.x, at.y), below, mtm)
+}
 /// What the release point of a tab of `sender` lands on, and whether the sender
 /// is on the same display as the release point. Main thread only.
 #[cfg(target_os = "macos")]
 pub fn locate(app: &tauri::AppHandle, sender: &tauri::WebviewWindow, point: Point) -> (Hit, bool) {
-  use objc2_app_kit::{NSApplication, NSScreen, NSWindow};
-  use objc2_foundation::NSPoint;
-  use tauri::Manager;
   let Some(mtm) = objc2::MainThreadMarker::new() else {
     log::warn!("locate called off the main thread");
     return (Hit::SelfWindow, true);
   };
-  let height = NSScreen::screens(mtm)
-    .firstObject()
-    .map_or(0.0, |screen| screen.frame().size.height);
-  let at = appkit_point(point, height);
-  let number =
-    NSWindow::windowNumberAtPoint_belowWindowWithWindowNumber(NSPoint::new(at.x, at.y), 0, mtm);
-  let hit = NSApplication::sharedApplication(mtm).windowWithWindowNumber(number);
-  let owner = hit.and_then(|ns_window| {
-    let wanted = objc2::rc::Retained::as_ptr(&ns_window) as usize;
-    app.webview_windows().into_iter().find_map(|(label, w)| {
-      let ptr = w.ns_window().ok()? as usize;
-      (ptr == wanted).then(|| (label, inner_origin(&w)))
-    })
-  });
+  let at = appkit_point(point, primary_height(mtm));
+  let owner = owner_of_number(app, mtm, number_at(mtm, at, 0));
   let hit = classify(
     point,
     owner
@@ -270,9 +332,37 @@ pub fn locate(app: &tauri::AppHandle, sender: &tauri::WebviewWindow, point: Poin
   let centre = centre_of(sender);
   (hit, same_display(centre, point, &monitors))
 }
-/// `locate` for Windows: the z-order walk, front to back.
+/// What lies under `point` for a window that follows the pointer: the topmost
+/// window, unless that is `following` itself, then the one below it. Main thread
+/// only.
+#[cfg(target_os = "macos")]
+pub fn locate_skipping(
+  app: &tauri::AppHandle,
+  following: &tauri::WebviewWindow,
+  point: Point,
+) -> Hit {
+  let Some(mtm) = objc2::MainThreadMarker::new() else {
+    log::warn!("locate_skipping called off the main thread");
+    return Hit::Outside;
+  };
+  let at = appkit_point(point, primary_height(mtm));
+  let hit_of = |number: isize| {
+    let owner = owner_of_number(app, mtm, number);
+    classify(
+      point,
+      owner
+        .as_ref()
+        .map(|(label, origin)| (label.as_str(), *origin)),
+      following.label(),
+    )
+  };
+  let first = number_at(mtm, at, 0);
+  skip_following(hit_of(first), || hit_of(number_at(mtm, at, first)))
+}
+/// Every top-level window of the desktop in z-order, front to back, as a hit
+/// test sees it.
 #[cfg(windows)]
-pub fn locate(app: &tauri::AppHandle, sender: &tauri::WebviewWindow, point: Point) -> (Hit, bool) {
+fn desktop_stack(app: &tauri::AppHandle) -> Vec<StackWindow> {
   use tauri::Manager;
   use windows_sys::Win32::Foundation::{HWND, LPARAM, RECT};
   use windows_sys::Win32::Graphics::Dwm::{
@@ -302,7 +392,7 @@ pub fn locate(app: &tauri::AppHandle, sender: &tauri::WebviewWindow, point: Poin
   unsafe {
     EnumWindows(Some(collect), &mut order as *mut Vec<isize> as LPARAM);
   }
-  let stack: Vec<StackWindow> = order
+  order
     .into_iter()
     .filter_map(|id| {
       let hwnd = id as HWND;
@@ -358,25 +448,83 @@ pub fn locate(app: &tauri::AppHandle, sender: &tauri::WebviewWindow, point: Poin
         alpha_zero: layered && alpha == 0,
       })
     })
-    .collect();
-  let hit = pick_window_at(point, &stack, sender.label());
+    .collect()
+}
+/// `locate` for Windows: the z-order walk, front to back.
+#[cfg(windows)]
+pub fn locate(app: &tauri::AppHandle, sender: &tauri::WebviewWindow, point: Point) -> (Hit, bool) {
+  let hit = pick_window_at(point, &desktop_stack(app), sender.label());
   let monitors = monitors(sender);
   let centre = centre_of(sender);
   (hit, same_display(centre, point, &monitors))
 }
-/// The sender's inner origin as a screen point.
-#[cfg(any(target_os = "macos", windows))]
+/// What lies under `point` for a window that follows the pointer, which is never
+/// itself what is under it.
+#[cfg(windows)]
+pub fn locate_skipping(
+  app: &tauri::AppHandle,
+  following: &tauri::WebviewWindow,
+  point: Point,
+) -> Hit {
+  pick_window_skipping(point, &desktop_stack(app), following.label())
+}
+/// The page's top left minus the frame's, from the frame height and the content
+/// layout rect (window coordinates, bottom-left origin).
+#[cfg(any(target_os = "macos", test))]
+pub fn layout_inset(frame_height: f64, layout_origin: Point, layout_size: (f64, f64)) -> Point {
+  Point {
+    x: layout_origin.x,
+    y: frame_height - (layout_origin.y + layout_size.1),
+  }
+}
+/// The window's page top left minus its frame top left, in points. The content
+/// rect is the whole frame here (Tauri gives windows a full-size content view),
+/// so the title bar is read from the content layout rect, where the page is.
+#[cfg(target_os = "macos")]
+pub fn page_inset(ns: &objc2_app_kit::NSWindow) -> Point {
+  let layout = ns.contentLayoutRect();
+  layout_inset(
+    ns.frame().size.height,
+    Point {
+      x: layout.origin.x,
+      y: layout.origin.y,
+    },
+    (layout.size.width, layout.size.height),
+  )
+}
+/// The window's inner origin (where its page starts) as a screen point. Main
+/// thread only on macOS.
+#[cfg(target_os = "macos")]
+pub fn inner_origin(window: &tauri::WebviewWindow) -> Point {
+  let (Some(mtm), Ok(ptr)) = (objc2::MainThreadMarker::new(), window.ns_window()) else {
+    log::warn!("inner_origin called off the main thread");
+    return Point { x: 0.0, y: 0.0 };
+  };
+  // Safety: the pointer is the window's own NSWindow, read on the main thread.
+  let ns = unsafe { &*(ptr as *const objc2_app_kit::NSWindow) };
+  let frame = ns.frame();
+  let top_left = screen_of_appkit(
+    Point {
+      x: frame.origin.x,
+      y: frame.origin.y + frame.size.height,
+    },
+    primary_height(mtm),
+  );
+  let inset = page_inset(ns);
+  Point {
+    x: top_left.x + inset.x,
+    y: top_left.y + inset.y,
+  }
+}
+/// The window's inner origin as a screen point.
+#[cfg(windows)]
 pub fn inner_origin(window: &tauri::WebviewWindow) -> Point {
   let Ok(position) = window.inner_position() else {
     return Point { x: 0.0, y: 0.0 };
   };
-  #[cfg(target_os = "macos")]
-  let position = position.to_logical::<f64>(window.scale_factor().unwrap_or(1.0));
-  #[cfg(windows)]
-  let position = tauri::LogicalPosition::new(f64::from(position.x), f64::from(position.y));
   Point {
-    x: position.x,
-    y: position.y,
+    x: f64::from(position.x),
+    y: f64::from(position.y),
   }
 }
 /// The point in the middle of a window's inner area.
@@ -546,6 +694,19 @@ mod tests {
       width,
       height,
     }
+  }
+  #[test]
+  fn the_page_starts_below_the_title_bar_the_layout_rect_leaves_out() {
+    // A 600 pt frame whose layout rect leaves the top 32 pt to the title bar.
+    assert_eq!(
+      layout_inset(600.0, p(0.0, 0.0), (800.0, 568.0)),
+      p(0.0, 32.0)
+    );
+    // No title bar: the page starts at the frame.
+    assert_eq!(
+      layout_inset(600.0, p(0.0, 0.0), (800.0, 600.0)),
+      p(0.0, 0.0)
+    );
   }
   fn doc(label: &str, frame: Rect, origin: Point) -> StackWindow {
     StackWindow {
@@ -805,6 +966,68 @@ mod tests {
     assert!(same_display(p(10.0, 10.0), p(900.0, 800.0), &monitors));
     assert!(!same_display(p(10.0, 10.0), p(1500.0, 10.0), &monitors));
     assert!(same_display(p(10.0, 10.0), p(1500.0, 10.0), &[]));
+  }
+
+  #[test]
+  fn the_flip_between_appkit_and_the_screen_frame_is_its_own_inverse_everywhere() {
+    let h = 900.0;
+    for point in [
+      p(10.0, 20.0),
+      p(-1440.0, 300.0),
+      p(100.0, -700.0),
+      p(-5.0, 1200.0),
+    ] {
+      assert_eq!(screen_of_appkit(appkit_point(point, h), h), point);
+    }
+    // A display above the primary one has a negative y in the screen frame and
+    // a y above the primary's height in AppKit.
+    assert_eq!(appkit_point(p(0.0, -300.0), h), p(0.0, 1200.0));
+    assert_eq!(screen_of_appkit(p(-200.0, 1300.0), h), p(-200.0, -400.0));
+  }
+
+  #[test]
+  fn a_pointer_over_the_following_window_looks_at_the_window_below_it_only_then() {
+    // Topmost is the following window itself: the one below decides.
+    assert_eq!(
+      skip_following(Hit::SelfWindow, || doc_hit("doc-b", 1.0, 2.0)),
+      doc_hit("doc-b", 1.0, 2.0)
+    );
+    // Topmost is another window, a pinned one above the following window: it
+    // wins and nothing below is asked.
+    assert_eq!(
+      skip_following(doc_hit("doc-pin", 3.0, 4.0), || panic!("asked below")),
+      doc_hit("doc-pin", 3.0, 4.0)
+    );
+    // Topmost is a foreign window: outside, nothing below is asked.
+    assert_eq!(
+      skip_following(Hit::Outside, || panic!("asked below")),
+      Hit::Outside
+    );
+  }
+
+  #[test]
+  fn the_stack_walk_leaves_the_following_window_out_and_a_window_above_it_wins() {
+    let frame = r(0.0, 0.0, 100.0, 100.0);
+    let stack = vec![
+      doc("doc-pin", frame, p(0.0, 20.0)),
+      doc("doc-t", frame, p(0.0, 20.0)),
+      doc("doc-a", frame, p(0.0, 20.0)),
+    ];
+    // The window above the following one wins.
+    assert_eq!(
+      pick_window_skipping(p(5.0, 30.0), &stack, "doc-t"),
+      doc_hit("doc-pin", 5.0, 10.0)
+    );
+    // With it topmost the one below does, and the original sender is a document
+    // window like any other.
+    assert_eq!(
+      pick_window_skipping(p(5.0, 30.0), &stack[1..], "doc-t"),
+      doc_hit("doc-a", 5.0, 10.0)
+    );
+    assert_eq!(
+      pick_window_skipping(p(5.0, 30.0), &stack[1..2], "doc-t"),
+      Hit::Outside
+    );
   }
 
   #[test]

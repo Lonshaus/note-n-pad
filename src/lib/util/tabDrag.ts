@@ -1,5 +1,11 @@
 // Copyright © 2026 Lonshaus
 // SPDX-License-Identifier: GPL-3.0-only
+import {
+  DROP,
+  type HoverAckArgs,
+  type HoverPayload,
+  type TearOffTarget,
+} from './tabTransferWire';
 /** Pointer travel, in CSS pixels, past which a press on a tab becomes a drag. */
 export const DRAG_THRESHOLD = 4;
 /** Where the tabs are. The tab boxes are in the bar's content coordinates (the
@@ -9,6 +15,11 @@ export interface TabBarGeometry {
   scrollLeft: number;
   bar: { left: number; right: number; top: number; bottom: number };
 }
+/** The class of the tab drawn under the pointer for a tab hovering over a bar: it
+ *  looks like a tab and is not one. */
+export const GHOST_CLASS = 'tab-ghost';
+/** The tabs of a bar, for its geometry: the ghost is never one of them. */
+export const TAB_SELECTOR = `:scope > .tab:not(.${GHOST_CLASS})`;
 /** The index the dragged tab takes when released at viewport point `x`: the
  *  number of tabs other than `from` whose midpoint is left of the pointer. */
 export function slotAt(
@@ -36,6 +47,67 @@ export function dropSlot(
     return null;
   }
   return slotAt(point.x, geometry, null);
+}
+/** How far above and below its bar, in CSS pixels, a point still counts as in
+ *  the tab strip. */
+export const TEAROFF_BAND = 15;
+/** Whether the viewport point has left the tab strip: its x is outside the bar's
+ *  drag area, or its y is more than `TEAROFF_BAND` above or below the bar. */
+export function outsideStrip(
+  x: number,
+  y: number,
+  bar: TabBarGeometry['bar'],
+): boolean {
+  return (
+    x < bar.left ||
+    x >= bar.right ||
+    y < bar.top - TEAROFF_BAND ||
+    y >= bar.bottom + TEAROFF_BAND
+  );
+}
+/** Whether a drag may take a tab out of its bar: a mouse, not on Linux (where no
+ *  window can be placed under the pointer), and not from a full-screen window. */
+export function canTearOff(
+  pointerType: string,
+  os: string,
+  fullscreen: boolean,
+): boolean {
+  return pointerType === 'mouse' && os !== 'linux' && !fullscreen;
+}
+/** What a tab that leaves its bar tells the core: where the pointer holds the
+ *  tab, where the tab sits in a bar of its own and where it goes back to on Esc,
+ *  all in client CSS pixels. The tab's slot is `geometry.tabs[index]`; `pressed`
+ *  is where the button went down on it. The grab comes from the press, not from
+ *  the tab as drawn: the drawn tab stops at the bar's ends while the pointer
+ *  goes on. */
+export function tearOffStart(args: {
+  id: string;
+  pressed: { x: number; y: number };
+  geometry: TabBarGeometry;
+  index: number;
+  dpr: number;
+  title: string;
+}): TearOffTarget {
+  const { geometry, pressed } = args;
+  const tab = geometry.tabs[args.index] ?? { left: 0, width: 0 };
+  const first = geometry.tabs[0] ?? { left: 0, width: 0 };
+  const bar = geometry.bar;
+  // The tab's slot in the bar's scrolled content.
+  const slotLeft = bar.left + tab.left - geometry.scrollLeft;
+  return {
+    kind: DROP.tearOff,
+    id: args.id,
+    grab: { x: pressed.x - slotLeft, y: pressed.y },
+    // A tear-off's bar holds one tab and is not scrolled.
+    firstTabClientX: bar.left + first.left,
+    escOffset: {
+      x: bar.left + tab.left - geometry.scrollLeft + 1,
+      y: (bar.top + bar.bottom) / 2,
+    },
+    dpr: args.dpr,
+    width: tab.width,
+    title: args.title,
+  };
 }
 /** The client point (CSS pixels of this window's viewport) of `offset`, the
  *  core's distance from this window's inner origin in native units. A CSS pixel
@@ -100,6 +172,32 @@ export function hoverAccepted(state: {
 }): boolean {
   return state.ready && !state.locked;
 }
+/** What a window answers to a hover of the core's follow loop: whether it takes
+ *  the tab, as it is right now. Null for a hover that is not from a follow, which
+ *  is not answered. */
+export function hoverAck(
+  payload: HoverPayload,
+  ready: boolean,
+  locked: boolean,
+): HoverAckArgs | null {
+  if (payload.follow === undefined) {
+    return null;
+  }
+  return {
+    generation: payload.follow.generation,
+    accepted: hoverAccepted({ ready, locked }),
+  };
+}
+/** The left edge, in the viewport, of the tab drawn under the pointer at `point`:
+ *  the pointer minus its distance from the tab's left edge, kept inside the bar. */
+export function ghostLeft(
+  point: { x: number },
+  grabX: number,
+  width: number,
+  bar: { left: number; right: number },
+): number {
+  return Math.max(bar.left, Math.min(bar.right - width, point.x - grabX));
+}
 /** How far the tab at `index` moves aside for a gap at `slot`. */
 export function hoverShift(index: number, slot: number, width: number): number {
   return index >= slot ? width : 0;
@@ -131,14 +229,35 @@ export function hoverGap(
 }
 /** What took the mouse away from a drag. */
 export type CancelReason = 'escape' | 'pointercancel' | 'lostcapture' | 'blur';
+/** What the window knows of whether the dragged tab may leave its bar. */
+export interface TearOffInput {
+  /** A mouse, not on Linux, and the window is not full screen. */
+  canTearOff: boolean;
+  /** The tab is the window's only one: the window itself moves. */
+  onlyTab: boolean;
+  /** Something keeps the tab from being transferred. */
+  blocked: boolean;
+  /** A fresh id for the drag, asked for once, when the tab leaves. */
+  mintId: () => string;
+}
 export type DragInput =
   | { kind: 'down'; x: number; y: number; index: number }
-  | { kind: 'move'; x: number; y: number; geometry: TabBarGeometry }
+  | {
+      kind: 'move';
+      x: number;
+      y: number;
+      geometry: TabBarGeometry;
+      tearOff?: TearOffInput;
+    }
   | { kind: 'up'; x: number; y: number; geometry: TabBarGeometry }
   | { kind: 'cancel'; reason: CancelReason }
-  | { kind: 'click' };
+  | { kind: 'click' }
+  /** The core did not start what the drag asked for: the tab stays. */
+  | { kind: 'notStarted' }
+  /** `tab-tearoff-end`: the core ended the follow `id`. */
+  | { kind: 'end'; id: string };
 export interface DragState {
-  phase: 'idle' | 'pressed' | 'dragging';
+  phase: 'idle' | 'pressed' | 'dragging' | 'detached' | 'moveWindow';
   /** The pressed tab's index. */
   index: number;
   startX: number;
@@ -149,13 +268,25 @@ export interface DragState {
   overBar: boolean;
   /** The next click is the tail of a drag. */
   swallowClick: boolean;
+  /** The id of the drag that left the bar (`detached` and `moveWindow`). */
+  tearOffId: string;
+  /** The core refused to follow this drag: the tab is not offered again. */
+  tearOffTried: boolean;
 }
 /** What an event decided. A `release` is any release after the threshold, on the
  *  tab bar or not: `overBar` says which, and the viewport alone never does. */
 export type DragOutcome =
   | { kind: 'click' }
   | { kind: 'release'; slot: number; overBar: boolean }
-  | { kind: 'cancel' };
+  | { kind: 'cancel' }
+  /** The tab left its bar: a window of its own follows the pointer. */
+  | { kind: 'detach'; id: string }
+  /** The only tab left its bar: the window follows the pointer. */
+  | { kind: 'moveWindow'; id: string }
+  /** The button went up while the core follows the pointer. */
+  | { kind: 'releaseSeen'; id: string }
+  /** Esc while the core follows the pointer. */
+  | { kind: 'tearOffCancel'; id: string };
 export interface DragResult {
   state: DragState;
   outcome: DragOutcome | null;
@@ -170,7 +301,13 @@ export const IDLE: DragState = {
   slot: 0,
   overBar: false,
   swallowClick: false,
+  tearOffId: '',
+  tearOffTried: false,
 };
+/** Whether the core follows the pointer for this drag. */
+export function isFollowing(state: DragState): boolean {
+  return state.phase === 'detached' || state.phase === 'moveWindow';
+}
 /** The drag state machine: pure, one event in, the next state and the decision out. */
 export function dragStep(state: DragState, event: DragInput): DragResult {
   switch (event.kind) {
@@ -188,7 +325,8 @@ export function dragStep(state: DragState, event: DragInput): DragResult {
         swallowed: false,
       };
     case 'move': {
-      if (state.phase === 'idle') {
+      // The pointer is the core's while it follows.
+      if (state.phase === 'idle' || isFollowing(state)) {
         return { state, outcome: null, swallowed: false };
       }
       if (
@@ -197,6 +335,30 @@ export function dragStep(state: DragState, event: DragInput): DragResult {
           DRAG_THRESHOLD
       ) {
         return { state, outcome: null, swallowed: false };
+      }
+      const tear = event.tearOff;
+      if (
+        state.phase === 'dragging' &&
+        tear !== undefined &&
+        tear.canTearOff &&
+        !tear.blocked &&
+        !state.tearOffTried &&
+        outsideStrip(event.x, event.y, event.geometry.bar)
+      ) {
+        const id = tear.mintId();
+        return {
+          state: {
+            ...state,
+            phase: tear.onlyTab ? 'moveWindow' : 'detached',
+            tearOffId: id,
+            slot: slotAt(event.x, event.geometry, state.index),
+            overBar: false,
+          },
+          outcome: tear.onlyTab
+            ? { kind: 'moveWindow', id }
+            : { kind: 'detach', id },
+          swallowed: false,
+        };
       }
       return {
         state: {
@@ -220,6 +382,13 @@ export function dragStep(state: DragState, event: DragInput): DragResult {
           swallowed: false,
         };
       }
+      if (isFollowing(state)) {
+        return {
+          state: { ...IDLE, swallowClick: true },
+          outcome: { kind: 'releaseSeen', id: state.tearOffId },
+          swallowed: false,
+        };
+      }
       return {
         state: { ...IDLE, swallowClick: true },
         outcome: {
@@ -233,6 +402,18 @@ export function dragStep(state: DragState, event: DragInput): DragResult {
     case 'cancel': {
       if (state.phase === 'idle') {
         return { state, outcome: null, swallowed: false };
+      }
+      // The button is still down, so its click still comes. Only Esc tells the
+      // core; losing the pointer or the focus leaves the follow to its own end.
+      if (isFollowing(state)) {
+        return {
+          state: { ...IDLE, swallowClick: true },
+          outcome:
+            event.reason === 'escape'
+              ? { kind: 'tearOffCancel', id: state.tearOffId }
+              : null,
+          swallowed: false,
+        };
       }
       // Escape and blur leave the button down, so its click still comes.
       const clickFollows =
@@ -249,6 +430,30 @@ export function dragStep(state: DragState, event: DragInput): DragResult {
         state: { ...state, swallowClick: false },
         outcome: null,
         swallowed: state.swallowClick,
+      };
+    case 'notStarted':
+      // Back to an ordinary drag, which the release ends as it always did.
+      if (!isFollowing(state)) {
+        return { state, outcome: null, swallowed: false };
+      }
+      return {
+        state: {
+          ...state,
+          phase: 'dragging',
+          tearOffId: '',
+          tearOffTried: true,
+        },
+        outcome: null,
+        swallowed: false,
+      };
+    case 'end':
+      if (!isFollowing(state) || event.id !== state.tearOffId) {
+        return { state, outcome: null, swallowed: false };
+      }
+      return {
+        state: { ...IDLE, swallowClick: true },
+        outcome: null,
+        swallowed: false,
       };
   }
 }

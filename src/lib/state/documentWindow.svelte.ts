@@ -71,7 +71,10 @@ import {
   type CommittedMeta,
   type DropTarget,
   type Point,
+  type SendPayload,
   type SettleAction,
+  type StartResult,
+  type TearOffTarget,
   type TransferBounds,
   type TransferTarget,
 } from '../util/tabTransferWire';
@@ -495,6 +498,10 @@ interface Bounds {
   width: number | null;
   height: number | null;
 }
+/** How long a tab the core sent on waits for the window to be ready to send it,
+ *  and how often it looks. */
+export const SEND_WAIT_MS = 5000;
+export const SEND_WAIT_STEP_MS = 20;
 /** What the window around the state says of a drag: a tab cannot be dragged
  *  while one of these holds. */
 export interface DragHost {
@@ -1796,7 +1803,7 @@ export class DocumentWindowState {
   transferListening = false;
   /** Whether a drag may not start, or end in a reorder, now: a dialog or gate
    *  holds the window, it is closing or quitting, or a tab is on its way. */
-  dragLocked(ownPreparing = false): boolean {
+  dragLocked(ownPreparing = false, exemptRole = false): boolean {
     const host = this.dragHost;
     if (
       host !== null &&
@@ -1813,9 +1820,32 @@ export class DocumentWindowState {
       this.incoming.size > 0 ||
       this.committing !== null ||
       this.outgoing.size > 0 ||
-      (!ownPreparing && this.preparing !== null)
+      (!ownPreparing && this.preparing !== null) ||
+      (this.tearOffRole && !exemptRole)
     );
   }
+  /** The window is a tear-off still waiting for its role to end: from its load
+   *  until the core sends it a send, a reveal or an end. Nothing is dragged to or
+   *  from it meanwhile, and it takes no tab but the one made for it. */
+  tearOffRole = false;
+  /** The transfer the core routed to this window when it built it: the one
+   *  incoming tab the role lets through. */
+  tearOffFirst: number | null = null;
+  /** `dragLocked` for the incoming transfer `t`: the tab the window was made for
+   *  is not held off by the role. */
+  lockedForIncoming(t: number): boolean {
+    return this.dragLocked(false, t === this.tearOffFirst);
+  }
+  /** The role is over: the window is an ordinary one. */
+  endTearOffRole(): void {
+    this.tearOffRole = false;
+    this.tearOffFirst = null;
+  }
+  /** Reveals the window (the page's `reveal_self`), set by the window. */
+  revealSelf: (() => Promise<void>) | null = null;
+  /** The tabs sent on by the core whose transfer, if it is called off, leaves the
+   *  window to show itself with the tab. */
+  private revealOnCancel = new Set<string>();
   /** The tab, if any, on its way out: set from the busy check until the core
    *  has answered `begin`. */
   preparing: Promise<void> | null = null;
@@ -1989,15 +2019,30 @@ export class DocumentWindowState {
         await this.transferOut(tab, target);
     }
   }
-  private transferOut(tab: DocTab, target: TransferTarget): Promise<void> {
+  /** A tab that left its bar becomes a window of its own that follows the
+   *  pointer. `cancelled` says Esc came before the core was asked: the tab
+   *  stays. */
+  detachTab(
+    tab: DocTab,
+    start: TearOffTarget,
+    cancelled: () => boolean,
+  ): Promise<StartResult> {
+    return this.transferOut(tab, start, cancelled);
+  }
+  private transferOut(
+    tab: DocTab,
+    target: TransferTarget,
+    cancelled: () => boolean = () => false,
+  ): Promise<StartResult> {
     if (this.transferHost === null || this.transferBlockerOf(tab) !== null) {
-      return Promise.resolve();
+      return Promise.resolve('notStarted');
     }
-    const run = this.carryOut(tab, target);
-    this.preparing = run;
+    const run = this.carryOut(tab, target, cancelled);
+    const preparing = run.then(() => {});
+    this.preparing = preparing;
     this.preparingTab = tab;
     return run.finally(() => {
-      if (this.preparing === run) {
+      if (this.preparing === preparing) {
         this.preparing = null;
         this.preparingTab = null;
       }
@@ -2005,10 +2050,14 @@ export class DocumentWindowState {
   }
   /** Flush and write `tab`, freeze it, pack it and begin the transfer. Any
    *  failure before the core has started it leaves the tab as it was. */
-  private async carryOut(tab: DocTab, target: TransferTarget): Promise<void> {
+  private async carryOut(
+    tab: DocTab,
+    target: TransferTarget,
+    cancelled: () => boolean,
+  ): Promise<StartResult> {
     const host = this.transferHost;
     if (host === null) {
-      return;
+      return 'notStarted';
     }
     if (tab === this.activeTab) {
       await this.endComposition?.();
@@ -2018,9 +2067,10 @@ export class DocumentWindowState {
     }
     if (
       !this.tabs.includes(tab) ||
-      this.transferBlockerOf(tab, true) !== null
+      this.transferBlockerOf(tab, true) !== null ||
+      cancelled()
     ) {
-      return;
+      return 'notStarted';
     }
     if (tab === this.activeTab) {
       this.persistActive.flush();
@@ -2029,14 +2079,15 @@ export class DocumentWindowState {
     await this.settleWrites(tab);
     if (
       !this.tabs.includes(tab) ||
-      this.transferBlockerOf(tab, true) !== null
+      this.transferBlockerOf(tab, true) !== null ||
+      cancelled()
     ) {
-      return;
+      return 'notStarted';
     }
     // The stored record would be stale: the tab stays here.
     if (tab.writeFailed === true) {
       this.unfreeze(tab);
-      return;
+      return 'notStarted';
     }
     this.freeze(tab);
     const payload = toPayload(tab, {
@@ -2045,6 +2096,11 @@ export class DocumentWindowState {
       view: this.viewPos.get(tab.id) ?? null,
       viewMode: host.viewModeOf(tab.id) ?? null,
     });
+    // Esc since the check above: the core is not asked.
+    if (cancelled()) {
+      this.cancelled(tab);
+      return 'notStarted';
+    }
     let result: BeginResult;
     try {
       result = await invoke<BeginResult>('tab_transfer_begin', {
@@ -2055,11 +2111,11 @@ export class DocumentWindowState {
     } catch (error) {
       console.error('tab_transfer_begin failed', error);
       this.cancelled(tab);
-      return;
+      return 'notStarted';
     }
     if (result.kind !== BEGIN.started) {
       this.cancelled(tab);
-      return;
+      return 'notStarted';
     }
     this.outgoing.set(result.t, tab);
     // The core may have been quicker than its own answer.
@@ -2070,6 +2126,7 @@ export class DocumentWindowState {
     } else if (early === 'cancel') {
       this.onTransferCancel(result.t);
     }
+    return 'started';
   }
   /** Wait until every write of `tab` has settled. */
   private async settleWrites(tab: DocTab): Promise<void> {
@@ -2109,6 +2166,7 @@ export class DocumentWindowState {
       return;
     }
     this.outgoing.delete(t);
+    this.revealOnCancel.delete(tab.id);
     tab.released = true;
     this.ordinaryMru = this.ordinaryMru.filter((id) => id !== tab.id);
     const at = this.tabs.indexOf(tab);
@@ -2148,6 +2206,82 @@ export class DocumentWindowState {
     }
     this.outgoing.delete(t);
     this.cancelled(tab);
+    if (this.revealOnCancel.delete(tab.id)) {
+      void this.revealWith(tab);
+    }
+  }
+  /** `tab-transfer-send`: the core says the tab `note`, which is the only one of
+   *  this tear-off, goes on to the bar it names. The role ends first. The tab is
+   *  sent once what is still putting it in, and what is still running on it, is
+   *  done, for at most `SEND_WAIT_MS`; a dialog, the wait running out, the core
+   *  not starting the transfer or calling it off later leaves the window to show
+   *  itself with the tab. A window that is closing or quitting sends nothing and
+   *  shows nothing: the tab goes the way of the window. */
+  async onTransferSend(payload: SendPayload): Promise<void> {
+    this.endTearOffRole();
+    if (this.goingAway()) {
+      return;
+    }
+    const deadline = Date.now() + SEND_WAIT_MS;
+    while (this.sendMustWait(payload.note) && Date.now() < deadline) {
+      await new Promise((resolve) => setTimeout(resolve, SEND_WAIT_STEP_MS));
+      if (this.goingAway()) {
+        return;
+      }
+    }
+    const tab = this.tabs.find((t) => t.id === payload.note);
+    if (tab === undefined) {
+      return;
+    }
+    if (this.transferBlockerOf(tab) !== null) {
+      await this.revealWith(tab);
+      return;
+    }
+    this.revealOnCancel.add(tab.id);
+    const started = await this.transferOut(tab, payload.target);
+    if (started !== 'started') {
+      this.revealOnCancel.delete(tab.id);
+      await this.revealWith(tab);
+    }
+  }
+  /** Whether the window is closing or a quit has it. */
+  private goingAway(): boolean {
+    const host = this.dragHost;
+    return host !== null && (host.closing() || host.quitting());
+  }
+  /** Whether a send still has to wait: the tab is not in yet, or something that
+   *  ends by itself is running on it. */
+  private sendMustWait(note: string): boolean {
+    if (this.committing !== null || this.incoming.size > 0) {
+      return true;
+    }
+    const tab = this.tabs.find((t) => t.id === note);
+    if (tab === undefined) {
+      return true;
+    }
+    const blocker = this.transferBlockerOf(tab);
+    return (
+      blocker === 'op' ||
+      blocker === 'in-flight' ||
+      blocker === 'windowed-op' ||
+      blocker === 'paste'
+    );
+  }
+  /** Show the window with `tab` the active one. A window a follow made invisible,
+   *  the only tab of a moving window whose send failed or was refused, is shown
+   *  again first. */
+  private async revealWith(tab: DocTab): Promise<void> {
+    if (this.goingAway()) {
+      return;
+    }
+    invoke('tab_window_restore').catch((error: unknown) => {
+      console.error('tab_window_restore failed', error);
+    });
+    const at = this.tabs.indexOf(tab);
+    if (at !== -1 && this.activeTab !== tab) {
+      await this.switchTo(at);
+    }
+    await this.revealSelf?.();
   }
   /** Call off the move of `tab`, or let it go when it has landed already: a
    *  close of the dimmed tab. Waits for a move that is still being set up. */

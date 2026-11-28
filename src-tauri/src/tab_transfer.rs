@@ -13,15 +13,16 @@
 // window that something new happened.
 
 use crate::note_store::{NoteStore, TabPlacement};
+use crate::tab_tearoff::{HoverFollow, StepGate, TearAction, TearOffBook, TearSpec};
 use crate::window_at::{self, Decision, Hit, Point};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::{HashMap, HashSet};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tauri::{AppHandle, Emitter, Manager, State};
 /// An existing receiving window has this long from `begin` to answer.
-const EXISTING_WINDOW_TIMEOUT: Duration = Duration::from_secs(5);
+pub(crate) const EXISTING_WINDOW_TIMEOUT: Duration = Duration::from_secs(5);
 /// A new window has this long from `begin` to load and claim.
 const NEW_WINDOW_CLAIM_TIMEOUT: Duration = Duration::from_secs(30);
 /// A new window has this long from its claim to answer and report.
@@ -49,6 +50,8 @@ pub enum DropTarget {
     point: Point,
   },
   Cancel,
+  /// The tab left its bar: a window of its own that follows the pointer.
+  TearOff(TearSpec),
 }
 /// Why `begin` did not start a transfer.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
@@ -159,6 +162,7 @@ struct TransferEvent {
 pub enum Target {
   Existing { label: String, offset: Point },
   NewWindow { label: String },
+  TearOff { label: String, spec: TearSpec },
 }
 impl Target {
   /// The target of a `begin` from a `DropTarget` it accepts; a new window gets
@@ -170,12 +174,18 @@ impl Target {
         offset: *offset,
       }),
       DropTarget::NewWindow { .. } => Ok(Target::NewWindow { label: mint() }),
+      DropTarget::TearOff(spec) => Ok(Target::TearOff {
+        label: mint(),
+        spec: spec.clone(),
+      }),
       other => Err(format!("a transfer cannot begin for {other:?}")),
     }
   }
   fn label(&self) -> &str {
     match self {
-      Target::Existing { label, .. } | Target::NewWindow { label } => label,
+      Target::Existing { label, .. }
+      | Target::NewWindow { label }
+      | Target::TearOff { label, .. } => label,
     }
   }
 }
@@ -212,12 +222,17 @@ pub enum Action {
     t: u64,
     after: Duration,
   },
+  /// Something of a tear-off, carried out by `tab_follow`.
+  Tear(TearAction),
 }
 /// What `begin` needs to know of the app.
 pub struct BeginContext<'a> {
   pub quitting: bool,
   /// Whether a window has announced itself and so takes an event directly.
   pub ready: &'a dyn Fn(&str) -> bool,
+  /// Whether the sender may tear a tab off: it is not full screen, and on macOS
+  /// not one window of a native tab group.
+  pub tearoff_ok: bool,
 }
 /// What `TransferBook::begin` decided.
 #[derive(Debug, PartialEq)]
@@ -267,6 +282,10 @@ struct Entry {
   deadline: Instant,
   /// The sender went after the receiver was told to commit.
   sender_gone: bool,
+  /// The receiver is a tear-off window.
+  tearoff: bool,
+  /// The sender is closing with the tab already in the tear-off.
+  sender_closing: bool,
 }
 /// The open transfers, by id and by the note they carry.
 #[derive(Default)]
@@ -274,6 +293,8 @@ pub struct TransferBook {
   entries: HashMap<u64, Entry>,
   by_note: HashMap<String, u64>,
   last: u64,
+  /// The follow loop and the releases of the tear-offs, under the same lock.
+  pub tear: TearOffBook,
 }
 /// The note id and the sticky id (when it has one) of a packed tab.
 fn ids_of(payload: &Value) -> Option<(String, Option<String>)> {
@@ -309,13 +330,24 @@ impl TransferBook {
     if matches!(&target, Target::Existing { label, .. } if !(ctx.ready)(label)) {
       return Ok(Begin::Refused(Refusal::NotReady));
     }
+    // A window that leads or follows the pointer, or waits to send, takes
+    // nothing; a second tear-off waits for the first.
+    if matches!(&target, Target::Existing { label, .. } if self.tear.holds(label))
+      || matches!(&target, Target::TearOff { .. }) && (self.tear.busy() || !ctx.tearoff_ok)
+    {
+      return Ok(Begin::Refused(Refusal::NotReady));
+    }
     self.last += 1;
     let t = self.last;
     let receiver = target.label().to_string();
-    let (offset, new_window, wait) = match target {
-      Target::Existing { offset, .. } => (Some(offset), false, EXISTING_WINDOW_TIMEOUT),
-      Target::NewWindow { .. } => (None, true, NEW_WINDOW_CLAIM_TIMEOUT),
+    let tearoff = matches!(&target, Target::TearOff { .. });
+    let (offset, new_window, wait) = match &target {
+      Target::Existing { offset, .. } => (Some(*offset), false, EXISTING_WINDOW_TIMEOUT),
+      Target::NewWindow { .. } | Target::TearOff { .. } => (None, true, NEW_WINDOW_CLAIM_TIMEOUT),
     };
+    if let Target::TearOff { spec, .. } = &target {
+      self.tear.start_tearoff(spec, sender, &receiver, &note, t);
+    }
     let mut actions = vec![Action::SetOwner {
       note: note.clone(),
       label: sender.to_string(),
@@ -341,9 +373,60 @@ impl TransferBook {
         phase: Phase::Open,
         deadline: now + wait,
         sender_gone: false,
+        tearoff,
+        sender_closing: false,
       },
     );
     Ok(Begin::Started { t, actions })
+  }
+  /// What the tear-off book decided, with a call-off it asks for carried out.
+  fn resolve(&mut self, actions: Vec<TearAction>) -> Vec<Action> {
+    let mut resolved = Vec::new();
+    for action in actions {
+      match action {
+        TearAction::Cancel { t } => resolved.extend(self.call_off(t)),
+        other => resolved.push(Action::Tear(other)),
+      }
+    }
+    resolved
+  }
+  /// A step of the follow loop found `hit` under the pointer.
+  #[cfg_attr(not(any(target_os = "macos", windows)), allow(dead_code))]
+  pub fn finish_step(
+    &mut self,
+    generation: u64,
+    down: bool,
+    hit: &Hit,
+    windows: bool,
+  ) -> Vec<Action> {
+    let actions = self.tear.finish_step(generation, down, hit, windows);
+    self.resolve(actions)
+  }
+  /// Esc of the sender of follow `id`.
+  pub fn tearoff_cancel(&mut self, id: &str, caller: &str, windows: bool) -> Vec<Action> {
+    let actions = self.tear.cancel(id, caller, windows);
+    self.resolve(actions)
+  }
+  /// A recorded release of the first transfer `t` found no `released` in time.
+  pub fn record_overdue(&mut self, t: u64) -> Vec<Action> {
+    let actions = self.tear.record_overdue(t);
+    self.resolve(actions)
+  }
+  /// The close of window `label` was called off.
+  pub fn close_vetoed(&mut self, label: &str) -> Vec<Action> {
+    let actions = self.tear.close_vetoed(label);
+    self.resolve(actions)
+  }
+  /// A quit was called off.
+  pub fn quit_cancelled(&mut self) -> Vec<Action> {
+    let actions = self.tear.quit_cancelled();
+    self.resolve(actions)
+  }
+  /// The tear-off window of the first transfer `t` could not be opened: nothing
+  /// follows, and the transfer is called off.
+  pub fn abort_tearoff(&mut self, t: u64, sender: &str) -> Vec<Action> {
+    self.tear.abort_start(t);
+    self.cancel(t, sender).1
   }
   /// Call transfer `t` off if it is not accepted: the note is the sender's
   /// again, the sender is told to unfreeze, the receiver to drop its copy, and a
@@ -355,6 +438,11 @@ impl TransferBook {
     }
     let entry = self.entries.remove(&t).expect("checked above");
     self.by_note.remove(&entry.note);
+    let tear = if entry.tearoff {
+      self.tear.first_called_off(t)
+    } else {
+      Vec::new()
+    };
     let mut actions = vec![
       Action::SetOwner {
         note: entry.note,
@@ -374,6 +462,7 @@ impl TransferBook {
         label: entry.receiver,
       });
     }
+    actions.extend(tear.into_iter().map(Action::Tear));
     actions
   }
   fn remove(&mut self, t: u64) {
@@ -469,14 +558,23 @@ impl TransferBook {
       t,
     };
     let gone = entry.sender_gone;
+    let (tearoff, receiver) = (entry.tearoff, entry.receiver.clone());
     if let Some(entry) = self.entries.get_mut(&t) {
       entry.phase = Phase::Accepted;
+    }
+    let mut actions = vec![release];
+    if tearoff {
+      self.tear.on_accepted(t);
     }
     // Nobody is left to say it let go.
     if gone {
       self.remove(t);
+      if tearoff {
+        let shown = self.tear.reveal(&receiver);
+        actions.extend(shown.into_iter().map(Action::Tear));
+      }
     }
-    (CommitResult::Accepted, vec![release])
+    (CommitResult::Accepted, actions)
   }
   /// The sender calls the transfer off. Too late once the receiver put the tab.
   pub fn cancel(&mut self, t: u64, caller: &str) -> (CancelResult, Vec<Action>) {
@@ -491,15 +589,28 @@ impl TransferBook {
       _ => (CancelResult::Cancelled, Vec::new()),
     }
   }
-  /// The sender let the tab go: the transfer is over.
-  pub fn released(&mut self, t: u64, caller: &str) {
-    let ours = self
+  /// The sender let the tab go: the transfer is over. A release that waited for
+  /// it applies now; the tear-off of a sender that is closing is shown instead.
+  pub fn released(&mut self, t: u64, caller: &str) -> Vec<Action> {
+    let Some(entry) = self
       .entries
       .get(&t)
-      .is_some_and(|e| e.sender == caller && e.phase == Phase::Accepted);
-    if ours {
-      self.remove(t);
+      .filter(|e| e.sender == caller && e.phase == Phase::Accepted)
+    else {
+      return Vec::new();
+    };
+    let (tearoff, closing, receiver) =
+      (entry.tearoff, entry.sender_closing, entry.receiver.clone());
+    self.remove(t);
+    if !tearoff {
+      return Vec::new();
     }
+    let actions = if closing {
+      self.tear.reveal(&receiver)
+    } else {
+      self.tear.on_released(t)
+    };
+    self.resolve(actions)
   }
   /// Where transfer `t` stands, for one of its two windows.
   pub fn status(&self, t: u64, caller: &str) -> Status {
@@ -532,9 +643,19 @@ impl TransferBook {
       };
       let accepted = entry.phase == Phase::Accepted;
       let note_id = entry.note.clone();
+      let tearoff = entry.tearoff;
       if entry.sender == label {
         if accepted {
           settled.push(SettleAction::Release { t, note_id });
+          // The tab is in the tear-off already: the follow and any release end,
+          // and the tear-off is shown when the sender lets go.
+          if tearoff {
+            if let Some(entry) = self.entries.get_mut(&t) {
+              entry.sender_closing = true;
+            }
+            let dropped = self.tear.drop_first(t, true);
+            actions.extend(dropped.into_iter().map(Action::Tear));
+          }
         } else {
           actions.extend(self.call_off(t));
           settled.push(SettleAction::Unfreeze { t, note_id });
@@ -544,6 +665,8 @@ impl TransferBook {
         settled.push(SettleAction::DropIncoming { t });
       }
     }
+    let closing = self.tear.window_closing(label, true);
+    actions.extend(closing.into_iter().map(Action::Tear));
     (settled, actions)
   }
   /// Window `label` is gone (destroyed, or its page loaded again). The sender
@@ -557,23 +680,44 @@ impl TransferBook {
         continue;
       };
       if entry.sender == label {
+        let (tearoff, receiver) = (entry.tearoff, entry.receiver.clone());
         match entry.phase {
-          Phase::Accepted => self.remove(t),
-          Phase::Answered => entry.sender_gone = true,
+          Phase::Accepted => {
+            self.remove(t);
+            // The tab is in the tear-off: nothing follows or waits, and the
+            // tear-off is shown, never sent on.
+            if tearoff {
+              let mut shown = self.tear.drop_first(t, false);
+              shown.extend(self.tear.reveal(&receiver));
+              actions.extend(shown.into_iter().map(Action::Tear));
+            }
+          }
+          Phase::Answered => {
+            entry.sender_gone = true;
+            if tearoff {
+              let dropped = self.tear.drop_first(t, false);
+              actions.extend(dropped.into_iter().map(Action::Tear));
+            }
+          }
           Phase::Open | Phase::Claimed => actions.extend(self.call_off(t)),
         }
       } else if entry.receiver == label {
         actions.extend(self.call_off(t));
       }
     }
+    let gone = self.tear.window_gone(label, false);
+    actions.extend(gone.into_iter().map(Action::Tear));
     actions
   }
-  /// A quit starts: every transfer not yet accepted is called off.
+  /// A quit starts: every transfer not yet accepted is called off, and nothing
+  /// follows the pointer or is shown until the quit is called off.
   pub fn quit_call_off(&mut self) -> Vec<Action> {
     let mut actions = Vec::new();
     for t in self.ids() {
       actions.extend(self.call_off(t));
     }
+    let ended = self.tear.quit();
+    actions.extend(ended.into_iter().map(Action::Tear));
     actions
   }
   /// The file `from` was renamed to `to`: the tabs in flight follow it.
@@ -631,12 +775,14 @@ fn drop_target_for(
 #[derive(Clone, Debug, PartialEq)]
 pub enum HoverAction {
   /// The tab is at (`x`, `y`) from the window's inner origin, in native units;
-  /// `width` is its width in CSS pixels, passed through.
+  /// `width` is its width in CSS pixels, passed through. `follow` is set only by
+  /// the follow loop.
   Hover {
     label: String,
     x: f64,
     y: f64,
     width: f64,
+    follow: Option<HoverFollow>,
   },
   /// The tab left the window.
   End { label: String },
@@ -667,6 +813,7 @@ fn hover_step(
     x: offset.x,
     y: offset.y,
     width,
+    follow: None,
   });
   (Some(label.clone()), actions)
 }
@@ -685,21 +832,27 @@ fn hover_gone(
     other => (other, Vec::new()),
   }
 }
-/// The payload of `tab-transfer-hover`.
-#[derive(Clone, Copy, Serialize)]
+/// The payload of `tab-transfer-hover`; only a hover of the follow loop has
+/// `follow`.
+#[derive(Clone, Serialize)]
 struct HoverEvent {
   x: f64,
   y: f64,
   width: f64,
+  #[serde(skip_serializing_if = "Option::is_none")]
+  follow: Option<HoverFollow>,
 }
 /// The open transfers, the windows whose first page has loaded (a later load is
 /// a reload: the page's state is gone), and the (sender, receiver) of the drag
 /// hovering over a window.
 #[derive(Default)]
 pub struct TransferState {
-  book: Mutex<TransferBook>,
+  pub(crate) book: Mutex<TransferBook>,
   loaded: Mutex<HashSet<String>>,
   hover: Mutex<Option<(String, String)>>,
+  /// At most one step of the follow loop is outstanding.
+  #[cfg_attr(not(any(target_os = "macos", windows)), allow(dead_code))]
+  pub(crate) gate: Arc<StepGate>,
 }
 fn emit(app: &AppHandle, label: &str, event: &str, t: u64) {
   let _ = app.emit_to(label, event, TransferEvent { t });
@@ -707,8 +860,23 @@ fn emit(app: &AppHandle, label: &str, event: &str, t: u64) {
 fn run_hover(app: &AppHandle, actions: Vec<HoverAction>) {
   for action in actions {
     match action {
-      HoverAction::Hover { label, x, y, width } => {
-        let _ = app.emit_to(&label, "tab-transfer-hover", HoverEvent { x, y, width });
+      HoverAction::Hover {
+        label,
+        x,
+        y,
+        width,
+        follow,
+      } => {
+        let _ = app.emit_to(
+          &label,
+          "tab-transfer-hover",
+          HoverEvent {
+            x,
+            y,
+            width,
+            follow,
+          },
+        );
       }
       HoverAction::End { label } => {
         let _ = app.emit_to(&label, "tab-transfer-hover-end", serde_json::json!({}));
@@ -717,7 +885,7 @@ fn run_hover(app: &AppHandle, actions: Vec<HoverAction>) {
   }
 }
 /// Carry out what the book decided.
-fn run(app: &AppHandle, actions: Vec<Action>) {
+pub(crate) fn run(app: &AppHandle, actions: Vec<Action>) {
   for action in actions {
     match action {
       Action::EmitIn { label, t } => emit(app, &label, "tab-transfer-in", t),
@@ -741,8 +909,83 @@ fn run(app: &AppHandle, actions: Vec<Action>) {
           expire(&app, t);
         });
       }
+      Action::Tear(action) => run_tear(app, action),
     }
   }
+}
+/// The payload of `tab-transfer-send`: the tab to send and where.
+#[derive(Clone, Serialize)]
+struct SendEvent {
+  note: String,
+  target: DropTarget,
+}
+/// The payload of `tab-tearoff-end`: the follow that ended for its sender, or
+/// none for the end of a tear-off's own role.
+#[derive(Clone, Serialize)]
+struct EndEvent {
+  id: Option<String>,
+}
+/// Carry out what the tear-off book decided.
+fn run_tear(app: &AppHandle, action: TearAction) {
+  match action {
+    TearAction::EmitSend {
+      label,
+      note,
+      to,
+      offset,
+    } => {
+      let target = DropTarget::Doc { label: to, offset };
+      let _ = app.emit_to(&label, "tab-transfer-send", SendEvent { note, target });
+    }
+    TearAction::Reveal { label } => crate::tab_follow::reveal_tearoff(app, &label),
+    TearAction::EmitEnd { label, id } => {
+      let _ = app.emit_to(&label, "tab-tearoff-end", EndEvent { id: Some(id) });
+    }
+    TearAction::EmitRoleEnd { label } => {
+      let _ = app.emit_to(&label, "tab-tearoff-end", EndEvent { id: None });
+    }
+    TearAction::Hover {
+      label,
+      x,
+      y,
+      width,
+      follow,
+    } => run_hover(
+      app,
+      vec![HoverAction::Hover {
+        label,
+        x,
+        y,
+        width,
+        follow: Some(follow),
+      }],
+    ),
+    TearAction::HoverEnd { label } => run_hover(app, vec![HoverAction::End { label }]),
+    TearAction::Hide { label } => crate::tab_follow::hide(app, &label),
+    TearAction::Show { label } => crate::tab_follow::restore(app, &label),
+    TearAction::MoveTo {
+      label,
+      point,
+      remaximize,
+    } => crate::tab_follow::move_back(app, &label, point, remaximize),
+    // The book calls the transfer off itself.
+    TearAction::Cancel { .. } => {}
+    TearAction::ArmOverdue { t, after } => {
+      let app = app.clone();
+      tauri::async_runtime::spawn(async move {
+        tokio::time::sleep(after).await;
+        overdue(&app, t);
+      });
+    }
+  }
+}
+/// A release recorded for the first transfer `t` waited long enough.
+fn overdue(app: &AppHandle, t: u64) {
+  let Some(state) = app.try_state::<TransferState>() else {
+    return;
+  };
+  let actions = state.book.lock().unwrap().record_overdue(t);
+  run(app, actions);
 }
 fn expire(app: &AppHandle, t: u64) {
   let Some(state) = app.try_state::<TransferState>() else {
@@ -800,6 +1043,23 @@ pub fn quit_call_off(app: &AppHandle) -> Vec<String> {
   run(app, actions);
   destroyed
 }
+/// A quit was called off: a tear-off that kept its tab and was never shown is
+/// shown now.
+pub fn quit_cancelled(app: &AppHandle) {
+  let Some(state) = app.try_state::<TransferState>() else {
+    return;
+  };
+  let actions = state.book.lock().unwrap().quit_cancelled();
+  run(app, actions);
+}
+/// What became of the tear-off role of window `label`, for a page that announces
+/// itself late: whether it ended, and whether the core showed the window.
+pub fn role_state(app: &AppHandle, label: &str) -> crate::tab_tearoff::RoleState {
+  app
+    .try_state::<TransferState>()
+    .map(|state| state.book.lock().unwrap().tear.role_state(label))
+    .unwrap_or_default()
+}
 /// The file `from` was renamed to `to`: tabs in flight follow it.
 pub fn follow_move(app: &AppHandle, from: &str, to: &str) {
   if let Some(state) = app.try_state::<TransferState>() {
@@ -842,6 +1102,10 @@ pub fn tab_drag_hover(
   only_tab: bool,
   width: f64,
 ) {
+  // The core follows the pointer for a sender that leads a follow.
+  if state.book.lock().unwrap().tear.is_sender(window.label()) {
+    return;
+  }
   let app = window.app_handle().clone();
   let target = tab_drop_target(
     app.clone(),
@@ -866,6 +1130,9 @@ pub fn tab_drag_hover(
 /// The calling window's dragged tab is no longer over another window.
 #[tauri::command]
 pub fn tab_drag_hover_end(window: tauri::WebviewWindow, state: State<TransferState>) {
+  if state.book.lock().unwrap().tear.is_sender(window.label()) {
+    return;
+  }
   let actions = {
     let mut hover = state.hover.lock().unwrap();
     match hover.take() {
@@ -884,6 +1151,13 @@ pub fn tab_drag_hover_end(window: tauri::WebviewWindow, state: State<TransferSta
 /// first. For the only tab of a window dropped outside it.
 #[tauri::command]
 pub fn tab_move_window(window: tauri::WebviewWindow, point: Point) -> Result<(), String> {
+  // A zoomed macOS window is put in its restored frame at the placed point in one
+  // synchronous step: `unmaximize` there is an async `zoom:`, so the size read
+  // after it is still the zoomed one.
+  #[cfg(target_os = "macos")]
+  if window.is_maximized().unwrap_or(false) {
+    return crate::tab_follow::place_zoomed(&window, point);
+  }
   #[cfg(any(target_os = "macos", windows))]
   {
     if window.is_maximized().unwrap_or(false) {
@@ -918,6 +1192,8 @@ pub fn tab_transfer_begin(
   let ctx = BeginContext {
     quitting: crate::QUIT_IN_FLIGHT.load(std::sync::atomic::Ordering::SeqCst),
     ready: &ready,
+    tearoff_ok: !matches!(target, DropTarget::TearOff(_))
+      || crate::tab_follow::sender_may_tear(&window),
   };
   let begin =
     state
@@ -939,6 +1215,17 @@ pub fn tab_transfer_begin(
       run(&app, actions);
       return Err(e);
     }
+  } else if let DropTarget::TearOff(spec) = &target {
+    let label = format!("doc-{group}");
+    pending.route_transfer(&label, t);
+    if let Err(e) = crate::tab_follow::open_tearoff(&app, &window, &group, project.as_deref(), spec)
+    {
+      pending.forget(&label);
+      let actions = state.book.lock().unwrap().abort_tearoff(t, window.label());
+      run(&app, actions);
+      return Err(e);
+    }
+    crate::tab_follow::start_timer(&app, &state);
   }
   run(&app, actions);
   Ok(BeginResult::Started { t })
@@ -1039,8 +1326,14 @@ pub fn tab_transfer_cancel(
 }
 /// The sender removed the tab: the transfer is over.
 #[tauri::command(async)]
-pub fn tab_transfer_released(window: tauri::WebviewWindow, state: State<TransferState>, t: u64) {
-  state.book.lock().unwrap().released(t, window.label());
+pub fn tab_transfer_released(
+  app: AppHandle,
+  window: tauri::WebviewWindow,
+  state: State<TransferState>,
+  t: u64,
+) {
+  let actions = state.book.lock().unwrap().released(t, window.label());
+  run(&app, actions);
 }
 /// Where transfer `t` stands.
 #[tauri::command(async)]
@@ -1062,6 +1355,124 @@ pub fn tab_transfer_settle_window(
   let (settled, actions) = state.book.lock().unwrap().settle_window(window.label());
   run(&app, actions);
   settled
+}
+/// The calling window's tab bar, in its client CSS pixels: where a tab that
+/// follows the pointer counts as over it.
+#[tauri::command]
+pub fn report_tab_bar(
+  window: tauri::WebviewWindow,
+  state: State<TransferState>,
+  top: f64,
+  bottom: f64,
+  left: f64,
+  right: f64,
+  dpr: f64,
+) {
+  let report = crate::tab_tearoff::BarReport {
+    top,
+    bottom,
+    left,
+    right,
+    dpr,
+  };
+  state
+    .book
+    .lock()
+    .unwrap()
+    .tear
+    .set_bar_report(window.label(), report);
+}
+/// The calling window, whose only tab is `note`, starts to move with the pointer.
+/// Whether it did. Main thread: it reads and moves the window.
+#[tauri::command]
+#[allow(clippy::too_many_arguments)]
+pub fn tab_window_follow_start(
+  window: tauri::WebviewWindow,
+  state: State<TransferState>,
+  id: String,
+  pressed: Point,
+  esc_offset: Point,
+  dpr: f64,
+  width: f64,
+  note: String,
+  title: String,
+  tab_grab_x: f64,
+) -> Result<bool, String> {
+  let spec = TearSpec {
+    id,
+    // Where the button went down, a client point: the window is held there.
+    grab: pressed,
+    first_tab_client_x: 0.0,
+    esc_offset,
+    dpr,
+    width,
+    title,
+  };
+  crate::tab_follow::start_move_window(&window, &state, &spec, &note, tab_grab_x)
+}
+/// Esc while the calling window's tab follows the pointer.
+#[tauri::command]
+pub fn tab_tearoff_cancel(
+  app: AppHandle,
+  window: tauri::WebviewWindow,
+  state: State<TransferState>,
+  id: String,
+) {
+  let actions = state
+    .book
+    .lock()
+    .unwrap()
+    .tearoff_cancel(&id, window.label(), cfg!(windows));
+  run(&app, actions);
+}
+/// The close of the calling window did not go through: a tear-off that still
+/// waits in its role is shown.
+#[tauri::command]
+pub fn tab_tearoff_close_vetoed(
+  app: AppHandle,
+  window: tauri::WebviewWindow,
+  state: State<TransferState>,
+) {
+  let actions = state.book.lock().unwrap().close_vetoed(window.label());
+  run(&app, actions);
+}
+/// The calling window, a receiver of a hover from the follow `generation`, says
+/// whether it takes the tab: the follower is hidden while it does.
+#[tauri::command]
+pub fn tab_hover_ack(
+  window: tauri::WebviewWindow,
+  state: State<TransferState>,
+  generation: u64,
+  accepted: bool,
+) {
+  state
+    .book
+    .lock()
+    .unwrap()
+    .tear
+    .hover_ack(window.label(), generation, accepted);
+}
+/// The calling window is shown at full alpha if a follow made it invisible, and
+/// is no longer marked hidden. Idempotent; a window that was not hidden is left
+/// as it is.
+#[tauri::command]
+pub fn tab_window_restore(app: AppHandle, window: tauri::WebviewWindow) {
+  crate::tab_follow::restore(&app, window.label());
+}
+/// The calling window saw the button go up. Only marks it: the next step of the
+/// loop takes the release point.
+#[tauri::command]
+pub fn tab_tearoff_release_seen(
+  window: tauri::WebviewWindow,
+  state: State<TransferState>,
+  id: String,
+) {
+  state
+    .book
+    .lock()
+    .unwrap()
+    .tear
+    .release_seen(&id, window.label());
 }
 
 #[cfg(test)]
@@ -1090,7 +1501,11 @@ mod tests {
     }
   }
   fn ctx<'a>(quitting: bool, ready: &'a dyn Fn(&str) -> bool) -> BeginContext<'a> {
-    BeginContext { quitting, ready }
+    BeginContext {
+      quitting,
+      ready,
+      tearoff_ok: true,
+    }
   }
   fn begin_with(book: &mut TransferBook, note: &str, target: Target, now: Instant) -> u64 {
     let ready = |_: &str| true;
@@ -2093,6 +2508,7 @@ mod tests {
       x,
       y,
       width: 90.0,
+      follow: None,
     }
   }
 
@@ -2181,10 +2597,40 @@ mod tests {
       json_of(&HoverEvent {
         x: 10.5,
         y: 20.0,
-        width: 90.0
+        width: 90.0,
+        follow: None
       }),
       r#"{"x":10.5,"y":20.0,"width":90.0}"#
     );
+  }
+
+  #[test]
+  fn only_a_hover_of_the_follow_loop_carries_the_follow_object() {
+    assert_eq!(
+      json_of(&HoverEvent {
+        x: 10.5,
+        y: 20.0,
+        width: 90.0,
+        follow: Some(HoverFollow {
+          generation: 3,
+          title: "a.txt".to_string(),
+          grab_x: 20.5
+        })
+      }),
+      HOVER_FOLLOW_EVENT
+    );
+    // The drag hover is built by `hover_step` and says nothing of a follow, and
+    // nothing in its path names one.
+    let source = include_str!("tab_transfer.rs");
+    let step = &source[source.find("fn hover_step(").unwrap()..];
+    let step = &step[..step.find("\n}\n").unwrap()];
+    assert!(step.contains("follow: None"));
+    assert!(!step.contains("follow: Some"));
+    assert!(!step.contains("HoverFollow"));
+    let command = &source[source.find("pub fn tab_drag_hover(").unwrap()..];
+    let command = &command[..command.find("\n}\n").unwrap()];
+    assert!(!command.contains("follow:"));
+    assert!(!command.contains("HoverFollow"));
   }
 
   #[test]
@@ -2241,5 +2687,966 @@ mod tests {
     assert!(called_off < arm);
     assert!(body.contains("tab_transfer::ack_set("));
     assert!(body.contains("&destroyed,"));
+  }
+  // ---- A tab torn off its bar.
+
+  fn pt(x: f64, y: f64) -> Point {
+    Point { x, y }
+  }
+  fn tear_spec(id: &str) -> TearSpec {
+    TearSpec {
+      id: id.to_string(),
+      grab: pt(20.0, 14.0),
+      first_tab_client_x: 4.0,
+      esc_offset: pt(101.0, 15.0),
+      dpr: 2.0,
+      width: 90.0,
+      title: "a.txt".to_string(),
+    }
+  }
+  fn bar_report() -> crate::tab_tearoff::BarReport {
+    crate::tab_tearoff::BarReport {
+      top: 0.0,
+      bottom: 30.0,
+      left: 0.0,
+      right: 600.0,
+      dpr: 1.0,
+    }
+  }
+  /// A book where doc-b and doc-a have a bar to be over.
+  fn torn_book() -> TransferBook {
+    let mut book = TransferBook::default();
+    book.tear.set_bar_report("doc-a", bar_report());
+    book.tear.set_bar_report("doc-b", bar_report());
+    book
+  }
+  /// doc-a tears note `note` off into the new window doc-t: (transfer, generation).
+  fn tear_off(book: &mut TransferBook, note: &str) -> (u64, u64) {
+    let ready = |_: &str| true;
+    let target = Target::TearOff {
+      label: "doc-t".to_string(),
+      spec: tear_spec("drag"),
+    };
+    let Begin::Started { t, .. } = book
+      .begin("doc-a", tab(note), target, T0(), &ctx(false, &ready))
+      .unwrap()
+    else {
+      panic!("refused");
+    };
+    (t, book.tear.generation().unwrap())
+  }
+  /// The tear-off claims, answers and commits transfer `t`.
+  fn land(book: &mut TransferBook, t: u64) {
+    book.claim(t, "doc-t", T0());
+    book.answer(t, true, "doc-t", T0());
+    let store = FakeStore::default();
+    assert_eq!(
+      book.committed(t, "doc-t", &meta(), &store).0,
+      CommitResult::Accepted
+    );
+  }
+  fn tears(actions: &[Action]) -> Vec<TearAction> {
+    actions
+      .iter()
+      .filter_map(|action| match action {
+        Action::Tear(tear) => Some(tear.clone()),
+        _ => None,
+      })
+      .collect()
+  }
+  fn over(label: &str) -> Hit {
+    Hit::Doc {
+      label: label.to_string(),
+      offset: pt(40.0, 10.0),
+    }
+  }
+  fn send_to(to: &str, offset: Point) -> TearAction {
+    TearAction::EmitSend {
+      label: "doc-t".to_string(),
+      note: "n".to_string(),
+      to: to.to_string(),
+      offset,
+    }
+  }
+  fn end_of_drag() -> TearAction {
+    TearAction::EmitEnd {
+      label: "doc-a".to_string(),
+      id: "drag".to_string(),
+    }
+  }
+  fn shown() -> Vec<TearAction> {
+    vec![
+      TearAction::Reveal {
+        label: "doc-t".to_string(),
+      },
+      TearAction::EmitRoleEnd {
+        label: "doc-t".to_string(),
+      },
+    ]
+  }
+  fn begin_from(book: &mut TransferBook, sender: &str, note: &str, to: &str) -> Begin {
+    let ready = |_: &str| true;
+    book
+      .begin(sender, tab(note), existing(to), T0(), &ctx(false, &ready))
+      .unwrap()
+  }
+
+  #[test]
+  fn a_tear_off_books_a_window_of_its_own_and_starts_the_follow() {
+    let mut book = torn_book();
+    let (t, generation) = tear_off(&mut book, "n");
+    assert!(book.tear.busy());
+    assert!(book.tear.follows(t));
+    assert_eq!(book.tear.generation(), Some(generation));
+    // A new window: thirty seconds to claim, and the same ownership rules.
+    assert_eq!(book.status(t, "doc-a"), Status::Pending);
+    let plan = book.tear.plan_step(generation, false).unwrap();
+    assert_eq!(plan.following, "doc-t");
+  }
+
+  #[test]
+  fn a_second_tear_off_a_full_screen_sender_and_a_window_that_leads_take_nothing() {
+    let mut book = torn_book();
+    tear_off(&mut book, "n");
+    let ready = |_: &str| true;
+    let target = || Target::TearOff {
+      label: "doc-u".to_string(),
+      spec: tear_spec("two"),
+    };
+    // A follow exists.
+    assert_eq!(
+      book
+        .begin("doc-x", tab("m"), target(), T0(), &ctx(false, &ready))
+        .unwrap(),
+      Begin::Refused(Refusal::NotReady)
+    );
+    // A tab cannot go to the window that follows, nor to the one it came from.
+    for to in ["doc-t", "doc-a"] {
+      assert_eq!(
+        begin_from(&mut book, "doc-x", "m", to),
+        Begin::Refused(Refusal::NotReady),
+        "{to}"
+      );
+    }
+    // A sender that may not tear is refused with no follow at all.
+    let mut other = TransferBook::default();
+    let full_screen = BeginContext {
+      quitting: false,
+      ready: &ready,
+      tearoff_ok: false,
+    };
+    assert_eq!(
+      other
+        .begin("doc-a", tab("n"), target(), T0(), &full_screen)
+        .unwrap(),
+      Begin::Refused(Refusal::NotReady)
+    );
+    assert!(!other.tear.busy());
+    assert_eq!(other.len(), 0);
+  }
+
+  #[test]
+  fn a_window_with_a_release_waiting_takes_nothing_either() {
+    let mut book = torn_book();
+    let (t, generation) = tear_off(&mut book, "n");
+    book.finish_step(generation, false, &over("doc-b"), false);
+    assert!(book.tear.holds("doc-t"));
+    assert_eq!(
+      begin_from(&mut book, "doc-x", "m", "doc-t"),
+      Begin::Refused(Refusal::NotReady)
+    );
+    land(&mut book, t);
+    book.released(t, "doc-a");
+    assert!(!book.tear.holds("doc-t"));
+  }
+
+  #[test]
+  fn a_release_after_the_first_transfer_ended_sends_at_once_and_the_send_can_begin() {
+    let mut book = torn_book();
+    let (t, generation) = tear_off(&mut book, "n");
+    land(&mut book, t);
+    assert!(book.released(t, "doc-a").is_empty());
+    let actions = book.finish_step(generation, false, &over("doc-b"), false);
+    assert_eq!(
+      tears(&actions),
+      vec![end_of_drag(), send_to("doc-b", pt(40.0, 10.0))]
+    );
+    // The note is free again: the tear-off begins the send.
+    assert!(matches!(
+      begin_from(&mut book, "doc-t", "n", "doc-b"),
+      Begin::Started { .. }
+    ));
+  }
+
+  #[test]
+  fn the_same_ending_elsewhere_shows_the_tear_off_and_ends_its_role() {
+    let mut book = torn_book();
+    let (t, generation) = tear_off(&mut book, "n");
+    land(&mut book, t);
+    book.released(t, "doc-a");
+    let actions = book.finish_step(generation, false, &Hit::Outside, false);
+    let mut want = vec![end_of_drag()];
+    want.extend(shown());
+    assert_eq!(tears(&actions), want);
+  }
+
+  #[test]
+  fn a_release_before_the_first_transfer_ended_sends_only_when_it_has() {
+    let mut book = torn_book();
+    let (t, generation) = tear_off(&mut book, "n");
+    land(&mut book, t);
+    // The button goes up over doc-b's bar while the sender has not let go yet.
+    let actions = book.finish_step(generation, false, &over("doc-b"), false);
+    assert_eq!(
+      tears(&actions),
+      vec![
+        end_of_drag(),
+        TearAction::ArmOverdue {
+          t,
+          after: EXISTING_WINDOW_TIMEOUT
+        }
+      ]
+    );
+    // The note is still the first transfer's: a begin now is busy.
+    assert_eq!(
+      begin_from(&mut book, "doc-t", "n", "doc-b"),
+      Begin::Refused(Refusal::Busy)
+    );
+    let sent = book.released(t, "doc-a");
+    assert_eq!(tears(&sent), vec![send_to("doc-b", pt(40.0, 10.0))]);
+    assert!(matches!(
+      begin_from(&mut book, "doc-t", "n", "doc-b"),
+      Begin::Started { .. }
+    ));
+  }
+
+  #[test]
+  fn over_the_senders_bar_it_is_the_same_and_elsewhere_it_is_a_reveal_at_released() {
+    let mut book = torn_book();
+    let (t, generation) = tear_off(&mut book, "n");
+    land(&mut book, t);
+    book.finish_step(generation, false, &over("doc-a"), false);
+    let sent = book.released(t, "doc-a");
+    assert_eq!(tears(&sent), vec![send_to("doc-a", pt(40.0, 10.0))]);
+    let mut book = torn_book();
+    let (t, generation) = tear_off(&mut book, "n");
+    land(&mut book, t);
+    book.finish_step(generation, false, &Hit::Outside, false);
+    assert_eq!(tears(&book.released(t, "doc-a")), shown());
+  }
+
+  #[test]
+  fn a_release_that_waited_too_long_only_reveals_and_a_live_follow_is_left_alone() {
+    let mut book = torn_book();
+    let (t, generation) = tear_off(&mut book, "n");
+    land(&mut book, t);
+    // The follow is live: the timer does nothing.
+    assert!(book.record_overdue(t).is_empty());
+    book.finish_step(generation, false, &over("doc-b"), false);
+    assert_eq!(tears(&book.record_overdue(t)), shown());
+    // Never a send, even when `released` comes late.
+    assert!(book.released(t, "doc-a").is_empty());
+  }
+
+  #[test]
+  fn a_first_transfer_called_off_drops_the_release_and_the_follow_and_sends_nothing() {
+    for off in 0..4 {
+      let mut book = torn_book();
+      let (t, generation) = tear_off(&mut book, "n");
+      book.finish_step(generation, true, &over("doc-b"), false);
+      let actions = match off {
+        0 => book.expire(t, T0() + Duration::from_secs(31)),
+        1 => {
+          book.claim(t, "doc-t", T0());
+          book.answer(t, false, "doc-t", T0()).1
+        }
+        2 => book.cancel(t, "doc-a").1,
+        _ => book.quit_call_off(),
+      };
+      let tear = tears(&actions);
+      assert!(tear.contains(&end_of_drag()), "{off}");
+      assert!(
+        tear.contains(&TearAction::HoverEnd {
+          label: "doc-b".to_string()
+        }),
+        "{off}"
+      );
+      assert!(!tear
+        .iter()
+        .any(|a| matches!(a, TearAction::EmitSend { .. } | TearAction::Reveal { .. })));
+      assert!(!book.tear.busy());
+      assert_eq!(book.status(t, "doc-a"), Status::Gone);
+    }
+  }
+
+  #[test]
+  fn a_failed_store_write_calls_the_first_transfer_off_with_its_follow() {
+    let mut book = torn_book();
+    let (t, _) = tear_off(&mut book, "n");
+    book.claim(t, "doc-t", T0());
+    book.answer(t, true, "doc-t", T0());
+    let store = FakeStore {
+      fail: true,
+      ..FakeStore::default()
+    };
+    let (result, actions) = book.committed(t, "doc-t", &meta(), &store);
+    assert_eq!(result, CommitResult::Rejected);
+    assert!(tears(&actions).contains(&end_of_drag()));
+    assert!(!book.tear.busy());
+  }
+
+  #[test]
+  fn a_release_recorded_before_the_first_transfer_is_called_off_is_dropped() {
+    let mut book = torn_book();
+    let (t, generation) = tear_off(&mut book, "n");
+    book.finish_step(generation, false, &over("doc-b"), false);
+    assert!(book.tear.holds("doc-t"));
+    book.cancel(t, "doc-a");
+    assert!(!book.tear.holds("doc-t"));
+    assert!(book.record_overdue(t).is_empty());
+  }
+
+  #[test]
+  fn esc_before_the_tab_is_in_the_tear_off_calls_the_transfer_off() {
+    let mut book = torn_book();
+    let (t, _) = tear_off(&mut book, "n");
+    let actions = book.tearoff_cancel("drag", "doc-a", false);
+    let tear = tears(&actions);
+    assert_eq!(tear, vec![end_of_drag()]);
+    assert!(actions.contains(&Action::EmitCancel {
+      label: "doc-a".to_string(),
+      t
+    }));
+    assert!(actions.contains(&Action::Destroy {
+      label: "doc-t".to_string()
+    }));
+    assert_eq!(book.status(t, "doc-a"), Status::Gone);
+  }
+
+  #[test]
+  fn esc_after_the_tab_is_in_goes_back_to_the_sender_at_the_slot_it_left() {
+    // macOS: the CSS offset; Windows: times the sender's ratio (2.0).
+    for (windows, want) in [(false, pt(101.0, 15.0)), (true, pt(202.0, 30.0))] {
+      let mut book = torn_book();
+      let (t, _) = tear_off(&mut book, "n");
+      land(&mut book, t);
+      book.released(t, "doc-a");
+      let actions = book.tearoff_cancel("drag", "doc-a", windows);
+      assert_eq!(
+        tears(&actions),
+        vec![end_of_drag(), send_to("doc-a", want)],
+        "{windows}"
+      );
+    }
+    // Before `released` it waits for it.
+    let mut book = torn_book();
+    let (t, _) = tear_off(&mut book, "n");
+    land(&mut book, t);
+    let actions = book.tearoff_cancel("drag", "doc-a", false);
+    assert!(!tears(&actions)
+      .iter()
+      .any(|a| matches!(a, TearAction::EmitSend { .. })));
+    assert_eq!(
+      tears(&book.released(t, "doc-a")),
+      vec![send_to("doc-a", pt(101.0, 15.0))]
+    );
+  }
+
+  #[test]
+  fn esc_with_an_old_id_or_from_another_window_does_nothing() {
+    let mut book = torn_book();
+    tear_off(&mut book, "n");
+    assert!(book.tearoff_cancel("old", "doc-a", false).is_empty());
+    assert!(book.tearoff_cancel("drag", "doc-t", false).is_empty());
+    assert!(book.tear.busy());
+  }
+
+  #[test]
+  fn a_sender_that_closes_while_the_tab_is_on_its_way_cancels_and_destroys_the_tear_off() {
+    let mut book = torn_book();
+    let (t, _) = tear_off(&mut book, "n");
+    let (_, actions) = book.settle_window("doc-a");
+    assert!(actions.contains(&Action::Destroy {
+      label: "doc-t".to_string()
+    }));
+    assert!(tears(&actions).contains(&end_of_drag()));
+    assert!(!book.tear.busy());
+    assert_eq!(book.status(t, "doc-a"), Status::Gone);
+    // Claimed, the same.
+    let mut book = torn_book();
+    let (t, _) = tear_off(&mut book, "n");
+    book.claim(t, "doc-t", T0());
+    let actions = book.window_gone("doc-a");
+    assert!(actions.contains(&Action::Destroy {
+      label: "doc-t".to_string()
+    }));
+    assert!(!book.tear.busy());
+  }
+
+  #[test]
+  fn a_sender_gone_while_the_receiver_commits_keeps_the_tear_off_and_shows_it_at_the_commit() {
+    let mut book = torn_book();
+    let (t, generation) = tear_off(&mut book, "n");
+    book.claim(t, "doc-t", T0());
+    book.answer(t, true, "doc-t", T0());
+    let gone = book.window_gone("doc-a");
+    assert!(!gone.iter().any(|a| matches!(a, Action::Destroy { .. })));
+    assert!(!book.tear.busy());
+    // The follow ended: a step of it does nothing.
+    assert!(book
+      .finish_step(generation, false, &Hit::Outside, false)
+      .is_empty());
+    let store = FakeStore::default();
+    let (result, actions) = book.committed(t, "doc-t", &meta(), &store);
+    assert_eq!(result, CommitResult::Accepted);
+    assert_eq!(tears(&actions), shown());
+    assert_eq!(book.len(), 0);
+  }
+
+  #[test]
+  fn a_sender_that_goes_after_the_tab_is_in_shows_the_tear_off_and_never_sends() {
+    // The loop is live, and with each kind of record waiting.
+    for stage in 0..3 {
+      let mut book = torn_book();
+      let (t, generation) = tear_off(&mut book, "n");
+      land(&mut book, t);
+      match stage {
+        1 => {
+          book.finish_step(generation, false, &over("doc-b"), false);
+        }
+        2 => {
+          book.finish_step(generation, false, &Hit::Outside, false);
+        }
+        _ => {}
+      }
+      let actions = book.window_gone("doc-a");
+      let tear = tears(&actions);
+      assert!(tear.ends_with(&shown()), "{stage}");
+      assert!(!tear
+        .iter()
+        .any(|a| matches!(a, TearAction::EmitSend { .. })));
+      assert!(!book.tear.busy());
+      assert!(book.record_overdue(t).is_empty());
+    }
+  }
+
+  #[test]
+  fn a_sender_that_closes_after_the_tab_is_in_shows_the_tear_off_when_it_lets_go() {
+    let mut book = torn_book();
+    let (t, generation) = tear_off(&mut book, "n");
+    land(&mut book, t);
+    book.finish_step(generation, false, &over("doc-b"), false);
+    let (settled, actions) = book.settle_window("doc-a");
+    assert_eq!(
+      settled,
+      vec![SettleAction::Release {
+        t,
+        note_id: "n".to_string()
+      }]
+    );
+    assert!(!tears(&actions)
+      .iter()
+      .any(|a| matches!(a, TearAction::Reveal { .. } | TearAction::EmitSend { .. })));
+    // The sender's `released` removes the entry and the tear-off is shown.
+    assert_eq!(tears(&book.released(t, "doc-a")), shown());
+  }
+
+  #[test]
+  fn nothing_is_shown_while_a_quit_is_under_way_and_a_quit_called_off_shows_the_tear_off() {
+    let mut book = torn_book();
+    let (t, _) = tear_off(&mut book, "n");
+    land(&mut book, t);
+    let quit = book.quit_call_off();
+    assert!(tears(&quit).contains(&end_of_drag()));
+    assert!(!tears(&book.window_gone("doc-a"))
+      .iter()
+      .any(|a| matches!(a, TearAction::Reveal { .. })));
+    assert_eq!(tears(&book.quit_cancelled()), shown());
+  }
+
+  #[test]
+  fn a_tear_off_that_goes_leaves_no_send_or_reveal_aimed_at_it() {
+    let mut book = torn_book();
+    let (t, generation) = tear_off(&mut book, "n");
+    land(&mut book, t);
+    book.finish_step(generation, false, &over("doc-b"), false);
+    let (_, actions) = book.settle_window("doc-t");
+    assert!(!tears(&actions)
+      .iter()
+      .any(|a| matches!(a, TearAction::Reveal { .. } | TearAction::EmitSend { .. })));
+    assert!(book.record_overdue(t).is_empty());
+    assert!(book.released(t, "doc-a").is_empty());
+    // Gone, with the loop live.
+    let mut book = torn_book();
+    let (t, _) = tear_off(&mut book, "n");
+    land(&mut book, t);
+    let actions = book.window_gone("doc-t");
+    assert!(tears(&actions).contains(&end_of_drag()));
+    assert!(!book.tear.busy());
+  }
+
+  #[test]
+  fn a_moving_window_whose_sender_closes_or_goes_does_not_move_again() {
+    for closing in [true, false] {
+      let mut book = torn_book();
+      let generation = book
+        .tear
+        .start_move(
+          &tear_spec("drag"),
+          "doc-a",
+          "n",
+          pt(1.0, 1.0),
+          true,
+          pt(5.0, 6.0),
+          20.0,
+        )
+        .unwrap();
+      let actions = if closing {
+        book.settle_window("doc-a").1
+      } else {
+        book.window_gone("doc-a")
+      };
+      assert!(!tears(&actions)
+        .iter()
+        .any(|a| matches!(a, TearAction::MoveTo { .. } | TearAction::EmitSend { .. })));
+      assert!(!book.tear.busy());
+      assert!(book
+        .finish_step(generation, false, &over("doc-b"), false)
+        .is_empty());
+    }
+  }
+
+  #[test]
+  fn every_end_of_a_follow_tells_the_hovered_window_and_the_sender() {
+    let mut book = torn_book();
+    let (_, generation) = tear_off(&mut book, "n");
+    book.finish_step(generation, true, &over("doc-b"), false);
+    let actions = book.tearoff_cancel("drag", "doc-a", false);
+    let tear = tears(&actions);
+    assert!(tear.contains(&end_of_drag()));
+    assert!(tear.contains(&TearAction::HoverEnd {
+      label: "doc-b".to_string()
+    }));
+  }
+
+  #[test]
+  fn the_hover_of_the_loop_carries_the_width_of_the_dragged_tab() {
+    let mut book = torn_book();
+    let (_, generation) = tear_off(&mut book, "n");
+    let actions = book.finish_step(generation, true, &over("doc-b"), false);
+    assert_eq!(
+      tears(&actions),
+      vec![TearAction::Hover {
+        label: "doc-b".to_string(),
+        x: 40.0,
+        y: 10.0,
+        width: 90.0,
+        follow: HoverFollow {
+          generation,
+          title: "a.txt".to_string(),
+          grab_x: 20.0
+        }
+      }]
+    );
+  }
+
+  #[test]
+  fn a_moving_window_sends_its_only_tab_to_the_bar_it_is_released_over() {
+    let mut book = torn_book();
+    let generation = book
+      .tear
+      .start_move(
+        &tear_spec("drag"),
+        "doc-a",
+        "n",
+        pt(1.0, 1.0),
+        false,
+        pt(5.0, 6.0),
+        20.0,
+      )
+      .unwrap();
+    let actions = book.finish_step(generation, false, &over("doc-b"), false);
+    assert_eq!(
+      tears(&actions),
+      vec![
+        end_of_drag(),
+        TearAction::EmitSend {
+          label: "doc-a".to_string(),
+          note: "n".to_string(),
+          to: "doc-b".to_string(),
+          offset: pt(40.0, 10.0)
+        }
+      ]
+    );
+  }
+
+  #[test]
+  fn esc_puts_a_moving_window_back_through_the_book() {
+    let mut book = torn_book();
+    book
+      .tear
+      .start_move(
+        &tear_spec("drag"),
+        "doc-a",
+        "n",
+        pt(1.0, 1.0),
+        true,
+        pt(5.0, 6.0),
+        20.0,
+      )
+      .unwrap();
+    let actions = book.tearoff_cancel("drag", "doc-a", false);
+    assert!(tears(&actions).contains(&TearAction::MoveTo {
+      label: "doc-a".to_string(),
+      point: pt(5.0, 6.0),
+      remaximize: true
+    }));
+  }
+
+  #[test]
+  fn a_tear_off_that_could_not_be_opened_leaves_no_follow_and_no_word() {
+    let mut book = torn_book();
+    let (t, generation) = tear_off(&mut book, "n");
+    let actions = book.abort_tearoff(t, "doc-a");
+    assert!(!tears(&actions)
+      .iter()
+      .any(|a| matches!(a, TearAction::EmitEnd { .. })));
+    assert!(!book.tear.busy());
+    assert!(book
+      .finish_step(generation, false, &Hit::Outside, false)
+      .is_empty());
+    assert_eq!(book.status(t, "doc-a"), Status::Gone);
+  }
+
+  #[test]
+  fn the_tear_off_target_is_a_new_window_target_with_its_spec() {
+    let target = DropTarget::TearOff(tear_spec("drag"));
+    assert_eq!(
+      Target::from_drop(&target, || "doc-t".to_string()),
+      Ok(Target::TearOff {
+        label: "doc-t".to_string(),
+        spec: tear_spec("drag")
+      })
+    );
+  }
+  // The same literal is pinned by `src/lib/util/tabTransferWire.test.ts`.
+  const DROP_TEAR: &str = r#"{"kind":"tear_off","id":"drag-1","grab":{"x":20.5,"y":14.25},"firstTabClientX":4.5,"escOffset":{"x":101.5,"y":15.25},"dpr":2.0,"width":90.5,"title":"a.txt"}"#;
+  const HOVER_FOLLOW_EVENT: &str =
+    r#"{"x":10.5,"y":20.0,"width":90.0,"follow":{"generation":3,"title":"a.txt","grabX":20.5}}"#;
+  const SEND_EVENT: &str =
+    r#"{"note":"n","target":{"kind":"doc","label":"doc-b","offset":{"x":40.5,"y":10.25}}}"#;
+  const END_EVENT: &str = r#"{"id":"drag-1"}"#;
+  const ROLE_END_EVENT: &str = r#"{"id":null}"#;
+
+  #[test]
+  fn the_tear_off_wire_types_serialize_to_exactly_the_json_the_frontend_reads() {
+    let target = DropTarget::TearOff(TearSpec {
+      id: "drag-1".to_string(),
+      grab: pt(20.5, 14.25),
+      first_tab_client_x: 4.5,
+      esc_offset: pt(101.5, 15.25),
+      dpr: 2.0,
+      width: 90.5,
+      title: "a.txt".to_string(),
+    });
+    assert_eq!(json_of(&target), DROP_TEAR);
+    let back: DropTarget = serde_json::from_str(DROP_TEAR).unwrap();
+    assert_eq!(back, target);
+    assert!(Target::from_drop(&back, || "doc-x".to_string()).is_ok());
+    assert_eq!(
+      json_of(&SendEvent {
+        note: "n".to_string(),
+        target: DropTarget::Doc {
+          label: "doc-b".to_string(),
+          offset: pt(40.5, 10.25)
+        }
+      }),
+      SEND_EVENT
+    );
+    assert_eq!(
+      json_of(&EndEvent {
+        id: Some("drag-1".to_string())
+      }),
+      END_EVENT
+    );
+    assert_eq!(json_of(&EndEvent { id: None }), ROLE_END_EVENT);
+  }
+
+  #[test]
+  fn the_tear_off_commands_check_the_calling_window_and_are_registered() {
+    let source = include_str!("tab_transfer.rs");
+    for name in [
+      "report_tab_bar",
+      "tab_window_follow_start",
+      "tab_tearoff_cancel",
+      "tab_tearoff_release_seen",
+      "tab_tearoff_close_vetoed",
+      "tab_hover_ack",
+      "tab_window_restore",
+    ] {
+      let at = source.find(&format!("pub fn {name}")).unwrap();
+      let signature = &source[at..];
+      let signature = &signature[..signature.find(") ").unwrap()];
+      assert!(signature.contains("window: tauri::WebviewWindow"), "{name}");
+    }
+    // Only the sender's own window can call off or end the drag.
+    let at = source.find("pub fn tab_tearoff_cancel").unwrap();
+    let body = &source[at..source[at..].find("\n}\n").unwrap() + at];
+    assert!(body.contains("window.label()"));
+  }
+
+  #[test]
+  fn the_release_seen_command_only_marks_it_and_never_reads_the_pointer() {
+    let source = include_str!("tab_transfer.rs");
+    let at = source.find("pub fn tab_tearoff_release_seen").unwrap();
+    let body = &source[at..source[at..].find("\n}\n").unwrap() + at];
+    assert!(body.contains(".release_seen("));
+    for forbidden in [
+      "locate",
+      "sample",
+      "cursor",
+      "mouseLocation",
+      "GetCursorPos",
+    ] {
+      assert!(!body.contains(forbidden), "{forbidden}");
+    }
+  }
+
+  #[test]
+  fn the_retained_hover_and_drop_commands_still_hit_test_on_their_own() {
+    let source = include_str!("tab_transfer.rs");
+    let at = source.find("pub fn tab_drag_hover(").unwrap();
+    let body = &source[at..source[at..].find("\n}\n").unwrap() + at];
+    assert!(body.contains("tab_drop_target("));
+    assert!(body.contains("is_sender(window.label())"));
+    let at = source.find("pub fn tab_drop_target(").unwrap();
+    let body = &source[at..source[at..].find("\n}\n").unwrap() + at];
+    assert!(body.contains("window_at::locate("));
+  }
+
+  #[test]
+  fn a_role_that_ended_before_the_page_announced_itself_is_remembered_for_its_ready_call() {
+    let mut book = torn_book();
+    let (t, generation) = tear_off(&mut book, "n");
+    // The pointer is released before the tear-off has claimed, and `released`
+    // never comes: the record runs out and the tear-off is shown, unclaimed.
+    book.finish_step(generation, false, &over("doc-b"), false);
+    assert!(!book.tear.role_state("doc-t").ended);
+    assert_eq!(tears(&book.record_overdue(t)), shown());
+    let role = book.tear.role_state("doc-t");
+    assert!(role.ended);
+    // The core shows the window itself only when the app is active.
+    assert!(!role.revealed);
+    book.tear.mark_revealed("doc-t");
+    assert!(book.tear.role_state("doc-t").revealed);
+    // The transfer is still the page's to claim.
+    assert!(book.claim(t, "doc-t", T0()).0.is_some());
+  }
+
+  fn show_of(label: &str) -> TearAction {
+    TearAction::Show {
+      label: label.to_string(),
+    }
+  }
+  /// The follow of `generation` hovers `label`, which took the tab: the follower
+  /// is hidden.
+  fn hide_over(book: &mut TransferBook, generation: u64, label: &str) {
+    book.finish_step(generation, true, &over(label), false);
+    book.tear.hover_ack(label, generation, true);
+    let actions = book.finish_step(generation, true, &over(label), false);
+    assert!(tears(&actions)
+      .iter()
+      .any(|a| matches!(a, TearAction::Hide { .. })));
+  }
+  /// doc-a, whose only tab is `n`, moves with the pointer: the follow's generation.
+  fn move_off(book: &mut TransferBook) -> u64 {
+    book
+      .tear
+      .start_move(
+        &tear_spec("drag"),
+        "doc-a",
+        "n",
+        pt(1.0, 1.0),
+        false,
+        pt(5.0, 6.0),
+        20.0,
+      )
+      .unwrap()
+  }
+  fn shows(actions: &[Action], label: &str) -> usize {
+    tears(actions)
+      .iter()
+      .filter(|a| **a == show_of(label))
+      .count()
+  }
+
+  #[test]
+  fn a_moving_window_that_merged_is_shown_again_when_its_close_or_quit_is_called_off() {
+    // (a) A close that is called off.
+    let mut book = torn_book();
+    let g = move_off(&mut book);
+    hide_over(&mut book, g, "doc-b");
+    book.finish_step(g, false, &over("doc-b"), false);
+    let (_, closing) = book.settle_window("doc-a");
+    assert_eq!(shows(&closing, "doc-a"), 0);
+    assert_eq!(shows(&book.close_vetoed("doc-a"), "doc-a"), 1);
+    assert_eq!(shows(&book.close_vetoed("doc-a"), "doc-a"), 0);
+    // (b) A quit that is called off.
+    let mut book = torn_book();
+    let g = move_off(&mut book);
+    hide_over(&mut book, g, "doc-b");
+    book.finish_step(g, false, &over("doc-b"), false);
+    assert_eq!(shows(&book.quit_call_off(), "doc-a"), 0);
+    book.settle_window("doc-a");
+    assert_eq!(shows(&book.quit_cancelled(), "doc-a"), 1);
+  }
+
+  #[test]
+  fn a_tear_off_that_merged_is_shown_again_when_its_close_or_quit_is_called_off() {
+    // (c) The role ended by the send, then a close that is called off.
+    let mut book = torn_book();
+    let (t, g) = tear_off(&mut book, "n");
+    land(&mut book, t);
+    book.released(t, "doc-a");
+    hide_over(&mut book, g, "doc-b");
+    let released = book.finish_step(g, false, &over("doc-b"), false);
+    assert!(tears(&released)
+      .iter()
+      .any(|a| matches!(a, TearAction::EmitSend { .. })));
+    assert_eq!(shows(&released, "doc-t"), 0);
+    book.settle_window("doc-t");
+    assert_eq!(shows(&book.close_vetoed("doc-t"), "doc-t"), 1);
+    // The same with a quit that is called off.
+    let mut book = torn_book();
+    let (t, g) = tear_off(&mut book, "n");
+    land(&mut book, t);
+    book.released(t, "doc-a");
+    hide_over(&mut book, g, "doc-b");
+    book.finish_step(g, false, &over("doc-b"), false);
+    book.quit_call_off();
+    book.settle_window("doc-t");
+    assert_eq!(shows(&book.quit_cancelled(), "doc-t"), 1);
+  }
+
+  #[test]
+  fn a_hidden_tear_off_is_shown_before_every_reveal() {
+    // A release that waited too long.
+    let mut book = torn_book();
+    let (t, g) = tear_off(&mut book, "n");
+    land(&mut book, t);
+    hide_over(&mut book, g, "doc-b");
+    let release = book.finish_step(g, false, &over("doc-b"), false);
+    assert_eq!(shows(&release, "doc-t"), 0);
+    let late = tears(&book.record_overdue(t));
+    assert_eq!(late.first(), Some(&show_of("doc-t")));
+    assert_eq!(&late[1..], &shown()[..]);
+    // The sender goes after the tab is in.
+    let mut book = torn_book();
+    let (t, g) = tear_off(&mut book, "n");
+    land(&mut book, t);
+    hide_over(&mut book, g, "doc-b");
+    let gone = tears(&book.window_gone("doc-a"));
+    let at = gone.iter().position(|a| *a == show_of("doc-t")).unwrap();
+    assert!(at < gone.len() - shown().len());
+    assert!(gone.ends_with(&shown()));
+    // A quit that is called off, after a release that waits.
+    let mut book = torn_book();
+    let (t, g) = tear_off(&mut book, "n");
+    land(&mut book, t);
+    hide_over(&mut book, g, "doc-b");
+    book.finish_step(g, false, &over("doc-b"), false);
+    book.quit_call_off();
+    let again = tears(&book.quit_cancelled());
+    assert_eq!(again.first(), Some(&show_of("doc-t")));
+    assert!(again.ends_with(&shown()));
+    // A close that is called off, with the follow still live.
+    let mut book = torn_book();
+    let (t, g) = tear_off(&mut book, "n");
+    land(&mut book, t);
+    hide_over(&mut book, g, "doc-b");
+    let (_, closing) = book.settle_window("doc-t");
+    assert_eq!(shows(&closing, "doc-t"), 1);
+    let vetoed = tears(&book.close_vetoed("doc-t"));
+    assert!(vetoed.ends_with(&shown()));
+  }
+
+  #[test]
+  fn a_hidden_tear_off_whose_first_transfer_is_called_off_is_shown_first() {
+    let mut book = torn_book();
+    let (t, g) = tear_off(&mut book, "n");
+    hide_over(&mut book, g, "doc-b");
+    let actions = book.cancel(t, "doc-a").1;
+    assert_eq!(shows(&actions, "doc-t"), 1);
+    assert!(book.tear.generation().is_none());
+  }
+
+  #[test]
+  fn a_hidden_follower_is_shown_at_the_end_of_a_release_that_goes_elsewhere() {
+    let mut book = torn_book();
+    let (t, g) = tear_off(&mut book, "n");
+    land(&mut book, t);
+    book.released(t, "doc-a");
+    hide_over(&mut book, g, "doc-b");
+    let actions = book.finish_step(g, false, &Hit::Outside, false);
+    let tear = tears(&actions);
+    let shown_at = tear.iter().position(|a| *a == show_of("doc-t")).unwrap();
+    let reveal_at = tear
+      .iter()
+      .position(|a| matches!(a, TearAction::Reveal { .. }))
+      .unwrap();
+    assert!(shown_at < reveal_at);
+  }
+
+  #[test]
+  fn a_quit_that_is_called_off_is_told_to_the_transfers() {
+    let source = include_str!("lib.rs");
+    let at = source.find("pub(crate) fn flush_then_exit").unwrap();
+    let body = &source[at..];
+    let body = &body[..body.find("\n}\n").unwrap()];
+    let cancelled = body.find("FlushOutcome::Cancelled").unwrap();
+    assert!(body[cancelled..].contains("tab_transfer::quit_cancelled(&app)"));
+  }
+
+  #[test]
+  fn a_quit_that_is_called_off_shows_a_tear_off_that_closed_for_it() {
+    let mut book = torn_book();
+    let (t, _) = tear_off(&mut book, "n");
+    land(&mut book, t);
+    book.quit_call_off();
+    book.settle_window("doc-a");
+    book.settle_window("doc-t");
+    assert!(tears(&book.released(t, "doc-a")).is_empty());
+    assert_eq!(tears(&book.quit_cancelled()), shown());
+  }
+
+  #[test]
+  fn a_close_that_is_called_off_shows_the_tear_off_and_a_closing_one_shows_nothing() {
+    let mut book = torn_book();
+    let (t, generation) = tear_off(&mut book, "n");
+    land(&mut book, t);
+    book.settle_window("doc-t");
+    // Neither the end of the first transfer nor a release shows or sends to it.
+    assert!(tears(&book.released(t, "doc-a")).is_empty());
+    assert!(
+      !tears(&book.finish_step(generation, false, &Hit::Outside, false))
+        .iter()
+        .any(|a| matches!(a, TearAction::Reveal { .. } | TearAction::EmitSend { .. }))
+    );
+    assert_eq!(tears(&book.close_vetoed("doc-t")), shown());
+    // Not for a window that is not in its role.
+    assert!(book.close_vetoed("doc-t").is_empty());
+    assert!(book.close_vetoed("doc-x").is_empty());
+  }
+
+  #[test]
+  fn a_tear_off_that_is_gone_after_it_closed_loses_its_role_for_good() {
+    let mut book = torn_book();
+    let (t, _) = tear_off(&mut book, "n");
+    land(&mut book, t);
+    book.settle_window("doc-t");
+    book.window_gone("doc-t");
+    assert!(book.quit_cancelled().is_empty());
+    assert!(book.close_vetoed("doc-t").is_empty());
+    assert!(!book.tear.role_state("doc-t").ended);
   }
 }

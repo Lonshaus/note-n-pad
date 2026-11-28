@@ -413,6 +413,8 @@ GHOST="$WORK/no-such-file.md"
 rm -f "$GHOST"
 open_window "$GHOST" || true
 if [ -n "${DL:-}" ]; then
+  # The report is drawn after the window answers: wait for it, then assert.
+  e2e_wait_eval "$DL" "String(document.querySelectorAll('.modal').length)" "1" || true
   check "the failed open is reported" \
     "$(e2e_read "$DL" "String(document.querySelectorAll('.modal').length)")" "1"
   check "the report offers one button, not a choice" \

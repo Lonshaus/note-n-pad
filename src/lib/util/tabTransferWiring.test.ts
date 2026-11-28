@@ -334,3 +334,270 @@ describe('the dialogs', () => {
     ).toContain('this.closingNow = true');
   });
 });
+
+const main = read('..', 'main.ts');
+const reveal = read('util', 'reveal.ts');
+
+describe('a tab torn off its bar', () => {
+  it('never selects text: the press is prevented before the lock guard', () => {
+    const down = body(
+      app,
+      'function onTabPointerDown(e: PointerEvent, index: number): void {',
+    );
+    const prevented = down.indexOf(
+      'if (e.button === 0) {\n      e.preventDefault();',
+    );
+    expect(prevented).toBeGreaterThan(-1);
+    expect(prevented).toBeLessThan(down.indexOf('documentWindow.dragLocked()'));
+    // The range box keeps its own branch.
+    expect(down).toContain('if (keepsBoxFocus(rangeBoxOpen)) {');
+  });
+
+  it('leaves the pointer to the core once the tab is out: no move, no hover command', () => {
+    const move = body(
+      app,
+      'function onTabPointerMove(e: PointerEvent): void {',
+    );
+    expect(move.indexOf('if (isFollowing(dragState)) {')).toBeLessThan(
+      move.indexOf('feedDrag({'),
+    );
+    expect(move).not.toContain('tab_drag_hover');
+    const start = body(app, '  async function startTearOff(');
+    expect(start).not.toContain('tab_drag_hover');
+    // The hover command is sent from the frame handler only, which sends
+    // nothing for a drag that is not `dragging`.
+    expect([...app.matchAll(/invoke\('tab_drag_hover'/g)]).toHaveLength(1);
+    expect(body(app, 'function onHoverFrame(): void {')).toContain(
+      "dragging: dragState.phase === 'dragging',",
+    );
+  });
+
+  it('ends the page hover before the core is asked, and asks the one that fits', () => {
+    const start = body(app, '  async function startTearOff(');
+    const ended = start.indexOf('await endHover();');
+    expect(ended).toBeGreaterThan(-1);
+    expect(ended).toBeLessThan(start.indexOf('documentWindow.detachTab('));
+    expect(ended).toBeLessThan(start.indexOf('await followWindow('));
+    expect(start).toContain("kind === 'detach'");
+    expect(body(app, '  async function followWindow(')).toContain(
+      "'tab_window_follow_start'",
+    );
+    // A refusal puts the drag back, so the release behaves as it always did.
+    expect(start).toContain("feedDrag({ kind: 'notStarted' })");
+  });
+
+  it('holds Esc until the start has answered, then tells the core', () => {
+    const start = body(app, '  async function startTearOff(');
+    expect(start).toContain('() => pendingTearOffCancel');
+    expect(start.indexOf('tearOffStarted = true;')).toBeLessThan(
+      start.indexOf('sendTearOffCancel(id);'),
+    );
+    const dispatch = body(
+      app,
+      'function dispatchTearOffCancel(id: string): void {',
+    );
+    expect(dispatch).toContain('if (tearOffStarted) {');
+    expect(dispatch).toContain('pendingTearOffCancel = true;');
+    expect(
+      body(app, 'function sendTearOffCancel(id: string): void {'),
+    ).toContain("'tab_tearoff_cancel'");
+  });
+
+  it('tells the core the button went up and gives the range box its focus on every exit', () => {
+    const up = body(app, 'function onTabPointerUp(e: PointerEvent): void {');
+    expect(up).toContain("outcome?.kind === 'releaseSeen'");
+    expect(up).toContain("'tab_tearoff_release_seen'");
+    expect(up).toContain('(outcome !== null || following) && rangeBoxOpen');
+    const cancel = body(
+      app,
+      'function cancelDrag(reason: CancelReason): void {',
+    );
+    expect(cancel).toContain('(outcome !== null || following) && rangeBoxOpen');
+    expect(cancel).toContain('dispatchTearOffCancel(outcome.id)');
+    expect(body(app, 'function afterDragExit(): void {')).toContain(
+      'focusActiveEditor();',
+    );
+  });
+
+  it('takes its events with the other transfer listeners, before it announces itself', () => {
+    const batch = app.slice(
+      app.indexOf('const transferListeners = Promise.all(['),
+      app.indexOf(']).then((unlisten) => {'),
+    );
+    expect(batch).toContain('win.listen<SendPayload>(TEAROFF_EVENT.send');
+    expect(batch).toContain('documentWindow.onTransferSend(event.payload)');
+    expect(batch).toContain('win.listen<TearOffEndPayload>(TEAROFF_EVENT.end');
+    // The end of a tear-off's own role carries no id.
+    expect(batch).toContain('event.payload.id === null');
+    expect(batch).toContain('documentWindow.endTearOffRole()');
+    expect(batch).toContain('onTearOffEnd(event.payload.id)');
+    expect(app.indexOf('await announceReady();')).toBeGreaterThan(
+      app.indexOf('await transferListeners;'),
+    );
+  });
+
+  it('drains the queue of the new ready answer and applies a role that ended already', () => {
+    const ready = body(
+      app,
+      'const announceReady = async (): Promise<void> => {',
+    );
+    expect(ready).toContain("invoke<WindowReady>('doc_window_ready'");
+    expect(ready).toContain('for (const item of ready.queued) {');
+    expect(ready).toContain('item.kind === QUEUED_TRANSFER');
+    expect(ready).toContain('incomingTransfers.take(item.value)');
+    // The first transfer is the one the role lets through.
+    expect(
+      ready.indexOf('documentWindow.tearOffFirst = item.value;'),
+    ).toBeLessThan(ready.indexOf('incomingTransfers.take(item.value)'));
+    // A role the core ended before the page listened ends after the tab is in.
+    const late = ready.slice(
+      ready.indexOf('if (tearOff && ready.tearOffRoleEnded)'),
+    );
+    expect(late).toContain('documentWindow.endTearOffRole();');
+    expect(late).toContain('if (ready.revealed) {');
+    expect(late).toContain("invoke('reveal_self')");
+  });
+
+  it('stamps the theme before it mounts, loads its chrome and never shows itself while it waits', () => {
+    expect(
+      main.indexOf('stampTearOff(document.documentElement'),
+    ).toBeGreaterThan(-1);
+    expect(main.indexOf('stampTearOff(document.documentElement')).toBeLessThan(
+      main.indexOf('mount(Component'),
+    );
+    expect(app).toMatch(
+      /if \(!receive\) \{\s+void revealWhenThemed\(\);\s+\} else if \(tearOff\) \{\s+void loadChrome\(\);/,
+    );
+    expect(reveal).toContain('export async function loadChrome()');
+    // `reveal_self` is not in `loadChrome`, and the page asks for it in three
+    // places: the reveal host (which the role keeps from running), the window
+    // state's own reveal, and the late end of a role.
+    expect(body(reveal, 'export async function loadChrome()')).not.toContain(
+      'reveal_self',
+    );
+    expect([...app.matchAll(/invoke\('reveal_self'\)/g)]).toHaveLength(3);
+    expect(app).toContain('documentWindow.tearOffRole = tearOff;');
+  });
+
+  it('tells the core where its tab bar is: on mount, with its height, its size and its pixel ratio', () => {
+    expect(body(app, '  function reportTabBar(): void {')).toContain(
+      "invoke('report_tab_bar'",
+    );
+    const effect = app.slice(
+      app.indexOf('// On mount, and whenever the bar'),
+      app.indexOf('let dragState'),
+    );
+    expect(effect).toContain('void tabbarEl;');
+    expect(effect).toContain('void tabbarHeight;');
+    expect(effect).toContain('reportTabBar();');
+    expect(app).toContain("window.addEventListener('resize', onWindowResize);");
+    expect(app).toContain(
+      "window.removeEventListener('resize', onWindowResize);",
+    );
+    const resized = app.slice(
+      app.indexOf('const onWindowResize = (): void => {'),
+      app.indexOf('let ratioQuery'),
+    );
+    expect(resized).toContain('refreshFullscreen();');
+    expect(resized).toContain('reportTabBar();');
+    expect(app).toContain('`(resolution: ${window.devicePixelRatio}dppx)`');
+    expect(body(app, '    const onRatioChange = (): void => {')).toContain(
+      'reportTabBar();',
+    );
+  });
+
+  it('knows whether it is full screen and asks no tear-off of a touch or a pen', () => {
+    expect(app).toContain(
+      'canTearOff: canTearOff(dragPointerType, platform.os, fullscreen)',
+    );
+    expect(app).toContain('dragPointerType = e.pointerType;');
+  });
+});
+
+describe('a tab of another window that follows the pointer over this one', () => {
+  it('answers every hover of a follow with what the window takes now, accepted or not', () => {
+    const hover = body(app, 'function onHover(payload: HoverPayload): void {');
+    expect(hover).toContain('hoverAck(payload, ready, locked)');
+    const asked = hover.indexOf("invoke('tab_hover_ack', { ...ack })");
+    expect(asked).toBeGreaterThan(-1);
+    // The answer goes out before the window decides whether it draws anything.
+    expect(asked).toBeLessThan(
+      hover.indexOf('hoverAccepted({ ready, locked })'),
+    );
+    expect(hover.slice(0, asked)).not.toContain('return;');
+    expect(hover.slice(0, asked)).toContain('if (ack !== null) {');
+  });
+
+  it('draws the tab only for a hover that carries a follow, and removes it with the gap', () => {
+    const hover = body(app, 'function onHover(payload: HoverPayload): void {');
+    expect(hover).toContain('const follow = payload.follow;');
+    expect(hover).toMatch(/ghost:\s+follow === undefined\s+\? null/);
+    expect(hover).toContain(
+      'ghostLeft(gap.point, follow.grabX, gap.width, geometry.bar)',
+    );
+    // It is shown while the gap is, and ends with it.
+    expect(app).toContain(
+      '{#if hover !== null && hover.ghost !== null && hoverShown}',
+    );
+    expect(app).toContain('class="tab-ghost"');
+  });
+
+  it('keeps the tab drawn under the pointer out of the bar and out of its geometry', () => {
+    const rects = body(app, 'function tabRects(bar: HTMLElement)');
+    expect(rects).toContain('querySelectorAll<HTMLElement>(TAB_SELECTOR)');
+    const bar = app.indexOf('class="tabbar"');
+    const ghost = app.indexOf('class="tab-ghost"');
+    const tabs = app.indexOf('{#each documentWindow.tabs as tab, i (tab.id)}');
+    const newTab = app.indexOf('class="tab-new"');
+    expect(bar).toBeLessThan(tabs);
+    expect(newTab).toBeLessThan(ghost);
+    // The look is shared with the tab through one rule.
+    expect(app).toMatch(/\.tab,\n\s+\.tab-ghost \{/);
+  });
+
+  it('names the tab and where the pointer holds it when it leaves, for both ways of leaving', () => {
+    expect(body(app, '  async function startTearOff(')).toContain(
+      'title: tabName(tab.path),',
+    );
+    const follow = body(app, '  async function followWindow(');
+    expect(follow).toContain('title: start.title,');
+    expect(follow).toContain('tabGrabX: start.grab.x,');
+  });
+});
+
+describe('a window a tab that follows the pointer made invisible', () => {
+  it('is shown before the close gate asks for its focus, whatever its role', () => {
+    const focus = body(app, 'focusWindow: async () => {');
+    expect(focus).toContain("invoke('tab_window_restore')");
+    expect(focus.indexOf("invoke('tab_window_restore')")).toBeLessThan(
+      focus.indexOf('win.setFocus()'),
+    );
+    expect(focus).not.toContain('tearOffRole');
+  });
+
+  it('is shown when a close or a quit is called off, whatever its role', () => {
+    const handler = body(app, 'gate.onCallOff = () => {');
+    const restore = handler.indexOf("invoke('tab_window_restore')");
+    expect(restore).toBeGreaterThan(-1);
+    expect(restore).toBeLessThan(handler.indexOf('tearOffCloseCalledOff('));
+    expect(
+      handler.slice(0, handler.indexOf('tearOffCloseCalledOff(')),
+    ).not.toContain('tearOffRole');
+    // The role-bound call stays as it was.
+    expect(handler).toContain("invoke('tab_tearoff_close_vetoed')");
+  });
+
+  it('is shown when the send of its only tab failed or was refused', () => {
+    const reveal = body(state, '  private async revealWith(tab: DocTab)');
+    expect(reveal).toContain("invoke('tab_window_restore')");
+    expect(reveal.indexOf('this.goingAway()')).toBeLessThan(
+      reveal.indexOf("invoke('tab_window_restore')"),
+    );
+    expect(reveal.indexOf("invoke('tab_window_restore')")).toBeLessThan(
+      reveal.indexOf('this.revealSelf?.()'),
+    );
+    const send = body(state, '  async onTransferSend(payload: SendPayload)');
+    // Every way the send does not start is shown through it.
+    expect(send.match(/await this\.revealWith\(tab\);/g)).toHaveLength(2);
+  });
+});
