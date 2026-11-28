@@ -4,21 +4,31 @@
 import { describe, expect, it } from 'vitest';
 import {
   DRAG_THRESHOLD,
+  GHOST_CLASS,
   IDLE,
+  TAB_SELECTOR,
+  TEAROFF_BAND,
+  canTearOff,
   dragStep,
+  dropSlot,
+  ghostLeft,
   hoverAccepted,
+  hoverAck,
   hoverCall,
   hoverGap,
   hoverShift,
+  outsideStrip,
   overTabBar,
   slideOffset,
   slotAt,
+  tearOffStart,
   translateXOf,
   type CancelReason,
   type DragInput,
   type DragOutcome,
   type DragState,
   type TabBarGeometry,
+  type TearOffInput,
 } from './tabDrag';
 /** Four tabs of 100 px in a bar 300 px wide at the left of the viewport, 30 px
  *  high: the last tab is partly out of view when `scrollLeft` is above 100. */
@@ -443,5 +453,321 @@ describe('hoverGap', () => {
       point: { x: 10, y: 20 },
       width: 90,
     });
+  });
+});
+
+const tear = (over: Partial<TearOffInput> = {}): TearOffInput => ({
+  canTearOff: true,
+  onlyTab: false,
+  blocked: false,
+  mintId: () => 'drag-1',
+  ...over,
+});
+const moveT = (x: number, y: number, over: Partial<TearOffInput> = {}) =>
+  ({
+    kind: 'move',
+    x,
+    y,
+    geometry: bar(),
+    tearOff: tear(over),
+  }) satisfies DragInput;
+/** A drag of the second tab that is under way inside the bar. */
+const underway: DragInput[] = [down(1), move(200)];
+
+describe('where the tab strip ends', () => {
+  it('is the bar widened by 15 px above and below, and its own width', () => {
+    expect(TEAROFF_BAND).toBe(15);
+    const b = bar().bar;
+    expect(outsideStrip(10, 10, b)).toBe(false);
+    // 15 px above the top is still in the strip, 16 px is out.
+    expect(outsideStrip(10, -15, b)).toBe(false);
+    expect(outsideStrip(10, -16, b)).toBe(true);
+    // Below the bottom (30): 14 px in, 15 px out (the band is half open).
+    expect(outsideStrip(10, 44, b)).toBe(false);
+    expect(outsideStrip(10, 45, b)).toBe(true);
+    // Left of the bar and at its right edge are out; the last pixel is in.
+    expect(outsideStrip(-1, 10, b)).toBe(true);
+    expect(outsideStrip(299, 10, b)).toBe(false);
+    expect(outsideStrip(300, 10, b)).toBe(true);
+  });
+});
+
+describe('a tab that leaves its bar', () => {
+  it('is detached when the pointer leaves the strip sideways', () => {
+    const left = play([...underway, moveT(-1, 15)]);
+    expect(left.outcome).toEqual({ kind: 'detach', id: 'drag-1' });
+    expect(left.state.phase).toBe('detached');
+    expect(left.state.tearOffId).toBe('drag-1');
+    expect(play([...underway, moveT(300, 15)]).outcome).toEqual({
+      kind: 'detach',
+      id: 'drag-1',
+    });
+  });
+
+  it('is detached when it leaves the band above or below, not before', () => {
+    expect(play([...underway, moveT(100, -15)]).outcome).toBeNull();
+    expect(play([...underway, moveT(100, -16)]).outcome).toEqual({
+      kind: 'detach',
+      id: 'drag-1',
+    });
+    expect(play([...underway, moveT(100, 44)]).outcome).toBeNull();
+    expect(play([...underway, moveT(100, 45)]).outcome).toEqual({
+      kind: 'detach',
+      id: 'drag-1',
+    });
+  });
+
+  it('moves the window instead when it is the only tab', () => {
+    const r = play([...underway, moveT(100, 80, { onlyTab: true })]);
+    expect(r.outcome).toEqual({ kind: 'moveWindow', id: 'drag-1' });
+    expect(r.state.phase).toBe('moveWindow');
+  });
+
+  it('is nothing when something blocks the tab or the window cannot do it', () => {
+    for (const over of [{ blocked: true }, { canTearOff: false }]) {
+      const r = play([...underway, moveT(100, 80, over)]);
+      expect(r.outcome).toBeNull();
+      expect(r.state.phase).toBe('dragging');
+      expect(r.state.overBar).toBe(false);
+      // The release is the ordinary one.
+      const up = dragStep(r.state, {
+        kind: 'up',
+        x: 100,
+        y: 80,
+        geometry: bar(),
+      });
+      expect(up.outcome).toEqual({ kind: 'release', slot: 1, overBar: false });
+    }
+    expect(play([...underway, move(100, 80)]).outcome).toBeNull();
+  });
+
+  it('is never started from a press that has not become a drag', () => {
+    const r = play([down(1, 150, 15), moveT(150, 17)]);
+    expect(r.state.phase).toBe('pressed');
+    expect(r.outcome).toBeNull();
+  });
+
+  it('is decided by the window: a mouse, not Linux, not full screen', () => {
+    expect(canTearOff('mouse', 'macos', false)).toBe(true);
+    expect(canTearOff('mouse', 'windows', false)).toBe(true);
+    expect(canTearOff('mouse', 'macos', true)).toBe(false);
+    expect(canTearOff('touch', 'windows', false)).toBe(false);
+    expect(canTearOff('pen', 'macos', false)).toBe(false);
+    expect(canTearOff('mouse', 'linux', false)).toBe(false);
+  });
+});
+
+describe('while the core follows the pointer', () => {
+  const detached = [...underway, moveT(100, 80)];
+  const moving = [...underway, moveT(100, 80, { onlyTab: true })];
+  const cases: [string, DragInput[]][] = [
+    ['detached', detached],
+    ['moving', moving],
+  ];
+
+  it.each(cases)('ignores every move (%s)', (_name, inputs) => {
+    const before = play(inputs).state;
+    const after = play([...inputs, moveT(10, 10), move(250, 15)]);
+    expect(after.state).toEqual(before);
+    expect(after.outcome).toBeNull();
+  });
+
+  it.each(cases)('tells the core the button went up (%s)', (_name, inputs) => {
+    const r = play([...inputs, up(100, 80)]);
+    expect(r.outcome).toEqual({ kind: 'releaseSeen', id: 'drag-1' });
+    expect(r.state.phase).toBe('idle');
+    expect(r.state.swallowClick).toBe(true);
+  });
+
+  const reasons: CancelReason[] = ['pointercancel', 'lostcapture', 'blur'];
+  it.each(cases)(
+    'ends with no word to the core when the pointer or the focus is lost (%s)',
+    (_name, inputs) => {
+      for (const reason of reasons) {
+        const r = play([...inputs, { kind: 'cancel', reason }]);
+        expect(r.outcome).toBeNull();
+        expect(r.state.phase).toBe('idle');
+        expect(r.state.swallowClick).toBe(true);
+      }
+    },
+  );
+
+  it.each(cases)('tells the core of Esc and ends (%s)', (_name, inputs) => {
+    const r = play([...inputs, { kind: 'cancel', reason: 'escape' }]);
+    expect(r.outcome).toEqual({ kind: 'tearOffCancel', id: 'drag-1' });
+    expect(r.state.phase).toBe('idle');
+    expect(r.state.swallowClick).toBe(true);
+  });
+
+  it.each(cases)(
+    'ends with the core, for its own id only (%s)',
+    (_name, inputs) => {
+      const other = play([...inputs, { kind: 'end', id: 'drag-0' }]);
+      expect(other.state.phase).not.toBe('idle');
+      const mine = play([...inputs, { kind: 'end', id: 'drag-1' }]);
+      expect(mine.state.phase).toBe('idle');
+      expect(mine.outcome).toBeNull();
+      expect(mine.state.swallowClick).toBe(true);
+      // The click that follows the release of the button is swallowed.
+      expect(dragStep(mine.state, { kind: 'click' }).swallowed).toBe(true);
+    },
+  );
+
+  it('ignores an end when nothing follows', () => {
+    expect(play([...underway, { kind: 'end', id: 'drag-1' }]).state.phase).toBe(
+      'dragging',
+    );
+    expect(play([{ kind: 'end', id: 'drag-1' }]).state.phase).toBe('idle');
+  });
+
+  it.each(cases)(
+    'goes back to an ordinary drag when the core did not start, and tries no more (%s)',
+    (_name, inputs) => {
+      const r = play([...inputs, { kind: 'notStarted' }]);
+      expect(r.state.phase).toBe('dragging');
+      expect(r.state.index).toBe(1);
+      // The pointer is still far out: no second offer.
+      const again = dragStep(r.state, moveT(100, 90, { onlyTab: true }));
+      expect(again.outcome).toBeNull();
+      expect(again.state.phase).toBe('dragging');
+      // The release behaves as it always did.
+      const release = dragStep(again.state, up(100, 90));
+      expect(release.outcome).toEqual({
+        kind: 'release',
+        slot: 1,
+        overBar: false,
+      });
+      // A new press may tear the tab off again.
+      const fresh = play([down(1), move(200), moveT(100, 90)]);
+      expect(fresh.outcome).toEqual({ kind: 'detach', id: 'drag-1' });
+    },
+  );
+
+  it('ignores a refusal that comes after the drag ended', () => {
+    const r = play([
+      ...detached,
+      { kind: 'cancel', reason: 'escape' },
+      { kind: 'notStarted' },
+    ]);
+    expect(r.state.phase).toBe('idle');
+  });
+});
+
+describe('what the core is told when the tab leaves', () => {
+  const geometry = (scrollLeft: number): TabBarGeometry => ({
+    ...bar(scrollLeft),
+    bar: { left: 10, right: 310, top: 2, bottom: 32 },
+  });
+  const start = (scrollLeft: number) =>
+    tearOffStart({
+      id: 'drag-1',
+      pressed: { x: 155, y: 20 },
+      geometry: geometry(scrollLeft),
+      index: 1,
+      dpr: 2,
+      title: 'a.txt',
+    });
+
+  it('holds the tab where the button went down on it', () => {
+    // The tab sits at 100 in the bar's content, 10 right of the viewport edge:
+    // its slot starts at 110, and the press was 45 into it.
+    expect(start(0)).toEqual({
+      kind: 'tear_off',
+      id: 'drag-1',
+      grab: { x: 45, y: 20 },
+      firstTabClientX: 10,
+      escOffset: { x: 111, y: 17 },
+      dpr: 2,
+      width: 100,
+      title: 'a.txt',
+    });
+  });
+
+  it('measures the grab from the slot with the bar scrolled, and not the first tab', () => {
+    const scrolled = start(300);
+    // Scrolled 300 px, the slot is 300 further left: the press is 345 into it.
+    expect(scrolled.grab).toEqual({ x: 345, y: 20 });
+    // The tear-off's bar is not scrolled: its first tab starts where an
+    // unscrolled bar's does.
+    expect(scrolled.firstTabClientX).toBe(start(0).firstTabClientX);
+    expect(scrolled.escOffset.x).toBe(start(0).escOffset.x - 300);
+  });
+});
+
+describe('hoverAck', () => {
+  const plain = { x: 10, y: 20, width: 90 };
+  const follow = {
+    ...plain,
+    follow: { generation: 7, title: 'a.txt', grabX: 20 },
+  };
+
+  it('answers a hover of a follow with its generation and what the window takes right now', () => {
+    expect(hoverAck(follow, true, false)).toEqual({
+      generation: 7,
+      accepted: true,
+    });
+    expect(hoverAck(follow, false, false)).toEqual({
+      generation: 7,
+      accepted: false,
+    });
+    expect(hoverAck(follow, true, true)).toEqual({
+      generation: 7,
+      accepted: false,
+    });
+  });
+
+  it('is the same check that decides whether the gap and the tab are drawn', () => {
+    for (const ready of [true, false]) {
+      for (const locked of [true, false]) {
+        expect(hoverAck(follow, ready, locked)?.accepted).toBe(
+          hoverAccepted({ ready, locked }),
+        );
+      }
+    }
+  });
+
+  it('answers nothing to a hover of a drag the sender leads itself', () => {
+    expect(hoverAck(plain, true, false)).toBeNull();
+    expect(hoverAck(plain, false, true)).toBeNull();
+  });
+});
+
+describe('ghostLeft', () => {
+  const barBox = { left: 10, right: 310 };
+
+  it('puts the tab where the pointer holds it', () => {
+    expect(ghostLeft({ x: 150 }, 45, 100, barBox)).toBe(105);
+    expect(ghostLeft({ x: 150 }, 0, 100, barBox)).toBe(150);
+  });
+
+  it('keeps the tab inside the bar at both ends', () => {
+    expect(ghostLeft({ x: 20 }, 45, 100, barBox)).toBe(10);
+    expect(ghostLeft({ x: 305 }, 45, 100, barBox)).toBe(210);
+    expect(ghostLeft({ x: 1000 }, 0, 100, barBox)).toBe(210);
+  });
+
+  it('keeps the left edge of a bar narrower than the tab', () => {
+    expect(ghostLeft({ x: 100 }, 20, 400, barBox)).toBe(10);
+  });
+});
+
+describe('the tab drawn under the pointer', () => {
+  it('is not one of the tabs of the bar: its class is kept out of the geometry selector', () => {
+    expect(GHOST_CLASS).toBe('tab-ghost');
+    expect(TAB_SELECTOR).toBe(':scope > .tab:not(.tab-ghost)');
+    // The ghost has the look of a tab, so only the exclusion keeps it out.
+    expect(TAB_SELECTOR).toContain(`:not(.${GHOST_CLASS})`);
+  });
+
+  it('would move the slot of a point if it were measured as a tab, which is why it is left out', () => {
+    const without = bar();
+    // A ghost measured as a tab sits in the bar's boxes under the pointer.
+    const withGhost = {
+      ...bar(),
+      tabs: [...bar().tabs, { left: 150, width: 100 }],
+    };
+    const point = { x: 250, y: 10 };
+    expect(dropSlot(point, without)).toBe(2);
+    expect(dropSlot(point, withGhost)).toBe(3);
   });
 });

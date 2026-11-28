@@ -2139,9 +2139,68 @@ mod platform {
     /// Whether this thread holds `PASTEBOARD_TESTS`.
     static PASTEBOARD_HELD: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
   }
-  /// `PASTEBOARD_TESTS`, held by this thread until dropped.
+  // Set by a parent test on the child process it spawns. The parent holds the
+  // lock file for the whole test, so the child must not wait for it.
+  #[cfg(test)]
+  const CHILD_VAR: &str = "NOTE_N_PAD_TEST_PASTEBOARD_CHILD";
+  /// How long a test waits for the lock file before it fails.
+  #[cfg(test)]
+  const PASTEBOARD_LOCK_WAIT: std::time::Duration = std::time::Duration::from_secs(300);
+  /// FNV-1a, 32 bits, of this checkout's path; keeps worktrees apart.
+  #[cfg(test)]
+  fn checkout_hash() -> u32 {
+    env!("CARGO_MANIFEST_DIR")
+      .bytes()
+      .fold(0x811c_9dc5_u32, |hash, byte| {
+        (hash ^ u32::from(byte)).wrapping_mul(0x0100_0193)
+      })
+  }
+  /// The lock file that serializes the pasteboard tests of this checkout across
+  /// processes.
+  #[cfg(test)]
+  fn pasteboard_lock_path() -> std::path::PathBuf {
+    std::env::temp_dir().join(format!(
+      "note-n-pad-test-{:08x}.pasteboard.lock",
+      checkout_hash()
+    ))
+  }
+  /// An exclusive `flock` on the lock file, released when dropped; polled so
+  /// that no wait is unbounded.
+  #[cfg(test)]
+  fn lock_pasteboard_file() -> std::fs::File {
+    use std::os::fd::AsRawFd;
+    let path = pasteboard_lock_path();
+    let file = std::fs::OpenOptions::new()
+      .create(true)
+      .truncate(false)
+      .write(true)
+      .open(&path)
+      .unwrap_or_else(|error| panic!("cannot open the lock file {}: {error}", path.display()));
+    let deadline = std::time::Instant::now() + PASTEBOARD_LOCK_WAIT;
+    loop {
+      if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
+        return file;
+      }
+      let error = std::io::Error::last_os_error();
+      match error.raw_os_error() {
+        Some(libc::EINTR) => {}
+        Some(libc::EWOULDBLOCK) => {
+          assert!(
+            std::time::Instant::now() < deadline,
+            "the lock file {} was not released within {PASTEBOARD_LOCK_WAIT:?}",
+            path.display()
+          );
+          std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        _ => panic!("cannot lock {}: {error}", path.display()),
+      }
+    }
+  }
+  /// `PASTEBOARD_TESTS`, held by this thread until dropped, and the lock file
+  /// unless this is a child process; the file is dropped first.
   #[cfg(test)]
   struct PasteboardTest {
+    _file: Option<std::fs::File>,
     _lock: std::sync::MutexGuard<'static, ()>,
   }
 
@@ -2158,8 +2217,16 @@ mod platform {
     let lock = PASTEBOARD_TESTS
       .lock()
       .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let file = if std::env::var_os(CHILD_VAR).is_some() {
+      None
+    } else {
+      Some(lock_pasteboard_file())
+    };
     PASTEBOARD_HELD.with(|held| held.set(true));
-    PasteboardTest { _lock: lock }
+    PasteboardTest {
+      _file: file,
+      _lock: lock,
+    }
   }
   /// Whether this thread holds `PASTEBOARD_TESTS`.
   #[cfg(test)]
@@ -2502,15 +2569,9 @@ mod platform {
     // --- plain text through the Pasteboard Manager ----------------------------
     /// The pasteboard name of `case` of `test`, fixed so that a run finds and
     /// releases what a killed run left. The checkout's hash keeps worktrees
-    /// apart; two runs of one checkout's pasteboard tests at once are not
-    /// supported.
+    /// apart; runs of one checkout wait for each other through the lock file.
     fn fixed_name(test: &str, case: impl std::fmt::Display) -> String {
-      // FNV-1a, 32 bits: 8 hex digits.
-      let checkout = env!("CARGO_MANIFEST_DIR")
-        .bytes()
-        .fold(0x811c_9dc5_u32, |hash, byte| {
-          (hash ^ u32::from(byte)).wrapping_mul(0x0100_0193)
-        });
+      let checkout = checkout_hash();
       format!("note-n-pad-test-{checkout:08x}-{test}-{case}")
     }
     /// Asserts that this thread holds `PASTEBOARD_TESTS`.
@@ -3397,6 +3458,7 @@ mod platform {
           "--test-threads=1",
           "--nocapture",
         ])
+        .env(CHILD_VAR, "1")
         .envs(vars.iter().map(|(k, v)| (*k, v.as_str())))
         .output();
       output.is_ok_and(|output| {
@@ -3727,6 +3789,35 @@ mod platform {
       }
     }
 
+    /// The text of this file from `start` to the next `end` after it.
+    fn source_between(start: &str, end: &str) -> &'static str {
+      const SOURCE: &str = include_str!("clipboard_store.rs");
+      let from = SOURCE.find(start).unwrap();
+      let to = from + SOURCE[from..].find(end).unwrap();
+      &SOURCE[from..to]
+    }
+
+    #[test]
+    fn the_spawns_of_child_processes_mark_them_as_children() {
+      let spawns = [
+        source_between("fn run_child(", ".output()"),
+        source_between(
+          // Split so that this text does not match itself.
+          concat!(
+            "fn a_pasteboard_a_killed_run_left",
+            "_is_released_by_the_next_run() {"
+          ),
+          ".spawn()",
+        ),
+      ];
+      for spawn in spawns {
+        assert!(
+          spawn.contains(".env(CHILD_VAR, \"1\")"),
+          "a spawn without CHILD_VAR would wait on its parent's lock file"
+        );
+      }
+    }
+
     #[test]
     fn a_pasteboard_a_killed_run_left_is_released_by_the_next_run() {
       let _held = pasteboard_test();
@@ -3743,6 +3834,7 @@ mod platform {
           "--test-threads=1",
           "--nocapture",
         ])
+        .env(CHILD_VAR, "1")
         .env(NAME_VAR, &name)
         .env(WAIT_VAR, "1")
         .stdin(std::process::Stdio::piped())

@@ -334,8 +334,9 @@ e2e_wait_setting large_select_all "file"
 check "setting is file" "$(e2e_read "$DL" "String(__auto.largeSelectAllMode())")" "file"
 
 echo "=== open lines.log for windowed editing ==="
-evl "$DL" "__auto.windowedOpen('$WORK/lines.log').then((r)=>{window.__ow=r;})" >/dev/null
+evl "$DL" "window.__ow=undefined;__auto.windowedOpen('$WORK/lines.log').then((r)=>{window.__ow=r;})" >/dev/null
 e2e_wait_eval "$DL" "String(__auto.getTabs().length===2 && __auto.isWindowedTab() && __auto.getContent().startsWith('0000000001 ') && __auto.windowedInfo().windowStartLine===0)" "true"
+e2e_wait_eval "$DL" "String(window.__ow!==undefined)" "true"
 check "lines.log opened without refusal" "$(e2e_read "$DL" "String(window.__ow===null)")" "true"
 check "total lines" "$(e2e_read "$DL" "String(__auto.windowedInfo().totalLines)")" "$N_LINES"
 evl "$DL" "$HELPERS" >/dev/null
@@ -500,8 +501,9 @@ fi
 ok "setup: lines.ref.log and lines.log have the same sha256 ($SETUP_A)"
 
 echo "--- reference pass (copy of the saved file, undo and x only) ---"
-evl "$DL" "__auto.windowedOpen('$WORK/lines.ref.log').then((r)=>{window.__or=r;})" >/dev/null
+evl "$DL" "window.__or=undefined;__auto.windowedOpen('$WORK/lines.ref.log').then((r)=>{window.__or=r;})" >/dev/null
 e2e_wait_eval "$DL" "String(__auto.getTabs().length===3 && __auto.getTabs()[2].active && __auto.isWindowedTab() && __auto.getContent().startsWith('0000000001 ') && __auto.windowedInfo().windowStartLine===0)" "true"
+e2e_wait_eval "$DL" "String(window.__or!==undefined)" "true"
 check "reference copy opened without refusal" "$(e2e_read "$DL" "String(window.__or===null)")" "true"
 replace_all_pass
 REF_QUEUED=$(e2e_read "$DL" "(()=>{__t.mod('z');__t.key('x');return String(__auto.windowedReplayLength());})()")
@@ -658,8 +660,9 @@ check "no exception thrown in the whole run" "$(e2e_read "$DL" "$(js_errors)")" 
 
 if [ "$(uname -s)" = "Linux" ]; then
   echo "=== 11. peak memory of a Select All over a file ending in a 60 MiB line ==="
-  evl "$DL" "__auto.windowedOpen('$WORK/longlast.log').then((r)=>{window.__ol=r;})" >/dev/null
+  evl "$DL" "window.__ol=undefined;__auto.windowedOpen('$WORK/longlast.log').then((r)=>{window.__ol=r;})" >/dev/null
   e2e_wait_eval "$DL" "String(__auto.getTabs().length===4 && __auto.isWindowedTab() && __auto.getContent().startsWith('zzzz') && __auto.windowedInfo().windowStartLine===0)" "true"
+  e2e_wait_eval "$DL" "String(window.__ol!==undefined)" "true"
   check "longlast.log opened without refusal" "$(e2e_read "$DL" "String(window.__ol===null)")" "true"
   PID=$(pgrep -x note-n-pad | head -1)
   echo "app pid: $PID"

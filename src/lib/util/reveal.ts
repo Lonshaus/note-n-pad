@@ -7,17 +7,9 @@ import { settingsState } from '../state/settings.svelte';
 import { themeRegistry } from '../theme/themeRegistry.svelte';
 import { localeRegistry } from '../i18n/localeRegistry.svelte';
 import { editionState } from '../state/edition.svelte';
-
-/** Reveal the current window once its theme is resolved and applied to the
- *  document root, so a dark-theme window never flashes its default white
- *  background. Windows are created hidden (`.visible(false)`) in the Rust core;
- *  call this from onMount after registering the OS color-scheme listener.
- *  Awaits the saved theme load, flushes the reactive effect that stamps
- *  data-theme onto the root, then reveals. Goes through the `reveal_self` command
- *  (not a bare show()) because on macOS show() alone leaves the WKWebView off the
- *  responder chain, so real keystrokes are dropped until a click; the command
- *  pairs show() with set_focus(). Both are idempotent. */
-export async function revealWhenThemed(): Promise<void> {
+/** Load what the first paint of the window's chrome waits for: the theme and
+ *  locale registries, the edition and the settings, flushed into the DOM. */
+export async function loadChrome(): Promise<void> {
   // Load custom themes and data locales before settings, so a stored custom
   // theme id or data-locale language resolves instead of falling back — the
   // settings derivations (resolvedLocale, theme) read both registries.
@@ -29,6 +21,18 @@ export async function revealWhenThemed(): Promise<void> {
   await settingsState.init();
   await tick();
   repaintNativeSelects();
+}
+/** Reveal the current window once its theme is resolved and applied to the
+ *  document root, so a dark-theme window never flashes its default white
+ *  background. Windows are created hidden (`.visible(false)`) in the Rust core;
+ *  call this from onMount after registering the OS color-scheme listener.
+ *  Awaits the saved theme load, flushes the reactive effect that stamps
+ *  data-theme onto the root, then reveals. Goes through the `reveal_self` command
+ *  (not a bare show()) because on macOS show() alone leaves the WKWebView off the
+ *  responder chain, so real keystrokes are dropped until a click; the command
+ *  pairs show() with set_focus(). Both are idempotent. */
+export async function revealWhenThemed(): Promise<void> {
+  await loadChrome();
   await invoke('reveal_self');
 }
 

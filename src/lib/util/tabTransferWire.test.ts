@@ -10,13 +10,21 @@ import {
   DROP,
   QUEUED_TRANSFER,
   SETTLE,
+  TEAROFF_EVENT,
+  HOVER_EVENT,
   TRANSFER_EVENT,
   committedMeta,
   type BeginResult,
   type CommittedMeta,
   type DropTarget,
+  type HoverAckArgs,
+  type HoverPayload,
+  type SendPayload,
   type SettleAction,
+  type TearOffEndPayload,
+  type TearOffTarget,
   type TransferEventPayload,
+  type WindowReady,
 } from './tabTransferWire';
 
 const DROP_SELF = '{"kind":"self"}';
@@ -33,6 +41,18 @@ const COMMITTED_META =
 const SETTLE_ACTIONS =
   '[{"kind":"unfreeze","t":1,"noteId":"n"},{"kind":"drop_incoming","t":2},{"kind":"release","t":3,"noteId":"m"}]';
 const EVENT = '{"t":9}';
+const DROP_TEAR =
+  '{"kind":"tear_off","id":"drag-1","grab":{"x":20.5,"y":14.25},"firstTabClientX":4.5,"escOffset":{"x":101.5,"y":15.25},"dpr":2.0,"width":90.5,"title":"a.txt"}';
+// The same two literals are pinned by `src-tauri/src/tab_transfer.rs`.
+const HOVER_PLAIN = '{"x":10.5,"y":20.0,"width":90.0}';
+const HOVER_FOLLOW =
+  '{"x":10.5,"y":20.0,"width":90.0,"follow":{"generation":3,"title":"a.txt","grabX":20.5}}';
+const SEND_EVENT =
+  '{"note":"n","target":{"kind":"doc","label":"doc-b","offset":{"x":40.5,"y":10.25}}}';
+const END_EVENT = '{"id":"drag-1"}';
+const ROLE_END_EVENT = '{"id":null}';
+const READY =
+  '{"queued":[{"kind":"path","value":"a.txt"},{"kind":"transfer","value":4},{"kind":"handoff","value":9}],"tearOffRoleEnded":true,"revealed":false}';
 
 describe('the drop targets the core answers', () => {
   it('are tagged by `kind` in snake_case', () => {
@@ -53,8 +73,33 @@ describe('the drop targets the core answers', () => {
     });
     expect(parsed(DROP_CANCEL).kind).toBe(DROP.cancel);
     expect(Object.values(DROP).sort()).toEqual(
-      ['cancel', 'doc', 'move_window', 'new_window', 'self'].sort(),
+      ['cancel', 'doc', 'move_window', 'new_window', 'self', 'tear_off'].sort(),
     );
+  });
+
+  it('carry a tab that left its bar as `tear_off` with camelCase fields', () => {
+    const target: TearOffTarget = {
+      kind: DROP.tearOff,
+      id: 'drag-1',
+      grab: { x: 20.5, y: 14.25 },
+      firstTabClientX: 4.5,
+      escOffset: { x: 101.5, y: 15.25 },
+      dpr: 2,
+      width: 90.5,
+      title: 'a.txt',
+    };
+    // `2.0` and `2` are the same number on the wire.
+    expect(JSON.parse(JSON.stringify(target))).toEqual(JSON.parse(DROP_TEAR));
+    expect(Object.keys(JSON.parse(DROP_TEAR)).sort()).toEqual([
+      'dpr',
+      'escOffset',
+      'firstTabClientX',
+      'grab',
+      'id',
+      'kind',
+      'title',
+      'width',
+    ]);
   });
 });
 
@@ -111,5 +156,68 @@ describe('the events of a transfer', () => {
     const payload: TransferEventPayload = JSON.parse(EVENT);
     expect(payload).toEqual({ t: 9 });
     expect(QUEUED_TRANSFER).toBe('transfer');
+  });
+});
+
+describe('the events of a tab that follows the pointer', () => {
+  it('are named and shaped as the core emits them', () => {
+    expect(TEAROFF_EVENT).toEqual({
+      send: 'tab-transfer-send',
+      end: 'tab-tearoff-end',
+    });
+    const send: SendPayload = JSON.parse(SEND_EVENT);
+    expect(send).toEqual({
+      note: 'n',
+      target: { kind: DROP.doc, label: 'doc-b', offset: { x: 40.5, y: 10.25 } },
+    });
+    const end: TearOffEndPayload = JSON.parse(END_EVENT);
+    expect(end).toEqual({ id: 'drag-1' });
+    const role: TearOffEndPayload = JSON.parse(ROLE_END_EVENT);
+    expect(role.id).toBeNull();
+  });
+
+  it('come back from `doc_window_ready` with the queue and what became of the role', () => {
+    const ready: WindowReady = JSON.parse(READY);
+    expect(ready.queued).toEqual([
+      { kind: 'path', value: 'a.txt' },
+      { kind: QUEUED_TRANSFER, value: 4 },
+      { kind: 'handoff', value: 9 },
+    ]);
+    expect(ready.tearOffRoleEnded).toBe(true);
+    expect(ready.revealed).toBe(false);
+  });
+});
+
+describe('the hover event', () => {
+  it('has no follow object when the sender itself leads the drag', () => {
+    expect(HOVER_EVENT).toEqual({
+      hover: 'tab-transfer-hover',
+      end: 'tab-transfer-hover-end',
+    });
+    const plain: HoverPayload = JSON.parse(HOVER_PLAIN);
+    expect(plain).toEqual({ x: 10.5, y: 20, width: 90 });
+    expect(plain.follow).toBeUndefined();
+  });
+
+  it('carries the generation, the title and the grab of a follow of the core', () => {
+    const hover: HoverPayload = JSON.parse(HOVER_FOLLOW);
+    expect(hover.follow).toEqual({
+      generation: 3,
+      title: 'a.txt',
+      grabX: 20.5,
+    });
+    expect(Object.keys(JSON.parse(HOVER_FOLLOW).follow).sort()).toEqual([
+      'generation',
+      'grabX',
+      'title',
+    ]);
+  });
+
+  it('is answered with the generation it came with and whether the window takes the tab', () => {
+    const ack: HoverAckArgs = { generation: 3, accepted: true };
+    expect(JSON.parse(JSON.stringify(ack))).toEqual({
+      generation: 3,
+      accepted: true,
+    });
   });
 });

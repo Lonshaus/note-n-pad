@@ -53,10 +53,12 @@ type IncomingWindow = Pick<
   | 'incoming'
   | 'indexKnown'
   | 'isEmpty'
+  | 'lockedForIncoming'
   | 'ready'
   | 'restoreIncoming'
   | 'settleForInsert'
   | 'tabs'
+  | 'tearOffRole'
   | 'wasDropped'
 >;
 /** What the receiver needs of the window around it. */
@@ -168,13 +170,16 @@ export class IncomingTransfers {
     if (first === undefined) {
       return;
     }
+    // A tear-off waiting for its role to end is shown by the core, never by the
+    // tab it takes in.
+    const inRole = this.win.tearOffRole;
     const known = await this.refreshSession(first);
     const ok =
       known &&
       receiverAnswer({
         ready: this.win.ready,
         indexSettled: this.win.indexKnown,
-        locked: this.win.dragLocked(),
+        locked: this.win.lockedForIncoming(t),
         holdsId: this.holds(first.tab.id),
       });
     let answer: Answer;
@@ -232,7 +237,9 @@ export class IncomingTransfers {
     const tab = this.win.acceptIncoming(t, !this.host.modalOpen());
     if (tab !== null) {
       this.host.arrived(tab);
-      await this.host.reveal();
+      if (!inRole) {
+        await this.host.reveal();
+      }
     }
   }
   /** Tell the core where the copy sits. When the call itself fails the core is
